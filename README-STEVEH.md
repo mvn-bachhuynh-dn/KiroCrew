@@ -67,15 +67,15 @@ EOF
 ```bash
 cd /tmp/telegram-proxy
 # Use OAuth login (the CLOUDFLARE_API_TOKEN_GMAIL doesn't have workers_scripts write)
-CLOUDFLARE_API_TOKEN="" CLOUDFLARE_ACCOUNT_ID="3b90d7e872640e27405defd7bb9a6813" wrangler deploy
+CLOUDFLARE_API_TOKEN="" CLOUDFLARE_ACCOUNT_ID="YOUR_CLOUDFLARE_ACCOUNT_ID" wrangler deploy
 ```
 
-Result: `https://telegram-proxy.bach-huynhvan.workers.dev`
+Result: `https://telegram-proxy.YOUR_SUBDOMAIN.workers.dev`
 
 ### 1.3 Test Worker
 
 ```bash
-curl -sS "https://telegram-proxy.bach-huynhvan.workers.dev/bot123:fake/getMe"
+curl -sS "https://telegram-proxy.YOUR_SUBDOMAIN.workers.dev/bot123:fake/getMe"
 # Expected: {"ok":false,"error_code":401,"description":"Unauthorized"}
 # (401 = Telegram received it, proxy works)
 ```
@@ -148,7 +148,7 @@ mkdir -p ~/kirocrew-data
 ```bash
 docker run -d --name kirocrew \
   -e KIROCREW_ALLOW_UNSANDBOXED=1 \
-  -e "TELEGRAM_API_BASE_URL=https://telegram-proxy.bach-huynhvan.workers.dev/bot{token}/{method}" \
+  -e "TELEGRAM_API_BASE_URL=https://telegram-proxy.YOUR_SUBDOMAIN.workers.dev/bot{token}/{method}" \
   -p 5476:5476 \
   -v ~/kirocrew-data:/home/kirocrew \
   -v ~/kirocrew-patches/telegram/client.py:/usr/local/lib/python3.12/site-packages/kiro_crew/telegram/client.py:ro \
@@ -187,7 +187,7 @@ Set `dashboard.url` to match **exactly** the URL you use in the browser:
 ```json
 {
   "dashboard": {
-    "url": "https://kirocrew.asiantech.vn"
+    "url": "https://YOUR_DOMAIN"
   }
 }
 ```
@@ -208,7 +208,7 @@ Edit `~/kirocrew-data/.kiro/crew/config.json`:
 {
   "telegram": {
     "enabled": true,
-    "allowed_user_ids": [7961476537],
+    "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
     "soft_threshold_pct": 80,
     "allow_forum": false,
     "allowed_forum_chat_ids": []
@@ -258,11 +258,11 @@ docker exec kirocrew curl -sS -b "mc_token_5476=$TOKEN" http://127.0.0.1:5476/ap
 
 - **Config path (host):** `~/kirocrew-data/.kiro/crew/config.json`
 - **Secrets (host):** `~/kirocrew-data/.kiro/crew/.env`
-- **Worker URL:** `https://telegram-proxy.bach-huynhvan.workers.dev`
-- **Dashboard domain:** `https://kirocrew.asiantech.vn`
-- **Telegram user ID:** `7961476537`
-- **Cloudflare account:** `Bach.huynhvan@gmail.com` (ID: `3b90d7e872640e27405defd7bb9a6813`)
-- **Workers subdomain:** `bach-huynhvan`
+- **Worker URL:** `https://telegram-proxy.YOUR_SUBDOMAIN.workers.dev`
+- **Dashboard domain:** `https://YOUR_DOMAIN`
+- **Telegram user ID:** `YOUR_TELEGRAM_USER_ID`
+- **Cloudflare account:** `YOUR_EMAIL` (ID: `YOUR_CLOUDFLARE_ACCOUNT_ID`)
+- **Workers subdomain:** `YOUR_SUBDOMAIN`
 - **All Telegram config is boot-read** — any change requires `docker restart kirocrew`
 - **Channel credential pages are always read-only from dashboard web** — use bind mount or `docker exec`
 - Patched files target: `/usr/local/lib/python3.12/site-packages/kiro_crew/`

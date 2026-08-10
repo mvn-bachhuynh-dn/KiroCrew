@@ -14,7 +14,7 @@ Steve runs Kiro Crew via Docker on a server behind a network that **blocks
 ```bash
 docker run -d --name kirocrew \
   -e KIROCREW_ALLOW_UNSANDBOXED=1 \
-  -e "TELEGRAM_API_BASE_URL=https://telegram-proxy.bach-huynhvan.workers.dev/bot{token}/{method}" \
+  -e "TELEGRAM_API_BASE_URL=https://telegram-proxy.YOUR_SUBDOMAIN.workers.dev/bot{token}/{method}" \
   -p 5476:5476 \
   -v ~/kirocrew-data:/home/kirocrew \
   -v ~/kirocrew-patches/telegram/client.py:/usr/local/lib/python3.12/site-packages/kiro_crew/telegram/client.py:ro \
@@ -24,11 +24,9 @@ docker run -d --name kirocrew \
 
 ### Key details
 
-- **Dashboard URL:** `https://kirocrew.asiantech.vn`
-- **Telegram proxy:** Cloudflare Worker at `https://telegram-proxy.bach-huynhvan.workers.dev`
-  - Deployed via `wrangler` OAuth login on Cloudflare account `Bach.huynhvan@gmail.com`
-  - Account ID: `3b90d7e872640e27405defd7bb9a6813`, subdomain: `bach-huynhvan`
-- **Telegram user ID:** `7961476537`
+- **Dashboard URL:** configured via `dashboard.url` in config.json
+- **Telegram proxy:** Cloudflare Worker reverse proxy to `api.telegram.org`
+  - Deployed via `wrangler` OAuth login
 - **Config on host:** `~/kirocrew-data/.kiro/crew/config.json`
 - **Secrets on host:** `~/kirocrew-data/.kiro/crew/.env`
 - **Patched files on host:** `~/kirocrew-patches/`
@@ -68,7 +66,40 @@ docker logs kirocrew | grep -i telegram
 vim ~/kirocrew-data/.kiro/crew/config.json
 ```
 
+### Git workflow
+
+- **Upstream (read-only):** `origin` → `ssh://git@github.com/kirodotdev/KiroCrew.git`
+- **Personal fork:** `fork` → `git@github.com-ml:mvn-bachhuynh-dn/KiroCrew.git`
+  - Uses SSH host alias `github.com-ml` (key: `~/.ssh/id_rsa`)
+  - The default `github.com` SSH key (`id_rsa_smd`) does NOT have access to this repo
+- **Branch strategy:** feature branches off `main`, push to `fork`, create PR on fork
+
+```bash
+# Create feature branch
+git checkout -b feat/my-feature
+
+# Push to personal fork
+git push -u fork feat/my-feature
+```
+
 ### Full setup guide
 
 See `README-STEVEH.md` in the repo root for the complete step-by-step setup
 from scratch.
+
+## Security rules for this repo
+
+**This fork is PUBLIC.** Never commit or push:
+
+- API tokens, bot tokens, passwords, or secrets of any kind
+- Real email addresses, Telegram user IDs, or Cloudflare account IDs
+- Internal domain names (e.g. `*.asiantech.vn`)
+- SSH key paths or content
+- Any value from `~/.kiro/crew/.env`, `config.json` credentials, or env vars
+
+Use `YOUR_*` placeholders in docs and steering files. Real values belong ONLY in:
+- `~/kirocrew-data/.kiro/crew/.env` (on host, never committed)
+- `~/kirocrew-data/.kiro/crew/config.json` (on host, never committed)
+- Local environment variables
+
+Before pushing, always verify: `git diff <base>..HEAD | grep -iE "(token|secret|@gmail|@.*\.com|asiantech|\d{7,})"` returns nothing sensitive.
