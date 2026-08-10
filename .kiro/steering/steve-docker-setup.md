@@ -68,6 +68,22 @@ docker logs kirocrew | grep -i telegram
 vim ~/kirocrew-data/.kiro/crew/config.json
 ```
 
+### Git workflow
+
+- **Upstream (read-only):** `origin` → `ssh://git@github.com/kirodotdev/KiroCrew.git`
+- **Personal fork:** `fork` → `git@github.com-ml:mvn-bachhuynh-dn/KiroCrew.git`
+  - Uses SSH host alias `github.com-ml` (key: `~/.ssh/id_rsa`)
+  - The default `github.com` SSH key (`id_rsa_smd`) does NOT have access to this repo
+- **Branch strategy:** feature branches off `main`, push to `fork`, create PR on fork
+
+```bash
+# Create feature branch
+git checkout -b feat/my-feature
+
+# Push to personal fork
+git push -u fork feat/my-feature
+```
+
 ### Full setup guide
 
 See `README-STEVEH.md` in the repo root for the complete step-by-step setup
