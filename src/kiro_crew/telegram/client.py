@@ -52,8 +52,14 @@ _ALBUM_MAX_GROUPS = 64
 # Safe chunk boundary (leave room for markdown overhead).
 TELEGRAM_CHUNK_LIMIT = 4000
 
-# Bot API base URL.
-_API_BASE = "https://api.telegram.org/bot{token}/{method}"
+# Bot API base URL. Override with TELEGRAM_API_BASE_URL for proxy setups
+# (e.g. a Cloudflare Worker reverse proxy when api.telegram.org is blocked).
+# The value must include a trailing path that accepts /bot{token}/{method}.
+# Example: "https://my-proxy.workers.dev/bot{token}/{method}"
+_API_BASE = os.environ.get(
+    "TELEGRAM_API_BASE_URL",
+    "https://api.telegram.org/bot{token}/{method}",
+)
 
 #: Consecutive polling failures before the status callback reports unhealthy.
 _STATUS_FAILURE_THRESHOLD = 3
