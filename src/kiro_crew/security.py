@@ -5873,15 +5873,22 @@ _CREDENTIAL_PATTERNS = re.compile(
     r")"
     r"|xox[bpas]-[0-9a-zA-Z-]{10,}"  # Slack token
     # Telegram bot token: ``<bot_id>:<secret>`` — bot_id is 6+ digits, secret is
-    # ~35 URL-safe base64 chars. The ``{30,}`` floor sits deliberately below the
-    # real length so shortened/rotated test tokens are still caught. Analogue to
-    # the Slack token above. Telegram tokens can live in ``config.json``
-    # (agent-readable), so an echoed config would otherwise leak a full
-    # bot-control credential unredacted. The value class ``[A-Za-z0-9_-]`` stops
-    # at structural delimiters (space, quote, comma, brace), so it can't swallow
-    # adjacent fields; over-redacting a rare ``digits:token`` lookalike is the
-    # safe direction.
-    r"|[0-9]{6,}:[A-Za-z0-9_-]{30,}"  # Telegram bot token
+    # exactly 35 URL-safe base64 chars. The ``{33,}`` floor sits deliberately
+    # below the real length so shortened/rotated test tokens are still caught,
+    # but NOT so low that it matches an incidental ``digits:token`` run inside
+    # binary data. A ``{30,}`` floor false-matched the 32-char run
+    # ``456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz`` that the standard JPEG baseline
+    # Huffman table embeds in every such image, which made the outbound-file
+    # gate (which ``latin-1``-decodes raster bytes and scans them) reject every
+    # JPEG upload over a channel. 33 is the tightest floor that clears that
+    # 32-char run while staying under a real (or plausibly shortened) token.
+    # Analogue to the Slack token above. Telegram tokens can live in
+    # ``config.json`` (agent-readable), so an echoed config would otherwise leak
+    # a full bot-control credential unredacted. The value class ``[A-Za-z0-9_-]``
+    # stops at structural delimiters (space, quote, comma, brace), so it can't
+    # swallow adjacent fields; over-redacting a rare ``digits:token`` lookalike
+    # is the safe direction.
+    r"|[0-9]{6,}:[A-Za-z0-9_-]{33,}"  # Telegram bot token
     # ── Third-party developer credentials (AWS-345 / AWS-59) ──
     # Distinctive, fixed-case prefixes → very low false-positive risk.  Minimum
     # lengths are kept slightly below the real token lengths so shortened test /

@@ -57,6 +57,33 @@ class TestRedactCredentials:
         result, _ = redact_credentials(text)
         assert "FwoGZXIvYXdzEBYaDH" not in result
 
+    def test_redacts_telegram_bot_token(self) -> None:
+        # Real Telegram token: <bot_id>:<35-char secret>. Must be redacted even
+        # when embedded in an agent-readable config value.
+        token = "123456789:AAF-abcDEF_ghiJKLmnoPQRstuVWxyzABC"
+        result, _ = redact_credentials(f'"bot_token": "{token}"')
+        assert token not in result
+        assert "[REDACTED: credential]" in result
+
+    def test_redacts_shortened_telegram_bot_token(self) -> None:
+        # The floor sits below the real 35-char length so a shortened/rotated
+        # test token (33 chars here) is still caught.
+        token = "12345678:AAF-abcDEF_ghiJKLmnoPQRstuVWxyz01"
+        result, _ = redact_credentials(token)
+        assert token not in result
+
+    def test_jpeg_huffman_run_is_not_a_telegram_token(self) -> None:
+        # Every JPEG baseline image embeds the standard Huffman table, whose
+        # byte layout contains the 32-char run below. A too-low Telegram floor
+        # ({30,}) false-matched it, so the outbound-file gate (which latin-1-
+        # decodes raster bytes and scans them) rejected every JPEG upload over a
+        # channel. The {33,} floor clears this run while still catching a real
+        # (or plausibly shortened) token -- see the companion redaction tests.
+        jpeg_huffman_run = "%&'()*456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x83"
+        result, warnings = redact_credentials(jpeg_huffman_run)
+        assert result == jpeg_huffman_run
+        assert warnings == []
+
     def test_redacts_private_key_header(self) -> None:
         text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQ"
         result, _ = redact_credentials(text)
