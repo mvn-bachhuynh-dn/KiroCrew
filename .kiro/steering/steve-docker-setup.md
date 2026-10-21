@@ -82,6 +82,30 @@ git checkout -b feat/my-feature
 git push -u fork feat/my-feature
 ```
 
+Rules learned from running PRs on this fork and upstream:
+
+- **One commit per PR.** Upstream's PR Hygiene allows 1-2 commits and no merge
+  commits. To refresh a stale branch, rebase (`git fetch origin && git rebase
+  origin/main`, or "Update with rebase" on GitHub), never "Update branch" /
+  merge. Squash before pushing, then `git push --force-with-lease`.
+- **PR description follows `.github/PULL_REQUEST_TEMPLATE.md` verbatim**,
+  headings included (`## Why it matters`, `## Not a goal`, …); PR Hygiene fails
+  on a missing heading.
+- **Delete a branch after its PR merges**, and check `gh pr view <n> --json
+  state` before pushing to a PR branch: a commit pushed after the merge never
+  reaches `main`.
+- **Keep fork `main` in sync with upstream** through a `sync/upstream-main` PR
+  (merge commit, not squash). A stale fork `main` fails gates that upstream has
+  already fixed (expired dependency-audit exceptions, missing CI workflows).
+- **Fork CI cannot pass every lane.** The AI review lanes, Design/First
+  Principles and `internal-content-scan` need upstream secrets; Dependency
+  License Gate needs the fork's dependency graph. Red there is not a code
+  defect. On upstream, a fork PR's workflows wait for a maintainer's "Approve
+  and run" after every push.
+- **The Slack Channels Onboard app lives in its own repo**
+  (`mvn-bachhuynh-dn/slack-channels-onboard`): its `AGENTS.md` owns the
+  `main`/`release` flow. `contrib/apps/channel-onboard` here is an older copy.
+
 ### Full setup guide
 
 See `README-STEVEH.md` in the repo root for the complete step-by-step setup
