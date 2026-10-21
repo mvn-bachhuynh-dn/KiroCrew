@@ -69,9 +69,10 @@ vim ~/kirocrew-data/.kiro/crew/config.json
 ### Git workflow
 
 - **Upstream (read-only):** `origin` → `ssh://git@github.com/kirodotdev/KiroCrew.git`
-- **Personal fork:** `fork` → `git@github.com-ml:mvn-bachhuynh-dn/KiroCrew.git`
-  - Uses SSH host alias `github.com-ml` (key: `~/.ssh/id_rsa`)
-  - The default `github.com` SSH key (`id_rsa_smd`) does NOT have access to this repo
+- **Personal fork:** `fork` → `mvn-bachhuynh-dn/KiroCrew`
+  - Push to `fork` with the remote URL already configured in this clone
+    (`git remote -v`); it uses a dedicated SSH host alias. Do not rewrite it to
+    plain `github.com`: the default key has no access to this repo.
 - **Branch strategy:** feature branches off `main`, push to `fork`, create PR on fork
 
 ```bash
@@ -117,7 +118,7 @@ from scratch.
 
 - API tokens, bot tokens, passwords, or secrets of any kind
 - Real email addresses, Telegram user IDs, or Cloudflare account IDs
-- Internal domain names (e.g. `*.asiantech.vn`)
+- Internal domain names of the company network
 - SSH key paths or content
 - Any value from `~/.kiro/crew/.env`, `config.json` credentials, or env vars
 
@@ -126,4 +127,4 @@ Use `YOUR_*` placeholders in docs and steering files. Real values belong ONLY in
 - `~/kirocrew-data/.kiro/crew/config.json` (on host, never committed)
 - Local environment variables
 
-Before pushing, always verify: `git diff <base>..HEAD | grep -iE "(token|secret|@gmail|@.*\.com|asiantech|\d{7,})"` returns nothing sensitive.
+Before pushing, always verify: `git diff <base>..HEAD | grep -iE "(token|secret|@gmail|@.*\.com|\d{7,})"` returns nothing sensitive, and run the same diff through `grep -iEf ~/.config/kirocrew-fork-denylist.txt` (a local, untracked list of internal names that must never appear here).
