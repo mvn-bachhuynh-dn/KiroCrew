@@ -17,12 +17,15 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
   'display.interface': ['chat mode', 'cli mode', 'bubbles', 'terminal'],
 
   // Chat
-  'chat.fallback-model': ['model', 'llm', 'opus', 'sonnet', 'haiku', 'gpt', 'default model', 'fallback model', 'switch model', 'which model'],
-  'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort'],
+  'chat.default-model': ['model', 'llm', 'opus', 'sonnet', 'haiku', 'gpt', 'default model', 'fallback model', 'switch model', 'which model'],
+  'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort', 'how long models think', 'think before answering', 'thinking time'],
   'chat.auto-compact-threshold': ['context window', 'compaction', 'memory', 'conversation length'],
   'chat.show-timestamps': ['time', 'clock', 'message time'],
   'chat.merge-queued-messages': ['queue', 'batch', 'combine messages'],
   'chat.quick-send': ['fast send', 'enter to send', 'hotkey'],
+  'chat.spell-check-message-input': ['spell check', 'spellcheck', 'spelling', 'red underline', 'squiggle', 'dictionary'],
+  'chat.style-markdown-while-typing': ['markdown', 'bold', 'italic', 'strikethrough', 'inline code', 'formatting', 'live preview'],
+  'chat.split-side-by-side-diffs': ['split', 'unified', 'split view', 'unified view', 'diff layout', 'side by side'],
 
   // Voice
   'voice.enabled': ['tts', 'speak', 'read aloud', 'narrate', 'text-to-speech'],
@@ -34,14 +37,27 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
 
   // Notifications
   'notifications.play-sound-on-new-notifications': ['alert', 'audio', 'mute', 'silent'],
+  'notifications.sources': ['mute', 'priority', 'channel', 'per-app', 'silence'],
+  'notifications.volume': ['loudness', 'sound level', 'quieter', 'louder'],
+
+  // About. fuzzyMatch is literal, so the spaced and hyphenated spellings are
+  // both listed; "auto-update on restart" is the name both switches shipped under.
+  'about.update-the-gateway-automatically': ['auto update', 'auto-update', 'automatic updates', 'gateway updates', 'auto update on restart', 'auto-update on restart', 'install updates', 'update check'],
+  'about.install-app-updates-automatically': ['auto update', 'auto-update', 'automatic updates', 'auto update on restart', 'auto-update on restart', 'auto download', 'app updates'],
+  // About (manual entries — settingsManual.ts)
+  'about.update-channel': ['stable', 'insider', 'nightly', 'release channel', 'beta'],
 
   // Browser
-  'browser.enable-browser-mode': ['playwright', 'headless', 'web automation', 'chromium', 'firefox', 'webkit'],
-  'browser.attach-to-my-running-browser': ['extension', 'chrome', 'edge', 'brave', 'arc', 'opera', 'attach'],
 
   // Computer use
   'computer-use.enable-computer-use': ['accessibility', 'desktop', 'click', 'keyboard', 'screenshot', 'a11y', 'automation', 'gui'],
   'computer-use.attach-screenshots': ['screen capture', 'screenshot', 'pixels', 'window image'],
+
+  // Security (manual entries — settingsManual.ts)
+  'security.how-long-auto-approve-stays-on': ['yolo', 'auto-approve', 'auto approve', 'skip permissions', 'dangerously skip permissions', 'permissions', 'ttl', 'duration', 'expiry', 'until shutdown'],
+  'security.trust-this-machine-s-tailnet-name': ['lan', 'network', 'remote', 'expose', 'tailscale', 'origin'],
+  'security.denied-commands': ['deny', 'denylist', 'blocklist', 'blocked commands', 'command rules'],
+  'security.trust-every-third-party-app': ['apps', 'third party', 'auto approve apps', 'trust'],
 
   // General navigation
   'chat.split-view-session-grid': ['split pane', 'multi session', 'grid view'],

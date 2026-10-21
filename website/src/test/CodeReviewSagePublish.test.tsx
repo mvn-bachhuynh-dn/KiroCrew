@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
 import type { PullRequestSource } from '../types'
 
 const mockApi = vi.hoisted(() => ({
@@ -72,14 +73,18 @@ const SAGE_PAYLOADS: Record<string, unknown> = {
 // publishing, so a case that is not about identity has to look identified.
 function openReviewedPr(draftDelivered = true, expectedReviewId = '4242') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // MemoryRouter because the owner-not-configured refusal renders a settings
+  // <Link>, which needs a Router ancestor even in tests that never hit it.
   return render(
-    <QueryClientProvider client={client}>
-      <DraftReviewActions
-        url={PR_URL}
-        draftDelivered={draftDelivered}
-        expectedReviewId={expectedReviewId}
-      />
-    </QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <DraftReviewActions
+          url={PR_URL}
+          draftDelivered={draftDelivered}
+          expectedReviewId={expectedReviewId}
+        />
+      </QueryClientProvider>
+    </MemoryRouter>,
   )
 }
 

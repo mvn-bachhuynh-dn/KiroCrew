@@ -4,12 +4,12 @@
  * The load-bearing invariant these pin: an MCP App's iframe is null-origin
  * (`sandbox="allow-scripts allow-forms"`, no `allow-same-origin`) with no
  * storage, so unmounting it reloads the app and destroys whatever the user has
- * drawn. See `src/kiro_crew/docs/dashboard-iframe-hosts.md`.
+ * drawn. See `docs/architecture/dashboard-iframe-hosts.md`.
  *
  * Two ways that could happen, both covered here:
  *   1. registering `app` as a ViewKind — SidePanel unmounts category views on
  *      tab switch (`if (!isActive) return null`);
- *   2. the `activityOpen` gate in ChatPage unmounting the whole SidePanel
+ *   2. the `activityOpen` gate in ChatSidePanels unmounting the whole SidePanel
  *      subtree when the panel is closed.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'

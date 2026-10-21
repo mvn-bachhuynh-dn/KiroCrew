@@ -9,11 +9,12 @@ F2: the "file-too-large" staging rejection (added in R33) must be in the
 from pathlib import Path
 
 import yaml
+from yaml_helpers import load_with
 
 from kiro_crew.deploy import iam as iam_mod
 
 REPO = Path(__file__).resolve().parents[1]
-HANDLERS = (REPO / "src" / "kiro_crew" / "deploy" / "handlers.py").read_text(encoding="utf-8")
+HANDLERS = (REPO / "src" / "kiro_crew" / "deploy" / "handlers_sites.py").read_text(encoding="utf-8")
 TEMPLATES = REPO / "src" / "kiro_crew" / "deploy" / "skills" / "artifact-deploy" / "templates"
 
 
@@ -57,7 +58,7 @@ class TestF1ApiGwTagCondition:
         )
         for name in ("app-apigw.yaml", "app-apigw-ddb.yaml"):
             raw = (TEMPLATES / name).read_text(encoding="utf-8")
-            doc = yaml.load(raw, Loader=_CfnLoader)  # noqa: S506 — tag-blind CFN parse
+            doc = load_with(_CfnLoader, raw)
             api = next(
                 r for r in doc["Resources"].values()
                 if r.get("Type") == "AWS::ApiGatewayV2::Api"

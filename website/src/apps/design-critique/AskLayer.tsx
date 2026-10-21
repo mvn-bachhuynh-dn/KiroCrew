@@ -4,7 +4,9 @@ import { Spinner } from './Motion'
 import { S } from './styles'
 import type { Ask, Sel } from './types'
 
+import ErrorNotice from '../../components/ErrorNotice'
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 interface Props {
   sel: Sel | null
   asks: Ask[]
@@ -24,6 +26,7 @@ interface Props {
 }
 
 export default function AskLayer(p: Props) {
+  const ime = useImeGuard()
   const { sel, asks, openAskId, askDraft, reduceMotion } = p
 
   // Floating "Ask about this" chip for the current selection.
@@ -67,7 +70,13 @@ export default function AskLayer(p: Props) {
               {t.q ? <div style={S.askQ}>{t.q}</div> : null}
               {t.pending
                 ? <div style={{ ...S.askAnswer, color: 'var(--muted)', display: 'flex', gap: '7px', alignItems: 'center' }}><Spinner size={13} reduceMotion={reduceMotion} />{i18nT('apps.designCritique.askLayer.thinking')}</div>
-                : <div style={{ ...S.askAnswer, marginTop: t.q ? '4px' : 0, color: t.failed ? 'var(--error, #e5484d)' : 'var(--text)' }}>{t.a}</div>}
+                : t.failed
+                  ? <div style={{ ...S.askAnswer, marginTop: t.q ? '4px' : 0 }}>
+                      {/* No hand-off: the Ask composer below holds an unsaved draft
+                          question, and it is the retry surface for this thread. */}
+                      <ErrorNotice variant="inline" title={i18nT('apps.designCritique.askLayer.answer_failed_ask_again_below')} messagePlacement="below" message={t.a} />
+                    </div>
+                  : <div style={{ ...S.askAnswer, marginTop: t.q ? '4px' : 0, color: 'var(--text)' }}>{t.a}</div>}
             </div>
           ))}
         </div>
@@ -79,13 +88,14 @@ export default function AskLayer(p: Props) {
           disabled={p.pending}
           placeholder={activeAsk && activeAsk.turns.length ? 'Ask a follow-up…' : 'What don’t you understand about this?'}
           onChange={(e) => p.setAskDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !p.pending) {
+          {...ime.bindEnter({
+            onEnter: () => {
+              if (p.pending) return
               if (composing) p.askAbout(sel!.quote, askDraft)
               else p.askFollowUp(activeAsk!.id, askDraft)
-            }
-            if (e.key === 'Escape') { p.setOpenAskId(null); p.setSel(null) }
-          }}
+            },
+            onEscape: () => { p.setOpenAskId(null); p.setSel(null) },
+          })}
         />
         <button
           style={{ ...S.askIcon, ...S.askSend, ...(p.pending ? { opacity: 0.6, cursor: 'default' } : {}) }}

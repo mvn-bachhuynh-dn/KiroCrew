@@ -21,6 +21,7 @@ push commits back. Every git invocation here follows the same three rules as
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -35,10 +36,16 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.papyrus.backend import procio, store
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_config_hooks import (
+    ConfigHookScanError,
+    config_hook_disable_args_sandboxed_async,
+)
+from kiro_crew.git_divergence import divergence_count_args, parse_divergence_counts
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.sel import sel
 
@@ -46,7 +53,10 @@ logger = logging.getLogger("kirocrew.app.papyrus")
 
 #: A clone URL must match a known transport. Modern git already refuses an
 #: option-shaped URL, but the check is free and closes the door on every version.
-GIT_URL_RE = re.compile(r"^(?:https?|git|ssh)://[^\s]+$|^git@[\w.-]+:[^\s]+$")
+#: Anchored at ``\Z`` in both alternations: Python's ``$`` matches before a
+#: trailing newline, so a ``$`` anchor would accept ``"https://host/repo\n"``
+#: and hand the newline through to git's argv.
+GIT_URL_RE = re.compile(r"^(?:https?|git|ssh)://[^\s]+\Z|^git@[\w.-]+:[^\s]+\Z")
 
 #: Wall-clock ceilings, by operation cost.
 CLONE_TIMEOUT_SEC = 120.0
@@ -341,6 +351,21 @@ async def _git(
     # Attribute-driven programs are disabled by a file, not by `-c` — see
     # `_pin_attributes_sync` for why the override list cannot cover them.
     await asyncio.to_thread(_pin_attributes_sync, cwd)
+    # A hook defined in config (`hook.<name>.command`, git 2.54+) is not reached by the
+    # `core.hooksPath` pin below, and its name is the repository's choice, so each one git
+    # can see is disabled by name. See `kiro_crew.git_config_hooks`.
+    try:
+        hook_off = await config_hook_disable_args_sandboxed_async(
+            cwd, spawn_argv=sandboxed_spawn_argv, mode="standard"
+        )
+    except SandboxUnavailableError as exc:
+        # The scan runs through the same sandbox the real call does; a missing backend
+        # surfaces the same actionable error here as it does below. Record the refusal in SEL
+        # first, exactly as the real-call branch does, so a scan-refused call is not silent.
+        _audit(args[0] if args else "run", str(cwd), "denied", error="sandbox unavailable")
+        raise GitSandboxUnavailable(str(exc)) from exc
+    except ConfigHookScanError as exc:
+        raise GitError(str(exc)) from exc
     # `-c` overrides BEFORE the subcommand, which is the only place git accepts them and
     # which beats anything in `.git/config`.
     #
@@ -383,6 +408,7 @@ async def _git(
         # --- hooks that fire on ordinary porcelain ---------------------------------
         "-c",
         "core.hooksPath=/dev/null",
+        *hook_off,
         # `core.fsmonitor` holds the PATHNAME OF A HOOK that `git status`/`add` run on
         # every invocation — the same class as `sshCommand`. `false` is the documented
         # "no monitor" value; an empty string would be read as a path.
@@ -422,15 +448,16 @@ async def _git(
     # heartbeat — for up to five seconds. Same form and reason as `latex._run` and
     # `apps/builtins/dev_fleet/server.py`.
     try:
-        wrapped, env, cleanup = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), sandboxed_spawn_argv, argv
+        wrapped, env, cleanup = await shielded_prepare_off_loop(
+            functools.partial(sandboxed_spawn_argv, argv),
+            executor=subprocess_executor(),
         )
     except SandboxUnavailableError as exc:
         # Translated, not bypassed. See `GitSandboxUnavailable` — the wrap is what
         # keeps an agent-written repo config from reaching a shell on the one path
-        # that deliberately keeps `~/.ssh` visible. Previously this escaped as an
-        # unhandled 500, so on a Windows host (no sandbox backend exists there)
-        # every clone/commit/push/pull reported "internal error" and named no fix.
+        # that deliberately keeps `~/.ssh` visible. Unhandled, this escapes as a 500,
+        # so on a Windows host (no sandbox backend exists there) every
+        # clone/commit/push/pull reports "internal error" and names no fix.
         _audit(args[0] if args else "run", str(cwd), "denied", error="sandbox unavailable")
         raise GitSandboxUnavailable(str(exc)) from exc
     # A push/pull must never block on an interactive credential prompt: the
@@ -474,9 +501,7 @@ async def _git(
     except asyncio.TimeoutError as exc:
         if proc is not None and proc.returncode is None:
             try:
-                await platform_compat.kill_process_tree_async(
-                    proc.pid, platform_compat.SIGKILL
-                )
+                await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
             except (ProcessLookupError, OSError, ValueError):
                 logger.debug("papyrus: git %s already gone before kill", args[:1])
             try:
@@ -582,13 +607,14 @@ async def status(project: Path) -> GitStatus:
     _c, remote_out, _e = await _git(["remote"], cwd=project)
 
     ahead = behind = 0
-    code, counts, _e = await _git(
-        ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], cwd=project
-    )
+    code, counts_out, _e = await _git(divergence_count_args("@{upstream}"), cwd=project)
     if code == 0:
-        parts = counts.strip().split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            ahead, behind = int(parts[0]), int(parts[1])
+        # Display surface, not a gate: an unreadable count folds to 0/0 so the
+        # status panel still renders. The refusal policy for unreadable counts
+        # lives at the update gates, which act on the numbers.
+        parsed = parse_divergence_counts(counts_out)
+        if parsed is not None:
+            ahead, behind = parsed.ahead, parsed.behind
 
     changed = [line for line in porcelain.strip().splitlines() if line]
     return GitStatus(
@@ -666,9 +692,7 @@ async def pull(project: Path) -> tuple[str, bool]:
         stashed = code == 0 and "no local changes" not in (out + err).lower()
 
     try:
-        code, out, err = await _git(
-            ["pull", "--rebase"], cwd=project, timeout=NETWORK_TIMEOUT_SEC
-        )
+        code, out, err = await _git(["pull", "--rebase"], cwd=project, timeout=NETWORK_TIMEOUT_SEC)
     except GitError:
         # The pull never produced an exit code (timeout / git vanished). Put the
         # tree back before surfacing the error; a best-effort pop, because failing

@@ -15,12 +15,39 @@ invoking prompt gives you the value.
 ## What you are looking at
 
 Kiro Crew is an open-source AI agent platform (Python backend, React/TS
-dashboard). It is a single-user tool: every component runs as one OS user's own
-local processes sharing that user's resources, so the trust boundary is that OS
-user — a team deployment stays per-user, same-UID — not a multi-tenant service.
-Keep the review proportional to that shape. `CLAUDE.md` and `AGENTS.md` (root and
-`website/`) are read automatically; follow the conventions there. This repo is a
-de-Amazoned public fork: do NOT flag the absence of Brazil/AUTOSDE tooling.
+dashboard). `CLAUDE.md` and `AGENTS.md` (root and `website/`) are read
+automatically; follow the conventions there. This repo is a de-Amazoned public
+fork: do NOT flag the absence of Brazil/AUTOSDE tooling.
+
+DO NOT REASON FROM AN ASSUMED USER COUNT, in either direction. "It is
+a single-user tool, so this guard is unnecessary" and "it will be
+multi-user one day, so build the general case now" are both analogy
+dressed as a requirement, and both are forbidden to you. Judge an item
+by the harm it removes and the boundary it protects, counted the same
+way as everything else.
+
+The security boundaries this codebase actually has are real and
+load-bearing, and each one gives a control a named cause, which makes
+it DERIVED rather than speculative --
+  - the AGENT is untrusted with respect to its own governance
+    ceiling: it can never WRITE security_policy.json, profiles/,
+    admission_policy.json or computer_use.json -- the OS sandbox
+    mounts them read-only in every mode -- and the PreToolUse
+    sensitive-path gate refuses its file tools reading them; a read
+    through a spawned shell is permitted by design;
+  - an ENTERPRISE ADMINISTRATOR sits above the local user, composing
+    a policy ceiling tightest-wins that a running agent or app can
+    narrow but never loosen;
+  - the NETWORK is a boundary whenever the gateway is not on
+    loopback, where a dashboard requires token authentication;
+  - EXTERNAL CONTENT is untrusted input: fork pull-request diffs, web
+    pages, tool and command output, and messages arriving from any
+    connected channel;
+  - MULTIPLE HUMANS reach one gateway through the messaging surfaces,
+    admitted by allow-lists.
+So a guard, permission check, redaction, or isolation step whose harm
+is one of those boundaries has a named cause -- never report it as
+speculative surface.
 
 The invoking message tells you how to obtain the diff for this pull
 request -- either a command to run or a path to read. That diff is your
@@ -37,9 +64,15 @@ most; they are not a closed list.
 **Lens 2 — repository rules.** Read both base-branch snapshots:
 
 ```
-.review-base-rules/AUTOSDE.yaml          (backend Python)
+.review-base-rules/AUTOSDE.yaml          (repo-wide)
 .review-base-rules/website-AUTOSDE.yaml  (frontend)
 ```
+
+Patterns in `AUTOSDE.yaml` are repo-relative. Patterns in `website-AUTOSDE.yaml`
+are relative to `website/`: match them against a changed path with its leading
+`website/` removed (`src/**/*.tsx` means `website/src/**/*.tsx`, never `src/kiro_crew/`).
+Both files use gitignore-style globs: `**` also matches zero directories, so
+`src/kiro_crew/**/*.py` covers `src/kiro_crew/hooks.py`.
 
 These encode defects this repo has decided it cares about, built up over months.
 Treat them as a **checklist of things to look for**, not as a limit on what
@@ -56,8 +89,9 @@ code you actually opened.
 
 Style, formatting, naming, import order, typing, lint warnings, dead code,
 duplication, dependency versions, and test-coverage gaps belong to other checks
-in this pipeline — flake8, mypy, isort, eslint, tsc, jscpd, Semgrep, CodeQL, the
-pytest shards, and a fail-closed coverage gate. Findings in those categories get
+in this pipeline — flake8, mypy, isort, eslint, tsc, jscpd, Semgrep,
+CodeQL (same-repository PRs), the pytest shards, and a fail-closed coverage
+gate. Findings in those categories get
 filtered out downstream, so turns spent there are turns wasted. **Judge
 behaviour, not form.** Do not ask for tests; coverage is measured with real
 numbers and you would be guessing.
@@ -88,8 +122,10 @@ Enumerate every changed file and judge every hunk. Investigate every suspicious
 pattern rather than assuming it is fine — chase the one that looks like it might
 be a problem, and use your turn budget to find out. A small diff is not evidence
 of a small risk; some of the worst defects are three deleted lines. Spend extra
-effort where the diff touches credential/token handling, auth, `security.py`,
-`hooks.py` sensitive-path controls, path/command/SQL construction, or a
+effort where the diff touches credential/token handling, auth,
+`src/kiro_crew/security/`, `src/kiro_crew/hooks.py` and `src/kiro_crew/hook_runtime/`
+sensitive-path controls,
+path/command/SQL construction, or a
 `blocking: true` rule — but do not skip a hunk because the change looks routine.
 
 Err on the side of recording. If you find yourself thinking "this is probably

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { withUnifiedPatchHeaders } from './unifiedPatchHeaders'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -16,6 +17,7 @@ import {
   Loader,
   RefreshCw,
   SkipForward,
+  TriangleAlert,
   XCircle,
 } from 'lucide-react'
 import { api } from '../api/client'
@@ -28,17 +30,15 @@ import type {
   PullRequestStatusBatch,
 } from '../types'
 import {
+  findSourceForUrl,
   MAX_PULL_REQUEST_SOURCES,
+  sourceLinkKey,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
-import { parseUnifiedDiff } from '../utils/parseUnifiedDiff'
+import { sourceProviderMeta, sourceTabQualifier } from '../utils/sourceProviderMeta'
 import CopyBranchButton from './CopyBranchButton'
-import hljs from '../utils/hljs'
-import DOMPurify from 'dompurify'
-import { DIFF_BG, DIFF_NUM, DIFF_EDGE } from '../utils/diffUtils'
-import UnchangedSeparator from './UnchangedSeparator'
-import GithubLogo from './icons/GithubLogo'
-import GitlabLogo from './icons/GitlabLogo'
+import { PierrePatch } from '../pierre'
+import SourceProviderMark from './SourceProviderMark'
 import { timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from './MarkdownRenderer'
 import CommentThreads from './CommentThreads'
@@ -46,9 +46,24 @@ import { Btn } from './ui'
 
 
 import { i18nT } from '../i18n/t'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
 const CHECK_POLL_BASE_MS = 10_000
 const CHECK_POLL_MAX_MS = 60_000
+/** How long an UNMOUNTED detail payload survives in the query cache. React
+ *  Query's default is five minutes, which is shorter than a typical gap between
+ *  two looks at the same pull request — so reopening the panel after a coffee
+ *  break started from a spinner and re-ran the provider fanout although nothing
+ *  had changed. A remount now renders the retained payload at once and
+ *  revalidates in the background (`refetchOnMount: 'always'` on the detail
+ *  query), so a long retention buys instant paint without presenting stale
+ *  data as final. Bounded so a day of browsing PRs cannot grow the cache
+ *  without limit. */
+export const SOURCE_DETAIL_GC_MS = 60 * 60_000
+/** Retained detail data older than this is revalidated in the background when
+ *  the panel mounts. Matches the gateway's full-payload cache window: inside
+ *  it a refetch would return the same cached bytes, so it is not sent. */
+export const SOURCE_REMOUNT_REVALIDATE_MS = 30_000
 // Strip-wide status poll. Steady state is paced by the TTL the server reports
 // for its chip-status cache (falling back to 60s when absent), so the client
 // never hardcodes a copy of it. While the server says a background refresh is in
@@ -62,6 +77,13 @@ const STATUS_FOLLOWUP_MS = 5_000
  *  STATUS_POLL_MAX_MS. Polling is never abandoned — a transient network or
  *  gateway blip must not freeze the strip's glyphs until the user intervenes. */
 const STATUS_ERROR_BACKOFF_MS = 30_000
+/** Retries allowed when the gateway reports it is at its concurrent-fetch
+ *  ceiling (`code: source_busy`). The server already waited its own admission
+ *  budget before answering, so these are spaced attempts at a ceiling that
+ *  clears as in-flight fetches complete — not a tight poll. Bounded so a
+ *  genuinely saturated gateway still surfaces the error instead of spinning. */
+const SOURCE_BUSY_RETRIES = 2
+const SOURCE_BUSY_RETRY_BASE_MS = 2_000
 /** Consecutive in-flight-refresh polls allowed at the fast interval before
  *  falling back to TTL pacing — bounds a provider that never settles. */
 export const STATUS_FOLLOWUP_MAX = 3
@@ -105,37 +127,23 @@ function age(value: string): string {
   return timeAgo(Number.isFinite(ms) ? ms / 1000 : 0)
 }
 
-export function pullRequestErrorDetails(error: unknown): {
-  message: string
-  loginCommand: 'gh auth login' | 'glab auth login' | ''
-  /** The server refused pending an acknowledgement the client may now offer. */
-  confirmationRequired: boolean
-} {
-  let message = error instanceof Error ? error.message : String(error || '')
-  let confirmationRequired = false
-  // ApiError already unwraps the human message, which discards every other
-  // field, so the structured marker is read from the raw body it preserves.
-  const raw = typeof (error as { body?: unknown })?.body === 'string'
-    ? (error as { body: string }).body
-    : message
-  try {
-    const payload = JSON.parse(raw) as { error?: unknown; confirmationRequired?: unknown }
-    if (typeof payload.error === 'string') message = payload.error
-    confirmationRequired = payload.confirmationRequired === true
-  } catch {
-    // Provider and network errors may already be plain text.
-  }
-  const authenticationFailure = /\b(?:not logged in(?:to)?|unauthenticated|authentication (?:failed|required)|requires authentication)\b/i.test(message)
-  const loginCommand = authenticationFailure && /(?:`|\b)gh auth login(?:`|\b)/i.test(message)
-    ? 'gh auth login'
-    : authenticationFailure && /(?:`|\b)glab auth login(?:`|\b)/i.test(message)
-      ? 'glab auth login'
-      : ''
-  return { message, loginCommand, confirmationRequired }
+/** Whether a failed source read is worth another attempt.
+ *
+ * Only admission pressure retries. A provider error (not authenticated, PR gone,
+ * malformed payload) is a message the user has to act on, so retrying it just
+ * delays that; `source_busy` instead means the gateway was at its
+ * concurrent-fetch memory ceiling, which clears on its own as in-flight fetches
+ * complete. */
+export function shouldRetrySourceRead(failureCount: number, error: unknown): boolean {
+  return pullRequestErrorDetails(error).sourceBusy && failureCount < SOURCE_BUSY_RETRIES
 }
 
-function safeExternalUrl(value: string): string | undefined {
-  if (!value) return undefined
+/** Backoff for a `source_busy` retry: 2s, then 4s. */
+export function sourceBusyRetryDelay(failureCount: number): number {
+  return SOURCE_BUSY_RETRY_BASE_MS * 2 ** failureCount
+}
+
+function safeExternalUrl(value: string): string | undefined {  if (!value) return undefined
   try {
     const url = new URL(value)
     return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : undefined
@@ -160,12 +168,15 @@ export interface PullRequestMergeBlocker {
  * avoids history rewriting (merge base into head); rebase + force-push is
  * reserved for genuine conflicts. */
 export function pullRequestMergeBlocker(source: PullRequestSource): PullRequestMergeBlocker | null {
+  // A provider that does not report merge state has nothing to block on, and a
+  // banner derived from absent fields would read as "clean" or invent a blocker.
+  if (!sourceProviderMeta(source.provider).capabilities.mergeState) return null
   // GitLab reports open MRs as 'opened'; the full payload carries the raw
   // provider state (matching stateTone below), so accept both spellings.
   const state = source.state.toLowerCase()
   if ((state !== 'open' && state !== 'opened') || source.mergedAt || source.draft) return null
   const base = source.baseBranch || 'the base branch'
-  const label = source.provider === 'github' ? `PR #${source.number}` : `MR !${source.number}`
+  const label = sourceProviderMeta(source.provider).refLabel(source.number)
   const sourceUrl = safeExternalUrl(source.url)
   const handoffHeader = (problem: string) => [
     `${problem} on ${label} (${source.title}):`,
@@ -222,7 +233,7 @@ export function pullRequestMergeBlocker(source: PullRequestSource): PullRequestM
 function stateTone(source: PullRequestSource): string {
   const state = source.state.toLowerCase()
   if (source.mergedAt || state === 'merged') return 'bg-aim/15 text-aim'
-  if (state === 'open' || state === 'opened') return 'bg-ok/15 text-ok'
+  if (state === 'open' || state === 'opened') return 'bg-ok/15 text-ok-text'
   return 'bg-bg-hover text-muted'
 }
 
@@ -268,6 +279,65 @@ export function pullRequestCiSignal(
   return 'passed'
 }
 
+/** A merge field the provider actually answered, or undefined.
+ *
+ * Both `''` and `'unknown'` are non-answers rather than values (see
+ * `PullRequestSource.mergeable`): `''` is the provider omitting the field, and
+ * `'unknown'` is GitHub reporting that it has not finished computing the merge
+ * commit yet -- a transient state every push re-enters. Neither may overwrite a
+ * value that WAS settled, or the pair would flicker off and back on through the
+ * recompute window. */
+const settledMergeField = (value: string | undefined): string | undefined =>
+  (value && value !== 'unknown' ? value : undefined)
+
+/** The status entry for the SELECTED pull request: its cached chip status with
+ * the fields the full payload can speak to layered on top.
+ *
+ * A per-FIELD preference, not a whole-record replacement. Both sides describe
+ * the same pull request, but neither is a superset of the other -- the payload
+ * is fresher and user-refreshable, while the cache is the only source for
+ * anything this panel does not recompute. Rebuilding the record from the
+ * payload alone silently dropped every field it does not mention (the settled
+ * `mergeable` / `mergeStateStatus` pair), and dropped it for the selected
+ * source ONLY, so the one tab with the most authoritative data behind it was
+ * the one carrying the least.
+ *
+ * Two rules keep the fallback from being worse than the drop it replaces:
+ *
+ *  - an UNSETTLED payload field keeps the cached one rather than erasing it,
+ *    the same keep-known rule `keptCi` applies to CI below and the backend's
+ *    `record_full_payload_status` applies on the other side of the wire;
+ *  - a TERMINAL pull request carries no merge pair at all. Mergeability is a
+ *    question about a merge that can still happen, so once merged or closed a
+ *    retained `conflicting` is not stale data, it is an answer to a question
+ *    nobody asked. `SourceTabState` suppresses CI on the same predicate and for
+ *    the same reason -- the lifecycle glyph is the terminal signal.
+ */
+export function selectedSourceStatus(
+  source: PullRequestSource,
+  cached: PullRequestStatus | undefined,
+): PullRequestStatus {
+  // A degraded payload (the provider's checks read failed or truncated, so
+  // `checks` is flagged in `partialSections`) carries nothing to recompute CI
+  // from, so fall back to the chip status the backend deliberately kept alive
+  // instead of erasing the glyph. A genuinely empty checks section (no CI
+  // configured, not flagged partial) still clears a stale glyph.
+  const keptCi = source.partialSections?.includes('checks') ? cached?.ci : undefined
+  const state = pullRequestLifecycleState(source)
+  const terminal = state === 'merged' || state === 'closed'
+  return {
+    ...cached,
+    state,
+    ci: pullRequestCiSignal(source.checks) ?? keptCi,
+    mergeable: terminal
+      ? undefined
+      : (settledMergeField(source.mergeable) ?? settledMergeField(cached?.mergeable)),
+    mergeStateStatus: terminal
+      ? undefined
+      : (settledMergeField(source.mergeStateStatus) ?? settledMergeField(cached?.mergeStateStatus)),
+  }
+}
+
 /**
  * Lifecycle glyph and tone for a pull request's state.
  *
@@ -301,6 +371,22 @@ const CI_LABEL_KEY: Record<NonNullable<PullRequestStatus['ci']>, string> = {
   failed: 'components.pullRequestPanel.checks_failed',
 }
 
+/** Catalog keys for a changed file's `status` — GitHub's per-file vocabulary
+ * (added|modified|removed|renamed|copied|changed|unchanged). The wire value was
+ * printed raw and CSS-capitalized: untranslated in every locale and invisible
+ * to the i18n added-lines gate. Flat and indexed inline so the key gate
+ * resolves the map, like LIFECYCLE_LABEL_KEY. `?? file_status_changed` covers a
+ * value outside the known set so an unmapped status still reads as a word. */
+const FILE_STATUS_LABEL_KEY: Record<string, string> = {
+  added: 'components.pullRequestPanel.file_status_added',
+  modified: 'components.pullRequestPanel.file_status_modified',
+  removed: 'components.pullRequestPanel.file_status_removed',
+  renamed: 'components.pullRequestPanel.file_status_renamed',
+  copied: 'components.pullRequestPanel.file_status_copied',
+  changed: 'components.pullRequestPanel.file_status_changed',
+  unchanged: 'components.pullRequestPanel.file_status_unchanged',
+}
+
 /** CI rollup glyph, tone, and catalog KEY. Keys not strings — see LIFECYCLE_META. */
 const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check; tone: string; spin?: boolean }> = {
   running: { icon: Loader, tone: 'text-warn', spin: true },
@@ -309,16 +395,25 @@ const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check
 }
 
 /** State markers for one pull-request tab in the source strip: lifecycle glyph
- * plus, while the pull request is still live, its CI rollup. CI is suppressed
- * once merged or closed — the lifecycle glyph is the terminal signal there.
- * `ChatSidebar.tsx::showsChipCi` applies the same rule to the sidebar chip; the
- * two render the same pull request and must not disagree about its lifecycle. */
+ * plus one health glyph while the pull request is live. Failed CI wins; a merge
+ * conflict otherwise replaces pending/passed CI so an unmergeable branch never
+ * reads as ready. Merged/closed suppress both CI and conflict because lifecycle
+ * is the terminal signal there. `SessionSourceChips.tsx::chipStatusGlyph` applies the
+ * same precedence to the sidebar chip. */
 function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   const lifecycle = status?.state
-  const ci = lifecycle === 'merged' || lifecycle === 'closed' ? undefined : status?.ci
-  if (!lifecycle && !ci) return null
+  const terminal = lifecycle === 'merged' || lifecycle === 'closed'
+  const ci = terminal ? undefined : status?.ci
+  const conflicting = !terminal && (
+    status?.mergeable === 'conflicting' || status?.mergeStateStatus === 'dirty'
+  )
+  // Failed CI is already a red, actionable stop signal. Otherwise a settled
+  // conflict outranks a pending/passing rollup, matching the sidebar chip.
+  const showConflict = conflicting && ci !== 'failed'
+  const shownCi = showConflict ? undefined : ci
+  if (!lifecycle && !shownCi && !showConflict) return null
   const life = lifecycle ? LIFECYCLE_META[lifecycle] : null
-  const check = ci ? CI_META[ci] : null
+  const check = shownCi ? CI_META[shownCi] : null
   const LifeIcon = life?.icon
   const CheckIcon = check?.icon
   // Resolved here, in the component body, so a language switch re-renders into
@@ -327,12 +422,18 @@ function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   // through a looked-up object is a shape `scripts/check-i18n-keys.mjs` cannot
   // resolve, which would exempt these sites from every catalog check.
   const lifeLabel = lifecycle ? i18nT(LIFECYCLE_LABEL_KEY[lifecycle]) : ''
-  const checkLabel = ci ? i18nT(CI_LABEL_KEY[ci]) : ''
+  const checkLabel = shownCi ? i18nT(CI_LABEL_KEY[shownCi]) : ''
+  const conflictLabel = showConflict ? i18nT('components.pullRequestPanel.merge_conflicts') : ''
   return (
     <>
       {LifeIcon && life && (
         <span className={`inline-flex shrink-0 ${life.tone}`} aria-label={lifeLabel} title={lifeLabel}>
           <LifeIcon className="lucide-inline" aria-hidden="true" />
+        </span>
+      )}
+      {showConflict && (
+        <span className="inline-flex shrink-0 text-danger" aria-label={conflictLabel} title={conflictLabel}>
+          <TriangleAlert className="lucide-inline" aria-hidden="true" />
         </span>
       )}
       {CheckIcon && check && (
@@ -344,14 +445,9 @@ function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   )
 }
 
-function diffLanguage(path: string): string | null {
-  const ext = path.split('.').pop()?.toLowerCase() || ''
-  return ext && hljs.getLanguage(ext) ? ext : null
-}
-
 /** Defer heavy subtree mounting until just after the drawer's slide-in
  * animation (120ms), so opening the panel animates with lightweight file
- * headers instead of stuttering on thousands of highlighted diff rows. */
+ * headers instead of the diff surface's first paint. */
 function useDeferredMount(delayMs = 140): boolean {
   const [ready, setReady] = useState(false)
   useEffect(() => {
@@ -363,43 +459,21 @@ function useDeferredMount(delayMs = 140): boolean {
 
 function DiffView({ patch, path }: { patch: string; path: string }) {
   const ready = useDeferredMount()
-  const rows = useMemo(() => parseUnifiedDiff(patch), [patch])
-  const language = useMemo(() => diffLanguage(path), [path])
-  // Per-line highlighting keyed by file extension. Lines are highlighted
-  // independently (multi-line constructs may reset), which matches the
-  // fidelity GitHub's own diff view accepts. hljs escapes the input, so
-  // its HTML output is safe to inject.
-  const highlighted = useMemo(() => {
-    if (!language || !ready) return null
-    return rows.map(row =>
-      row.kind === 'hunk-gap' ? '' : DOMPurify.sanitize(hljs.highlight(row.text, { language, ignoreIllegals: true }).value),
-    )
-  }, [rows, language, ready])
+  // The provider hands back a per-file patch body: hunks only, with no
+  // `diff --git` / `---` / `+++` headers. Pierre identifies a file from those
+  // headers, so synthesize them around the body.
+  const filePatch = useMemo(
+    () => withUnifiedPatchHeaders(path, patch),
+    [patch, path],
+  )
+  // ChangeRow already draws the file header (path, status, +/- counts), so the
+  // shared default (header off) is what we want; wrap because the drawer column
+  // is narrow.
+  const options = useMemo(() => ({ overflow: 'wrap' as const }), [])
   if (!ready) return <div className="px-3 py-3 text-[11px] text-muted">{i18nT('components.pullRequestPanel.loading_diff')}</div>
   return (
-    <div className="text-[11px] leading-5 font-mono">
-      {rows.map((row, index) => {
-        if (row.kind === 'hunk-gap') {
-          // Leading gap (diff starts mid-file): the gutter numbers already
-          // carry the position — render nothing.
-          if (index === 0) return null
-          if (row.hiddenCount <= 0) return <div key={index} className="border-t border-border/60" />
-          return <UnchangedSeparator key={index} count={row.hiddenCount} />
-        }
-        const tone = row.kind === 'add' ? DIFF_BG.add : row.kind === 'del' ? DIFF_BG.del : ''
-        const edge = row.kind === 'add' || row.kind === 'del' ? ` ${DIFF_EDGE[row.kind]}` : ''
-        const html = highlighted?.[index]
-        return (
-          <div key={index} className={`flex ${tone}${edge}`}>
-            <span className={`w-10 shrink-0 px-1 text-right select-none border-r border-border ${DIFF_NUM[row.kind]}`}>{(row.kind === 'del' ? row.oldLine : row.newLine) ?? ''}</span>
-            {html !== undefined && html !== '' ? (
-              <span className="hljs flex-1 min-w-0 whitespace-pre-wrap break-words px-2 !bg-transparent" dangerouslySetInnerHTML={{ __html: html }} />
-            ) : (
-              <span className="flex-1 min-w-0 whitespace-pre-wrap break-words px-2 text-text">{row.text}</span>
-            )}
-          </div>
-        )
-      })}
+    <div className="pierre-surface" data-testid="pr-diff-surface">
+      <PierrePatch patch={filePatch} options={options} />
     </div>
   )
 }
@@ -416,7 +490,7 @@ function ChangeRow({ file }: { file: PullRequestFile }) {
       >
         {open ? <ChevronDown className="lucide-inline shrink-0 text-muted" /> : <ChevronRight className="lucide-inline shrink-0 text-muted" />}
         <span className="text-[13px] text-text truncate min-w-0 flex-1">{file.path}</span>
-        <span className="text-[11px] text-muted capitalize shrink-0">{file.status}</span>
+        <span className="text-[11px] text-muted shrink-0">{i18nT(FILE_STATUS_LABEL_KEY[file.status?.toLowerCase()] ?? 'components.pullRequestPanel.file_status_changed')}</span>
         <span className="text-[11px] shrink-0"><span className="text-ok">+{file.additions}</span> <span className="text-danger">-{file.deletions}</span></span>
       </Btn>
       {open && (
@@ -457,7 +531,7 @@ function CheckRow({ check, source, onAddToChat }: { check: PullRequestCheck; sou
   const checkUrl = safeExternalUrl(check.url)
   const sourceUrl = safeExternalUrl(source.url)
   const handoff = () => {
-    const label = source.provider === 'github' ? `PR #${source.number}` : `MR !${source.number}`
+    const label = sourceProviderMeta(source.provider).refLabel(source.number)
     const lines = [
       `Failing CI check on ${label} (${source.title}):`,
       '',
@@ -556,10 +630,17 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   const queryClient = useQueryClient()
   const [confirmAutoMerge, setConfirmAutoMerge] = useState(false)
   const [immediateMergeWarning, setImmediateMergeWarning] = useState('')
-  const isGitHub = source.provider === 'github'
+  const meta = sourceProviderMeta(source.provider)
+  // Selects between the existing GitHub/GitLab catalog key pairs — "pull
+  // request" vs "merge request" wording — rather than asserting the provider IS
+  // GitHub. A registered provider takes the pull-request wording.
+  const isGitHub = meta.pullRequestWording
 
   const invalidate = () => {
-    void queryClient.invalidateQueries({ queryKey: ['pull-request-source'] })
+    // The mutation knows exactly which pull request it changed; marking the
+    // whole family stale would make every other session's panel refetch on its
+    // next open for a click that touched none of them.
+    void queryClient.invalidateQueries({ queryKey: ['pull-request-source', source.url] })
     void queryClient.invalidateQueries({ queryKey: ['pull-request-statuses'] })
   }
   const readyMutation = useMutation({
@@ -589,6 +670,10 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   }
 
   if (!pullRequestIsLive(source)) return null
+  // Ready-for-review and auto-merge are merge-state writes. A provider whose
+  // gateway plugin does not implement them must not get buttons that can only
+  // return "unsupported by this provider".
+  if (!meta.capabilities.mergeState) return null
   const showReady = source.draft
   const showAutoMerge = !source.draft && !source.autoMerge
   const errorDetails = pullRequestErrorDetails(readyMutation.error || autoMergeMutation.error)
@@ -600,6 +685,7 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   if (!showReady && !showAutoMerge && !source.autoMerge && !error) return null
 
   return (
+    <>
     <div className="mt-2 flex flex-wrap items-center gap-2">
       {showReady && (
         <Btn
@@ -642,7 +728,7 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
           title={isGitHub
             ? i18nT('components.pullRequestPanel.github_merges_this_pull_request_automatically_on')
             : i18nT('components.pullRequestPanel.gitlab_merges_this_merge_request_when_the_pipeli')}
-          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${confirmAutoMerge || immediateMergeWarning ? 'border-warn text-warn hover:bg-warn/10' : 'border-border bg-transparent text-muted hover:text-text hover:bg-bg-hover'}`}
+          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${confirmAutoMerge || immediateMergeWarning ? 'border-warn text-warn hover:text-warn-text hover:bg-warn/10' : 'border-border bg-transparent text-muted hover:text-text hover:bg-bg-hover'}`}
         >
           {autoMergeMutation.isPending ? <Loader className="lucide-inline animate-spin" /> : <GitMerge className="lucide-inline" />}
           {immediateMergeWarning ? i18nT('components.pullRequestPanel.merge_now') : confirmAutoMerge ? i18nT('components.pullRequestPanel.confirm_auto_merge') : i18nT('components.pullRequestPanel.enable_auto_merge')}
@@ -660,10 +746,11 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
       )}
       <ErrorNotice message={error} variant="inline" askAgent />
     </div>
+    </>
   )
 }
 
-function PullRequestBody({ source, tab, onAddToChat }: { source: PullRequestSource; tab: SourceTab; onAddToChat?: (text: string) => void }) {
+function PullRequestBody({ source, tab, onAddToChat, writesPaused = false }: { source: PullRequestSource; tab: SourceTab; onAddToChat?: (text: string) => void; writesPaused?: boolean }) {
   if (tab === 'description') {
     return source.description
       ? <div className="px-4 py-4 text-[13px]"><MarkdownRenderer content={source.description} /></div>
@@ -744,6 +831,7 @@ function PullRequestBody({ source, tab, onAddToChat }: { source: PullRequestSour
     <div className="p-3">
       <CommentThreads
         src={source}
+        writesPaused={writesPaused}
         // The panel owns what it says to the agent; the thread list only
         // reports which comment was picked.
         onAddToChat={onAddToChat && ((c) => onAddToChat(commentHandoff(c)))}
@@ -773,7 +861,18 @@ export default function PullRequestPanel({
   onAddToChat?: (text: string) => void
 }) {
   const cappedSources = sources.slice(0, MAX_PULL_REQUEST_SOURCES)
-  const selected = cappedSources.find(source => source.url === selectedUrl) || cappedSources[0]
+  const selected = findSourceForUrl(cappedSources, selectedUrl) || cappedSources[0]
+  // A GitLab MR IID is unique only within its project, so tabs read as bare
+  // `MR !1` and two projects sharing an IID become indistinguishable. When the
+  // rendered tabs span more than one distinct project, qualify each tab label
+  // with its project; a single-project panel keeps the concise form. Identity
+  // is host-aware (self-managed GitLab can carry the same group/project path as
+  // gitlab.com), and sources whose project cannot be recovered (Jira, an
+  // unparseable url) never force qualification on their own.
+  const tabQualifier = useMemo(
+    () => sourceTabQualifier(sources.slice(0, MAX_PULL_REQUEST_SOURCES)),
+    [sources],
+  )
   const [tab, setTab] = useState<SourceTab>('changes')
   const [checkPollState, setCheckPollState] = useState({ url: '', failures: 0 })
   const checkPollStateRef = useRef({ url: '', failures: 0 })
@@ -784,9 +883,10 @@ export default function PullRequestPanel({
     if (selected && selected.url !== selectedUrl) (onReconcile || onSelect)(selected.url)
   }, [selected, selectedUrl, onSelect, onReconcile])
 
+  const selectedKey = selected ? sourceLinkKey(selected) : undefined
   useEffect(() => {
     setTab('changes')
-  }, [selected?.url])
+  }, [selectedKey])
 
   const queryKey = useMemo(
     () => ['pull-request-source', selected?.url] as const,
@@ -794,6 +894,15 @@ export default function PullRequestPanel({
   )
   const query = useQuery<PullRequestSource>({
     queryKey,
+    // Keep the composer mounted across revisions of this review, but never
+    // carry another review's payload into the newly selected one.
+    placeholderData: (previousData, previousQuery) => {
+      const previousUrl = previousQuery?.queryKey[1]
+      return selected && typeof previousUrl === 'string'
+        && findSourceForUrl([selected], previousUrl)
+        ? previousData
+        : undefined
+    },
     queryFn: () => {
       const force = forceRefreshRef.current
       forceRefreshRef.current = false
@@ -801,13 +910,42 @@ export default function PullRequestPanel({
     },
     enabled: !!selected,
     staleTime: Infinity,
-    retry: false,
+    gcTime: SOURCE_DETAIL_GC_MS,
+    // Stale-while-revalidate on open: the retained payload renders at once
+    // (`isLoading` stays false while data exists, so no spinner) and a
+    // background refetch runs on mount whenever the retained data is older
+    // than the gateway's own cache window — not only after an event. Events
+    // from this gateway (turn boundary, status delta) cannot see a teammate's
+    // review or comment, so without this a reopened panel could present an
+    // hour-old discussion as current. Younger data is NOT refetched: the
+    // gateway would answer from its cache with the same bytes, and a sibling
+    // view that shares this key (Code Review Sage mounts its pane and this
+    // panel together) would otherwise pay two provider reads per open. Past
+    // that window the refetch is cheap by construction: the gateway
+    // revalidates with conditional GETs, so an unchanged pull request costs no
+    // provider fanout and no rate limit. Returns 'always' rather than true:
+    // with `staleTime: Infinity` a plain true would still defer to staleness
+    // and never refetch.
+    refetchOnMount: query =>
+      Date.now() - query.state.dataUpdatedAt > SOURCE_REMOUNT_REVALIDATE_MS ? 'always' : false,
+    // Provider errors (auth, missing PR, bad payload) stay fail-fast: retrying
+    // them only delays a message the user has to act on. Capacity pressure is
+    // the one retryable case -- the gateway is holding its concurrent-fetch
+    // ceiling and already waited its own budget, so a couple of spaced attempts
+    // turn a dead-end error card into a slower load.
+    retry: shouldRetrySourceRead,
+    retryDelay: sourceBusyRetryDelay,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   })
   const source = query.data
   const queryError = pullRequestErrorDetails(query.error)
   const sourceUrl = safeExternalUrl(source?.url || '')
+  // One meta lookup for every provider-shaped decision in this component: the
+  // Checks tab and its poll, the merge affordances, and the labels.
+  const providerChecks = Boolean(
+    source && sourceProviderMeta(source.provider).capabilities.checks,
+  )
   const sourceHasPendingChecks = Boolean(
     source?.checks.some(check => check.bucket === 'pending'),
   )
@@ -838,7 +976,7 @@ export default function PullRequestPanel({
         throw error
       }
     },
-    enabled: Boolean(selected && sourceHasPendingChecks && !query.isFetching),
+    enabled: Boolean(selected && providerChecks && sourceHasPendingChecks && !query.isFetching),
     retry: false,
     staleTime: 0,
     refetchOnWindowFocus: false,
@@ -943,20 +1081,18 @@ export default function PullRequestPanel({
   const showAllChecksPassed = allChecksPassed && !query.isFetching
   const mergeBlocker = source ? pullRequestMergeBlocker(source) : null
   const statusByUrl = useMemo(() => {
-    const merged: Record<string, PullRequestStatus> = { ...(statusQuery.data?.statuses || {}) }
+    const cached = statusQuery.data?.statuses || {}
+    const merged: Record<string, PullRequestStatus> = { ...cached }
     // The selected pull request already has a full, user-refreshable payload —
     // prefer it over the cached chip status so its own chip never lags the
-    // header badge it sits above.
+    // header badge it sits above. Field by field: see `selectedSourceStatus`.
     if (source) {
-      merged[source.url] = {
-        state: pullRequestLifecycleState(source),
-        ci: pullRequestCiSignal(source.checks),
-      }
+      merged[source.url] = selectedSourceStatus(source, cached[source.url])
     }
     return merged
   }, [statusQuery.data, source])
 
-  const tabs: Array<{ id: SourceTab; label: string; count?: number; tone?: string }> = source ? [
+  const allTabs: Array<{ id: SourceTab; label: string; count?: number; tone?: string }> = source ? [
     { id: 'changes', label: i18nT('components.pullRequestPanel.changes'), count: source.files.length },
     { id: 'description', label: i18nT('components.pullRequestPanel.description') },
     { id: 'commits', label: i18nT('components.pullRequestPanel.commits'), count: source.commits.length },
@@ -980,6 +1116,15 @@ export default function PullRequestPanel({
     },
     { id: 'reviews', label: i18nT('components.pullRequestPanel.reviews'), count: source.comments.length },
   ] : []
+  // The Checks tab is dropped for a provider that cannot report CI, rather than
+  // rendered as a permanently empty section.
+  const tabs = allTabs.filter(item => item.id !== 'checks' || providerChecks)
+  // A provider without a Checks tab must not leave the panel on a tab that no
+  // longer has a button: `tab` is component state and survives switching between
+  // source tabs, so it can name a section this provider does not have. Falling
+  // back to the first tab is derived rather than an effect, so the very first
+  // render is already correct instead of flashing an empty section.
+  const activeTab: SourceTab = tabs.some(item => item.id === tab) ? tab : 'changes'
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -989,7 +1134,10 @@ export default function PullRequestPanel({
           exactly one tab that does nothing. */}
       {cappedSources.length > 1 && (
       <div role="tablist" aria-label={i18nT('components.pullRequestPanel.pull_requests')} className="shrink-0 border-b border-border px-2 py-2 flex items-center gap-1 overflow-x-auto">
-        {cappedSources.map(item => (
+        {cappedSources.map(item => {
+          const itemMeta = sourceProviderMeta(item.provider)
+          const qualifier = tabQualifier(item)
+          return (
           <Btn
             key={item.url}
             type="button"
@@ -999,45 +1147,82 @@ export default function PullRequestPanel({
             className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border-none cursor-pointer text-[12px] transition-colors ${item.url === selected?.url ? 'bg-bg-hover text-text' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover/60'}`}
             title={item.url}
           >
-            {item.provider === 'github' ? <GithubLogo size={13} className="shrink-0" /> : <GitlabLogo size={13} className="shrink-0" />}
-            <span>{item.provider === 'github' ? 'PR' : 'MR'} {item.provider === 'github' ? '#' : '!'}{item.number}</span>
+            <SourceProviderMark provider={item.provider} size={13} />
+            {/* No CSS truncation here: sourceTabQualifier shortens deep paths
+                to their minimal unique trailing suffix, so the discriminating
+                segment is always visible. The full url stays on the Btn's
+                title. The reference (`MR !1`) is the part that must stay
+                legible. */}
+            {qualifier && <span>{qualifier}</span>}
+            <span>{itemMeta.refLabel(item.number)}</span>
             <SourceTabState status={statusByUrl[item.url]} />
           </Btn>
-        ))}
+          )
+        })}
       </div>
       )}
 
       {query.isLoading && <div className="flex-1 flex items-center justify-center gap-2 text-[13px] text-muted"><Loader className="lucide-inline animate-spin" />{i18nT('components.pullRequestPanel.loading_source_provider')}</div>}
-      {query.error && (
+      {/* The full-height error card is for a panel with NOTHING to show. Once a
+          payload has loaded, a failed background revalidation (expired provider
+          login, registry outage) must not stack "could not load" over a pull
+          request that is visibly on screen: it renders as a compact notice above
+          the retained content instead, naming the login command when there is
+          one, so the user knows the data is the last loaded version and how to
+          fix the refresh. */}
+      {query.error && !source && (
         <div className="flex-1 flex items-center justify-center px-6">
-          <div role="alert" className="max-w-md flex flex-col items-center">
-            <AlertCircle className={`lucide-inline mb-2 ${queryError.loginCommand ? 'text-warn' : 'text-danger'}`} />
-            <div className="text-[13px] font-medium text-text">
-              {queryError.loginCommand
-                ? queryError.loginCommand === 'gh auth login'
-                  ? i18nT('components.pullRequestPanel.github_cli_login_required')
-                  : i18nT('components.pullRequestPanel.gitlab_cli_login_required')
-                : i18nT('components.pullRequestPanel.could_not_load_this_pull_request')}
-            </div>
+          <div className="max-w-md w-full flex flex-col items-center">
+            {/* askAgent on, as in the Issues panel: the panel is read-only (no
+                draft), and a provider CLI that is missing or logged out is the
+                kind of failure the agent can diagnose. The login command rides
+                in the notice's footer, so it reads as the answer to the message. */}
             {queryError.loginCommand ? (
-              <>
-                <div className="text-[12px] text-muted mt-1 text-center">{i18nT('components.pullRequestPanel.kiro_crew_uses_your_local_provider_cli_to_load_p')}</div>
-                <code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text">{queryError.loginCommand}</code>
-              </>
+              <ErrorNotice
+                className="w-full"
+                title={queryError.loginCommand.startsWith('gh ')
+                  ? i18nT('components.pullRequestPanel.github_cli_login_required')
+                  : i18nT('components.pullRequestPanel.gitlab_cli_login_required')}
+                message={i18nT('components.pullRequestPanel.kiro_crew_uses_your_local_provider_cli_to_load_p')}
+                footer={<code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text break-all">{queryError.loginCommand}</code>}
+                actionPlacement="below"
+                askAgent
+                testId="pull-request-panel-load-error"
+              />
             ) : (
-              <div className="mt-2 w-full max-h-64 overflow-y-auto rounded-md bg-bg-hover/50 border border-border px-3 py-2 text-left text-[12px] text-muted whitespace-pre-wrap break-words font-mono leading-relaxed">{queryError.message}</div>
+              <ErrorNotice
+                className="w-full max-h-64 leading-relaxed"
+                messageClassName="font-mono whitespace-pre-wrap break-words"
+                title={i18nT('components.pullRequestPanel.could_not_load_this_pull_request')}
+                message={queryError.message}
+                messagePlacement="below"
+                actionPlacement="below"
+                scrollMessage
+                askAgent
+                testId="pull-request-panel-load-error"
+              />
             )}
-            <Btn type="button" onClick={handleRefresh} className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-border bg-transparent text-[12px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer"><RefreshCw className="lucide-inline" />{i18nT('components.pullRequestPanel.retry')}</Btn>
+            <Btn type="button" onClick={handleRefresh} className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-border bg-transparent text-[12px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer"><RefreshCw className="lucide-inline" aria-hidden="true" />{i18nT('components.pullRequestPanel.retry')}</Btn>
           </div>
         </div>
       )}
 
       {source && (
         <>
+          {query.error && (
+            <div role="status" className="shrink-0 flex items-center gap-2 px-4 py-1.5 border-b border-border bg-bg-hover/40 text-[11px] text-muted">
+              <AlertCircle className="lucide-inline shrink-0 text-warn" />
+              <span className="min-w-0 truncate">{i18nT('components.pullRequestPanel.could_not_refresh_showing_cached')}</span>
+              {/* The login command is the one actionable fix, so it must survive a narrow
+                  panel: it sits outside the truncating span and never clips. */}
+              {queryError.loginCommand && <code className="shrink-0 text-text" title={queryError.loginCommand}>{queryError.loginCommand}</code>}
+              <Btn type="button" onClick={handleRefresh} className="ml-auto inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-border bg-transparent text-[11px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer"><RefreshCw className="lucide-inline" />{i18nT('components.pullRequestPanel.retry')}</Btn>
+            </div>
+          )}
           <div className="shrink-0 px-4 py-3 border-b border-border">
             <div className="flex items-center gap-2 text-[11px] text-muted">
               <span className={`px-1.5 py-0.5 rounded font-medium ${stateTone(source)}`}>{stateLabel(source)}</span>
-              <span>{source.provider === 'github' ? 'GitHub' : 'GitLab'}</span>
+              <span>{sourceProviderMeta(source.provider).displayName}</span>
               {source.headBranch && source.baseBranch && (
                 <span className="min-w-0 flex items-center gap-1 truncate"><CopyBranchButton branch={source.headBranch} /><ArrowRight className="lucide-inline shrink-0" /><span className="truncate">{source.baseBranch}</span></span>
               )}
@@ -1053,13 +1238,15 @@ export default function PullRequestPanel({
               </Btn>
               {sourceUrl && <a href={sourceUrl} target="_blank" rel="noopener noreferrer" className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover" aria-label={i18nT('components.pullRequestPanel.open_pull_request')} title={i18nT('components.pullRequestPanel.open_pull_request')}><ExternalLink className="lucide-inline" /></a>}
             </div>
-            <div className="mt-2 text-[15px] font-semibold text-text-strong leading-snug">{source.title} <span className="font-normal text-muted">{source.provider === 'github' ? '#' : '!'}{source.number}</span></div>
+            <div className="mt-2 text-[15px] font-semibold text-text-strong leading-snug">{source.title} <span className="font-normal text-muted">{sourceProviderMeta(source.provider).numberLabel(source.number)}</span></div>
             <div className="mt-1 flex items-center gap-2 text-[11px] text-muted">
               {source.author && <span>{source.author}</span>}
               <span><span className="text-ok">+{source.additions}</span> <span className="text-danger">-{source.deletions}</span></span>
               {source.updatedAt && <span>{i18nT('components.pullRequestPanel.updated')} {age(source.updatedAt)}</span>}
             </div>
-            <PullRequestActions key={source.url} source={source} />
+            {/* A placeholder payload belongs to an earlier revision, so its
+                merge-state writes would land on that revision's url. */}
+            {!query.isPlaceholderData && <PullRequestActions key={source.url} source={source} />}
           </div>
 
           {mergeBlocker && (
@@ -1084,7 +1271,7 @@ export default function PullRequestPanel({
             <div role="status" className="shrink-0 flex items-start gap-2 px-4 py-2 border-b border-border bg-warn/10 text-[11px] text-muted">
               <AlertCircle className="lucide-inline shrink-0 mt-0.5 text-warn" />
               <span>
-                {source.provider === 'github'
+                {sourceProviderMeta(source.provider).pullRequestWording
                   ? i18nT('components.pullRequestPanel.provider_results_may_be_partial_pull_request', { sections: source.partialSections.join(', ') })
                   : i18nT('components.pullRequestPanel.provider_results_may_be_partial_merge_request', { sections: source.partialSections.join(', ') })}
               </span>
@@ -1098,10 +1285,10 @@ export default function PullRequestPanel({
                 type="button"
                 role="tab"
                 id={`pr-tab-${item.id}`}
-                aria-selected={tab === item.id}
+                aria-selected={activeTab === item.id}
                 aria-controls="pr-tabpanel"
                 onClick={() => setTab(item.id)}
-                className={`shrink-0 flex items-center gap-1.5 px-2 py-1.5 rounded-md border-none cursor-pointer text-[11px] transition-colors ${tab === item.id ? 'bg-bg-hover text-text' : `bg-transparent text-muted hover:text-text ${item.tone || ''}`}`}
+                className={`shrink-0 flex items-center gap-1.5 px-2 py-1.5 rounded-md border-none cursor-pointer text-[11px] transition-colors ${activeTab === item.id ? 'bg-bg-hover text-text' : `bg-transparent text-muted hover:text-text ${item.tone || ''}`}`}
               >
                 {item.id === 'checks' && checksUnavailable ? (
                   <AlertCircle className="lucide-inline text-warn" />
@@ -1116,8 +1303,8 @@ export default function PullRequestPanel({
             ))}
           </div>
 
-          <div id="pr-tabpanel" role="tabpanel" aria-labelledby={`pr-tab-${tab}`} className="flex-1 min-h-0 overflow-y-auto">
-            <PullRequestBody source={source} tab={tab} onAddToChat={onAddToChat} />
+          <div id="pr-tabpanel" role="tabpanel" aria-labelledby={`pr-tab-${activeTab}`} className="flex-1 min-h-0 overflow-y-auto">
+            <PullRequestBody source={source} tab={activeTab} onAddToChat={onAddToChat} writesPaused={query.isPlaceholderData} />
           </div>
         </>
       )}

@@ -24,6 +24,7 @@ import logging
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers import mcp as _mcp
+from kiro_crew.dashboard.handlers._shared import rebuild_agent_spec
 from kiro_crew.dashboard.handlers.mcp import (
     _find_server_spec_anywhere,
     _get_kirocrew_entry,
@@ -31,6 +32,9 @@ from kiro_crew.dashboard.handlers.mcp import (
     _is_valid_mcp_name,
     _replace_kirocrew_spec,
 )
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
+from kiro_crew.mcp_discovery import MCP_REDACTED_HEADER_VALUE, redact_mcp_headers
+from kiro_crew.mcp_provenance import MARKER_KEY
 from kiro_crew.mcp_utils import (
     INTERNAL_CLIENT_ID_KEY,
     INTERNAL_SCOPES_KEY,
@@ -38,6 +42,7 @@ from kiro_crew.mcp_utils import (
     KIRO_SCOPES_KEY,
 )
 from kiro_crew.sel import sel
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +59,12 @@ _STDIO_KEYS = {"command", "args", "env"}
 # owns the authorization exchange, so scope narrowing and client registration
 # are its decisions, not ours.  A clientId is a public OAuth identifier — the
 # corresponding secret never lives in an MCP spec — so neither key is redacted.
-_REMOTE_ONLY_KEYS = {"scopes", "clientId"}
+# ``headers`` carries per-request HTTP headers (typically credentials) to the
+# runtime verbatim.  Unlike the OAuth hints its VALUES are secrets: reads
+# redact them (``redact_mcp_headers``), so a fresh spec may author headers but
+# an existing entry's stored values are preserve-only on edit — they can only
+# round-trip, never be rewritten through this surface.
+_REMOTE_ONLY_KEYS = {"scopes", "clientId", "headers"}
 _REMOTE_KEYS = {"url"} | _REMOTE_ONLY_KEYS
 _ALLOWED_SPEC_KEYS = _STDIO_KEYS | _REMOTE_KEYS
 
@@ -68,11 +78,12 @@ def _validate_spec(spec: object, carried_keys: frozenset[str] = frozenset()) -> 
 
     ``carried_keys`` are extra keys tolerated for THIS spec because they
     already exist on the entry being edited (e.g. ``disabledTools``,
-    ``autoApprove``, ``headers`` written by other flows).  Without it a
-    GET→PUT round-trip of an unmodified spec would 400, and stripping
-    the key to get past validation would silently widen the agent's
-    tool surface.  Fresh adds pass no carried keys — the tight
-    allowlist still rejects genuinely unknown keys by name.
+    ``autoApprove`` written by other flows, or stored ``headers`` whose
+    values are preserve-only).  Without it a GET→PUT round-trip of an
+    unmodified spec would 400, and stripping the key to get past
+    validation would silently widen the agent's tool surface.  Fresh
+    adds pass no carried keys — the tight allowlist still rejects
+    genuinely unknown keys by name.
     """
     if not isinstance(spec, dict):
         return "spec must be an object"
@@ -124,7 +135,30 @@ def _validate_spec(spec: object, carried_keys: frozenset[str] = frozenset()) -> 
                 if not isinstance(nested, list) or any(
                     not isinstance(scope, str) or not scope.strip() for scope in nested
                 ):
-                    return f"'{KIRO_OAUTH_KEY}.{KIRO_SCOPES_KEY}' must be a list of non-empty strings"
+                    return (
+                        f"'{KIRO_OAUTH_KEY}.{KIRO_SCOPES_KEY}' must be a list of non-empty strings"
+                    )
+        if "headers" in spec:
+            headers = spec["headers"]
+            if not isinstance(headers, dict) or any(
+                not isinstance(k, str) or not k.strip() or not isinstance(v, str)
+                for k, v in headers.items()
+            ):
+                return "'headers' must be an object of string values"
+            # Names and values travel into raw HTTP requests; a CR/LF or other
+            # control character is a header-injection vector, never a legitimate
+            # credential byte.
+            if any(
+                any(ord(ch) < 0x20 or ch == "\x7f" for ch in name + value)
+                for name, value in headers.items()
+            ):
+                return "'headers' must not contain control characters"
+            # A pasted spec copied from a read response carries the redaction
+            # marker where the real values were.  Writing the marker verbatim
+            # would store a nonsense credential that fails auth with no hint
+            # why; stored headers round-trip via carried_keys instead.
+            if "headers" not in carried_keys and MCP_REDACTED_HEADER_VALUE in headers.values():
+                return "'headers' values are redacted in copied specs — enter the real value"
         return None
 
     command = spec["command"]
@@ -148,6 +182,8 @@ def _clean_spec(spec: dict) -> dict:
     out: dict = {}
     if "url" in spec:
         out["url"] = spec["url"]
+        if spec.get("headers"):
+            out["headers"] = dict(spec["headers"])
         if spec.get("scopes"):
             out["scopes"] = list(spec["scopes"])
         if spec.get("clientId"):
@@ -159,6 +195,43 @@ def _clean_spec(spec: dict) -> dict:
     if spec.get("env"):
         out["env"] = dict(spec["env"])
     return out
+
+
+def _merge_stored_headers(stored: dict, submitted: object) -> tuple[dict[str, str] | None, str]:
+    """Stored headers updated by a submitted map, or ``None`` and why it is refused.
+
+    The names must match the stored names exactly. Per name, a value that is
+    exactly the placeholder keeps the stored value for that name, and any
+    other value with visible text and without the placeholder in it replaces
+    it. An empty or whitespace-only value, or one that only contains the
+    placeholder, is refused: neither says
+    clearly whether the user meant to keep the value or to replace it. The
+    reason names only stored header names, which a read already shows.
+    """
+    marker = MCP_REDACTED_HEADER_VALUE
+    if not isinstance(submitted, dict) or set(submitted) != set(stored):
+        return None, (
+            "Header names can't change here. Adding, removing or renaming a"
+            " header means removing and re-adding this server, which brings it"
+            " back disabled and without its tool restrictions."
+        )
+    merged: dict[str, str] = {}
+    for name, value in submitted.items():
+        if value == marker:
+            merged[name] = stored[name]
+        elif isinstance(value, str) and value.strip() and marker not in value:
+            merged[name] = value
+        elif not (value.strip() if isinstance(value, str) else value):
+            return None, (
+                f"'{name}' can't be empty. Put back \"{marker}\" exactly to keep"
+                " its saved value, or type a new value."
+            )
+        else:
+            return None, (
+                f"'{name}' mixes \"{marker}\" with other text. Put back"
+                f' "{marker}" exactly to keep its saved value, or type a new value.'
+            )
+    return merged, ""
 
 
 def _resolve_oauth_hints(spec: dict, submitted: dict, existing: dict) -> str | None:
@@ -250,8 +323,8 @@ def _load_kirocrew_config_strict() -> dict | None:
     is malformed or unreadable.  The batch-add path must refuse to write
     in the None case: the lenient ``_load_json_or_empty`` coerces a broken
     file to ``{}``, and the subsequent atomic write would then silently
-    replace EVERY previously configured server with just the new batch
-    while reporting success.
+    replace EVERY configured server with just the new batch while reporting
+    success.
     """
     try:
         text = _mcp._kirocrew_mcp_json().read_text(encoding="utf-8")
@@ -260,7 +333,7 @@ def _load_kirocrew_config_strict() -> dict | None:
     except OSError:
         return None
     try:
-        data = json.loads(text)
+        data = loads_user_json(text)
     except json.JSONDecodeError:
         return None
     if not isinstance(data, dict):
@@ -270,15 +343,29 @@ def _load_kirocrew_config_strict() -> dict | None:
     return data
 
 
-async def _rebuild_agent_config() -> None:
-    """Best-effort agent-config rebuild so changes load on the next session."""
-    try:
-        # circular import: kiro_crew.agent imports dashboard handlers.
-        from kiro_crew.agent import rebuild_agent_config
+async def _record_owner_servers(entries: dict[str, dict]) -> None:
+    """Record the owner's remote servers so the dashboard sign-in can reach them.
 
-        await asyncio.to_thread(rebuild_agent_config)
-    except Exception:
-        logger.warning("rebuild_agent_config failed after MCP custom write", exc_info=True)
+    Best effort: a failed write leaves the server added and working, just not
+    offered an in-place sign-in, and is logged rather than failing the request.
+    """
+    from kiro_crew.config.loader import update_config_locked
+    from kiro_crew.connections.owner_servers import record
+    from kiro_crew.dashboard.chat_utils import run_config_write
+
+    try:
+        await run_config_write(update_config_locked, mutate=lambda cfg: record(cfg, entries))
+    except Exception:  # noqa: BLE001 -- the add itself already landed
+        logger.warning("could not record owner MCP servers %s", sorted(entries), exc_info=True)
+
+
+async def _rebuild_agent_config() -> bool:
+    """Rebuild the agent spec so the change loads on the next session.
+
+    True only when the spec was rewritten; the caller reports a False to the
+    dashboard instead of claiming the change is live.
+    """
+    return await asyncio.to_thread(rebuild_agent_spec, "MCP custom write")
 
 
 async def api_mcp_custom_add(request: web.Request) -> web.Response:
@@ -288,6 +375,15 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     Validates EVERY entry before writing ANY (no partial adds), and
     refuses to clobber existing servers (409 listing the conflicts).
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_custom_add")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -322,7 +418,7 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     async with _get_mcp_lock():
         # Load once, strictly: a malformed existing file must fail the
         # request, never be coerced to {} and overwritten (that would
-        # destroy every previously configured server "successfully").
+        # destroy every configured server "successfully").
         data = _load_kirocrew_config_strict()
         if data is None:
             sel().log_api_access(
@@ -357,9 +453,12 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
             if not enable:
                 entry["disabled"] = True
             entries[name] = entry
-        _mcp._atomic_write(_mcp._kirocrew_mcp_json(), data)
+        # The secure store write applies an owner-only DACL to its temp file on
+        # Windows — blocking filesystem work kept off the event loop.
+        await _mcp._offload_config_write(_mcp._atomic_write, _mcp._kirocrew_mcp_json(), data)
 
-    await _rebuild_agent_config()
+    await _record_owner_servers(cleaned)
+    spec_rewritten = await _rebuild_agent_config()
 
     added = sorted(cleaned)
     sel().log_api_access(
@@ -369,15 +468,18 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
         source="dashboard",
         resources=f"custom:{','.join(added)} enabled={enable}",
     )
-    return web.json_response({"ok": True, "added": added, "enabled": enable})
+    return web.json_response(
+        {"ok": True, "added": added, "enabled": enable, "agent_spec_rewritten": spec_rewritten}
+    )
 
 
 async def api_mcp_custom_get(request: web.Request) -> web.Response:
-    """GET /api/mcp/custom/{name} — the raw editable spec of one server.
+    """GET /api/mcp/custom/{name} — the editable spec of one server.
 
     The servers list endpoint intentionally omits ``env``; the edit modal
-    must prefill from the FULL spec or a save would silently drop the
-    user's env vars.  Reads the same scope PUT writes (404 otherwise).
+    must prefill from the full spec or a save would silently drop the
+    user's env vars. Header names remain visible, but their values are
+    preserve-only redaction markers. Reads the same scope PUT writes.
     """
     name = request.match_info.get("name", "")
     if not _is_valid_mcp_name(name):
@@ -388,8 +490,12 @@ async def api_mcp_custom_get(request: web.Request) -> web.Response:
     if entry is None:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)
 
-    enabled = not entry.get("disabled", False)
+    # The launch predicate (fail-closed), so the editor's chip and the table's
+    # Disabled row agree on a non-boolean ``disabled``.
+    enabled = not mcp_entry_is_muted(entry)
     spec = {k: v for k, v in entry.items() if k != "disabled"}
+    if "headers" in spec:
+        spec["headers"] = redact_mcp_headers(spec["headers"])
     return web.json_response({"name": name, "spec": spec, "enabled": enabled})
 
 
@@ -400,12 +506,39 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
     enabled/disabled state is preserved — editing is not consent to run.
 
     Keys outside the editable allowlist that already exist on the entry
-    (``disabledTools``, ``autoApprove``, ``headers``, …) round-trip: the
-    GET payload includes them, an unmodified save is accepted, and their
-    on-disk values are preserved verbatim.  They cannot be edited or
-    removed through this endpoint — dropping ``disabledTools`` on a save
-    would silently widen the agent's tool surface.
+    (``disabledTools``, ``autoApprove``, …) round-trip: the GET payload
+    includes them, an unmodified save is accepted, and their on-disk
+    values are preserved verbatim.  They cannot be edited or removed
+    through this endpoint — dropping ``disabledTools`` on a save would
+    silently widen the agent's tool surface.
+
+    ``headers`` straddles that line: an entry WITHOUT stored headers may
+    author them here like a fresh add, but once values exist on disk they
+    join the carried set — reads redact header values, so the placeholder
+    a read returns must never overwrite a real credential. A submitted value
+    that is exactly the placeholder keeps the value stored under that same
+    name; any other non-empty value replaces it. Adding, removing or
+    renaming a stored header, or changing ``url``, still means removing and
+    re-adding the server.
+
+    The authorship marker is the one exception: it records that Kiro Crew
+    wrote an entry into a file it does NOT own, so it has no meaning in the
+    store.  An unmodified round trip still SAVES with it present — refusing
+    would strand the entry — but it is dropped rather than written back.  That
+    keeps "the editor never writes the marker" structurally true: a hand-added
+    marker in the store cannot ride a save back out and volunteer the entry
+    for management on a shared surface.  A FRESH add carries no tolerated
+    keys, so a pasted block naming it is still rejected outright.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_custom_update")
+    if denied is not None:
+        return denied
     name = request.match_info.get("name", "")
     if not _is_valid_mcp_name(name):
         return web.json_response({"error": f"invalid server name '{name[:64]}'"}, status=400)
@@ -428,18 +561,35 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
         carried = {
             k: v
             for k, v in existing.items()
-            if k not in _ALLOWED_SPEC_KEYS
+            # ``headers`` is in the editable allowlist for entries WITHOUT
+            # stored values, but once values exist on disk they are carried:
+            # reads redact them, so an editable headers key would let the
+            # redaction markers overwrite the real credentials on save.  An
+            # EMPTY stored map carries no credential, so it does not join the
+            # carried set — the entry stays header-authorable.
+            if (k not in _ALLOWED_SPEC_KEYS or (k == "headers" and v))
             and k != "disabled"
+            and k != MARKER_KEY
             and k not in (KIRO_SCOPES_KEY, KIRO_OAUTH_KEY)
         }
         err = _validate_spec(
-            submitted, frozenset(carried) | {KIRO_SCOPES_KEY, KIRO_OAUTH_KEY}
+            submitted, frozenset(carried) | {KIRO_SCOPES_KEY, KIRO_OAUTH_KEY, MARKER_KEY}
         )
         if err:
             return web.json_response({"error": err}, status=400)
         assert isinstance(submitted, dict)  # narrowed by _validate_spec
+        replaced_headers: dict[str, str] | None = None
         for key, on_disk in carried.items():
-            if key in submitted and submitted[key] != on_disk:
+            visible_value = redact_mcp_headers(on_disk) if key == "headers" else on_disk
+            if key in submitted and submitted[key] != visible_value:
+                if key == "headers":
+                    replaced_headers, refusal = _merge_stored_headers(on_disk, submitted[key])
+                    if replaced_headers is not None:
+                        continue
+                    return web.json_response(
+                        {"error": refusal, "code": "stored_headers_not_editable"},
+                        status=400,
+                    )
                 return web.json_response(
                     {
                         "error": f"'{key}' is managed by other flows and cannot be"
@@ -447,18 +597,39 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
+        # A headers map is scoped to the HOST it was typed for. The carried-key
+        # restore below puts the on-disk credential back verbatim, so accepting
+        # a url change here would silently re-point that credential at a
+        # different origin — the next probe would send it there. Dropping costs
+        # a re-auth; forwarding a secret cannot be undone.
+        if "headers" in carried and submitted.get("url", "") != existing.get("url", ""):
+            return web.json_response(
+                {
+                    "error": "cannot change 'url' while stored header credentials"
+                    " exist — they were issued for the current URL. Remove"
+                    " this server and re-add it with the new URL and fresh"
+                    " headers.",
+                    "code": "url_change_with_stored_headers",
+                },
+                status=400,
+            )
         spec = _clean_spec(submitted)
         spec.update(carried)  # preserved verbatim, never dropped
+        if replaced_headers is not None:
+            spec["headers"] = replaced_headers
         _oauth_err = _resolve_oauth_hints(spec, submitted, existing)
         if _oauth_err:
             return web.json_response(
                 {"error": _oauth_err, "code": "oauth_field_not_editable"}, status=400
             )
-        replaced = _replace_kirocrew_spec(name, spec)
+        # Same offload rationale as the add path: the store write is blocking
+        # file IO (owner-only lockdown included, in-process on Windows).
+        replaced = await _mcp._offload_config_write(_replace_kirocrew_spec, name, spec)
     if not replaced:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)
 
-    await _rebuild_agent_config()
+    await _record_owner_servers({name: spec})
+    spec_rewritten = await _rebuild_agent_config()
 
     sel().log_api_access(
         caller="dashboard",
@@ -467,4 +638,4 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
         source="dashboard",
         resources=f"custom:{name}",
     )
-    return web.json_response({"ok": True, "name": name})
+    return web.json_response({"ok": True, "name": name, "agent_spec_rewritten": spec_rewritten})

@@ -21,71 +21,72 @@ structure/security logic lives, so no aiohttp app is needed. Covers:
 * Persona injection: _installed_theme_persona slug/symlink/cap guards.
 * The GitHub URL guard, recognized-file staging, copy-overwrite/re-install, and
   an install→list→remove round-trip.
+
+Manifest declarations, the placement the asset descriptor reports and font roles
+are in ``test_theme_install_declarations.py``; slugs and pack identity are in
+``test_theme_install_identity.py``. The pack builders all three share are in
+``theme_install_helpers.py``.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
 
 import pytest
+from theme_install_helpers import _VALID_MP3, _VALID_VARS, _make_theme, _make_tiered, _write
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers.themes import (
     _atomic_write_theme_json,
     _clone_github,
     _copy_installed_theme,
 )
 from kiro_crew.dashboard.theme_validate import (
-    _THEME_OVERLAY_DEFAULT_POSITION,
-    _THEME_OVERLAY_DEFAULT_ZINDEX,
+    _THEME_LOADER_ICONS,
+    _THEME_LOADER_ICONS_MAX,
+    _THEME_MAX_FONTS,
     _classify_theme_file,
     _installed_theme_dir,
-    _overrides_layout_violation,
     _resolve_theme_asset,
     _safe_theme_slug,
     _sniff_audio,
     _theme_asset_descriptor,
-    _validate_audio_manifest,
-    _validate_overlay_decls,
     _validate_overlay_html,
     _validate_overrides_css,
     _validate_persona,
     _validate_theme_dir,
-    _validate_topbar_decls,
 )
 
-# _validate_theme_data only *requires* --bg/--text/--accent and rejects unknown
-# keys, so a 3-var map per mode is a complete, valid Level-0 theme.
-_VALID_VARS = {
-    "dark": {"--bg": "#000000", "--text": "#ffffff", "--accent": "#3366ff"},
-    "light": {"--bg": "#ffffff", "--text": "#000000", "--accent": "#0033cc"},
-}
 
-
-def _write(path: Path, obj: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj), encoding="utf-8")
-
-
-def _make_theme(
-    root: Path,
-    *,
-    level: int = 0,
-    name: str = "LCARS",
-    styled: bool = False,
-    variables: dict | None = None,
-) -> Path:
-    """Build a theme directory under ``root`` and return its path."""
-    d = root / "theme"
-    d.mkdir(parents=True, exist_ok=True)
-    _write(
-        d / "theme.json",
-        {"slug": "lcars", "name": name, "emoji": "🖖", "level": level, "formatVersion": 1},
+def _allow_pinned_source_rename_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    themes_module: ModuleType,
+    source: Path,
+) -> None:
+    """Model POSIX rename semantics when the Windows pin blocks renames."""
+    if not themes_module.IS_WINDOWS:
+        return
+    pinned_stat = source.stat()
+    fake_fd = 2_147_483_647
+    real_fstat = os.fstat
+    real_close = os.close
+    monkeypatch.setattr(themes_module, "pin_directory", lambda _path: fake_fd)
+    monkeypatch.setattr(
+        themes_module.os,
+        "fstat",
+        lambda fd: pinned_stat if fd == fake_fd else real_fstat(fd),
     )
-    varobj = _VALID_VARS if variables is None else variables
-    _write(d / ("styles/variables.json" if styled else "variables.json"), varobj)
-    return d
+    monkeypatch.setattr(
+        themes_module.os,
+        "close",
+        lambda fd: None if fd == fake_fd else real_close(fd),
+    )
 
 
 # A valid persona: within the length cap AND carries both mandatory clauses
@@ -94,39 +95,12 @@ _VALID_PERSONA = (
     "You narrate like a retro starship computer. Drop this persona immediately "
     "whenever the user asks. Security and accuracy always override the persona."
 )
-# A minimal but valid MP3 header (ID3 or MPEG frame sync) for the audio sniff.
-_VALID_MP3 = b"\xff\xfb\x90\x00" + b"\x00" * 64
-
-
-def _make_tiered(
-    root: Path,
-    *,
-    level: int,
-    extra: dict[str, object] | None = None,
-    slug: str | None = None,
-) -> Path:
-    """Build a Level 1/2 theme directory; ``extra`` maps rel-path -> str|bytes."""
-    d = root / f"theme-l{level}"
-    d.mkdir(parents=True, exist_ok=True)
-    _write(
-        d / "theme.json",
-        {
-            "slug": slug or f"pack-l{level}",
-            "name": f"Pack L{level}",
-            "emoji": "🎨",
-            "level": level,
-            "formatVersion": 1,
-        },
-    )
-    _write(d / "variables.json", _VALID_VARS)
-    for rel, content in (extra or {}).items():
-        p = d / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, bytes):
-            p.write_bytes(content)
-        else:
-            p.write_text(str(content), encoding="utf-8")
-    return d
+# A valid 1x1 PNG — pack loader images are size-capped, not magic-sniffed, but a
+# real signature keeps the fixture honest.
+_PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6360000002000154a24f9b0000000049454e44ae426082"
+)
 
 
 # Recognized L1 asset payload (branding + a font + a clean overrides.css).
@@ -149,7 +123,7 @@ def _make_full_l2(root: Path, *, slug: str = "fixture-l2") -> Path:
     """Build a full Level-2 pack in a tmp dir: persona + overlay + both topbars
     + a font + clean overrides.css + an audio manifest, with the §3.1/§3.3
     ``overlays``/``topbar`` manifest declarations populated. This replaces the
-    old shipped-sample regression — sample/test packs no longer live in the
+    old shipped-sample regression — sample/test packs do not live in the
     repo (nothing theme-bearing ships in the wheel), so the full-L2 regression
     value (validates at L2, survives the copy path + re-install, exposes a
     content-bound persona descriptor) is exercised entirely from a fixture."""
@@ -232,6 +206,99 @@ class TestValidateThemeDir:
         summary, err = _validate_theme_dir(_make_theme(tmp_path / "ok", level=2))
         assert err is None, err
         assert summary is not None and summary["level"] == 2
+
+    def test_level_one_loader_icons_are_accepted_and_described(self, tmp_path: Path) -> None:
+        d = _make_theme(tmp_path, level=1)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        manifest["loaderIcons"] = ["star", "sparkles", "moon", "cloud"]
+        _write(d / "theme.json", manifest)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        assert summary is not None
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderIcons"] == manifest["loaderIcons"]
+
+    @pytest.mark.parametrize(
+        ("level", "icons", "message"),
+        [
+            (0, ["star", "sparkles", "moon", "cloud"], "requires level 1"),
+            (1, None, "must be an array"),
+            (1, "star", "must be an array"),
+            (1, ["star", "moon", "cloud"], "must contain"),
+            (1, ["star", "sparkles", "moon", "unknown"], "unknown symbol"),
+            (1, ["star", "sparkles", "moon", "star"], "must be unique"),
+        ],
+    )
+    def test_invalid_loader_icons_are_rejected(
+        self, tmp_path: Path, level: int, icons: object, message: str
+    ) -> None:
+        d = _make_theme(tmp_path, level=level)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        manifest["loaderIcons"] = icons
+        _write(d / "theme.json", manifest)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None and message in err
+
+    def test_backend_loader_icon_allowlist_matches_frontend(self) -> None:
+        frontend = (
+            Path(__file__).parents[1] / "website" / "src" / "themeLoaderIcons.ts"
+        ).read_text("utf-8")
+        declared = set(re.findall(r"^  ([a-z]+): [A-Z]", frontend, re.MULTILINE))
+        assert declared == _THEME_LOADER_ICONS
+        assert _THEME_LOADER_ICONS_MAX == len(declared)
+
+    def test_pack_loader_images_accepted_and_described(self, tmp_path: Path) -> None:
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        for i in range(4):
+            (d / "loader" / f"{i}.png").write_bytes(_PNG_1PX)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderImages"] == [
+            "loader/0.png", "loader/1.png", "loader/2.png", "loader/3.png",
+        ]
+
+    @pytest.mark.parametrize("count", [9, 12])
+    def test_pack_loader_images_out_of_range_rejected(
+        self, tmp_path: Path, count: int
+    ) -> None:
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        for i in range(count):
+            (d / "loader" / f"{i}.png").write_bytes(_PNG_1PX)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None and "loader/" in err
+
+    def test_pack_loader_single_image_accepted(self, tmp_path: Path) -> None:
+        # One image is a valid loader on its own (rendered directly, not cycled).
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        (d / "loader" / "spin.webp").write_bytes(_PNG_1PX)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderImages"] == ["loader/spin.webp"]
+
+    def test_pack_loader_svg_and_gif_accepted(self, tmp_path: Path) -> None:
+        # SVG rides the same <img>-secure-mode asset path as logo.svg; GIF/animated
+        # formats self-animate in the <img>. Both are valid loader images.
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        (d / "loader" / "a.svg").write_text(
+            "<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>",
+            encoding="utf-8",
+        )
+        (d / "loader" / "b.gif").write_bytes(_PNG_1PX)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderImages"] == ["loader/a.svg", "loader/b.gif"]
 
     def test_l2_overlay_asset_rejected(self, tmp_path: Path) -> None:
         d = _make_theme(tmp_path)  # declares level 0 but ships an overlay
@@ -505,7 +572,7 @@ class TestCopyInstalledTheme:
         assert (dst / "theme.json").is_file()
 
     def test_oversized_source_rejected_by_copy_budget(self, tmp_path: Path) -> None:
-        # TOCTOU round 2 (Codex HIGH): a regular file swapped for a huge one
+        # A regular file swapped for a huge one
         # after any earlier walk must not exhaust memory / land in staging —
         # the copy loop enforces a hard cumulative byte ceiling itself.
         from kiro_crew.dashboard.theme_validate import _THEME_TOTAL_BYTES_BY_LEVEL
@@ -524,7 +591,7 @@ class TestCopyInstalledTheme:
     def test_source_containing_themes_dir_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Codex HIGH round 3: staging lives inside _themes_dir(), so a source
+        # Staging lives inside _themes_dir(), so a source
         # equal to (or an ancestor of) the themes dir would make the copy walk
         # recursively consume its own staging output (unbounded nesting →
         # ENAMETOOLONG → residue). Must 400 by containment, leaving no residue.
@@ -539,10 +606,291 @@ class TestCopyInstalledTheme:
             assert theme is None and status == 400, (bad, err, status)
             assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
 
+    def test_dest_ancestor_of_source_rejected_without_deleting_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Promotion displaces dest to `.old` and rmtree()s it. A source
+        # nested UNDER the directory its own slug names (dest is an ancestor)
+        # rides along in that displaced tree. Deleting the tree removes the
+        # source and unrelated siblings while the handler returns 200.
+        # The containment guard must return 400 with the source AND a sibling
+        # file intact and no staging residue. Status alone is not enough: a
+        # reject-after-delete implementation would still return 400.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = themes_root / "lcars" / "subpack"
+        src.mkdir(parents=True)
+        _write(
+            src / "theme.json",
+            {"slug": "lcars", "name": "LCARS", "emoji": "🖖", "level": 0, "formatVersion": 1},
+        )
+        _write(src / "variables.json", _VALID_VARS)
+        sibling = themes_root / "lcars" / "unrelated-sibling.txt"
+        sibling.write_text("precious", encoding="utf-8")
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "inside the install destination" in err
+        assert (src / "theme.json").is_file(), "install deleted its own source"
+        assert sibling.is_file(), "install deleted an unrelated sibling"
+        assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
+
+    def test_source_moved_under_dest_while_waiting_for_lock_is_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The source identity is pinned before lock acquisition. If the source
+        # moves beneath dest in that window, promotion restores the displaced
+        # tree and rejects the install without deleting source bytes.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = _make_theme(tmp_path / "source")
+        _allow_pinned_source_rename_on_windows(monkeypatch, th_mod, src)
+        expected_manifest = (src / "theme.json").read_bytes()
+        expected_variables = (src / "variables.json").read_bytes()
+        relocated = themes_root / "lcars" / "relocated-source"
+        real_install_lock = th_mod._theme_install_lock
+
+        @contextmanager
+        def _relocating_lock(slug: str):  # type: ignore[no-untyped-def]
+            relocated.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(relocated)
+            with real_install_lock(slug):
+                yield
+
+        monkeypatch.setattr(th_mod, "_theme_install_lock", _relocating_lock)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "moved into the install destination" in err
+        assert (relocated / "theme.json").read_bytes() == expected_manifest
+        assert (relocated / "variables.json").read_bytes() == expected_variables
+        assert not list(themes_root.glob(".install-staging-*"))
+        assert not list(themes_root.glob(".lcars.old-*"))
+
+    def test_source_decoy_swap_while_waiting_for_lock_is_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = _make_theme(tmp_path / "source")
+        _allow_pinned_source_rename_on_windows(monkeypatch, th_mod, src)
+        expected_manifest = (src / "theme.json").read_bytes()
+        expected_variables = (src / "variables.json").read_bytes()
+        relocated = themes_root / "lcars" / "relocated-source"
+        real_install_lock = th_mod._theme_install_lock
+
+        def _swap_source() -> None:
+            relocated.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(relocated)
+            src.mkdir()
+            (src / "decoy.txt").write_text("decoy", encoding="utf-8")
+
+        # The pathname hook makes the vulnerable late stat capture the decoy.
+        # The lock hook drives the same swap when identity comes from the early
+        # descriptor instead, so both implementations exercise one race.
+        real_path_stat = Path.stat
+
+        def _stat_with_pre_lock_swap(
+            path: Path, *args: object, **kwargs: object
+        ) -> os.stat_result:
+            if (
+                path == src
+                and not relocated.exists()
+                and any(themes_root.glob(".install-staging-*"))
+            ):
+                _swap_source()
+            return real_path_stat(path, *args, **kwargs)
+
+        def _swapping_lock(slug: str):  # type: ignore[no-untyped-def]
+            if not relocated.exists():
+                _swap_source()
+            return real_install_lock(slug)
+
+        monkeypatch.setattr(Path, "stat", _stat_with_pre_lock_swap)
+        monkeypatch.setattr(th_mod, "_theme_install_lock", _swapping_lock)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "moved into the install destination" in err
+        assert (relocated / "theme.json").read_bytes() == expected_manifest
+        assert (relocated / "variables.json").read_bytes() == expected_variables
+        assert (src / "decoy.txt").read_text(encoding="utf-8") == "decoy"
+        assert not list(themes_root.glob(".install-staging-*"))
+        assert not list(themes_root.glob(".lcars.old-*"))
+
+    def test_vanished_source_pin_returns_400_before_staging(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = _make_theme(tmp_path / "source")
+
+        def _missing_source(_path: object) -> int:
+            raise FileNotFoundError
+
+        monkeypatch.setattr(th_mod, "pin_directory", _missing_source)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err == "source directory is not accessible"
+        assert not list(themes_root.glob(".install-staging-*"))
+        assert not list(themes_root.glob(".lcars.old-*"))
+
+    def test_dest_case_variant_ancestor_rejected_on_case_insensitive_fs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # On a case-insensitive filesystem (default macOS APFS),
+        # Path.resolve() preserves the caller's spelling while PosixPath
+        # comparison is case-sensitive: a source supplied as
+        # themes/LCARS/subpack lexically misses dest themes/lcars even though
+        # they are the same directory on disk. A lexical-only guard misses the
+        # case variant and promotion deletes the source. The inode fallback
+        # must catch it. Skipped where case spelling creates distinct paths.
+        probe = tmp_path / "CaseProbe"
+        probe.mkdir()
+        if not (tmp_path / "caseprobe").exists():
+            pytest.skip("requires a case-insensitive filesystem")
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = themes_root / "lcars" / "subpack"
+        src.mkdir(parents=True)
+        _write(
+            src / "theme.json",
+            {"slug": "lcars", "name": "LCARS", "emoji": "🖖", "level": 0, "formatVersion": 1},
+        )
+        _write(src / "variables.json", _VALID_VARS)
+        sibling = themes_root / "lcars" / "unrelated-sibling.txt"
+        sibling.write_text("precious", encoding="utf-8")
+        case_variant = themes_root / "LCARS" / "subpack"
+
+        theme, err, status = th_mod._do_install("local", {"path": str(case_variant)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        # Two fail-closed refusals are possible, both before promotion touches
+        # the destination: the ancestor guard names the destination, or the
+        # staging read's within_root containment (fd real path in on-disk case
+        # vs the caller-cased source root) refuses the file first.
+        assert err is not None and (
+            "inside the install destination" in err or "unreadable/unsafe file" in err
+        ), err
+        assert (src / "theme.json").is_file(), "install deleted its own source"
+        assert sibling.is_file(), "install deleted an unrelated sibling"
+        assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
+
+    def test_staging_walks_the_pinned_directory_by_its_kernel_spelling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The staging read compares each opened file's real path with the name
+        # it was opened by. ``resolve()`` follows links but keeps the caller's
+        # case, so on a case-insensitive filesystem a source typed as
+        # ``themes/LCARS/pack`` for a directory stored as ``themes/lcars/pack``
+        # is refused as unsafe before any later guard runs
+        # (test_dest_case_variant_ancestor_rejected_on_case_insensitive_fs is
+        # that case, on such a filesystem). The install must therefore walk the
+        # source by the spelling the kernel reports for the pinned descriptor.
+        # A case-sensitive filesystem cannot spell one directory two ways, so
+        # the kernel's answer is stood in for by a second directory: the walk
+        # must follow the answer, not the path the caller supplied.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        supplied = _make_theme(tmp_path / "typed")
+        kernel = _make_theme(tmp_path / "on-disk", name="On Disk")
+        pinned: list[int] = []
+
+        def _fake_real_path(fd: int) -> str:
+            pinned.append(fd)
+            return str(kernel)
+
+        monkeypatch.setattr(th_mod, "fd_real_path", _fake_real_path)
+
+        walked: list[Path] = []
+        real_copy = th_mod._copy_installed_theme
+
+        def _spy(source: Path, dst: Path) -> None:
+            walked.append(Path(source))
+            real_copy(source, dst)
+
+        monkeypatch.setattr(th_mod, "_copy_installed_theme", _spy)
+        theme, err, status = th_mod._do_install("local", {"path": str(supplied)})
+        assert err is None and status == 200 and theme is not None
+        assert walked == [kernel]
+        assert theme["name"] == "On Disk"
+        # Asked about the descriptor pin_directory opened, not any pathname.
+        assert len(pinned) == 1 and pinned[0] >= 0
+
+    def test_themes_dir_containment_is_judged_on_the_pinned_spelling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The "source must not contain the themes directory" guard protects
+        # the staging walk from copying its own output. It must judge the
+        # spelling that walk uses -- the pinned descriptor's -- not the one the
+        # caller supplied, or a source the kernel reports as the themes
+        # directory itself would pass the guard and be walked.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        supplied = _make_theme(tmp_path)
+        themes_root = tv_mod._themes_dir()
+        themes_root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(th_mod, "fd_real_path", lambda fd: str(themes_root))
+
+        theme, err, status = th_mod._do_install("local", {"path": str(supplied)})
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "must not contain the themes directory" in err
+        assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
+
+    def test_staging_keeps_the_caller_spelling_when_the_kernel_has_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A host that cannot report the descriptor's path gives the install
+        # nothing better than the caller's spelling; the read-side check on
+        # every file still decides, so the install proceeds rather than
+        # refusing every local source on such a host.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        src = _make_theme(tmp_path)
+        monkeypatch.setattr(th_mod, "fd_real_path", lambda fd: None)
+
+        walked: list[Path] = []
+        real_copy = th_mod._copy_installed_theme
+
+        def _spy(source: Path, dst: Path) -> None:
+            walked.append(Path(source))
+            real_copy(source, dst)
+
+        monkeypatch.setattr(th_mod, "_copy_installed_theme", _spy)
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+        assert err is None and status == 200 and theme is not None
+        assert walked == [src]
+
     def test_install_validates_the_staging_snapshot_not_the_source(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # TOCTOU round 2 (Codex HIGH): validation must run on the private
+        # Validation must run on the private
         # staging copy (immutable to an attacker), NOT on the still-writable
         # source dir — otherwise content swapped in after validation gets
         # promoted unvalidated. Pin the order by capturing the path
@@ -555,10 +903,12 @@ class TestCopyInstalledTheme:
         seen: list[Path] = []
         real_validate = th_mod._validate_theme_dir
 
-        def _spy(path: Path):  # type: ignore[no-untyped-def]
+        def _spy(path: Path, **kwargs):  # type: ignore[no-untyped-def]
             seen.append(Path(path))
-            return real_validate(path)
+            seen_kwargs.append(dict(kwargs))
+            return real_validate(path, **kwargs)
 
+        seen_kwargs: list[dict] = []
         monkeypatch.setattr(th_mod, "_validate_theme_dir", _spy)
         theme, err, status = th_mod._do_install("local", {"path": str(src)})
         assert err is None and status == 200 and theme is not None
@@ -567,6 +917,10 @@ class TestCopyInstalledTheme:
         # never the caller-supplied source.
         assert seen[0] != src
         assert seen[0].name.startswith(".install-staging-")
+        # The install path must opt into the font-pin refusal; the read path is
+        # the one that tolerates a legacy pin, so losing this flag here would
+        # silently let a pinning pack install.
+        assert seen_kwargs[0].get("installing") is True
         # The promoted install came from that snapshot.
         assert (tmp_path / "cfg" / "themes" / theme["slug"] / "theme.json").is_file()
 
@@ -649,7 +1003,12 @@ class TestValidateThemeDirL1:
         assert err is not None and "forbidden selector" in err
 
     def test_too_many_fonts_rejected(self, tmp_path: Path) -> None:
-        assets = {f"styles/fonts/f{i}.woff2": b"wOF2" + b"\x00" * 8 for i in range(4)}
+        # Derived from the constant, not a literal: the cap covers both font roles
+        # (a sans set plus a mono pair), so a literal drifts the moment it moves.
+        assets = {
+            f"styles/fonts/f{i}.woff2": b"wOF2" + b"\x00" * 8
+            for i in range(_THEME_MAX_FONTS + 1)
+        }
         summary, err = _validate_theme_dir(_make_tiered(tmp_path, level=1, extra=assets))
         assert summary is None
         assert err is not None and "too many fonts" in err
@@ -932,8 +1291,8 @@ class TestDoSCeilings:
 
 
 class TestFullL2Fixture:
-    """Regression for a full Level-2 pack built in a tmp dir. Sample/test packs
-    live OUTSIDE the repo now — nothing theme-bearing ships in the wheel — so
+    """A full Level-2 pack built in a tmp dir. Sample/test packs
+    live OUTSIDE the repo — nothing theme-bearing ships in the wheel — so
     this fixture carries persona + overlays + topbar + a font + an audio
     manifest to exercise the §3.1/§3.3 overlay/topbar/audio manifest
     declarations and the content-bound persona descriptor end to end."""
@@ -965,6 +1324,7 @@ class TestFullL2Fixture:
         assert info["chars"] == len(text)
         assert info["text"] == text
 
+    @requires_symlinks
     def test_descriptor_rejects_symlinked_persona(self, tmp_path: Path) -> None:
         # TOCTOU symlink-swap: persona.md replaced by a symlink to a file outside
         # the theme dir must NOT be read. The nolink chokepoint (O_NOFOLLOW +
@@ -988,322 +1348,6 @@ class TestFullL2Fixture:
         assert isinstance(manifest.get("overlays"), list) and manifest["overlays"]
         assert isinstance(manifest.get("topbar"), dict)
         assert (pack / "audio" / "manifest.json").is_file()
-
-
-# ── §3.1/§3.3 manifest declarations + §4.2 layout denylist + descriptor ──
-
-# A pack-relative overlay/topbar HTML file set the resolvers can find on disk.
-def _decl_pack(root: Path, files: dict[str, object] | None = None) -> Path:
-    """Bare directory with the given rel-path files (str|bytes). Used to back
-    the manifest declaration validators, which resolve ``src`` against disk."""
-    d = root / "decl-pack"
-    d.mkdir(parents=True, exist_ok=True)
-    for rel, content in (files or {}).items():
-        p = d / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, bytes):
-            p.write_bytes(content)
-        else:
-            p.write_text(str(content), encoding="utf-8")
-    return d
-
-
-# A fully-specified, valid overlay declaration (every optional field present).
-_FULL_OVERLAY = {
-    "id": "scanner",
-    "src": "overlays/scanner.html",
-    "position": "top-right",
-    "zIndex": 42,
-    "pointerEvents": False,
-    "animation": "once",
-    "trigger": "idle-30s",
-}
-
-
-class TestValidateOverlayDecls:
-    """§3.1 theme.json ``overlays`` list validation (declarations are OPTIONAL)."""
-
-    def _pack(self, tmp_path: Path) -> Path:
-        return _decl_pack(
-            tmp_path,
-            {"overlays/scanner.html": "<div>x</div>", "overlays/other.html": "<div>y</div>"},
-        )
-
-    def test_valid_full_decl_passes(self, tmp_path: Path) -> None:
-        assert _validate_overlay_decls({"overlays": [_FULL_OVERLAY]}, self._pack(tmp_path)) is None
-
-    def test_no_overlays_key_backward_compat(self, tmp_path: Path) -> None:
-        assert _validate_overlay_decls({}, self._pack(tmp_path)) is None
-
-    def test_bad_id_rejected(self, tmp_path: Path) -> None:
-        err = _validate_overlay_decls(
-            {"overlays": [{"id": "Bad Id", "src": "overlays/scanner.html"}]}, self._pack(tmp_path)
-        )
-        assert err is not None and "id' must match" in err
-
-    def test_id_not_equal_file_rejected(self, tmp_path: Path) -> None:
-        # id must equal the src file stem so /overlay/{id} serves it.
-        err = _validate_overlay_decls(
-            {"overlays": [{"id": "scanner", "src": "overlays/other.html"}]}, self._pack(tmp_path)
-        )
-        assert err is not None and "must be overlays/scanner.html" in err
-
-    def test_duplicate_id_rejected(self, tmp_path: Path) -> None:
-        dup = {"id": "scanner", "src": "overlays/scanner.html"}
-        err = _validate_overlay_decls({"overlays": [dup, dict(dup)]}, self._pack(tmp_path))
-        assert err is not None and "duplicate overlay id" in err
-
-    def test_too_many_overlays_rejected(self, tmp_path: Path) -> None:
-        decls = [{"id": f"o{i}", "src": f"overlays/o{i}.html"} for i in range(6)]
-        err = _validate_overlay_decls({"overlays": decls}, self._pack(tmp_path))
-        assert err is not None and "too many overlay" in err
-
-    def test_bad_position_rejected(self, tmp_path: Path) -> None:
-        err = _validate_overlay_decls(
-            {"overlays": [dict(_FULL_OVERLAY, position="diagonal")]}, self._pack(tmp_path)
-        )
-        assert err is not None and "invalid position" in err
-
-    def test_zindex_over_max_rejected(self, tmp_path: Path) -> None:
-        err = _validate_overlay_decls(
-            {"overlays": [dict(_FULL_OVERLAY, zIndex=10000)]}, self._pack(tmp_path)
-        )
-        assert err is not None and "zIndex must be an int" in err
-
-    def test_bad_trigger_rejected(self, tmp_path: Path) -> None:
-        # idle-<N>s allows 1..3 digits; idle-9999s (4 digits) is invalid.
-        err = _validate_overlay_decls(
-            {"overlays": [dict(_FULL_OVERLAY, trigger="idle-9999s")]}, self._pack(tmp_path)
-        )
-        assert err is not None and "invalid trigger" in err
-
-    def test_missing_src_file_rejected(self, tmp_path: Path) -> None:
-        err = _validate_overlay_decls(
-            {"overlays": [{"id": "ghost", "src": "overlays/ghost.html"}]}, self._pack(tmp_path)
-        )
-        assert err is not None and "missing file" in err
-
-
-class TestValidateTopbarDecls:
-    """§3.1 theme.json ``topbar`` object validation (declaration OPTIONAL)."""
-
-    def _pack(self, tmp_path: Path) -> Path:
-        return _decl_pack(
-            tmp_path, {"topbar/dark.html": "<div>d</div>", "topbar/light.html": "<div>l</div>"}
-        )
-
-    def test_valid_topbar_passes(self, tmp_path: Path) -> None:
-        tb = {
-            "topbar": {
-                "dark": "topbar/dark.html",
-                "light": "topbar/light.html",
-                "height": "56px",
-                "hideOnMobile": True,
-            }
-        }
-        assert _validate_topbar_decls(tb, self._pack(tmp_path)) is None
-
-    @pytest.mark.parametrize("height", ["10vh", "-5px"])
-    def test_bad_height_rejected(self, tmp_path: Path, height: str) -> None:
-        err = _validate_topbar_decls({"topbar": {"height": height}}, self._pack(tmp_path))
-        assert err is not None and "height' must match" in err
-
-    @pytest.mark.parametrize("height", ["9999rem", "9999em", "201px", "500px"])
-    def test_over_cap_height_rejected(self, tmp_path: Path, height: str) -> None:
-        # Arbiter MEDIUM: syntactically valid but viewport-consuming heights
-        # (e.g. 9999rem ≈ 160000px) must be rejected — a pointer-enabled topbar
-        # iframe that size would cover/intercept the dashboard (UI redress),
-        # the same containment class overrides.css already enforces.
-        err = _validate_topbar_decls({"topbar": {"height": height}}, self._pack(tmp_path))
-        assert err is not None and "px" in err
-
-    @pytest.mark.parametrize("height", ["28px", "200px", "3rem", "2em"])
-    def test_within_cap_height_accepted(self, tmp_path: Path, height: str) -> None:
-        tb = {"topbar": {"dark": "topbar/dark.html", "light": "topbar/light.html",
-                         "height": height}}
-        assert _validate_topbar_decls(tb, self._pack(tmp_path)) is None
-
-    def test_declared_dark_missing_file_rejected(self, tmp_path: Path) -> None:
-        d = _decl_pack(tmp_path, {"topbar/light.html": "<div>l</div>"})  # no dark.html
-        err = _validate_topbar_decls({"topbar": {"dark": "topbar/dark.html"}}, d)
-        assert err is not None and "missing file" in err
-
-
-# A minimal but valid MP3 header for audio-manifest fixtures (mirrors _VALID_MP3).
-class TestValidateAudioManifest:
-    """§3.3 audio/manifest.json validation (manifest file OPTIONAL)."""
-
-    def _audio_pack(self, tmp_path: Path, manifest: dict, *, valid_audio: bool = True) -> Path:
-        head = _VALID_MP3 if valid_audio else (b"NOTAUDIO" + b"\x00" * 16)
-        return _decl_pack(
-            tmp_path, {"audio/manifest.json": json.dumps(manifest), "audio/chime.mp3": head}
-        )
-
-    def test_valid_triggers_and_ambient_pass(self, tmp_path: Path) -> None:
-        manifest = {
-            "triggers": {"notification": {"src": "audio/chime.mp3", "volume": 0.5, "maxDuration": 2}},
-            "ambient": {"src": "audio/chime.mp3", "volume": 0.3, "loop": True, "fadeIn": 1},
-        }
-        desc, err = _validate_audio_manifest(self._audio_pack(tmp_path, manifest))
-        assert err is None
-        assert desc is not None
-        assert "notification" in desc["triggers"]
-        assert desc["ambient"] is not None
-
-    def test_unknown_trigger_rejected(self, tmp_path: Path) -> None:
-        d = self._audio_pack(tmp_path, {"triggers": {"boop": {"src": "audio/chime.mp3"}}})
-        desc, err = _validate_audio_manifest(d)
-        assert desc is None and err is not None and "unknown audio trigger" in err
-
-    def test_volume_over_one_rejected(self, tmp_path: Path) -> None:
-        d = self._audio_pack(
-            tmp_path, {"triggers": {"notification": {"src": "audio/chime.mp3", "volume": 1.5}}}
-        )
-        desc, err = _validate_audio_manifest(d)
-        assert desc is None and err is not None and "volume must be a number 0..1" in err
-
-    def test_max_duration_over_cap_rejected(self, tmp_path: Path) -> None:
-        # message-sent's per-trigger cap is 1s; 2s exceeds it.
-        d = self._audio_pack(
-            tmp_path, {"triggers": {"message-sent": {"src": "audio/chime.mp3", "maxDuration": 2}}}
-        )
-        desc, err = _validate_audio_manifest(d)
-        assert desc is None and err is not None and "exceeds cap" in err
-
-    def test_src_outside_audio_dir_rejected(self, tmp_path: Path) -> None:
-        d = self._audio_pack(tmp_path, {"triggers": {"notification": {"src": "other/chime.mp3"}}})
-        desc, err = _validate_audio_manifest(d)
-        assert desc is None and err is not None and "invalid audio 'src'" in err
-
-    def test_non_audio_magic_bytes_rejected(self, tmp_path: Path) -> None:
-        d = self._audio_pack(
-            tmp_path,
-            {"triggers": {"notification": {"src": "audio/chime.mp3"}}},
-            valid_audio=False,
-        )
-        desc, err = _validate_audio_manifest(d)
-        assert desc is None and err is not None and "not a valid audio file" in err
-
-    def test_legacy_version_sounds_tolerated(self, tmp_path: Path) -> None:
-        # Older sample manifests carry {version, sounds}; unknown top-level keys
-        # are tolerated and yield an empty trigger/ambient descriptor.
-        d = self._audio_pack(tmp_path, {"version": 1, "sounds": {"x": "y"}})
-        desc, err = _validate_audio_manifest(d)
-        assert err is None
-        assert desc == {"triggers": {}, "ambient": None}
-
-
-class TestOverridesLayoutDenylist:
-    """§4.2/§5.1 per-rule layout denylist with the decorative-pseudo exemption."""
-
-    @pytest.mark.parametrize(
-        "decls",
-        [
-            [("z-index", "10000")],
-            [("display", "none")],
-            [("pointer-events", "none")],
-            [("position", "fixed"), ("inset", "0")],
-        ],
-    )
-    def test_topbar_rule_rejected(self, decls: list) -> None:
-        assert _overrides_layout_violation([".topbar"], decls) is not None
-
-    def test_decorative_pseudo_exempt(self) -> None:
-        # The decorative-scanline idiom on body::before/after must validate.
-        decls = [("position", "fixed"), ("inset", "0"), ("pointer-events", "none")]
-        assert _overrides_layout_violation(["body::before", "body::after"], decls) is None
-
-    def test_zindex_exactly_9999_passes(self) -> None:
-        assert _overrides_layout_violation([".topbar"], [("z-index", "9999")]) is None
-
-    def test_integration_topbar_fixed_cover_rejected(self) -> None:
-        assert _validate_overrides_css(".topbar{position:fixed;inset:0;}") is not None
-
-    def test_integration_scanline_passes(self) -> None:
-        assert (
-            _validate_overrides_css("body::before{position:fixed;inset:0;pointer-events:none;}")
-            is None
-        )
-
-    def test_brace_in_string_does_not_hide_violations(self) -> None:
-        # A ``}`` inside a quoted value must NOT terminate the rule early; the
-        # declarations after it (position:fixed;inset:0 + z-index) are still
-        # parsed, so this viewport-hijacking rule is rejected.
-        css = '.sidebar{content:"}";position:fixed;inset:0;z-index:99999}'
-        assert _validate_overrides_css(css) is not None
-
-    def test_legit_rule_with_brace_in_content_passes(self) -> None:
-        # ``content:"}"`` with otherwise-safe declarations must not be
-        # false-rejected by brace-blind parsing.
-        assert _validate_overrides_css('.foo{content:"}";color:red}') is None
-
-    def test_data_uri_url_with_braces_passes(self) -> None:
-        # A data-URI in url() may legitimately contain ``{}``; on a decorative
-        # pseudo the covering position:fixed is exempt, so the pack installs.
-        css = (
-            "body::before{content:'';position:fixed;inset:0;pointer-events:none;"
-            'background:url("data:image/svg+xml,<svg>{}</svg>")}'
-        )
-        assert _validate_overrides_css(css) is None
-
-    def test_semicolon_in_string_does_not_split_declarations(self) -> None:
-        # A ``;`` inside a quoted value must stay part of that value and not be
-        # mistaken for a declaration boundary — the trailing z-index is still
-        # seen and rejected.
-        css = '.bar{content:"a;b";z-index:12345}'
-        assert _validate_overrides_css(css) is not None
-
-
-class TestThemeAssetDescriptor:
-    """The frontend descriptor surfaces manifest-declared placement/behaviour."""
-
-    def test_declared_pack_surfaces_rich_shape(self, tmp_path: Path) -> None:
-        manifest = {
-            "level": 2,
-            "name": "Bk",
-            "branding": {"botName": "KarenClaw"},
-            "fonts": [{"family": "Krabby Patty", "file": "krabby-patty.ttf"}],
-            "overlays": [
-                {
-                    "id": "karen",
-                    "src": "overlays/karen.html",
-                    "position": "bottom-right",
-                    "zIndex": 41,
-                    "trigger": "continuous",
-                }
-            ],
-            "topbar": {"dark": "topbar/dark.html", "height": "56px", "hideOnMobile": True},
-        }
-        d = _decl_pack(
-            tmp_path,
-            {
-                "overlays/karen.html": "<div>k</div>",
-                "topbar/dark.html": "<div>d</div>",
-                "styles/fonts/krabby-patty.ttf": b"\x00\x01\x00\x00" + b"\x00" * 16,
-                "audio/manifest.json": json.dumps(
-                    {"triggers": {"notification": {"src": "audio/chime.mp3", "maxDuration": 2}}}
-                ),
-                "audio/chime.mp3": _VALID_MP3,
-            },
-        )
-        desc = _theme_asset_descriptor(d, manifest, 2)
-        # Overlays are objects carrying declared placement/behaviour.
-        assert desc["overlays"][0]["position"] == "bottom-right"
-        assert desc["overlays"][0]["zIndex"] == 41
-        assert desc["overlays"][0]["trigger"] == "continuous"
-        # Topbar height/hideOnMobile echo the manifest.
-        assert desc["topbar"]["height"] == "56px"
-        assert desc["topbar"]["hideOnMobile"] is True
-        # Audio trigger map is parsed.
-        assert "notification" in desc["audio"]["triggers"]
-        # A .ttf font surfaces with format 'truetype'.
-        assert desc["fonts"][0]["format"] == "truetype"
-
-    def test_undeclared_pack_gets_default_placement(self, tmp_path: Path) -> None:
-        d = _decl_pack(tmp_path, {"overlays/foo.html": "<div>f</div>"})
-        desc = _theme_asset_descriptor(d, {"level": 2, "name": "U"}, 2)
-        assert desc["overlays"][0]["position"] == _THEME_OVERLAY_DEFAULT_POSITION
-        assert desc["overlays"][0]["zIndex"] == _THEME_OVERLAY_DEFAULT_ZINDEX
 
 
 class TestDeleteLock:
@@ -1352,7 +1396,7 @@ class TestDeleteLock:
 
 
 class TestServingReadNolink:
-    """Codex HIGH round 4: _resolve_theme_asset CHECKS the path but the route
+    """_resolve_theme_asset CHECKS the path but the route
     OPENED it later with a plain read — a swap-to-symlink in the window was
     followed (credential exfil via the asset endpoint). Serving reads now go
     through _read_theme_bytes_nolink (O_NOFOLLOW + containment)."""
@@ -1391,100 +1435,8 @@ class TestServingReadNolink:
         assert _read_theme_bytes_nolink("mypack", target) is None
 
 
-class TestWindowsGate:
-    """Arbiter item 4: the pack routes traverse hooks' POSIX-only
-    O_NOFOLLOW + fd-real-path chokepoint (no Windows impl), so they honestly
-    501 on Windows instead of 500-ing. The flag is monkeypatched True here;
-    on this (POSIX) host it defaults False, so the rest of the suite exercises
-    the normal path. The editor custom-record CRUD paths are NOT gated."""
-
-    @staticmethod
-    def _req(**match_info: object) -> object:
-        import types
-
-        async def _json() -> dict:
-            return {"source": {"type": "local", "path": "/tmp/does-not-matter"}}
-
-        r = types.SimpleNamespace(match_info=match_info)
-        r.json = _json  # type: ignore[attr-defined]
-        return r
-
-    def test_install_501_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(th_mod.api_themes_install(self._req()))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        assert b"KiroCrew#311" in resp.body
-
-    @pytest.mark.parametrize(
-        "handler,match_info",
-        [
-            ("api_theme_asset", {"slug": "wintheme", "path": "branding/logo.svg"}),
-            ("api_theme_overlay", {"slug": "wintheme", "id": "scanner"}),
-            ("api_theme_topbar", {"slug": "wintheme", "mode": "dark"}),
-        ],
-    )
-    def test_serving_routes_501_on_windows(
-        self, monkeypatch: pytest.MonkeyPatch, handler: str, match_info: dict
-    ) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(getattr(th_mod, handler)(self._req(**match_info)))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-
-    def test_delete_installed_dir_501_on_windows(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import asyncio
-        import types
-
-        import kiro_crew.dashboard.theme_validate as tv_mod
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path)
-        slug = "wintheme"
-        d = tv_mod._installed_theme_dir(slug)
-        d.mkdir(parents=True)
-        (d / "theme.json").write_text(
-            '{"name": "W", "level": 0, "formatVersion": 1}', encoding="utf-8"
-        )
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        req = types.SimpleNamespace(method="DELETE", match_info={"slug": slug})
-        resp = asyncio.run(th_mod.api_theme_detail(req))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        # The gate short-circuits before any rmtree — the dir is untouched.
-        assert d.is_dir()
-
-    def test_flag_false_does_not_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # With the flag False (the POSIX default), install is NOT short-circuited:
-        # it proceeds to parse the body, so invalid JSON yields the normal 400.
-        import asyncio
-        import types
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        assert th_mod._THEMES_WIN_UNSUPPORTED is False  # POSIX host default
-
-        async def _bad_json() -> dict:
-            raise ValueError("no body")
-
-        req = types.SimpleNamespace(match_info={})
-        req.json = _bad_json  # type: ignore[attr-defined]
-        resp = asyncio.run(th_mod.api_themes_install(req))
-        assert resp.status == 400
-
-
 class TestCssParserCorpus:
-    """Shared-corpus guard for the two theme-CSS parsers (PR #107 arbiter item).
+    """Shared-corpus guard for the two theme-CSS parsers.
 
     The install-time denylist (``_validate_overrides_css``) and the runtime
     positive-selector scoper (useTheme.tsx) implement different models BY
@@ -1504,7 +1456,7 @@ class TestCssParserCorpus:
 
         mismatches = []
         for case in self._corpus():
-            err = _validate_overrides_css(case["css"])
+            err = _validate_overrides_css(case["css"], enforce_font_pins=True)
             accepted = err is None
             if accepted != case["installAccepts"]:
                 mismatches.append(f"{case['name']}: expected installAccepts={case['installAccepts']}, got {accepted} (err={err})")

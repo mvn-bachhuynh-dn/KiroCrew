@@ -25,7 +25,6 @@ vi.mock('../api/client', () => ({
       ],
       tasks: [],
       totals: { rss_mb: 600, runtimes: 3, host_mb: 16384, host_pct: 3.6, rss_is_upper_bound: false },
-      unattributed: null,
       history: [],
     }),
     system: () => Promise.resolve({
@@ -54,7 +53,7 @@ describe('Sessions grouping labels the group, not its first member', () => {
     renderWithProviders(<SystemPage />)
     await waitFor(() => expect(screen.getByText('alpha session')).toBeTruthy())
 
-    fireEvent.click(screen.getByRole('button', { name: /channel/i }))
+    fireEvent.click(screen.getByRole('radio', { name: /channel/i }))
 
     await waitFor(() => {
       // Two folds: slack (2 members) and cron (1).

@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from kiro_crew import __version__, code_fingerprint, platform_compat, release_channel
 from kiro_crew.cloud import aws, sizes
+from kiro_crew.deploy import profiles as profiles_mod
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
 
 logger = logging.getLogger(__name__)
@@ -40,7 +44,6 @@ _FAILED_STATES = {
     "DELETE_FAILED",
     "UPDATE_ROLLBACK_FAILED",
 }
-_DELETE_DONE = "DELETE_COMPLETE"
 _DISCOVERABLE_STACK_STATES = sorted(
     _COMPLETE_STATES
     | _FAILED_STATES
@@ -71,22 +74,101 @@ _POLL_TIMEOUT = 60
 # Cap at 51 chars: the template names the IAM role/instance-profile
 # `kirocrew-ec2-${StackTag}` (13-char prefix), and IAM role names max out at 64,
 # so 13 + 51 = 64. A longer tag would fail role creation at deploy time.
-_TAG_RE = re.compile(r"^[a-zA-Z0-9-]{1,51}$")
+_TAG_RE = re.compile(r"^[a-zA-Z0-9-]{1,51}\Z")
 _TAG_SPEC = FieldSpec(name="tag", type=str, max_len=51, pattern=_TAG_RE)
-_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+\Z")
 _REGION_SPEC = FieldSpec(name="region", type=str, max_len=32, pattern=_REGION_RE)
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
-_CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+# The profile charset ('+' admitted for IAM Identity Center derived names,
+# leading '-' excluded so a value is never option-shaped, \Z anchor)
+# is deploy/profiles.py's PROFILE_SPEC, aliased rather than re-spelled here
+# (same idiom as deploy/handlers_sites.py; cloud/ already depends on deploy via the
+# shared aws-bin resolver in cloud/aws.py).
+_PROFILE_SPEC = profiles_mod.PROFILE_SPEC
+_CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}\Z")
 _CIDR_SPEC = FieldSpec(name="allow_ssh_cidr", type=str, max_len=18, pattern=_CIDR_RE)
 # repo/ref reach a `git clone --branch '<ref>' '<repo>'` in the instance
 # UserData; charset-validate them so a crafted value can't break out of the
 # single quotes and run as root on the box (defense in depth even though these
 # are not CLI-wired today).
-_REPO_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,255}$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,255}\Z")
 _REPO_SPEC = FieldSpec(name="repo", type=str, max_len=255, pattern=_REPO_RE)
-_REF_RE = re.compile(r"^[A-Za-z0-9_./-]{1,128}$")
+_REF_RE = re.compile(r"^[A-Za-z0-9_./-]{1,128}\Z")
 _REF_SPEC = FieldSpec(name="ref", type=str, max_len=128, pattern=_REF_RE)
+#: Where the template's public-repo fallback clones from when no ``repo`` is
+#: passed: the ``KirocrewRepo`` default of ``kirocrew-ec2.yaml``, spelled here
+#: too because the release-tag probe below must ask the SAME remote the
+#: instance will clone (``test_cloud_ec2.py`` pins the two spellings together).
+PUBLIC_REPO_URL = "https://github.com/kirodotdev/KiroCrew.git"
+#: Budget for one ``git ls-remote`` round trip to that remote. A launch already
+#: waits minutes on CloudFormation, so a slow answer costs little; a hung one
+#: must not hang the launch, and a miss is never worse than today's ``main``.
+_REF_PROBE_TIMEOUT_SECONDS = 15.0
+# EC2 subnet ids are `subnet-` + 8 (EC2-Classic era) or 17 hex chars.
+_SUBNET_ID_RE = re.compile(r"^subnet-[0-9a-f]{8,17}\Z")
+_SUBNET_ID_SPEC = FieldSpec(name="subnet_id", type=str, max_len=24, pattern=_SUBNET_ID_RE)
+# `--ami`: EC2 image ids are `ami-` + 8 or 17 lowercase hex chars. Mirrored by
+# the template's CustomAmiId AllowedPattern.
+_AMI_ID_RE = re.compile(r"^ami-[0-9a-f]{8,17}\Z")
+_AMI_ID_SPEC = FieldSpec(name="ami", type=str, required=True, max_len=21, pattern=_AMI_ID_RE)
+# `--extra-packages`: each name is expanded into the root user-data script, so
+# the charset is an allowlist with no shell metacharacters, and a name must
+# start alphanumeric so it can never be read as a dnf option. The total-length
+# cap bounds the UserData growth (EC2's 16 KB decoded limit; the template's
+# ExtraPackages MaxLength mirrors EXTRA_PACKAGES_MAX_LEN).
+_EXTRA_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}\Z")
+EXTRA_PACKAGES_MAX_LEN = 256
+
+
+def validate_ami_id(ami_id: str) -> str:
+    """Return ``ami_id`` if it is a well-formed EC2 image id, else raise."""
+    return validate_field(ami_id, _AMI_ID_SPEC) or ""
+
+
+# `--ssm-kms-key`: a FULL KMS key ARN, the one key the instance role is
+# granted for encrypted Session Manager. Aliases, wildcards, other services and
+# bare key ids are refused: the value becomes an IAM Resource, so it must name
+# exactly one key. Key ids are UUIDs or multi-Region `mrk-<hex>` ids. Only the
+# `aws` partition: the boundary and its KMS ceiling are `arn:aws` ARNs, so a
+# China or GovCloud key would be capped to nothing. The template's SsmKmsKeyArn
+# AllowedPattern mirrors this.
+_SSM_KMS_KEY_RE = re.compile(
+    r"^arn:aws:kms:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:key/(mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\Z"
+)
+_SSM_KMS_KEY_SPEC = FieldSpec(
+    name="ssm-kms-key", type=str, required=True, max_len=128, pattern=_SSM_KMS_KEY_RE
+)
+
+
+def validate_ssm_kms_key_arn(arn: str) -> str:
+    """Return ``arn`` if it is one full KMS key ARN, else raise ValidationError."""
+    return validate_field(arn, _SSM_KMS_KEY_SPEC) or ""
+
+
+def normalize_extra_packages(raw: str) -> str:
+    """Validate a comma/space-separated package list; return it space-joined.
+
+    Duplicates are dropped (first occurrence wins). Raises
+    :class:`ValidationError` for any name outside the allowlist charset or a
+    joined value longer than :data:`EXTRA_PACKAGES_MAX_LEN`.
+    """
+    names: list[str] = []
+    for name in re.split(r"[, ]+", raw or ""):
+        if not name:
+            continue
+        if not _EXTRA_PACKAGE_RE.match(name):
+            raise ValidationError(
+                "extra_packages",
+                f"{name!r} is not a valid package name "
+                "(letters, digits and . _ + - only; must start with a letter or digit)",
+            )
+        if name not in names:
+            names.append(name)
+    joined = " ".join(names)
+    if len(joined) > EXTRA_PACKAGES_MAX_LEN:
+        raise ValidationError(
+            "extra_packages", f"list is {len(joined)} characters (at most {EXTRA_PACKAGES_MAX_LEN})"
+        )
+    return joined
 
 
 def _validate_cidr(cidr: str) -> str:
@@ -158,6 +240,10 @@ def validate_tag(tag: str) -> str:
     return val
 
 
+def validate_subnet_id(subnet_id: str) -> str:
+    return validate_field(subnet_id, _SUBNET_ID_SPEC) or ""
+
+
 @dataclass
 class DeployResult:
     """Outcome of a launch."""
@@ -199,8 +285,108 @@ def azs_offering_instance_type(instance_type: str, profile: str, region: str) ->
     return {o.get("Location", "") for o in offerings if o.get("Location")}
 
 
-def discover_network(profile: str, region: str, instance_type: str = "") -> tuple[str, str]:
-    """Resolve a (vpc_id, subnet_id) to launch into.
+# Hosts the bootstrap MUST resolve to build the box. Keep in sync with the
+# UserData in templates/kirocrew-ec2.yaml — the kiro-cli URL is pinned to
+# us-east-1 there regardless of the launch region, so it is literal here too.
+_BOOTSTRAP_DOWNLOAD_HOSTS = (
+    "desktop-release.q.us-east-1.amazonaws.com",  # kiro-cli musl build
+    "nodejs.org",  # Node >= NODE_MIN tarball
+)
+
+
+def _zone_shadows_host(zone: str, host: str) -> bool:
+    """True when a hosted zone named ``zone`` is authoritative for ``host``.
+
+    A private hosted zone owns its apex **and every subdomain**, so
+    ``q.us-east-1.amazonaws.com`` shadows ``desktop-release.q.us-east-1.amazonaws.com``.
+    Matching is done on label boundaries so ``xq.us-east-1.amazonaws.com`` does
+    not match — a plain ``endswith`` would produce false positives.
+    """
+    zone = zone.rstrip(".").lower()
+    host = host.rstrip(".").lower()
+    if not zone or not host:
+        return False
+    return host == zone or host.endswith("." + zone)
+
+
+def shadowed_download_hosts(vpc_id: str, profile: str, region: str) -> list[tuple[str, str]]:
+    """``(host, zone)`` pairs where a private hosted zone hides a download host.
+
+    An interface VPC endpoint with private DNS enabled creates a private hosted
+    zone that is authoritative for its whole domain. Amazon Q's
+    ``com.amazonaws.<region>.q`` endpoint creates one for
+    ``q.<region>.amazonaws.com`` — and kiro-cli is downloaded from
+    ``desktop-release.q.us-east-1.amazonaws.com``, which sits inside it. In such
+    a VPC the lookup is answered by the private zone, finds no matching record,
+    and returns NXDOMAIN **without falling through to public DNS**, so the
+    bootstrap dies ~4 minutes in on a name that resolves fine everywhere else.
+
+    The failure is deterministic — retries do not help — and it surfaces as
+    "kiro-cli did not install", which names the wrong layer. One read-only call
+    here turns it into a pre-launch error.
+
+    Returns an empty list when the check cannot be performed (for example the
+    launch role predates ``route53:ListHostedZonesByVPC``): a missing optional
+    permission must never block a launch that would otherwise succeed.
+    """
+    try:
+        data = aws.checked_json(
+            [
+                "route53",
+                "list-hosted-zones-by-vpc",
+                "--vpc-id",
+                vpc_id,
+                "--vpc-region",
+                region,
+            ],
+            profile,
+            region,
+            action="route53:ListHostedZonesByVPC",
+        )
+    except aws.AWSError:
+        # Non-fatal by design — see the docstring.
+        logger.info("could not list private hosted zones for %s; skipping DNS preflight", vpc_id)
+        return []
+
+    summaries = data.get("HostedZoneSummaries", []) if isinstance(data, dict) else []
+    hits: list[tuple[str, str]] = []
+    for host in _BOOTSTRAP_DOWNLOAD_HOSTS:
+        for zone in summaries:
+            name = zone.get("Name", "") if isinstance(zone, dict) else ""
+            if _zone_shadows_host(name, host):
+                hits.append((host, name.rstrip(".")))
+                break
+    return hits
+
+
+def assert_download_hosts_resolvable(vpc_id: str, profile: str, region: str) -> None:
+    """Fail fast when a private hosted zone shadows a bootstrap download host.
+
+    Raises :class:`aws.AWSError` naming the zone, the host, and the ``--subnet``
+    remedy. See :func:`shadowed_download_hosts` for why this is worth a check.
+    """
+    hits = shadowed_download_hosts(vpc_id, profile, region)
+    if not hits:
+        return
+    detail = "; ".join(f"{host} is inside private zone {zone}" for host, zone in hits)
+    raise aws.AWSError(
+        f"VPC {vpc_id} has a private hosted zone that shadows a host the bootstrap "
+        f"must download from ({detail}). Inside this VPC that name resolves to "
+        "NXDOMAIN instead of falling through to public DNS, so the install would "
+        "fail several minutes from now with a misleading error. This is usually an "
+        "interface VPC endpoint with private DNS enabled (e.g. Amazon Q's "
+        "`com.amazonaws.<region>.q`). Launch into a VPC without that endpoint via "
+        "`--subnet <subnet-id>`, or disable private DNS on the endpoint, then retry.",
+        action="route53:ListHostedZonesByVPC",
+    )
+
+
+def discover_network(profile: str, region: str, instance_type: str = "") -> tuple[str, str, str]:
+    """Resolve a (vpc_id, subnet_id, egress_kind) to launch into.
+
+    ``egress_kind`` is ``"nat"`` or ``"igw"`` — the caller uses it to decide
+    whether the instance needs a public IP (IGW egress requires one; a NAT
+    subnet must NOT get one).
 
     Prefers the account's **default VPC** and a public subnet within it. When an
     ``instance_type`` is given, the subnet is chosen in an AZ that actually
@@ -228,7 +414,7 @@ def discover_network(profile: str, region: str, instance_type: str = "") -> tupl
         if len(vpc_list) != 1:
             raise aws.AWSError(
                 "no default VPC found — create one (`aws ec2 create-default-vpc`) "
-                "or specify a VPC/subnet, then retry.",
+                "or pass `--subnet <subnet-id>`, then retry.",
                 action="ec2:DescribeVpcs",
             )
     vpc_id = vpc_list[0]["VpcId"]
@@ -271,20 +457,72 @@ def discover_network(profile: str, region: str, instance_type: str = "") -> tupl
     egress = _subnet_egress_kinds(vpc_id, profile, region)  # {subnet_id: "igw"|"nat"}
     nat = [s for s in candidates if egress.get(s["SubnetId"]) == "nat"]
     if nat:
-        return vpc_id, nat[0]["SubnetId"]
+        return vpc_id, nat[0]["SubnetId"], "nat"
     igw = [s for s in candidates if egress.get(s["SubnetId"]) == "igw"]
     if igw:
         # Prefer one that also auto-assigns a public IP, but the template's
-        # AssociatePublicIpAddress makes any IGW subnet workable.
+        # conditional AssociatePublicIpAddress makes any IGW subnet workable.
         igw.sort(key=lambda s: not s.get("MapPublicIpOnLaunch"))
-        return vpc_id, igw[0]["SubnetId"]
+        return vpc_id, igw[0]["SubnetId"], "igw"
     raise aws.AWSError(
         f"no subnet in VPC {vpc_id} has a verified internet egress route (internet "
         "gateway or NAT). KiroCrew needs outbound access to install packages and "
         "reach SSM. Add an internet gateway + public route (or a NAT), or pass a "
-        "subnet that has one, then retry.",
+        "subnet that has one via `--subnet`, then retry.",
         action="ec2:DescribeRouteTables",
     )
+
+
+def resolve_explicit_subnet(
+    subnet_id: str, profile: str, region: str, instance_type: str = ""
+) -> tuple[str, str, str]:
+    """Resolve a user-chosen ``--subnet`` to ``(vpc_id, subnet_id, egress_kind)``.
+
+    The explicit path skips VPC discovery entirely (the point of the flag:
+    launching into a dedicated VPC that auto-discovery would never pick while a
+    default VPC exists) but keeps the launch-time guarantees discover_network
+    provides: the subnet must exist, its AZ must offer ``instance_type``, and it
+    must have a verified internet-egress route (NAT or IGW) — a subnet without
+    egress would hang the launch until the WaitCondition timeout, so fail fast
+    with actionable text instead.
+    """
+    data = aws.checked_json(
+        ["ec2", "describe-subnets", "--subnet-ids", subnet_id],
+        profile,
+        region,
+        action="ec2:DescribeSubnets",
+    )
+    subnet_list = data.get("Subnets", []) if isinstance(data, dict) else []
+    if not subnet_list:
+        raise aws.AWSError(
+            f"subnet {subnet_id} not found in {region} — check the id and --region.",
+            action="ec2:DescribeSubnets",
+        )
+    subnet = subnet_list[0]
+    vpc_id = subnet.get("VpcId", "")
+    az = subnet.get("AvailabilityZone", "")
+    if instance_type:
+        try:
+            ok_azs = azs_offering_instance_type(instance_type, profile, region)
+        except aws.AWSError:
+            ok_azs = set()  # non-fatal — same fallback as discover_network
+        if ok_azs and az not in ok_azs:
+            raise aws.AWSError(
+                f"subnet {subnet_id} is in {az}, which does not offer "
+                f"{instance_type} — pick a subnet in one of "
+                f"{', '.join(sorted(ok_azs))}, or a different size.",
+                action="ec2:DescribeInstanceTypeOfferings",
+            )
+    egress = _subnet_egress_kinds(vpc_id, profile, region)
+    if subnet_id not in egress:
+        raise aws.AWSError(
+            f"subnet {subnet_id} has no verified internet egress route (NAT or "
+            "internet gateway). Kiro Crew needs outbound access to install "
+            "packages and reach SSM — add a NAT (or IGW) default route to the "
+            "subnet's route table, then retry.",
+            action="ec2:DescribeRouteTables",
+        )
+    return vpc_id, subnet_id, egress[subnet_id]
 
 
 def _subnet_egress_kinds(vpc_id: str, profile: str, region: str) -> dict:
@@ -354,18 +592,121 @@ def _subnet_egress_kinds(vpc_id: str, profile: str, region: str) -> dict:
     return result
 
 
+def release_tag_exists(ref: str, repo: str = "") -> bool:
+    """Whether ``repo`` (default: the public repo) carries the tag ``ref``.
+
+    One ``git ls-remote --exit-code`` against the remote, with a short timeout,
+    run from the trusted git's own directory rather than the gateway's working
+    directory: the gateway may be sitting inside a repository the agent can
+    write to, and a ``.git/config`` there (``url.*.insteadOf`` onto an
+    ``ext::`` transport) would otherwise decide
+    what the probe runs. Repository-local config has no env switch — git finds
+    it by walking up from ``cwd`` — so ``GIT_CEILING_DIRECTORIES`` names that
+    same directory and the walk never climbs past it; the only ``.git/config``
+    git could then honour sits where the agent cannot write. Everything the
+    environment CAN switch off (inherited ``GIT_*``, global and system config,
+    the credential prompt) is :func:`code_fingerprint.hardened_git_env`, the
+    gateway's one hardened-git recipe. ``git`` itself comes from
+    :func:`platform_compat.trusted_git_bin`, never a bare ``PATH`` lookup: the
+    gateway's ``PATH`` can lead with an agent-writable directory, and a shim
+    there would run with the gateway's privileges on every packaged launch.
+    Any way of not getting a definite "yes" — no trusted ``git`` on this
+    machine, no network, a 128 from the remote, a timeout — answers ``False``:
+    the caller then keeps the template default rather than asking the instance
+    to clone a tag that may not be there, which would fail the boot inside the
+    stack.
+    """
+    git = platform_compat.trusted_git_bin()
+    if git is None:
+        logger.warning(
+            "no trusted git on this machine; cannot probe %s for tag %s",
+            repo or PUBLIC_REPO_URL,
+            ref,
+        )
+        return False
+    argv = [
+        git,
+        "ls-remote",
+        "--exit-code",
+        "--tags",
+        "--",
+        repo or PUBLIC_REPO_URL,
+        f"refs/tags/{ref}",
+    ]
+    trusted_dir = Path(git).resolve().parent
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=trusted_dir,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_REF_PROBE_TIMEOUT_SECONDS,
+            env=code_fingerprint.hardened_git_env(GIT_CEILING_DIRECTORIES=str(trusted_dir)),
+            check=False,
+            **UTF8_TEXT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("could not probe %s for tag %s: %s", repo or PUBLIC_REPO_URL, ref, exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "tag %s not found on %s (git ls-remote exit %d)",
+            ref,
+            repo or PUBLIC_REPO_URL,
+            proc.returncode,
+        )
+        return False
+    return True
+
+
+def resolve_public_ref(repo: str = "") -> str:
+    """The git ref the public-repo clone should install for THIS build.
+
+    The template's ``KirocrewRef`` defaults to ``main``, which is right for a
+    checkout that ships its own source and wrong for a packaged install: the
+    instance then runs whatever ``main`` is while this machine runs a release,
+    and the remote-crew version gate (``apps.version.versions_compatible``)
+    refuses the pair on ``major.minor``. So a packaged install pins the first release tag
+    its own version names (:func:`release_channel.release_refs`, likeliest
+    first) that the remote confirms it has. Returns ``""`` — "let the template
+    default stand" — when no tag maps onto the version (a nightly) or the
+    remote carries none of them (a fork, a build stamped before its tag was
+    pushed, no network from here); the WARNING says which, and the launch
+    proceeds exactly as it does today.
+    """
+    refs = release_channel.release_refs()
+    if not refs:
+        logger.warning(
+            "no release tag maps onto Kiro Crew %s; the instance will run main", __version__
+        )
+        return ""
+    for ref in refs:
+        if release_tag_exists(ref, repo):
+            return ref
+    logger.warning(
+        "no release tag %s for Kiro Crew %s; the instance will run main",
+        " / ".join(refs),
+        __version__,
+    )
+    return ""
+
+
 def build_deploy_argv(
     *,
     tag: str,
     tier: sizes.SizeTier,
     vpc_id: str,
     subnet_id: str,
+    associate_public_ip: str = "true",
     permissions_boundary_arn: str,
     repo: str = "",
     ref: str = "",
     allow_ssh_cidr: str = "",
     source_bucket: str = "",
     source_key: str = "",
+    ami_id: str = "",
+    extra_packages: str = "",
+    ssm_kms_key_arn: str = "",
 ) -> list[str]:
     """Assemble the exact ``aws cloudformation deploy`` argv (also the dry-run output).
 
@@ -373,6 +714,11 @@ def build_deploy_argv(
     instance permissions boundary (``source.ensure_instance_boundary`` creates it
     once); it fills the template's ``PermissionsBoundaryArn`` parameter so the
     InstanceRole is capped by it instead of a per-launch CFN-authored boundary.
+
+    ``ami_id`` / ``extra_packages`` (``--ami`` / ``--extra-packages``) are
+    emitted only when set, so a stock launch's argv is unchanged. The same holds
+    for ``ssm_kms_key_arn`` (``--ssm-kms-key``): set, it adds ``SsmKmsKeyArn``
+    and the caller passes the KMS-session boundary ARN; unset, nothing changes.
     """
     overrides = [
         f"InstanceType={tier.instance_type}",
@@ -380,6 +726,7 @@ def build_deploy_argv(
         f"VolumeSizeGb={tier.disk_gb}",
         f"VpcId={vpc_id}",
         f"SubnetId={subnet_id}",
+        f"AssociatePublicIp={associate_public_ip}",
         f"StackTag={tag}",
         f"PermissionsBoundaryArn={permissions_boundary_arn}",
     ]
@@ -393,6 +740,12 @@ def build_deploy_argv(
         overrides.append(f"KirocrewRef={ref}")
     if allow_ssh_cidr:
         overrides.append(f"AllowSshCidr={allow_ssh_cidr}")
+    if ami_id:
+        overrides.append(f"CustomAmiId={ami_id}")
+    if extra_packages:
+        overrides.append(f"ExtraPackages={extra_packages}")
+    if ssm_kms_key_arn:
+        overrides.append(f"SsmKmsKeyArn={ssm_kms_key_arn}")
     return [
         "cloudformation",
         "deploy",
@@ -416,33 +769,68 @@ def deploy(
     tier: sizes.SizeTier,
     profile: str = "",
     region: str = "",
+    subnet_id: str = "",
     repo: str = "",
     ref: str = "",
     allow_ssh_cidr: str = "",
-    ship_source: bool = True,
+    ship_source: Optional[bool] = None,
     disable_rollback: bool = False,
     dry_run: bool = False,
     proc_sink: Optional[Any] = None,
+    ami_id: str = "",
+    extra_packages: str = "",
+    ssm_kms_key_arn: str = "",
 ) -> DeployResult:
     """Provision (or update) the KiroCrew stack. Idempotent by stack name.
 
-    When ``ship_source`` (default) the local source is packaged and uploaded to
-    S3 so the instance installs from it (private-repo safe) instead of cloning
-    GitHub. ``dry_run`` returns the exact argv without calling AWS. ``proc_sink``
-    is forwarded to :func:`aws.run_aws` for the (long) deploy call so a caller
-    running deploy on a background thread can terminate the child on Ctrl+C.
+    By default the local source is packaged and uploaded only when Kiro Crew is
+    running from a checkout; packaged installs use the template's public-repo
+    clone path. Explicit ``ship_source=True`` remains fail-closed when no checkout
+    exists. ``subnet_id`` pins the launch to an explicit subnet (validated by
+    :func:`resolve_explicit_subnet`) instead of auto-discovery. ``dry_run``
+    returns the exact argv without calling AWS. ``proc_sink`` is forwarded to
+    :func:`aws.run_aws` for the (long) deploy call so a caller running deploy on
+    a background thread can terminate the child on Ctrl+C. ``ami_id`` and
+    ``extra_packages`` customize the box (see :func:`validate_ami_id` and
+    :func:`normalize_extra_packages`); empty means the stock image and packages.
+    ``ssm_kms_key_arn`` (``--ssm-kms-key``, see :func:`validate_ssm_kms_key_arn`)
+    opts in to encrypted Session Manager: the role gets the opt-in KMS-session
+    boundary and an inline grant on exactly that key. Empty means the default
+    boundary and no KMS grant, byte-identical to a launch before the flag existed.
     """
     if not dry_run:
         aws.assert_human_action("cloudformation:CreateStack")
     tag = validate_tag(tag)
     profile = validate_profile(profile)
     region = validate_region(region)
+    if subnet_id:
+        subnet_id = validate_subnet_id(subnet_id)
     if allow_ssh_cidr:
         allow_ssh_cidr = _validate_cidr(allow_ssh_cidr)
     if repo:
         repo = validate_field(repo, _REPO_SPEC) or ""
     if ref:
         ref = validate_field(ref, _REF_SPEC) or ""
+    if ami_id:
+        ami_id = validate_ami_id(ami_id)
+    extra_packages = normalize_extra_packages(extra_packages)
+    if ssm_kms_key_arn:
+        ssm_kms_key_arn = validate_ssm_kms_key_arn(ssm_kms_key_arn)
+
+    from kiro_crew.cloud import source as source_mod
+
+    if ship_source is None:
+        ship_source = source_mod.find_repo_root() is not None
+        if not ship_source:
+            logger.info("no checkout found; the instance will clone the public repo")
+    # A public-repo clone with no explicit ref would install the template's
+    # `main`; pin this build's release tag instead so the instance can talk to
+    # this machine. The dry run stays offline (the probe is a network round
+    # trip), so its argv shows the ref only when the caller passed one.
+    if not ship_source and not ref and not dry_run:
+        ref = resolve_public_ref(repo)
+        if ref:
+            logger.info("the instance will install release tag %s", ref)
 
     if dry_run:
         # For the dry run we can't hit AWS for the VPC or account id, so show
@@ -452,13 +840,17 @@ def deploy(
             tag=tag,
             tier=tier,
             vpc_id="<auto>",
-            subnet_id="<auto>",
+            subnet_id=subnet_id or "<auto>",
+            associate_public_ip="<auto>",
             permissions_boundary_arn="<auto>",
             repo=repo,
             ref=ref,
             allow_ssh_cidr=allow_ssh_cidr,
             source_bucket="<auto>" if ship_source else "",
             source_key=f"{tag}/kirocrew-src.tar.gz" if ship_source else "",
+            ami_id=ami_id,
+            extra_packages=extra_packages,
+            ssm_kms_key_arn=ssm_kms_key_arn,
         )
         return DeployResult(
             tag=tag,
@@ -472,15 +864,19 @@ def deploy(
     existing = find_stack(tag, profile, region)
     reused = existing is not None
 
-    from kiro_crew.cloud import source as source_mod
-
     # Ensure the SHARED, immutable instance permissions boundary exists (created
     # once by launcher code, not per-launch CFN — see source.ensure_instance_boundary
     # / cloud.iam). Every launch references it by its deterministic ARN; the
     # InstanceRole is capped by it. Done before the source upload so a
     # boundary-create failure (e.g. missing iam:CreatePolicy) surfaces before we
     # ship anything to S3.
-    boundary_arn = source_mod.ensure_instance_boundary(profile, region)
+    #
+    # `--ssm-kms-key` selects the opt-in KMS-session boundary instead;
+    # without it the default boundary is the only one named, created or read.
+    if ssm_kms_key_arn:
+        boundary_arn = source_mod.ensure_instance_kms_boundary(profile, region)
+    else:
+        boundary_arn = source_mod.ensure_instance_boundary(profile, region)
 
     # Package + upload the local source so the box installs from S3 (no GitHub
     # access needed). Fall back to a git clone only if source shipping is off.
@@ -500,9 +896,18 @@ def deploy(
                 logger.info("could not remove uploaded source after failed launch")
 
     # Any failure from here to a successful deploy orphans the uploaded source —
-    # network discovery included — so clean it up on the way out.
+    # network discovery/validation included — so clean it up on the way out.
     try:
-        vpc_id, subnet_id = discover_network(profile, region, tier.instance_type)
+        if subnet_id:
+            vpc_id, subnet_id, egress_kind = resolve_explicit_subnet(
+                subnet_id, profile, region, tier.instance_type
+            )
+        else:
+            vpc_id, subnet_id, egress_kind = discover_network(profile, region, tier.instance_type)
+        # Both paths above settle on a VPC; check the resolver BEFORE provisioning
+        # anything. A private hosted zone that shadows a download host makes the
+        # bootstrap fail deterministically minutes later, blaming the wrong layer.
+        assert_download_hosts_resolvable(vpc_id, profile, region)
     except Exception:
         _cleanup_uploaded_source()
         raise
@@ -511,12 +916,19 @@ def deploy(
         tier=tier,
         vpc_id=vpc_id,
         subnet_id=subnet_id,
+        # A NAT-routed (private) subnet must NOT get a public IP — it is unused
+        # surface and can violate SCPs that deny RunInstances-with-public-IP.
+        # An IGW subnet REQUIRES one for egress.
+        associate_public_ip="false" if egress_kind == "nat" else "true",
         permissions_boundary_arn=boundary_arn,
         repo="" if ship_source else repo,
         ref="" if ship_source else ref,
         allow_ssh_cidr=allow_ssh_cidr,
         source_bucket=source_bucket,
         source_key=source_key,
+        ami_id=ami_id,
+        extra_packages=extra_packages,
+        ssm_kms_key_arn=ssm_kms_key_arn,
     )
     # `cloudformation deploy` blocks until the stack settles (WaitCondition gates
     # on the gateway being healthy). "No changes" exits 0 with a message on reuse.
@@ -911,8 +1323,10 @@ def destroy(
     deleting an already-gone stack is a no-op success.
 
     ``dry_run`` returns the argv without calling AWS. When ``wait`` is true this
-    blocks until the stack reaches ``DELETE_COMPLETE`` (or raises on
-    ``DELETE_FAILED``).
+    blocks on :func:`wait_for_delete` and returns its verdict as ``destroyed``:
+    ``False`` means the wait did not confirm ``DELETE_COMPLETE``
+    (``DELETE_FAILED``, the timeout, or any other failed ``wait`` call). That
+    outcome is returned, never raised.
     """
     if not dry_run:
         aws.assert_human_action("cloudformation:DeleteStack")

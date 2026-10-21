@@ -1,5 +1,12 @@
+import { useSyncExternalStore } from 'react'
 import { Sparkles } from 'lucide-react'
-import { findReport, sendErrorToChat, type ErrorReport } from '../utils/errorReport'
+import {
+  findReport,
+  isGatewayConnected,
+  sendErrorToChat,
+  subscribeGatewayConnected,
+  type ErrorReport,
+} from '../utils/errorReport'
 import { buildErrorPrompt } from '../utils/errorReport.prompt'
 
 import { i18nT } from '../i18n/t'
@@ -19,12 +26,15 @@ import { i18nT } from '../i18n/t'
  *    from the error journal by message match, which is what makes this droppable
  *    into the ~80 existing ad-hoc `setError(e.message)` sites unchanged.
  *
- * **Deliberately hook-free.** Its most important callers are ErrorBoundary
+ * **Deliberately context-free.** Its most important callers are ErrorBoundary
  * fallbacks, and a boundary is exactly where the store or router may be the
  * thing that threw — so requiring `<Provider>`/`<Router>` context would make the
  * button unavailable in the case it matters most. Navigation goes through the
  * `installSoftNavigate` seam in `utils/errorReport`, which degrades to a full
- * page load instead of throwing.
+ * page load instead of throwing — and the connectivity gate below reads the
+ * gateway-connectivity seam in the same module rather than the store, for the
+ * same reason. (`useSyncExternalStore` needs no context, so the hook keeps
+ * that constraint.)
  */
 export function askAgentPrompt(report: ErrorReport | { message: string }): string {
   return buildErrorPrompt(report, i18nT('components.askAgent.prompt_lead'))
@@ -43,12 +53,38 @@ export function askAgentHard(message: string): void {
   sendErrorToChat(askAgentPrompt(resolved), { hard: true })
 }
 
+export function handoffErrorToAgent({
+  report,
+  message,
+  hard = false,
+  leaveGranted = false,
+  onHandoff,
+}: {
+  report?: ErrorReport
+  message?: string
+  hard?: boolean
+  /** The caller's own leave gate already asked the page and it agreed — see `sendErrorToChat`. */
+  leaveGranted?: boolean
+  onHandoff?: () => void
+}): boolean {
+  const resolved: ErrorReport | { message: string } | null =
+    report ?? findReport(message) ?? (message ? { message } : null)
+  if (!resolved) return false
+  if (!sendErrorToChat(askAgentPrompt(resolved), { hard, leaveGranted })) return false
+  try { onHandoff?.() } catch { /* dismissal is cosmetic; never throw here */ }
+  return true
+}
+
 export default function AskAgentButton({
   report,
   message,
   variant = 'link',
   hard = false,
+  onHandoff,
+  label,
+  gate,
   className = '',
+  tone = 'danger',
 }: {
   report?: ErrorReport
   message?: string
@@ -56,8 +92,56 @@ export default function AskAgentButton({
   variant?: 'link' | 'solid'
   /** Force a full page load (crash fallbacks, where the live tree is suspect). */
   hard?: boolean
+  /**
+   * Runs only once the hand-off has actually proceeded — for a caller that
+   * DISMISSES something (a modal that would otherwise sit over the chat, an error
+   * banner whose job is done).
+   *
+   * The guard matters: clearing a surface on a staging failure leaves neither a
+   * navigation nor a visible diagnostic, so the error is erased with nothing shown
+   * in its place. `sendErrorToChat` reports whether it staged, so one check covers
+   * every caller.
+   */
+  onHandoff?: () => void
+  /**
+   * Overrides the shared "Ask the agent" label.
+   *
+   * For a surface that stacks SEVERAL notices, where the default leaves every
+   * hand-off looking like the same affordance and nothing says which failure
+   * each one carries. The reports genuinely differ -- each has its own
+   * endpoint, status and code -- so the label is the only part that was
+   * indistinguishable. Pass a full localized label, not a fragment to append.
+   */
+  label?: string
+  /**
+   * Runs the hand-off through the caller's own gate — `useGuardedLeave`'s
+   * `leave`, for a fallback rendered somewhere that HAS one in scope (the
+   * notification sheet's). The hand-off navigates away from the page on
+   * screen, and this button is context-free by design, so it cannot ask that page
+   * itself. The gate receives the hand-off as `proceed` and decides whether it
+   * runs; a veto leaves the surface exactly as it was — nothing staged, nothing
+   * moved. Without a gate the hand-off runs directly.
+   *
+   * The gate IS the leave ask: once it has run `proceed`, the hand-off skips the
+   * installed navigator's own guard (`leaveGranted`). Both read the same
+   * `useMayLeaveForNavigation` channel, so asking twice posed one discard
+   * question two times, and a "keep my draft" on the second cancelled a hand-off
+   * the first had already accepted.
+   */
+  gate?: (proceed: () => void) => void
   className?: string
+  /**
+   * Link tint. `danger` (default) for placement inside an error surface;
+   * `warn` for a WARNING surface (the pre-approval findings box) — a
+   * danger-red link inside an amber box dresses a not-yet-failed state in
+   * error color. Only affects the `link` variant.
+   */
+  tone?: 'danger' | 'warn'
 }) {
+  // Subscribed, not read once: the button must come BACK when the gateway
+  // reconnects, and disappear when it drops, without the caller re-rendering.
+  const gatewayConnected = useSyncExternalStore(subscribeGatewayConnected, isGatewayConnected)
+
   // Render only needs to know whether there is anything to offer. The report is
   // resolved at CLICK time, not here, because of an ordering hazard in the
   // boundaries: React runs getDerivedStateFromError -> renders this fallback ->
@@ -67,19 +151,34 @@ export default function AskAgentButton({
   // instance field rather than state, nothing re-renders to correct it.
   if (!report && !message) return null
 
+  // While the gateway is unreachable the hand-off is a dead end: it delivers
+  // the error to a composer that cannot send ("gateway offline — message will
+  // not send"), and the most likely error on screen right then IS the
+  // connectivity failure itself. Hide rather than disable: a disabled "Ask the
+  // agent" next to "Failed to fetch" reads as one more broken thing.
+  if (!gatewayConnected) return null
+
   const onClick = () => {
-    const resolved: ErrorReport | { message: string } | null =
-      report ?? findReport(message) ?? (message ? { message } : null)
-    if (!resolved) return
-    sendErrorToChat(askAgentPrompt(resolved), { hard })
+    // The gate goes in FRONT of the whole hand-off, staging included: a vetoed
+    // hand-off that had already queued its prompt would deliver it to the next
+    // chat the user opens, long after the crash it describes.
+    if (gate) gate(() => { handoffErrorToAgent({ report, message, hard, leaveGranted: true, onHandoff }) })
+    else handoffErrorToAgent({ report, message, hard, onHandoff })
   }
 
   const base = 'inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors'
   const skin = variant === 'solid'
     ? 'px-4 py-1.5 rounded-lg text-[13px] font-medium bg-accent text-accent-fg border-none hover:opacity-90'
-    // Danger-tinted, not muted grey: inside a red alert a grey link reads as
-    // unrelated chrome. Underline marks it as the action in the banner.
-    : 'text-[12px] font-medium text-danger/80 hover:text-danger bg-transparent border-none p-0 underline decoration-danger/30 hover:decoration-danger underline-offset-2'
+    // Surface-tinted, not muted grey: inside an alert a grey link reads as
+    // unrelated chrome. Underline marks it as the action in the banner. The
+    // tint follows the surface (danger in an error banner, warn in the
+    // pre-approval warning box) so the link never escalates its host.
+    : tone === 'warn'
+      ? 'text-[12px] font-medium text-warn/80 hover:text-warn bg-transparent border-none p-0 underline decoration-warn/30 hover:decoration-warn underline-offset-2'
+      // `--danger-text`, not a faded `--danger`: the link sits on the error
+      // banner's danger tint, where only the darkened token clears 4.5:1 in
+      // light palettes. Hover marks itself with the underline instead.
+      : 'text-[12px] font-medium text-danger-text bg-transparent border-none p-0 underline decoration-danger/30 hover:decoration-danger underline-offset-2'
 
   return (
     <button
@@ -89,7 +188,7 @@ export default function AskAgentButton({
       onClick={onClick}
     >
       <Sparkles size={13} aria-hidden="true" />
-      {i18nT('components.askAgent.ask_the_agent')}
+      {label ?? i18nT('components.askAgent.ask_the_agent')}
     </button>
   )
 }

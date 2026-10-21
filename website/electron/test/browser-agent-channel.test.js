@@ -170,6 +170,35 @@ test("the X-Internal-Secret header is sent on drain and result", async () => {
   assert.strictEqual(sawSecretOnResult, "abc123");
 });
 
+// ── the secret is chosen for the URL each request dials ──
+
+test("secret header: getSecret is asked for the exact URL each request dials", async () => {
+  // The backend URL can change between requests. Each request must carry the
+  // secret for the gateway it dials, never one read for another URL.
+  const urls = ["http://127.0.0.1:6777", "http://127.0.0.1:7778"];
+  let urlReads = 0;
+  const command = { id: "c1", session_key: "sess-1", op: "snapshot", args: {} };
+  const ff = fakeFetch((idx) => (idx === 0 ? res(200, command) : res(204)));
+  const pairs = [];
+  const ch = createAgentCommandChannel(
+    baseDeps({
+      getGatewayUrl: () => urls[urlReads++ % urls.length],
+      getSecret: (gatewayUrl) => `secret-for-${gatewayUrl}`,
+      fetchFn: async (url, opts) => {
+        pairs.push([url, opts.headers["X-Internal-Secret"]]);
+        return ff.fetchFn(url, opts);
+      },
+    })
+  );
+  ch.start();
+  await waitFor(() => ff.calls.result >= 1);
+  await ch.stop();
+  assert.ok(pairs.length >= 2);
+  for (const [url, secret] of pairs) {
+    assert.ok(url.startsWith(secret.slice("secret-for-".length) + "/"), `${url} got ${secret}`);
+  }
+});
+
 // ── a rejecting dispatch posts ok:false and the loop survives ──
 
 test("rejecting dispatch: posts ok:false and keeps polling", async () => {
@@ -332,4 +361,58 @@ test("start(): idempotent — a second start does not launch a second loop", asy
   // crash or double-run. isRunning must be false after stop.
   assert.strictEqual(ch.isRunning(), false);
   assert.strictEqual(calls.drain, 0);
+});
+
+// ── idle host-presence heartbeat (local gateway only) ──
+
+test("idle + local gateway: sends a host-presence heartbeat (empty keys, wait_ms 0)", async () => {
+  const { fetchFn, calls } = fakeFetch(() => res(204));
+  const ch = createAgentCommandChannel(
+    baseDeps({ fetchFn, listPanelIds: () => [], isGatewayLocal: () => true, idleMs: 10 })
+  );
+  ch.start();
+  await waitFor(() => calls.drain >= 1);
+  await ch.stop();
+  assert.deepStrictEqual(calls.drains[0], { session_keys: [], wait_ms: 0 });
+  assert.strictEqual(calls.result, 0, "a heartbeat never posts a result");
+});
+
+test("idle + remote gateway: no heartbeat, never hits the network", async () => {
+  const { fetchFn, calls } = fakeFetch(() => res(204));
+  const ch = createAgentCommandChannel(
+    baseDeps({ fetchFn, listPanelIds: () => [], isGatewayLocal: () => false, idleMs: 10 })
+  );
+  ch.start();
+  await sleep(60); // several idle cycles
+  await ch.stop();
+  assert.strictEqual(calls.drain, 0, "must not push the local secret to a remote gateway");
+});
+
+// ── poke(): abort an in-flight long-poll and re-read the tracked set ──
+
+test("poke(): wakes an idle loop to re-read listPanelIds at once", async () => {
+  let keys = [];
+  const { fetchFn, calls } = fakeFetch(() => res(204));
+  const ch = createAgentCommandChannel(
+    baseDeps({
+      fetchFn,
+      isGatewayLocal: () => false, // no heartbeat -> the loop parks in the idle sleep
+      idleMs: 10000,               // a long park that only a poke() should cut short
+      listPanelIds: () => keys.slice(),
+    })
+  );
+  ch.start();
+  await sleep(30); // let it read [] and enter the long idle sleep
+  assert.strictEqual(calls.drain, 0, "no drain while idle with no panels");
+  keys = ["new"];
+  ch.poke(); // must wake the idle sleep -> re-read -> drain the new key at once
+  await waitFor(() => calls.drains.some((d) => d.session_keys.includes("new")));
+  await ch.stop();
+  assert.strictEqual(ch.isRunning(), false);
+});
+
+test("poke(): safe no-op when the loop is not running", () => {
+  const { fetchFn } = fakeFetch(() => res(204));
+  const ch = createAgentCommandChannel(baseDeps({ fetchFn }));
+  assert.doesNotThrow(() => ch.poke());
 });

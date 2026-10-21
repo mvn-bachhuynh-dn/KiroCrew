@@ -1,39 +1,55 @@
-import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo, lazy, Suspense, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Bot, ScrollText, FileText, X, Lock, CheckCircle, AlertCircle, Loader as LoaderIcon, Ban, Handshake, Wrench, MessageSquare, Workflow, BookmarkPlus, Component, GitPullRequest, CircleDot, ArrowLeft, Square, RotateCcw, Clock, Search, Link as LinkIcon, ExternalLink } from 'lucide-react'
+import { Bot, ScrollText, X, Lock, CheckCircle, AlertCircle, Loader as LoaderIcon, Ban, Wrench, MessageCircleQuestionMark, Workflow, BookmarkPlus, Component, GitPullRequest, CircleDot, Square, RotateCcw, Clock, Search, Link as LinkIcon, ExternalLink } from 'lucide-react'
 import { api } from '../../api/client'
-import MarkdownPanel, { type MarkdownPanelHandle } from '../../components/MarkdownPanel'
-import { fileReadUrl } from '../../utils/fileReadUrl'
+import { isTerminalApprovalRefusal } from '../../api/apiError'
 import { LogViewer } from '../LogsPage'
-import TrustDropdown from '../../components/TrustDropdown'
 import Clickable from '../../components/Clickable'
+import ErrorNotice from '../../components/ErrorNotice'
 import type { SubagentActivity, ToolActivity, Artifact } from '../../types'
-import type { TouchedFile } from '../../hooks/useTouchedFiles'
-import { getInlineDraft, setInlineDraft, clearInlineDraft } from '../../hooks/usePanelTabs'
+import { countDiffStats } from '../../utils/diffLineCounts'
+import { toApiDecision } from '../../utils/approvalDecision'
 import type { ExtractedLink } from '../../utils/extractChatLinks'
 import { dedupResourceLinks, resourceKey } from '../../utils/extractChatLinks'
 import type { PullRequestLink } from '../../utils/pullRequestLinks'
 import PullRequestPanel from '../../components/PullRequestPanel'
 import IssuePanel from '../../components/IssuePanel'
+import { PinnedMessagesPanel } from './PinnedMessagesPanel'
+import type { ChatPin } from '../../api/pins'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { markSubagentApproving, openActivityToTab, selectSubagent, clearTerminalSubagents, sseSubagentDone } from '../../store/chatSlice'
+import { markSubagentApproving, markSubagentApprovalGone, reconcileGoneSubagent, isSpawnApprovalGone, isSpawnApprovalRetired, openActivityToTab, selectSubagent, clearTerminalSubagents, sseSubagentDone } from '../../store/chatSlice'
 import SegmentedControl from '../../components/SegmentedControl'
-import { PanelSectionHeader } from '../../components/ui'
-import { colorForExt, fileIcon } from '../../utils/fileIcons'
-import { kindForFilename } from '../../lib/artifactImport'
+import { Btn, PanelSectionHeader, ContentSkeleton } from '../../components/ui'
 import SideChat from './SideChat'
 import WorkflowSidebarRow, { type WfRunRow } from './WorkflowSidebarRow'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
 
 import { ContextBreakdownTab } from '../ContextBreakdownPanel'
+import ErrorBoundary from '../../components/ErrorBoundary'
+
+// The crew log is a drill-in: six fold sections, their own i18n copy and the table
+// that draws each one, on a tab most sessions never open. Fetched on first open
+// rather than riding in the dashboard shell, the same shape `CapabilitiesPage` uses
+// for its templates tab and `DeveloperPage` for the memory graph.
+const CrewLogTab = lazy(() => import('./CrewLogPanel').then(m => ({ default: m.CrewLogTab })))
+import SessionSummaryTab from './SessionSummaryTab'
 import { i18nT } from '../../i18n/t'
-import { fmtDateFields } from '../../i18n/format'
+import { isNeverStarted, neverStartedKind, queuedWaitText } from './subagentQueuedReason'
+import GitReposPanel from '../../components/GitReposPanel'
+import { fmtDateFields, fmtElapsed } from '../../i18n/format'
+import { isModelDowngrade } from './subagentCompletion'
+import { normalizeModelKey } from '../../lib/model'
+import { fmtCredits } from '../../i18n/format'
+import MarkdownRenderer from '../../components/MarkdownRenderer'
+import { sanitizeLlmOutput } from '../../utils/sanitize'
+import { findReport, type ErrorReport } from '../../utils/errorReport'
+
 const STATUS = {
   pending: <Lock size={12} className="text-muted" />,
   running: <LoaderIcon size={12} className="text-accent animate-spin" />,
-  tool: <Wrench size={12} className="text-amber-400" />,
-  done: <CheckCircle size={12} className="text-green-400" />,
+  tool: <Wrench size={12} className="text-warn" />,
+  done: <CheckCircle size={12} className="text-ok" />,
   error: <AlertCircle size={12} className="text-danger" />,
   stopped: <Square size={12} className="text-muted" />,
 } as const
@@ -41,12 +57,11 @@ const STATUS = {
 // Resource-link type ('cr' | 'issue' | 'other', from extractChatLinks) is
 // encoded on the ResourceRow ICON — a pull-request glyph in accent for code
 // reviews, a filled-dot glyph in ok for provider issues, a link glyph in muted
-// for everything else — rather than a leading text badge. A badge's width
-// varies with its label, which pushed link labels off the left text edge shared
-// with the Changed-files rows above; an icon is fixed-width, so both sections
-// line up. Since the icon is now the only VISUAL type signal, each row also
-// carries the type as sr-only text — translated, because it is the only signal
-// a screen-reader user gets.
+// for everything else — rather than a leading text badge. An icon is
+// fixed-width, so every row's label starts at the same left text edge; a
+// badge's width varies with its label and would ragged them. The icon is the
+// only VISUAL type signal, so each row also carries the type as sr-only text —
+// translated, because it is the only signal a screen-reader user gets.
 const resourceTypeLabel = (type: string): string =>
   type === 'cr' ? i18nT('pages.chat.activityViewer.resource_type_pr')
     : type === 'issue' ? i18nT('pages.chat.activityViewer.resource_type_issue')
@@ -82,14 +97,79 @@ function DiskLoader({ id, autoLoad }: { id: string; autoLoad?: boolean }) {
     if (autoLoad && text === null && !loading && !error) load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoLoad])
-  if (text !== null) return <>{text}</>
+  if (text !== null) return <MarkdownRenderer content={text} softBreaks readOnlyCode />
   if (loading) return <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.loading')}</span>
-  if (error) return <button className="text-danger/70 hover:text-danger text-[12px] underline cursor-pointer bg-transparent border-none p-0 font-mono" onClick={e => { e.stopPropagation(); load() }}>{i18nT('pages.chat.activityViewer.failed_click_to_retry')}</button>
+  // Retry and hand-off are two separate controls: the notice carries the
+  // agent hand-off (a side-panel read failure, nothing to lose), the button
+  // stays the retry. Folding "click to retry" into the error text made the
+  // notice itself the only affordance and left the failure a dead end.
+  if (error) return (
+    <span className="inline-flex flex-wrap items-center gap-2 font-body">
+      <ErrorNotice variant="inline" message={i18nT('pages.chat.activityViewer.output_load_failed')} askAgent />
+      <button type="button" className="text-accent/70 hover:text-accent text-[12px] underline cursor-pointer bg-transparent border-none p-0" onClick={e => { e.stopPropagation(); load() }}>{i18nT('pages.chat.activityViewer.retry')}</button>
+    </span>
+  )
   return <button className="text-accent/70 hover:text-accent text-[12px] underline cursor-pointer bg-transparent border-none p-0 font-mono" onClick={e => { e.stopPropagation(); load() }}>{i18nT('pages.chat.activityViewer.load_output_from_disk')}</button>
 }
 
+const RUNNING_PREFIX = /^Running: /
+
+function SubagentToolCalls({ a, isRunning }: { a: SubagentActivity; isRunning: boolean }) {
+  const calls = a.toolCalls ?? []
+  // Follow the newest call the way the output body does: stay pinned to the
+  // bottom unless the user scrolled up to read an earlier one.
+  const listRef = useRef<HTMLOListElement>(null)
+  const follow = useRef(true)
+  // Rows scrolled out above the box are cut mid-line; fade that edge so the
+  // cut reads as "more above" rather than a rendering fault.
+  const [fadeTop, setFadeTop] = useState(false)
+  const newestTool = calls[calls.length - 1]?.tool
+  useEffect(() => {
+    const el = listRef.current
+    if (el && follow.current) el.scrollTop = el.scrollHeight
+    if (el) setFadeTop(el.scrollTop > 0)
+  }, [calls.length, newestTool])
+  if (!calls.length) return null
+  // `toolCount` is the backend's own count; the timeline is capped and can
+  // miss frames the scale coalescer merged, so say how many it leaves out
+  // instead of implying the list is the whole run. The count sits in the
+  // heading, outside the scroller: the list follows the newest call, so a row
+  // at its top would scroll away on exactly the long, capped runs it is for.
+  const unlisted = Math.max(0, (a.toolCount ?? 0) - calls.length)
+  const fade = fadeTop ? 'linear-gradient(to bottom,transparent,#000 24px)' : undefined
+  return (
+    <div className="px-3 pb-2" data-testid="subagent-tool-calls">
+      <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">
+        {i18nT('pages.chat.activityViewer.tool_calls')}
+        {unlisted > 0 && <span className="normal-case tracking-normal text-muted/70" data-testid="subagent-tool-calls-unlisted"> · {i18nT('pages.chat.activityViewer.tool_calls_not_listed', { count: unlisted })}</span>}
+      </div>
+      {/* The solid box stays put; only the inner scroller is masked, so the
+          fade dims rows sliding out of view rather than the box's own edge. */}
+      <div className="px-2.5 py-2 bg-bg rounded-md">
+      <ol ref={listRef} onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8; setFadeTop(el.scrollTop > 0) }} data-fade-top={fadeTop || undefined} style={fade ? { maskImage: fade, WebkitMaskImage: fade } : undefined} className="text-[12px] font-mono max-h-[144px] overflow-y-auto space-y-0.5 list-none m-0 p-0">
+        {calls.map((c, i) => {
+          const current = isRunning && i === calls.length - 1
+          const tool = sanitizeLlmOutput(c.tool)
+          // Native titles carry kiro-cli's "Running: " status prefix. It is
+          // false on finished rows and redundant on the live one, which the
+          // spinner, accent colour and aria-current already mark.
+          const label = tool.replace(RUNNING_PREFIX, '')
+          return (
+            <li key={i} className={`truncate ${current ? 'text-accent' : 'text-muted/70'}`} title={label} aria-current={current ? 'step' : undefined}>
+              {current
+                ? <LoaderIcon className="lucide-inline animate-spin" aria-hidden="true" />
+                : <Wrench className="lucide-inline" aria-hidden="true" />} {label}
+            </li>
+          )
+        })}
+      </ol>
+      </div>
+    </div>
+  )
+}
+
 function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slot: string; onClick: () => void; selected?: boolean }) {
-  const bodyRef = useRef<HTMLPreElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
   const cardRef = useRef<HTMLDivElement>(null)
   const autoScroll = useRef(true)
   const isPending = a.status === 'pending'
@@ -107,6 +187,27 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
 
   // Approval handling for pending subagents
   const dispatch = useAppDispatch()
+  // Outcome of the last approve / reject / cancel round-trip that FAILED. The
+  // Redux flags only roll back the busy state, which left a refused decision
+  // indistinguishable from one that never happened.
+  const [actionError, setActionError] = useState<string | null>(null)
+  // WHICH approval is gone, not merely that one was: the id scopes the
+  // withdrawal, so a later live approval here is never suppressed by it.
+  // Kept beside the store marker because this card renders the `a` its PROPS
+  // carry: a host whose `subagents` prop is not the live store slice (or lags
+  // it by a render) would otherwise re-offer the buttons the press just proved
+  // dead. The store marker covers every other surface.
+  const [goneFor, setGoneFor] = useState<string | null>(null)
+  // A failed read of the spawn inventory while this card's liveness is open.
+  // Reported, not swallowed: the composer and Reload stay blocked until it
+  // resolves, so a silent failure would read as a hang.
+  const [livenessError, setLivenessError] = useState<string | null>(null)
+  const checkLiveness = useCallback((approvalId: string) => {
+    if (!slot) return
+    dispatch(reconcileGoneSubagent({ slot, id: a.id, approval_id: approvalId })).unwrap()
+      .then(() => setLivenessError(null))
+      .catch(() => setLivenessError(i18nT('pages.chat.subagentProgressBar.liveness_check_failed')))
+  }, [a.id, slot, dispatch])
   // 1-click transcript: chip selection expands the card, scrolls it into
   // view, and (via DiskLoader autoLoad) fetches the output — then clears the
   // selection so a later re-click re-triggers.
@@ -120,6 +221,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
   const onApprove = useCallback((e: React.MouseEvent, action: 'approve' | 'reject') => {
     e.stopPropagation()
     if (!a.approval_id) return
+    setActionError(null)
     dispatch(markSubagentApproving({ id: a.id, approving: true }))
     api.resolveApproval(a.approval_id, action).then(() => {
       // See the matching note in ChatInput's resolveOneSpawn: the backend's
@@ -130,8 +232,43 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       if (action === 'reject' && slot) {
         dispatch(sseSubagentDone({ slot, id: a.id, elapsed: 0, error: 'rejected' }))
       }
-    }).catch(() => dispatch(markSubagentApproving({ id: a.id, approving: false })))
-  }, [a.approval_id, a.id, slot, dispatch])
+    }).catch((e: unknown) => {
+      dispatch(markSubagentApproving({ id: a.id, approving: false }))
+      const gone = isTerminalApprovalRefusal(e)
+      setGoneFor(gone ? a.approval_id ?? null : null)
+      // The composer banner resolves this same id from the store.
+      if (gone && a.approval_id) {
+        dispatch(markSubagentApprovalGone({ id: a.id, approval_id: a.approval_id }))
+        checkLiveness(a.approval_id)
+      }
+      const reason = e instanceof Error ? e.message : ''
+      setActionError(gone
+        ? i18nT('components.approvalCard.approval_no_longer_pending')
+        : reason
+          ? i18nT('components.approvalCard.decision_not_recorded_error', { error: reason })
+          : i18nT('components.approvalCard.decision_failed'))
+    })
+  }, [a.approval_id, a.id, slot, dispatch, checkLiveness])
+
+  // A refusal found through the composer banner lands here via the store, so
+  // this card withdraws the same approval. The refused request reports itself
+  // once, on the surface that sent it: the composer already said why, so this
+  // card adds only its neutral status. A transient failure from an older press
+  // here is superseded by that verdict, and its retry advice is now false.
+  const retired = isSpawnApprovalRetired(a)
+  const storeGone = isSpawnApprovalGone(a) || retired
+  const shownError = storeGone && goneFor !== a.approval_id ? null : actionError
+  // SubagentProgressBar owns the periodic re-read of a gone approval's
+  // liveness, but it is unmounted while this tab is open. This card keeps that
+  // retry going on the same cadence until the inventory settles the card.
+  const livenessOpen = isSpawnApprovalGone(a) && !retired && !!slot && !!a.approval_id
+  useEffect(() => {
+    if (!livenessOpen || !a.approval_id) return
+    const approvalId = a.approval_id
+    const t = setInterval(() => checkLiveness(approvalId), 30_000)
+    return () => clearInterval(t)
+  }, [livenessOpen, a.approval_id, checkLiveness])
+  const shownLivenessError = livenessOpen ? livenessError : null
 
   // Live elapsed timer for running subagents
   const [elapsed, setElapsed] = useState(0)
@@ -156,22 +293,74 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
 
   const onCancel = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
-    api.spawnDelete(a.id).catch(() => {})
+    setActionError(null)
+    // The card converges through the spawn/done stream on success; a refused
+    // delete leaves it running, so say so instead of letting the press vanish.
+    api.spawnDelete(a.id).catch(() => setActionError(i18nT('pages.chat.activityViewer.cancel_failed')))
   }, [a.id])
 
   const displayElapsed = isRunning ? elapsed : Math.round(a.elapsed || 0)
-  const fmtElapsed = displayElapsed >= 60 ? `${Math.floor(displayElapsed / 60)}m ${displayElapsed % 60}s` : `${displayElapsed}s`
+  // A running card whose start time was only ASSUMED has no elapsed figure to
+  // show: the agent may have been running long before the frame that minted its
+  // entry, so a number here would be wrong rather than merely imprecise. A
+  // `subagent_done` or snapshot frame supplies real timing and this resolves.
+  // Whole seconds, matching the progress-bar row, so one run reads the same
+  // figure in both places (and `1h 9m 32s`, not `69m 32s`, past an hour).
+  const shownElapsed = isRunning && a.startedAtAssumed ? '--' : fmtElapsed(displayElapsed * 1000, { wholeSeconds: true })
+  // What the header calls this agent. An entry recovered from an incremental
+  // frame has no agent name, and showing nothing left two such cards reading as
+  // the same "Running Tool" with no way to tell them apart -- the same complaint
+  // the progress row had, so the same fallback answers it. This is not a redesign
+  // of the header, only a refusal to leave the recovered state anonymous.
+  const identity = a.agent || (a.id ? `agent #${a.id.slice(-6)}` : '')
+  // Short, stable wave tag. Follows the `agent #…` identity chip's raw-literal
+  // convention in this file rather than a new catalog string (#759 item 4).
+  const waveTag = a.batchId ? `wave #${a.batchId.slice(-6)}` : ''
+  const terminalCredits = isDone && typeof a.credits === 'number' && Number.isFinite(a.credits) && a.credits > 0
+    ? a.credits
+    : null
 
   // Inside the Subagents tab the "Subagent" prefix is redundant, and in a
   // narrow rail it was the part that survived truncation while the actual
   // status got clipped. Show the status; keep the full phrase as the tooltip.
-  const statusLabel = isPending
-    ? i18nT('pages.chat.activityViewer.pending_approval')
+  // A gone approval's card says what is still open: whether it started. A card
+  // the inventory retired says only what the inventory found, no record: an
+  // absent row can also be a run the gateway no longer retains.
+  const statusLabel = storeGone
+    ? i18nT(retired ? 'pages.chat.activityViewer.no_record' : 'pages.chat.subagentProgressBar.checking_whether_it_started')
+    : isPending ? i18nT('pages.chat.activityViewer.pending_approval')
     : a.status === 'tool' ? i18nT('pages.chat.activityViewer.running_tool')
       : a.status === 'running' ? (a.streaming ? i18nT('pages.chat.activityViewer.running') : i18nT('pages.chat.activityViewer.starting'))
         : a.status === 'done' ? i18nT('pages.chat.activityViewer.complete')
           : a.status === 'stopped' ? i18nT('pages.chat.activityViewer.stopped')
-            : a.error?.includes('Cancelled') ? i18nT('pages.chat.activityViewer.cancelled') : i18nT('pages.chat.activityViewer.error')
+            : a.error?.includes('Cancelled') ? i18nT('pages.chat.activityViewer.cancelled')
+              // A run a memory wait ended never ran, so the header says that rather
+              // than "Error". It still counts under "Retry failed": retrying it is
+              // the way out its notice names.
+              : isNeverStarted(a.error) ? i18nT('pages.chat.activityViewer.never_started')
+                : i18nT('pages.chat.activityViewer.error')
+
+  // The gate's terminal for a run that never started is written for every
+  // reader (the parent agent, Slack, the CLI), none of which has this panel's
+  // "Retry failed" control. Here the notice names the reason the run ended with
+  // and that control instead.
+  const neverStarted = neverStartedKind(a.error)
+  const errorMessage = neverStarted === 'memory_pressure'
+    ? i18nT('pages.chat.activityViewer.never_started_memory_pressure_reason')
+    : neverStarted === 'low_memory'
+      ? i18nT('pages.chat.activityViewer.never_started_low_memory_reason')
+      : a.error
+  // The rewording is for the reader; "Ask the agent" still hands off the
+  // backend terminal, so the agent sees what the gate actually reported.
+  const errorReport: ErrorReport | undefined = neverStarted && a.error
+    ? findReport(a.error) ?? {
+      id: `subagent-never-started-${a.id}`,
+      at: 0,
+      source: 'system',
+      message: a.error,
+      route: typeof location === 'undefined' ? '' : location.pathname,
+    }
+    : undefined
 
   return (
     // Card-level mouse convenience that selects the subagent; it wraps its own
@@ -197,40 +386,111 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       >
         <span className="shrink-0 flex items-center">{STATUS[a.status]}</span>
         <span className="text-[13px] font-semibold text-text truncate min-w-0" title={i18nT('pages.chat.activityViewer.subagent', { label: statusLabel })}>{statusLabel}</span>
-        {a.agent && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={a.agent}>{a.agent}</code>}
-        {!isPending && <span className="text-[11px] text-muted/40 ml-auto font-mono shrink-0 whitespace-nowrap tabular-nums">{fmtElapsed}</span>}
-        {isRunning && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
+        {identity && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={identity}>{identity}</code>}
+        {waveTag && <code data-testid="subagent-batch" data-batch={a.batchId} className="text-[11px] text-muted/40 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={waveTag}>{waveTag}</code>}
+        {(() => {
+          const resolvedKnown = !!a.model
+          const display = a.model || a.requestedModel || ''
+          if (!display) return null
+          const liveDowngrade = resolvedKnown && isModelDowngrade(a.requestedModel ?? '', a.model!)
+          // Requested-only (model not yet resolved): render a muted chip only
+          // for the 'auto' sentinel — the user asked "whatever the server picks"
+          // and that deserves a visible label. For a concrete pinned id, render
+          // nothing: showing an unconfirmed pin as fact is misleading; the chip
+          // appears once the model actually resolves.
+          if (!resolvedKnown && !liveDowngrade && normalizeModelKey(display) !== 'auto') return null
+          return (
+            <code
+              className={`text-[11px] px-1.5 py-0.5 rounded shrink-[4] min-w-0 max-w-[7rem] truncate inline-block align-middle [direction:rtl] [unicode-bidi:plaintext] text-left${liveDowngrade ? ' bg-warn-subtle border border-warn/20 text-warn-text' : resolvedKnown ? ' text-accent/70 bg-accent/10' : ' text-muted/60 bg-bg-hover'}`}
+              data-testid="subagent-model"
+              // The downgrade meaning rides on the amber colour + the AlertCircle
+              // glyph (aria-hidden), and the chip's [direction:rtl] truncation can
+              // reorder how a screen reader voices the id — so mirror the tooltip
+              // text into an aria-label. Otherwise AT users hear only the bare
+              // (possibly truncated) model id with no requested-vs-served context,
+              // the exact fact this chip exists to surface. Parallels the sibling
+              // SubagentCompletionCard's role="status" downgrade banner.
+              aria-label={liveDowngrade
+                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
+                : resolvedKnown
+                  ? i18nT('pages.chat.activityViewer.model_label', { model: a.model })
+                  : i18nT('pages.chat.activityViewer.model_effective', { model: display })}
+              title={liveDowngrade
+                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
+                : resolvedKnown
+                  ? i18nT('pages.chat.activityViewer.model_label', { model: a.model })
+                  : i18nT('pages.chat.activityViewer.model_effective', { model: display })}
+            >
+              {liveDowngrade && <AlertCircle size={10} aria-hidden className="inline-block mr-0.5 align-middle" />}
+              {display}
+            </code>
+          )
+        })()}
+        {!isPending && !retired && <span
+          data-testid="subagent-run-stats"
+          className="text-[11px] text-muted/40 ml-auto font-mono shrink-0 whitespace-nowrap tabular-nums"
+        >{shownElapsed}</span>}
+        {isRunning && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger-text cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
         {isDone && <span className="text-[14px] text-muted bg-bg-hover px-1.5 py-0.5 rounded shrink-0 ml-1">{collapsed ? '▸' : '▾'}</span>}
       </div>
-      {/* Input (task) */}
-      {!collapsed && (
+      {/* A recovered terminal entry can have usage but no task yet. Keep the
+          usage visible while withholding an empty input block. */}
+      {!collapsed && (a.task || (isDone && !isNative && !retired)) && (
         <div className="px-3 pt-1 pb-2">
-          <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.input')}</div>
-          <pre className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto text-muted/80 leading-relaxed">{a.task}</pre>
+          {isDone && !isNative && !retired && (
+            <div data-testid="subagent-credit-usage" className="text-[12px] text-muted font-mono tabular-nums break-words mb-2">
+              {terminalCredits === null
+                ? i18nT('pages.chat.activityViewer.credits_not_reported')
+                : i18nT('pages.chat.activityViewer.credits_used', {
+                    credits: fmtCredits(terminalCredits),
+                  })}
+            </div>
+          )}
+          {a.task && <>
+            <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.input')}</div>
+            <div className="px-2.5 py-2 bg-bg rounded-md text-[12px] break-words max-h-[120px] overflow-y-auto text-muted/80 leading-relaxed"><MarkdownRenderer content={a.task} softBreaks readOnlyCode /></div>
+          </>}
         </div>
       )}
       {/* Approval buttons for pending */}
-      {isPending && !a.approving && (
+      {isPending && !a.approving && goneFor !== a.approval_id && !storeGone && (
         <div className="px-3 pb-2 flex gap-1.5">
           <button className="px-2.5 py-1 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all" onClick={e => onApprove(e, 'approve')}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approve')}</button>
           <button className="px-2.5 py-1 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={e => onApprove(e, 'reject')}><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.reject')}</button>
         </div>
       )}
       {isPending && a.approving && <div className="px-3 pb-2 text-[12px] text-muted/50">{i18nT('pages.chat.activityViewer.resolving')}</div>}
+      {/* Activity panel, no draft to lose → hand-off on. Also covers a refused
+          Cancel on a running card. */}
+      {shownError && (
+        <div className="px-3 pb-2">
+          <ErrorNotice variant="inline" message={shownError} askAgent />
+        </div>
+      )}
+      {shownLivenessError && (
+        <div className="px-3 pb-2">
+          <ErrorNotice variant="inline" message={shownLivenessError} askAgent />
+        </div>
+      )}
       {/* Output (streaming body) */}
-      {!isPending && !collapsed && (
+      {!isPending && !retired && !collapsed && (
       <>
       <div className="px-3 pb-2">
         <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.output')}</div>
-        <pre ref={bodyRef} onScroll={onScroll} className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[240px] overflow-y-auto text-muted/80 leading-relaxed">
-          {a.streaming || a.result || (isDone ? (isNative ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.output_shown_in_chat')}</span> : <DiskLoader id={a.id} autoLoad={selected} />) : <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.waiting_for_output')}</span>)}
-          {a.lastTool && <div className="text-accent mt-1"><Wrench className="lucide-inline" /> {a.lastTool}</div>}
-        </pre>
+        {/* Sub-agent output is usually markdown (fences, lists, tables): render it
+            the way the transcript's completion card does. `streaming` holds a
+            half-typed fence until it closes. */}
+        <div ref={bodyRef} onScroll={onScroll} data-testid="subagent-output-body" className="px-2.5 py-2 bg-bg rounded-md text-[12px] break-words max-h-[240px] overflow-y-auto text-muted/80 leading-relaxed">
+          {(a.streaming || a.result) ? <MarkdownRenderer content={a.streaming || a.result || ''} streaming={isRunning && !!a.streaming} softBreaks readOnlyCode /> : (isDone ? (isNative ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.output_shown_in_chat')}</span> : isNeverStarted(a.error) ? <span className="text-muted/70 italic">{i18nT('pages.chat.activityViewer.no_output_never_started')}</span> : <DiskLoader id={a.id} autoLoad={selected} />) : <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.waiting_for_output')}</span>)}
+          {a.lastTool && !a.toolCalls?.length && <div className="text-accent mt-1 font-mono"><Wrench className="lucide-inline" /> {sanitizeLlmOutput(a.lastTool)}</div>}
+        </div>
       </div>
-      {/* Error details */}
+      <SubagentToolCalls a={a} isRunning={isRunning} />
+      {/* Error details — a backend-reported subagent failure, so it takes the
+          shared notice (hand-off on: nothing in this panel is unsaved). */}
       {a.error && (
         <div className="px-3 py-1.5 text-[12px] border-t border-border/20 space-y-0.5">
-          <div className="text-red-400">{a.error}</div>
+          <ErrorNotice variant="inline" message={errorMessage ?? a.error} report={errorReport} askAgent />
           {a.lastTool && <div className="text-muted/40">{i18nT('pages.chat.activityViewer.last_tool')} {a.lastTool}</div>}
         </div>
       )}
@@ -248,349 +508,91 @@ const isSpawnApproval = (e: ToolActivity) => (e.type === 'approval' || e.type ==
 
 /* ── Approval entry ── */
 
-function ApprovalEntry({ entry, slot }: { entry: ToolActivity; slot: string }) {
+function ApprovalEntry({ entry }: { entry: ToolActivity }) {
   const resolved = entry.type === 'approval_resolved'
   const [localDecision, setLocalDecision] = useState<string | null>(null)
   const isResolved = resolved || !!localDecision
   const [acting, setActing] = useState(false)
-  const onAction = useCallback(async (action: string, pattern?: string) => {
+  const [actionError, setActionError] = useState<string | null>(null)
+  // WHICH approval is gone, not merely that one was: the id scopes the
+  // withdrawal, so a later live approval here is never suppressed by it.
+  const [goneFor, setGoneFor] = useState<string | null>(null)
+  const onAction = useCallback(async (action: string) => {
     setActing(true)
+    setActionError(null)
     setLocalDecision(action)
     try {
-      if (entry.approval_type === 'chat') {
-        const extra: Record<string, string> = {}
-        if (entry.approval_id) extra.request_id = entry.approval_id
-        if (pattern) extra.pattern = pattern
-        await api.approveChatSlot(slot, action, extra)
-      } else {
-        await api.resolveApproval(entry.approval_id!, action === 'rejected' ? 'reject' : 'approve')
-      }
-    } catch { setLocalDecision(null); setActing(false) }
-  }, [entry.approval_id, entry.approval_type, slot])
+      await api.resolveApproval(entry.approval_id!, toApiDecision(action))
+    } catch (e: unknown) {
+      setLocalDecision(null); setActing(false)
+      const gone = isTerminalApprovalRefusal(e)
+      setGoneFor(gone ? entry.approval_id ?? null : null)
+      const reason = e instanceof Error ? e.message : ''
+      setActionError(gone
+        ? i18nT('components.approvalCard.approval_no_longer_pending')
+        : reason
+          ? i18nT('components.approvalCard.decision_not_recorded_error', { error: reason })
+          : i18nT('components.approvalCard.decision_failed'))
+    }
+  }, [entry.approval_id])
 
-  const toolTitle = entry.text || ''
-  const isShell = toolTitle.startsWith('Running: ')
-  const normalized = toolTitle.replace(/^(Running: |Reading )/, '')
-  const baseCmd = normalized.split(/\s+/)[0] || normalized
-
-  const decisionLabel: Record<string, ReactNode> = { approved: <><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approved')}</>, trust: <><Handshake className="lucide-inline" /> {i18nT('pages.chat.activityViewer.trusted')}</>, trust_command: <><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.trusted_command')}</>, trust_base: <><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.trusted_base')}</>, rejected: <><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.rejected')}</> }
+  // This card mounts only for non-chat approvals (see the `isSpawnApproval`
+  // filter at the render site), which resolve through `api.resolveApproval` —
+  // an endpoint with no trust verb, so the only decisions this card can carry
+  // out are a one-shot approve or reject. Offering trust tiers here (or
+  // labelling a decision "Trusted") would overstate the grant: the next
+  // identical call prompts again (#5400).
+  //
+  // `onAction` above maps through the shared fail-closed `toApiDecision` rather
+  // than the inline `action === 'rejected' ? 'reject' : 'approve'` it used to
+  // spell. That ternary was fail-OPEN — any verb but `rejected` became an
+  // `approve` — and was safe only because the two buttons below pass literals.
+  // It was the last in-tree instance of the shape #5400/#5434/#5486 each shipped
+  // (#8193): a render gate is one edit away from being widened, and the mapping
+  // is what decides whether a widened gate grants or denies.
+  const decisionLabel: Record<string, ReactNode> = { approved: <><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approved')}</>, rejected: <><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.rejected')}</> }
   const btnClass = 'px-2.5 py-1 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all'
   return (
     <div className={`mx-2 mb-2 rounded-lg border overflow-hidden shadow-sm transition-all ${isResolved ? 'border-ok/40 bg-card' : 'border-warn/40 bg-warn/5'}`}>
       <div className="flex items-center gap-2 px-3 py-2">
-        <span className="shrink-0 flex items-center">{isResolved ? <CheckCircle size={15} className="text-green-400" /> : <Lock size={15} className="text-muted" />}</span>
+        <span className="shrink-0 flex items-center">{isResolved ? <CheckCircle size={15} className="text-ok" /> : <Lock size={15} className="text-muted" />}</span>
         <span className="text-[13px] font-semibold text-text truncate min-w-0">{isResolved ? (decisionLabel[localDecision || ''] || i18nT('pages.chat.activityViewer.resolved')) : i18nT('pages.chat.activityViewer.approval_needed')}</span>
         <span className="text-[11px] text-muted/40 font-mono ml-auto shrink-0">{fmtTime(entry.ts)}</span>
       </div>
       {!isResolved && <div className="px-3 pb-2 text-[13px] text-muted/70">{entry.text}</div>}
-      {!isResolved && !acting && (
+      {!isResolved && !acting && goneFor !== entry.approval_id && (
         <div className="px-3 pb-2 flex gap-1.5">
           <button className={btnClass} onClick={() => onAction('approved')}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approve')}</button>
-          <TrustDropdown
-            fullCommand={normalized}
-            baseCommand={baseCmd}
-            isShell={isShell}
-            className={btnClass}
-            onAction={(action, pattern) => onAction(action, pattern)}
-          />
           <button className={btnClass + ' hover:!text-danger hover:!border-danger'} onClick={() => onAction('rejected')}><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.reject')}</button>
         </div>
       )}
       {acting && <div className="px-3 pb-2 text-[12px] text-muted/50">{i18nT('pages.chat.activityViewer.resolving')}</div>}
+      {/* Approval card in the activity panel: no draft → hand-off on. */}
+      {actionError && (
+        <div className="px-3 pb-2">
+          <ErrorNotice variant="inline" message={actionError} askAgent />
+        </div>
+      )}
     </div>
   )
 }
 
-/* ── Files-tab inline file preview ──────────────────────────────────────────
- * Opening a file from the Files tab keeps it IN the Files tab (no new document
- * tab in the strip): the list is replaced by the file's content plus a "Back to
- * files" bar. Content is fetched here (same file-read query key as ChatPage's
- * tab opener, so re-opening is cache-instant) and rendered through the shared
- * embedded MarkdownPanel — identical viewer to the document-tab path, just
- * hosted inline. Back returns to the list. */
-
-function FilePreview({ path, slot, onBack, onFileSave, onSubmitComments, onFolderOpen }: {
-  path: string
-  slot: string
-  onBack: () => void
-  onFileSave: (filePath: string, content: string) => Promise<void>
-  onSubmitComments?: (message: string) => void
-  /** Open a directory (a clicked breadcrumb segment) as a folder tab. */
-  onFolderOpen?: (p: string) => void
-}) {
-  const { data, isLoading, refetch } = useQuery({
-    queryKey: ['file-read', path],
-    // Same query key + result shape ({ text, ok }) as ChatPage's document-tab
-    // reader, so the inline view SHARES that cache instead of colliding with it.
-    queryFn: async () => {
-      try {
-        const res = await fetch(fileReadUrl(path))
-        const text = res.ok
-          ? await res.text()
-          : res.status === 404 ? i18nT('pages.chat.activityViewer.file_not_found_on_disk_it_may_have_been_moved_or')
-            : i18nT('pages.chat.activityViewer.unable_to_read_file')
-        return { text, ok: res.ok }
-      } catch {
-        // Network-level failure (fetch rejected) — return a NOT-ok result rather
-        // than throwing, so `data` is always defined and the editor is never
-        // mounted over an empty buffer that a save could write to the file.
-        return { text: i18nT('pages.chat.activityViewer.unable_to_read_file'), ok: false }
-      }
-    },
-    staleTime: 10_000,
-  })
-  // Working copy is backed by the module-level inline-draft store (keyed by
-  // path), NOT component state, so an in-progress edit survives everything that
-  // unmounts this subtree — the close control, an activity-tab switch, a chat-
-  // slot switch, and the automatic force-collapse on window resize — matching
-  // how document-tab content persists above the panel. On (re)open we restore a
-  // preserved draft if present, else seed once from a successful disk read
-  // (never the failure placeholder). One draft per path = one editor per path.
-  const [content, setContentState] = useState<string>(() => getInlineDraft(slot, path) ?? '')
-  // Keep the working copy synced to the freshest SUCCESSFUL disk read UNTIL the
-  // user starts editing (a draft exists for this path). This avoids locking the
-  // editor onto a stale (≤10s) cached read when the file changed on disk since;
-  // once the user has a draft we stop syncing so their edits aren't clobbered.
-  useEffect(() => {
-    if (data?.ok && getInlineDraft(slot, path) === undefined) {
-      setContentState(prev => (prev === data.text ? prev : data.text))
-    }
-  }, [data, path, slot])
-  const setContent = useCallback((c: string) => {
-    setContentState(c)
-    setInlineDraft(slot, path, c)
-  }, [slot, path])
-  // Only mount the editable panel once the working copy is RECONCILED with the
-  // source of truth: either the user has a draft (their edits), or the content
-  // equals the successful disk read. This defers the editor past the brief
-  // window where `content` is still the initial '' (or a not-yet-synced value)
-  // while `data.ok` is already true from cache — mounting then would show an
-  // empty/dirty buffer whose save could truncate the file.
-  const inlineReady = getInlineDraft(slot, path) !== undefined || (!!data?.ok && content === data.text)
-  const name = path.split('/').pop() || path
-  // Keep the shared ['file-read', path] cache coherent after a save (otherwise a
-  // reopen within the 10s stale window seeds pre-save content and a subsequent
-  // edit could clobber the newer file), and drop the now-committed draft. Wraps
-  // — never replaces — the caller's save.
-  const qc = useQueryClient()
-  const handleSave = useCallback(async (p: string, c: string) => {
-    await onFileSave(p, c)
-    qc.setQueryData(['file-read', p], { text: c, ok: true })
-    // Draft reconciliation (clearing) is owned by ChatPage.handleFileSave, which
-    // clears only if the draft still equals what was saved — so edits typed
-    // during a pending save aren't dropped. We don't clear here.
-  }, [onFileSave, qc])
-  // "Back to files" reuses MarkdownPanel's existing close guard (via the
-  // imperative handle) so leaving with unsaved edits shows its normal discard
-  // prompt. guardedClose only calls this after the guard accepts (not dirty, or
-  // the user confirmed discard), so it is safe to drop the draft here — a
-  // confirmed discard should not survive to the next open. (An involuntary
-  // unmount never reaches this path, so the draft is preserved there.)
-  const handleClose = useCallback(() => { clearInlineDraft(slot, path); onBack() }, [slot, path, onBack])
-  const panelRef = useRef<MarkdownPanelHandle>(null)
-  const back = useCallback(() => {
-    if (panelRef.current) { panelRef.current.requestClose(); return }
-    // No editor mounted (e.g. the read failed, so the retry state is showing
-    // instead of MarkdownPanel) — its close guard can't fire. If an unsaved
-    // draft exists, confirm before discarding it ourselves; otherwise just go
-    // back. (The guarded path above already prompts, so this never double-asks.)
-    if (getInlineDraft(slot, path) !== undefined && !window.confirm(i18nT('pages.chat.activityViewer.discard_unsaved_changes'))) return
-    handleClose()
-  }, [slot, path, handleClose])
-
-  return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-      {/* Back-to-list bar — mirrors the file's tab-chip identity so the Files
-          tab reads as one place that swaps between list and file. */}
-      <div className="flex items-center gap-2 h-[38px] px-2 shrink-0 border-b border-border">
-        <button
-          onClick={back}
-          className="flex items-center gap-1.5 h-7 px-2 rounded-md text-[12px] text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-          title={i18nT('pages.chat.activityViewer.back_to_files')}
-          aria-label={i18nT('pages.chat.activityViewer.back_to_files')}
-        >
-          <ArrowLeft size={14} />
-          <span>{i18nT('pages.chat.activityViewer.files')}</span>
-        </button>
-        <span aria-hidden="true" className="w-px h-4 bg-border shrink-0" />
-        <span className="flex items-center gap-1.5 min-w-0 text-[12px] text-text-strong">
-          <FileText size={13} className="text-muted shrink-0" />
-          <span className="truncate" title={path}>{name}</span>
-        </span>
-      </div>
-      <div className="flex-1 min-h-0 relative">
-        {isLoading || (data?.ok && !inlineReady) ? (
-          <div className="flex items-center justify-center h-full text-muted text-[13px]">{i18nT('pages.chat.activityViewer.loading')}</div>
-        ) : data?.ok ? (
-          <MarkdownPanel
-            ref={panelRef}
-            embedded
-            filePath={path}
-            content={content}
-            onContentChange={setContent}
-            onSave={handleSave}
-            onClose={handleClose}
-            savedBaseline={data?.ok ? data.text : undefined}
-            onSubmitComments={onSubmitComments}
-            onOpenFolder={onFolderOpen}
-          />
-        ) : (
-          // Loading finished but the read did NOT succeed (404, HTTP error, or a
-          // network-level rejection → `data` may be undefined). Never mount an
-          // editable panel here: a save would write empty/placeholder content
-          // over the real (or temporarily-unreadable) file. Offer a retry.
-          <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-6">
-            <span className="text-[13px] text-muted">
-              {data?.text ? data.text.replace(/^_|_$/g, '') : i18nT('pages.chat.activityViewer.unable_to_read_this_file')}
-            </span>
-            <button
-              onClick={() => refetch()}
-              className="h-7 px-3 rounded-md text-[12px] text-text border border-border hover:bg-bg-hover transition-colors bg-transparent cursor-pointer"
-            >
-              {i18nT('pages.chat.activityViewer.retry')}
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/* ── Files tab ────────────────────────────────────────────────────────────────
- * Two scannable lists — the files the agent touched this turn ("Changed files")
- * and any links it surfaced ("Resources") — with a search box that filters both
- * by name/path (and link label/URL). Opening a file previews it inline (see
- * FilePreview) rather than spawning a document tab. Extracted from the render so
- * it can own the search state as a real component (hooks can't live in the
- * conditional render IIFE it replaced). */
-function FilesTab({
-  files, sources, issues, navLinks, navResolving, slot,
-  onFileOpen, onArtifactOpen, onFileRemove, onFileSave, onSubmitComments, onFolderOpen, openDocPaths,
-  previewPathValue, setPreviewPath,
+/* ── Links tab ────────────────────────────────────────────────────────────────
+ * One scannable list of the links this session surfaced, with a search box that
+ * filters by label and URL. Files are NOT listed here: the pinned Files tab
+ * browses the project tree and its git working-tree status, which is the
+ * general "what changed" view — this tab is only the URLs the conversation
+ * referenced. */
+function LinksTab({
+  sources, issues, navLinks, navResolving,
 }: {
-  files?: TouchedFile[]
   sources?: PullRequestLink[]
   issues?: PullRequestLink[]
   navLinks?: ExtractedLink[]
   navResolving?: boolean
-  slot: string
-  onFileOpen?: (path: string) => void
-  /** Opens an artifact tab in this same panel — the target for a file row whose
-   *  artifact already exists (so the row opens it instead of saving a second). */
-  onArtifactOpen?: (slug: string) => void
-  onFileRemove?: (path: string) => void
-  onFileSave?: (filePath: string, content: string) => Promise<void>
-  onSubmitComments?: (message: string) => void
-  onFolderOpen?: (p: string) => void
-  openDocPaths?: Set<string>
-  previewPathValue: string | null
-  setPreviewPath: (p: string | null) => void
 }) {
   const [query, setQuery] = useState('')
-  const qc = useQueryClient()
 
-  /* ── Add-to-library, per file row ──────────────────────────────────────────
-   * The Artifacts tab lists artifact RECORDS only, so a plain file can no
-   * longer drift into the library by having the right extension — getting in is
-   * an explicit act, and this is where that act lives, next to the files.
-   *
-   * Derived above the inline-preview early return below so every hook here runs
-   * unconditionally (a hook after that `return` would be a conditional hook). */
-  const changed = useMemo(() => (files || []).filter(f => f.source === 'tool'), [files])
-  // Which rows can even offer it, by extension. IMPORTABLE_EXT_KINDS is the
-  // shared extension→kind map the "Add Artifact" file picker already enforces
-  // (and which `test/test_artifact_import_parity.py` holds identical to the
-  // backend's `_EXT_KIND_MAP`) — so both ways into the library agree on what is
-  // admissible, and every kind it yields has a real renderer.
-  const promotable = useMemo(
-    () => new Map(changed.map(f => [f.path, kindForFilename(f.path)] as const)),
-    [changed],
-  )
-  const anyPromotable = useMemo(() => [...promotable.values()].some(k => k !== null), [promotable])
-  // Already-in-the-library detection. Same query key AND fetcher as the
-  // Artifacts tab's library section, so the two tabs share ONE cache entry and
-  // one request rather than each holding its own copy of the library. Gated on
-  // there being a promotable row at all: a session that only touched code
-  // never pulls the library. (Keyed off the UNFILTERED list so typing in the
-  // search box can't toggle the query on and off.)
-  const { data: libraryData } = useQuery<{ artifacts: Artifact[] }>({
-    queryKey: ['artifacts', 'panel-library'],
-    queryFn: () => api.artifacts({}),
-    enabled: anyPromotable,
-  })
-  // source_path → slug. Only LINKED artifacts carry a source_path: the backend
-  // classifier deliberately stores none for a COPY (a disposable file's
-  // snapshot has no live pointer), so a copied file's row shows as
-  // not-yet-added. Clicking it again is still safe — POST /api/artifacts
-  // de-dups on the source_path it was sent.
-  const artifactBySourcePath = useMemo(() => {
-    const m = new Map<string, string>()
-    for (const a of libraryData?.artifacts || []) if (a.source_path) m.set(a.source_path, a.slug)
-    return m
-  }, [libraryData])
-  const promoteMut = useMutation({
-    mutationFn: async (path: string) => {
-      const kind = promotable.get(path) ?? kindForFilename(path)
-      if (!kind) throw new Error('unsupported file type')
-      // Read through the same endpoint (and cache-shape) the inline preview
-      // uses. The create endpoint does not read from disk — it stores the
-      // content it is given — so the bytes have to come from here.
-      const res = await fetch(fileReadUrl(path))
-      if (!res.ok) throw new Error('cannot read file')
-      // /api/file-read truncates very large files and says so in a header.
-      // Promoting a truncated read would persist the PREFIX as though it were
-      // the whole document -- and because a disposable file is COPIED, the
-      // original is not referenced, so the loss would be silent and permanent.
-      if (res.headers.get('X-Truncated') === 'true') throw new Error('file too large to add')
-      const content = await res.text()
-      // `source_path` is sent unconditionally and the SERVER decides copy vs
-      // link from it (a temp/Downloads/Desktop file is snapshotted, a file in a
-      // project is linked). The frontend deliberately does not classify.
-      // The session key is passed EXPLICITLY so the server can apply the
-      // restricted-session gate. Without it the request carried the shared
-      // `dashboard:ui` placeholder and an incognito session could persist a
-      // promoted file that its own restriction was supposed to refuse.
-      return await api.createArtifact({
-        name: path.split('/').pop() || path,
-        content,
-        kind,
-        source_path: path,
-        origin_session_key: slot || undefined,
-      }, slot ? `dashboard:${slot}` : undefined) as { slug: string }
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['artifacts'] })
-      qc.invalidateQueries({ queryKey: ['session-artifact-records', slot] })
-      // Keeps the file editor's own per-path artifact state coherent, so its
-      // "already an artifact" controls agree with this list.
-      qc.invalidateQueries({ queryKey: ['artifact-by-source-path'] })
-    },
-  })
-  const promotingPath = promoteMut.isPending ? (promoteMut.variables as string) : null
-  const failedPath = promoteMut.isError ? (promoteMut.variables as string) : null
-
-  // Inline file preview: opening a file from this tab keeps it HERE (no new
-  // document tab) — the list is swapped for the file's content with a "Back to
-  // files" bar. A thin host of the shared MarkdownPanel editor (keyed by path);
-  // falls back to the tab opener only if no save handler was wired.
-  if (previewPathValue && onFileSave) {
-    return (
-      <FilePreview
-        key={previewPathValue}
-        path={previewPathValue}
-        slot={slot}
-        onBack={() => setPreviewPath(null)}
-        onFileSave={onFileSave}
-        onSubmitComments={onSubmitComments}
-        onFolderOpen={onFolderOpen}
-      />
-    )
-  }
-  // One editor per path: if this file is already open as a document tab, focus
-  // that tab instead of spawning a second (inline) editor for it.
-  const openInline = onFileSave
-    ? (p: string) => { if (openDocPaths?.has(p)) onFileOpen?.(p); else setPreviewPath(p) }
-    : onFileOpen
   // Hide links that already have a RICH panel of their own — the Changes tab's
   // `sources` and the Issues tab's `issues`. Keep every other link, including
   // cr-classified hosts (Bitbucket, self-hosted, code reviews) and
@@ -600,22 +602,18 @@ function FilesTab({
   const resourceLinks = dedupResourceLinks((navLinks || []).filter(l => !richUrls.has(resourceKey(l.url))))
 
   const q = query.trim().toLowerCase()
-  const filteredChanged = q
-    ? changed.filter(f => f.path.toLowerCase().includes(q))
-    : changed
   const filteredLinks = q
     ? resourceLinks.filter(l => (l.label || '').toLowerCase().includes(q) || l.url.toLowerCase().includes(q))
     : resourceLinks
 
-  const isEmpty = changed.length === 0 && resourceLinks.length === 0
-  const noMatches = !isEmpty && filteredChanged.length === 0 && filteredLinks.length === 0
+  const isEmpty = resourceLinks.length === 0
+  const noMatches = !isEmpty && filteredLinks.length === 0
   // Only offer the search box once the list is long enough that scanning it by
   // eye stops being the faster option — a short list needs no filter. The
   // `query` clause matters: the box must stay mounted while a query is active,
   // or a filter that shrinks the list below the threshold would unmount its own
   // input and keep filtering invisibly, with no way to clear it.
-  const showSearch = changed.length + resourceLinks.length > 5 || query !== ''
-
+  const showSearch = resourceLinks.length > 5 || query !== ''
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {showSearch && (
@@ -627,7 +625,7 @@ function FilesTab({
               value={query}
               onChange={e => setQuery(e.target.value)}
               placeholder={i18nT('pages.chat.activityViewer.search_files')}
-              className="w-full h-7 pl-8 pr-8 rounded-md bg-bg-elevated border border-border text-[12px] text-text placeholder:text-muted/50 focus:outline-none focus:border-border-strong transition-colors"
+              className="w-full h-7 pl-8 pr-8 rounded-md bg-bg-elevated border border-border text-[12px] text-text placeholder:text-muted/50 focus:outline-hidden focus-visible:border-border-strong transition-colors"
               aria-label={i18nT('pages.chat.activityViewer.search_files')}
             />
             {query && (
@@ -645,213 +643,44 @@ function FilesTab({
       )}
       <div className="flex-1 overflow-y-auto py-1.5">
         {isEmpty ? (
-          <div className="flex-1 flex items-center justify-center text-muted text-[13px] py-8">{i18nT('pages.chat.activityViewer.no_files_changed_yet')}</div>
+          <div className="flex-1 flex items-center justify-center text-muted text-[13px] py-8">{i18nT('pages.chat.activityViewer.no_links_yet')}</div>
         ) : noMatches ? (
           <div className="flex-1 flex items-center justify-center text-muted text-[13px] py-8">{i18nT('pages.chat.activityViewer.no_matches')}</div>
         ) : (
-          <>
-            {filteredChanged.length > 0 && (
-              <div className="px-3 mb-2">
-                <PanelSectionHeader
-                  label={i18nT('pages.chat.activityViewer.changed_files')}
-                  count={filteredChanged.length}
-                  className="mt-1 mb-0.5"
-                />
-                <div className="flex flex-col">
-                  {filteredChanged.map(f => (
-                    <FileRow
-                      key={f.path}
-                      f={f}
-                      onFileOpen={openInline}
-                      onFileRemove={onFileRemove}
-                      artifactSlug={artifactBySourcePath.get(f.path)}
-                      promotable={promotable.get(f.path) != null}
-                      onPromote={promoteMut.mutate}
-                      onArtifactOpen={onArtifactOpen}
-                      promoting={promotingPath === f.path}
-                      promoteBusy={promoteMut.isPending}
-                      promoteFailed={failedPath === f.path}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-            {filteredLinks.length > 0 && (
-              <div className="px-3 mb-2">
-                <PanelSectionHeader
-                  label={i18nT('pages.chat.activityViewer.resources')}
-                  count={filteredLinks.length}
-                  className="mt-1 mb-0.5"
-                  trailing={navResolving
-                    ? <span className="text-[10px] text-accent animate-pulse">{i18nT('pages.chat.activityViewer.resolving_2')}</span>
-                    : undefined}
-                />
-                <div className="flex flex-col">
-                  {filteredLinks.map((link, i) => (
-                    <ResourceRow key={i} link={link} />
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
+          <div className="px-3 mb-2">
+            <PanelSectionHeader
+              label={i18nT('pages.chat.activityViewer.resources')}
+              count={filteredLinks.length}
+              className="mt-1 mb-0.5"
+              trailing={navResolving
+                ? <span className="text-[10px] text-accent animate-pulse">{i18nT('pages.chat.activityViewer.resolving_2')}</span>
+                : undefined}
+            />
+            <div className="flex flex-col">
+              {filteredLinks.map((link, i) => (
+                <ResourceRow key={i} link={link} />
+              ))}
+            </div>
+          </div>
         )}
       </div>
     </div>
   )
 }
 
+// Re-exported so the symbol `ActivityViewer` exported before this extraction
+// stays importable from here; the implementation lives in `utils/diffLineCounts`
+// so a pure test need not pull this page's module graph.
+export { countDiffStats }
+
 /* ── Main component ── */
 
-
-export function countDiffStats(diff: string): { added: number; removed: number } {
-  let added = 0, removed = 0
-  for (const line of diff.split('\n')) {
-    if (line.startsWith('+') && !line.startsWith('+++')) added++
-    else if (line.startsWith('-') && !line.startsWith('---')) removed++
-  }
-  return { added, removed }
-}
-
-/* ── Changed-files list row ──────────────────────────────────────────────────
- * One touched file per full-width row: type-colored icon + filename (with the
- * parent directory as a dimmed subtitle for disambiguation) on the left, a
- * +N/-N diffstat on the right, and hover-revealed add-to-library and remove
- * controls. Reads as a scannable list instead of a wrapping pile of cramped
- * chips. */
-function FileRow({ f, onFileOpen, onFileRemove, artifactSlug, promotable, onPromote, onArtifactOpen, promoting, promoteBusy, promoteFailed }: {
-  f: TouchedFile
-  onFileOpen?: (p: string) => void
-  onFileRemove?: (p: string) => void
-  /** Slug of the artifact already backing this file, if there is one. */
-  artifactSlug?: string
-  /** Whether the artifact store can take this file (extension check). */
-  promotable?: boolean
-  onPromote?: (p: string) => void
-  onArtifactOpen?: (slug: string) => void
-  promoting?: boolean
-  /** True while ANY promotion is in flight. Dedup is resolved server-side on
-   *  source_path, so two concurrent POSTs can both pass the pre-create lookup
-   *  and mint duplicate records -- the lock has to be global, not per-row. */
-  promoteBusy?: boolean
-  promoteFailed?: boolean
-}) {
-  const name = f.path.split('/').pop() || f.path
-  const dir = f.path.slice(0, Math.max(0, f.path.length - name.length)).replace(/\/+$/, '')
-  const Icon = fileIcon(f.path)
-  const colorCls = colorForExt(f.path)
-  const { data } = useQuery({
-    queryKey: ['file-diff', f.path, f.lastWrite],
-    queryFn: () => api.fileDiff(f.path),
-    placeholderData: (prev) => prev,
-  })
-  const stats = data?.diff ? countDiffStats(data.diff) : null
-  // Artifact control, three mutually exclusive states:
-  //   • already in the library → an always-visible accent glyph that OPENS it
-  //     (never a second save — the row is the entry point for both)
-  //   • admissible but not there yet → a muted glyph revealed on row hover OR
-  //     keyboard focus, which adds it
-  //   • anything else → no control, because the store would not take the file
-  // `Component` is the library's own glyph (it identifies a row in the
-  // Artifacts tab). Safe on the right here because the left glyph is always a
-  // file icon from `fileIcon()` — File/FileCode/FileJson/FileText/Image/
-  // Paintbrush/Settings/Terminal — so the two can never be the same shape.
-  const promoted = !!artifactSlug
-  const artifactLabel = promoted
-    ? i18nT('pages.chat.activityViewer.file_artifact_open')
-    : promoteFailed
-      ? i18nT('pages.chat.activityViewer.file_artifact_add_failed')
-      : i18nT('pages.chat.activityViewer.file_artifact_add')
-  const artifactAria = promoted
-    ? i18nT('pages.chat.activityViewer.file_artifact_open_aria', { name })
-    : i18nT('pages.chat.activityViewer.file_artifact_add_aria', { name })
-  const artifactCls = 'shrink-0 p-1 rounded transition-all bg-transparent border-none cursor-pointer disabled:cursor-default '
-    + (promoted
-      ? 'text-accent'
-      : promoteFailed
-        ? 'text-danger'
-        : 'text-muted/50 hover:text-accent opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100')
-  const artifactGlyph = promoting
-    ? <LoaderIcon size={13} className="animate-spin" />
-    : <Component size={13} />
-  return (
-    <div
-      className="group flex items-center gap-2 px-2 py-1 rounded-md cursor-pointer hover:bg-bg-hover transition-colors"
-      onClick={() => onFileOpen?.(f.path)}
-      title={f.path}
-      role="button"
-      tabIndex={0}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onFileOpen?.(f.path) } }}
-    >
-      <Icon size={14} className={`shrink-0 ${colorCls}`} />
-      <span className="min-w-0 flex-1 flex flex-col leading-tight">
-        <span className="text-[12.5px] text-text truncate">{name}</span>
-        {dir && <span className="text-[10.5px] text-muted/80 truncate">{dir}</span>}
-      </span>
-      {stats && (stats.added > 0 || stats.removed > 0) && (
-        <span className="flex items-center gap-1.5 text-[11px] font-mono shrink-0 tabular-nums">
-          {stats.added > 0 && <span className="text-ok">+{stats.added}</span>}
-          {stats.removed > 0 && <span className="text-danger">-{stats.removed}</span>}
-        </span>
-      )}
-      {/* Both inner controls stop keydown as well as click: the row itself
-          handles Enter/Space to open the file, so without this, activating a
-          control from the keyboard would ALSO open the file underneath it. */}
-      {promoted && !onArtifactOpen ? (
-        // No panel host wired (this tab rendered outside a chat) — a plain link
-        // to the detail page keeps the row from being a dead click without
-        // needing a router hook here.
-        <a
-          href={`/artifacts/${encodeURIComponent(artifactSlug)}`}
-          data-testid={`file-artifact-${f.path}`}
-          className={`${artifactCls} no-underline inline-flex`}
-          title={artifactLabel}
-          aria-label={artifactAria}
-          onClick={e => e.stopPropagation()}
-          onKeyDown={e => e.stopPropagation()}
-        >
-          {artifactGlyph}
-        </a>
-      ) : (promoted || promotable) ? (
-        <button
-          type="button"
-          data-testid={`file-artifact-${f.path}`}
-          disabled={promoting || promoteBusy}
-          className={artifactCls}
-          title={artifactLabel}
-          aria-label={artifactAria}
-          onClick={e => {
-            e.stopPropagation()
-            if (promoted) onArtifactOpen?.(artifactSlug)
-            else onPromote?.(f.path)
-          }}
-          onKeyDown={e => e.stopPropagation()}
-        >
-          {artifactGlyph}
-        </button>
-      ) : null}
-      {onFileRemove && (
-        // Hover-revealed, but ALSO revealed on keyboard focus — otherwise a
-        // keyboard user tabs onto an invisible control.
-        <button
-          className="shrink-0 p-1 rounded opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 text-muted/50 hover:text-danger transition-all bg-transparent border-none cursor-pointer"
-          onClick={e => { e.stopPropagation(); onFileRemove(f.path) }}
-          onKeyDown={e => e.stopPropagation()}
-          title={i18nT('pages.chat.activityViewer.remove')}
-          aria-label={i18nT('pages.chat.activityViewer.remove_file_from_list')}
-        >
-          <X size={13} />
-        </button>
-      )}
-    </div>
-  )
-}
-
 /* ── Resource-link list row ──────────────────────────────────────────────────
- * Shares FileRow's anatomy so the two sections read as one list: a fixed-width
- * type icon (pull-request glyph in accent for code reviews, a filled dot in ok
- * for provider issues, link glyph in muted otherwise), the link label, the host
- * as a dimmed subtitle, and a trailing external-link arrow in the same right
- * slot the file rows use for +N/-N. */
+ * One row of the Links tab, left to right: a fixed-width type icon (pull-request
+ * glyph in accent for code reviews, a filled dot in ok for provider issues, link
+ * glyph in muted otherwise), the link label, the host as a dimmed subtitle, and
+ * a trailing external-link arrow in the row's right slot. The whole row is the
+ * anchor, so any part of it opens the link in a new tab. */
 function ResourceRow({ link }: { link: ExtractedLink }) {
   const { Icon, colorCls } = link.type === 'cr'
     ? { Icon: GitPullRequest, colorCls: 'text-accent' }
@@ -872,8 +701,8 @@ function ResourceRow({ link }: { link: ExtractedLink }) {
       <Icon size={14} className={`shrink-0 ${colorCls}`} aria-hidden="true" />
       {/* The icon carries the type VISUALLY; this keeps a text alternative so
        *  the type is not conveyed by shape/colour alone (it would otherwise be
-       *  invisible to a screen reader). sr-only costs no layout, so the left
-       *  text edge stays aligned with the Changed-files rows. */}
+       *  invisible to a screen reader). sr-only costs no layout, so it does not
+       *  shift the label off the row's left text edge. */}
       <span className="sr-only">{typeLabel}</span>
       <span className="min-w-0 flex-1 flex flex-col leading-tight">
         <span className="text-[12.5px] text-text truncate">{link.label}</span>
@@ -928,6 +757,9 @@ type SessionArtifactRow = {
   offerSave: boolean
 }
 
+/** `Btn` restyled as an inline text link, for the tab's navigation controls. */
+const PANEL_LINK_BTN = 'border-transparent bg-transparent text-accent hover:underline hover:border-transparent hover:bg-transparent'
+
 /** Cap on library search results shown inline — the panel is a ~460px rail, so
  *  a search that matches half the library still shows a readable slice, and the
  *  "Browse all" link goes to the full /artifacts page for the rest. */
@@ -945,12 +777,12 @@ const toRow = (a: Artifact): SessionArtifactRow => ({
 
 function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifactOpen?: (slug: string) => void }) {
   const qc = useQueryClient()
-  // Artifact rows have no filesystem path, so the Files tab's `onFileOpen` can't
+  // Artifact rows have no filesystem path, so the file-open path can't
   // serve them; `onArtifactOpen` is their twin and opens an artifact tab in this
   // same panel. It is optional because this tab also renders outside a chat (no
   // panel to open into), where the standalone detail page stays the target.
   const navigate = useNavigate()
-  const { data: artifactData, isFetching: artifactsFetching } = useQuery<{ artifacts: Artifact[] }>({
+  const { data: artifactData, isFetching: artifactsFetching, isError: artifactsError } = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['session-artifact-records', slot],
     queryFn: () => api.artifacts({ touchedBy: slot }),
     enabled: !!slot,
@@ -958,7 +790,7 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
   // The whole library, for section B. Its own query key so the session query's
   // invalidations don't force a refetch of the (larger) library list and vice
   // versa; both still refresh on the shared ['artifacts'] invalidation below.
-  const { data: libraryData, isFetching: libraryFetching } = useQuery<{ artifacts: Artifact[] }>({
+  const { data: libraryData, isFetching: libraryFetching, isError: libraryError } = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['artifacts', 'panel-library'],
     queryFn: () => api.artifacts({}),
   })
@@ -966,6 +798,12 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
   // slot field changing (message count, running flag) can't re-render the tab.
   const boundArtifactSlug = useAppSelector(
     s => s.dashboard.slots.find(x => x.key === slot)?.artifact || '',
+  )
+  // The sidebar folder this chat is filed in, if any: it adds a "Browse this
+  // folder" link that opens the library scoped to the chats in that folder and
+  // its sub-folders.
+  const slotFolderId = useAppSelector(
+    s => s.dashboard.slots.find(x => x.key === slot)?.folder_id || '',
   )
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['session-artifact-records', slot] })
@@ -979,6 +817,10 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
     onSuccess: invalidate,
   })
   const busySlug = pinMut.isPending ? (pinMut.variables as string) : null
+  // A refused save used to just un-busy the row. The backend reason (when it
+  // gives one) is the journal key, so it goes in `message`; the fixed lead is
+  // the title.
+  const pinErrorReason = pinMut.isError ? (pinMut.error instanceof Error ? pinMut.error.message : '') : ''
 
   const rows = useMemo<SessionArtifactRow[]>(() => {
     const out: SessionArtifactRow[] = (artifactData?.artifacts || []).map(toRow)
@@ -1049,6 +891,24 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
   return (
     <div className="flex-1 overflow-y-auto py-1.5">
       <div className="px-3 flex flex-col">
+        {/* Read failures first: without these a failed load rendered as the
+            "nothing touched yet" hero, which is a claim the panel cannot make.
+            Side panel with no draft → hand-off on for all three. */}
+        {artifactsError && (
+          <ErrorNotice className="mb-2" message={i18nT('pages.chat.activityViewer.artifacts_load_failed')} askAgent />
+        )}
+        {libraryError && (
+          <ErrorNotice className="mb-2" message={i18nT('pages.chat.activityViewer.library_load_failed')} askAgent />
+        )}
+        {pinMut.isError && (
+          <ErrorNotice
+            className="mb-2"
+            title={pinErrorReason ? i18nT('pages.chat.activityViewer.artifact_save_failed') : undefined}
+            message={pinErrorReason || i18nT('pages.chat.activityViewer.artifact_save_failed')}
+            askAgent
+            onDismiss={() => pinMut.reset()}
+          />
+        )}
         {/* Section A — this session. When the session has touched nothing yet, a
             short hero explains what the panel collects instead of an empty heading. */}
         {rows.length > 0 ? (
@@ -1057,6 +917,15 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
               label={i18nT('pages.chat.activityViewer.artifacts_this_session')}
               count={rows.length}
               className="mt-0.5 mb-0.5"
+              trailing={slot ? (
+                <Btn
+                  type="button"
+                  onClick={() => navigate(`/artifacts?touched_by=${encodeURIComponent(slot)}`)}
+                  className={`shrink-0 px-1 py-0 text-[11px] ${PANEL_LINK_BTN}`}
+                >
+                  {i18nT('pages.chat.activityViewer.artifacts_open_session_in_library')}
+                </Btn>
+              ) : undefined}
             />
             {rows.map(r => (
               <ArtifactListRow key={r.key} row={r} busy={rowBusy(r)} onOpen={openRow} onSave={savePermanently} />
@@ -1090,7 +959,7 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
                 onChange={e => setLibQuery(e.target.value)}
                 placeholder={i18nT('pages.chat.activityViewer.artifacts_search_library')}
                 aria-label={i18nT('pages.chat.activityViewer.artifacts_search_library')}
-                className="w-full text-[12px] pl-7 pr-2.5 py-1.5 rounded-md bg-bg border border-border text-text placeholder:text-muted focus:outline-none focus:border-accent transition-colors"
+                className="w-full text-[12px] pl-7 pr-2.5 py-1.5 rounded-md bg-bg border border-border text-text placeholder:text-muted focus:outline-hidden focus-visible:border-accent transition-colors"
               />
             </div>
             {libQuery.trim() && (
@@ -1106,13 +975,24 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
                 </div>
               )
             )}
-            <button
-              type="button"
-              onClick={() => navigate('/artifacts')}
-              className="self-start mt-1.5 px-2 py-1 text-[11.5px] text-accent hover:underline bg-transparent border-none cursor-pointer transition-colors"
-            >
-              {i18nT('pages.chat.activityViewer.artifacts_browse_all', { count: libraryTotal })}
-            </button>
+            <div className="self-start mt-1.5 flex flex-wrap items-center gap-x-1">
+              {slotFolderId && (
+                <Btn
+                  type="button"
+                  onClick={() => navigate(`/artifacts?chat_folder=${encodeURIComponent(slotFolderId)}`)}
+                  className={`px-2 py-1 text-[11.5px] ${PANEL_LINK_BTN}`}
+                >
+                  {i18nT('pages.chat.activityViewer.artifacts_browse_folder')}
+                </Btn>
+              )}
+              <Btn
+                type="button"
+                onClick={() => navigate('/artifacts')}
+                className={`px-2 py-1 text-[11.5px] ${PANEL_LINK_BTN}`}
+              >
+                {i18nT('pages.chat.activityViewer.artifacts_browse_all', { count: libraryTotal })}
+              </Btn>
+            </div>
           </div>
         )}
       </div>
@@ -1173,53 +1053,31 @@ function ArtifactListRow({ row, busy, onOpen, onSave }: {
   )
 }
 
-export default function ActivityViewer({ subagents, toolLog, open, onToggle, slot, files, onFileOpen, onFolderOpen, onArtifactOpen, onFileRemove, navLinks, navResolving, view, sources, selectedSourceUrl, onSelectSource, onReconcileSource, issues, selectedIssueUrl, onSelectIssue, onReconcileIssue, onAddToChat, onFileSave, onSubmitComments, openDocPaths, previewPath, onPreviewPathChange }: {
+export default function ActivityViewer({ subagents, toolLog, open, onToggle, slot, onFileOpen, onArtifactOpen, navLinks, navResolving, view, sources, selectedSourceUrl, onSelectSource, onReconcileSource, issues, selectedIssueUrl, onSelectIssue, onReconcileIssue, onAddToChat, pins, pinsLoading, onJumpToPin, onUnpin, slotTitle, chatMode }: {
   subagents: Record<string, SubagentActivity>; toolLog: ToolActivity[]; open: boolean; onToggle: () => void; slot: string
-  files?: TouchedFile[]; onFileOpen?: (path: string) => void; onFolderOpen?: (p: string) => void; onArtifactOpen?: (slug: string) => void; onFileRemove?: (path: string) => void; onFilesClear?: (source: 'history' | 'tool') => void
-  projectDir?: string
+  onFileOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void
   navLinks?: ExtractedLink[]; navResolving?: boolean
   sources?: PullRequestLink[]; selectedSourceUrl?: string; onSelectSource?: (url: string) => void; onReconcileSource?: (url: string) => void; onAddToChat?: (text: string) => void
   /** Issue links mentioned in this session, plus the Issues tab's own selection. */
   issues?: PullRequestLink[]; selectedIssueUrl?: string; onSelectIssue?: (url: string) => void; onReconcileIssue?: (url: string) => void
-  /** Save handler for the Files-tab inline file preview (opening a file keeps
-   *  it in the Files tab instead of spawning a document tab). */
-  onFileSave?: (filePath: string, content: string) => Promise<void>
-  onSubmitComments?: (message: string) => void
-  /** Absolute paths already open as `file:` document tabs. Enforces one editor
-   *  per path: opening such a path from the Files list routes to its existing
-   *  document tab instead of spawning a second (inline) editor for it. */
-  openDocPaths?: Set<string>
-  /** Files-tab inline preview path — lifted to ChatPage (survives panel
-   *  collapse and lets chat-link opens route to this editor). `onPreviewPathChange`
-   *  is the setter. */
-  previewPath?: string | null
-  onPreviewPathChange?: (path: string | null) => void
+  /** Pinned messages for this session (Pins tab). Passed down rather than
+   *  queried here so the jump stays with ChatPage, which owns the transcript
+   *  and can page older history in when the target is out of the loaded window.
+   *  `slotTitle` / `chatMode` only shape the copyable deep link. */
+  pins?: ChatPin[]
+  pinsLoading?: boolean
+  onJumpToPin?: (messageTs: string, mid?: string) => void
+  onUnpin?: (id: string) => void
+  slotTitle?: string
+  chatMode?: string
   /** When set, render ONLY this view and hide the internal SegmentedControl.
    *  Used by SidePanel, which owns the top-level tab strip. */
-  view?: 'changes' | 'issues' | 'subagents' | 'logs' | 'context' | 'files' | 'artifacts' | 'side' | 'workflows'
+  view?: 'changes' | 'issues' | 'subagents' | 'logs' | 'crewlog' | 'context' | 'links' | 'artifacts' | 'side' | 'workflows' | 'git' | 'summary' | 'pins'
 }) {
   const dispatch = useAppDispatch()
   const [, setSelected] = useState(0)
-  // Files-tab inline preview path. Controlled when ChatPage lifts it (via
-  // `previewPath`/`onPreviewPathChange`) — that keeps it alive across panel
-  // collapse and lets a chat-link open of the same file route back to THIS
-  // editor instead of a competing document tab (one editor per path). Falls
-  // back to internal state when unmanaged. `null` = show the file list.
-  const [localPreview, setLocalPreview] = useState<string | null>(null)
-  const controlledPreview = onPreviewPathChange !== undefined
-  const previewPathValue = controlledPreview ? (previewPath ?? null) : localPreview
-  const setPreviewPath = useCallback((p: string | null) => {
-    if (controlledPreview) onPreviewPathChange?.(p); else setLocalPreview(p)
-  }, [controlledPreview, onPreviewPathChange])
-  // The panel-level Escape-to-collapse handler (below) must defer to the inline
-  // editor when a file is open: Escape then returns to the list via
-  // MarkdownPanel's own guarded close (which prompts on unsaved edits) instead
-  // of collapsing the whole panel out from under the editor. A ref avoids
-  // re-registering the listener on every open/close.
-  const previewOpenRef = useRef(false)
-  previewOpenRef.current = previewPathValue != null
   const reduxTab = useAppSelector(s => s.chat.activityTab)
-  const [tab, setTab] = useState<'changes' | 'issues' | 'subagents' | 'workflows' | 'logs' | 'files' | 'side' | 'artifacts'>(reduxTab === ('nav' as string) ? 'files' : reduxTab)
+  const [tab, setTab] = useState<'changes' | 'issues' | 'subagents' | 'workflows' | 'logs' | 'links' | 'side' | 'artifacts'>(reduxTab === ('nav' as string) ? 'changes' : reduxTab)
   const hasSources = (sources?.length || 0) > 0
   const hasIssues = (issues?.length || 0) > 0
   const explicitTab = useRef(false)
@@ -1247,6 +1105,9 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
   // freshly-accepted wave, which is flatly false and the single most confusing
   // state this panel had.
   const queuedCount = useAppSelector(s => s.chat.subagentQueued?.[slot] ?? 0)
+  // Why they wait, when the gateway said (memory floor, critical posture, a
+  // paused adaptive cap); undefined keeps the concurrency text below.
+  const queuedReason = useAppSelector(s => s.chat.subagentQueuedReason?.[slot])
   // Render cap: bounds DOM at 60-100 agents; exceptions are always within
   // the cap thanks to the ordering above.
   const [showAllSubagents, setShowAllSubagents] = useState(false)
@@ -1270,45 +1131,58 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
     [ids, subagents],
   )
   const [retryingFailed, setRetryingFailed] = useState(false)
+  // Outcome of the last batch control (retry-failed / dismiss-done) that did
+  // not fully succeed. Both used to discard their settled results, so a
+  // rejected retry or a refused delete was invisible.
+  const [batchError, setBatchError] = useState<string | null>(null)
   const retryFailed = useCallback(() => {
     setRetryingFailed(true)
-    Promise.allSettled(failedRetryableIds.map(id => api.spawnRetry(id))).finally(() => setRetryingFailed(false))
+    setBatchError(null)
+    Promise.allSettled(failedRetryableIds.map(id => api.spawnRetry(id)))
+      .then(results => {
+        const rejected = results.filter(r => r.status === 'rejected').length
+        if (rejected > 0) setBatchError(i18nT('pages.chat.activityViewer.retry_failed_error', { count: rejected }))
+      })
+      .finally(() => setRetryingFailed(false))
   }, [failedRetryableIds])
   const dismissDone = useCallback(() => {
     // Slot-scoped by construction: delete exactly this slot's terminal cards
-    // by id — the global DELETE /api/spawn clear would nuke other sessions'
-    // completed agents too (their cards would 404 on status/output).
-    for (const id of terminalIds) api.spawnDelete(id).catch(() => {})
+    // by id via DELETE /api/spawn/{id}. There is no global clear route, so a
+    // cross-session wipe is not reachable from here.
+    // The local clear stays optimistic; a refused delete is reported so the
+    // user knows the card still exists server-side.
+    setBatchError(null)
+    // A retired card is one the inventory already showed the backend holds no
+    // record of, so it is cleared locally only: a DELETE would 404.
+    const serverIds = terminalIds.filter(id => !isSpawnApprovalRetired(subagents[id]))
+    void Promise.allSettled(serverIds.map(id => api.spawnDelete(id))).then(results => {
+      if (results.some(r => r.status === 'rejected')) setBatchError(i18nT('pages.chat.activityViewer.dismiss_failed'))
+    })
     dispatchRedux(clearTerminalSubagents({ slot }))
-  }, [dispatchRedux, slot, terminalIds])
+  }, [dispatchRedux, slot, terminalIds, subagents])
 
-  // Dynamic Workflow runs (M6) — dedup + caching + self-managed polling
-  const { data: wfRuns = [] } = useQuery<WfRunRow[]>({
+  // Dynamic Workflow runs (M6) — dedup + caching + self-managed polling.
+  // Through the api client, which REJECTS on a non-OK response (its doc comment
+  // states the rule: "never as 'no runs'") and carries the backend body as an
+  // ApiError — the journal context the hand-off exists to recover. The raw
+  // fetch this replaces mapped a failure to `{ runs: [] }`.
+  const { data: wfRuns = [], isError: wfRunsError } = useQuery<WfRunRow[]>({
     queryKey: ['workflow-runs'],
-    queryFn: () =>
-      fetch('/api/workflows/runs', { credentials: 'same-origin' })
-        .then(r => (r.ok ? r.json() : { runs: [] }))
-        .then(d => (Array.isArray(d?.runs) ? d.runs : [])),
+    queryFn: () => api.workflowRuns().then(d => (Array.isArray(d?.runs) ? (d.runs as WfRunRow[]) : [])),
     enabled: open,
     refetchInterval: 2500,
   })
   const wfRunsForSlot = wfRuns.filter(r => runBelongsToSlot(r.session_key, slot))
   const wfRunningCount = wfRunsForSlot.filter(r => r.status === 'running').length
 
-  const visibleLog = toolLog.filter(e => e.type !== 'reasoning')
-
   // Subagent events are subscribed eagerly at WS connect time — no need to toggle here.
 
-  useEffect(() => { setTab(reduxTab === ('nav' as string) ? 'files' : reduxTab); explicitTab.current = true }, [reduxTab])
+  useEffect(() => { setTab(reduxTab === ('nav' as string) ? 'changes' : reduxTab); explicitTab.current = true }, [reduxTab])
 
   useEffect(() => {
     if (!open) return
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      // When an inline file is open, let MarkdownPanel's own Escape/close guard
-      // handle it (return to the list, prompting on unsaved edits) rather than
-      // collapsing the panel and unmounting the editor mid-edit.
-      if (previewOpenRef.current) return
       e.preventDefault(); onToggle()
     }
     const el = containerRef.current
@@ -1318,7 +1192,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
 
   // Auto-switch to subagents tab when subagents or spawn approvals first appear
   const hadSubagents = useRef(false)
-  const hasSpawnApprovals = visibleLog.some(e => e.type === 'approval' && isSpawnApproval(e))
+  const hasSpawnApprovals = toolLog.some(e => e.type === 'approval' && isSpawnApproval(e))
   const hasSubagentActivity = hasSubagents || hasSpawnApprovals
   useEffect(() => {
     if (hasSubagentActivity && !hadSubagents.current && !explicitTab.current) setTab('subagents')
@@ -1331,24 +1205,25 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
   // When a `view` prop is supplied, SidePanel owns the tab strip — render only
   // that view and skip the internal SegmentedControl.
   const requestedTab = view ?? tab
-  // In the internal SegmentedControl (`!view`) the Changes segment only exists
-  // when there are sources, so a stale `changes` selection with none left must
-  // fall back to Files. But under `view` mode Changes is a PINNED tab that is
-  // ALWAYS present — falling back there would render the touched-files list
-  // under a "Changes" header (confusing, and wrong when files were touched with
-  // no PR). Keep it on `changes` and let it render its own PR empty state,
-  // mirroring how the (unpinned) Issues view already owns its empty state.
-  const effectiveTab = requestedTab === 'changes' && !hasSources && !view ? 'files' : requestedTab
+  // The internal SegmentedControl lists a Changes segment only when there are
+  // sources, so a `changes` selection with none left falls back to Links — the
+  // segment that is always in the strip. The `!view` guard confines that to the
+  // internal strip: under `view` mode SidePanel owns the strip and Changes is a
+  // PINNED tab that is always present, so it stays on `changes` and renders its
+  // own PR empty state, mirroring how the (unpinned) Issues view owns its empty
+  // state. Every call site in the app passes `view`, so the internal strip — and
+  // this fallback with it — is reachable only without one.
+  const effectiveTab = requestedTab === 'changes' && !hasSources && !view ? 'links' : requestedTab
 
   const TABS: { key: typeof tab; label: string; icon: ReactNode; count?: number }[] = [
     ...(hasSources ? [{ key: 'changes' as const, label: i18nT('pages.chat.activityViewer.changes'), icon: <GitPullRequest size={13} />, count: sources!.length }] : []),
     ...(hasIssues ? [{ key: 'issues' as const, label: i18nT('pages.chat.activityViewer.issues'), icon: <CircleDot size={13} />, count: issues!.length }] : []),
-    { key: 'files', label: i18nT('pages.chat.activityViewer.files'), icon: <FileText size={13} />, count: files?.length || 0 },
+    { key: 'links', label: i18nT('pages.chat.activityViewer.links'), icon: <LinkIcon size={13} />, count: navLinks?.length || 0 },
     { key: 'artifacts', label: i18nT('pages.chat.activityViewer.artifacts'), icon: <Component size={13} /> },
-    { key: 'subagents', label: i18nT('pages.chat.activityViewer.subagents'), icon: <Bot size={13} />, count: ids.length + visibleLog.filter(isSpawnApproval).length },
+    { key: 'subagents', label: i18nT('pages.chat.activityViewer.subagents'), icon: <Bot size={13} />, count: ids.length + toolLog.filter(isSpawnApproval).length },
     { key: 'workflows', label: i18nT('pages.chat.activityViewer.workflows'), icon: <Workflow size={13} />, count: wfRunningCount },
     { key: 'logs', label: i18nT('pages.chat.activityViewer.logs'), icon: <ScrollText size={13} /> },
-    { key: 'side', label: i18nT('pages.chat.activityViewer.side'), icon: <MessageSquare size={13} /> },
+    { key: 'side', label: i18nT('pages.chat.activityViewer.side'), icon: <MessageCircleQuestionMark size={13} /> },
   ]
 
   return (
@@ -1362,7 +1237,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
         <div className="px-3 py-2 shrink-0 flex justify-center">
           <SegmentedControl
             segments={TABS}
-            value={effectiveTab === 'context' ? tab : effectiveTab}
+            value={effectiveTab === 'context' || effectiveTab === 'crewlog' || effectiveTab === 'git' || effectiveTab === 'summary' || effectiveTab === 'pins' ? tab : effectiveTab}
             onChange={t => { setTab(t); explicitTab.current = true; dispatch(openActivityToTab(t)) }}
             layoutId="activity-tab"
           />
@@ -1385,6 +1260,13 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
               {i18nT('pages.chat.activityViewer.no_pull_requests_yet')}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Git: every repository this chat works in, the project's first */}
+      {effectiveTab === ('git' as string) && (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <GitReposPanel slotKey={slot} onFileOpen={onFileOpen} />
         </div>
       )}
 
@@ -1434,9 +1316,15 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
               )}
             </div>
           )}
+          {/* Batch-control outcome. Activity panel, no draft → hand-off on. */}
+          {batchError && (
+            <div className="mx-2 mb-2">
+              <ErrorNotice message={batchError} askAgent onDismiss={() => setBatchError(null)} />
+            </div>
+          )}
           {/* Pending approvals */}
-          {visibleLog.filter(isSpawnApproval).map((entry, i) => (
-            <ApprovalEntry key={`a${i}`} entry={entry} slot={slot} />
+          {toolLog.filter(isSpawnApproval).map((entry, i) => (
+            <ApprovalEntry key={entry.approval_id || `a${i}`} entry={entry} />
           ))}
           {/* Accepted-but-not-started banner: the only signal for a wave still
               behind the concurrency cap. Shown alongside started agents too,
@@ -1449,7 +1337,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
             >
               <Clock size={12} className="shrink-0" aria-hidden />
               <span>
-                {queuedCount} {i18nT('pages.chat.activityViewer.waiting_to_start_queued_behind_the_concurrency_l')}
+                {queuedCount} {queuedWaitText(queuedReason) ?? i18nT('pages.chat.activityViewer.waiting_to_start_queued_behind_the_concurrency_l')}
               </span>
             </div>
           )}
@@ -1474,7 +1362,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
                 </button>
               )}
             </>
-          ) : visibleLog.filter(isSpawnApproval).length === 0 && queuedCount === 0 && (
+          ) : toolLog.filter(isSpawnApproval).length === 0 && queuedCount === 0 && (
             <div className="flex flex-col items-center justify-center h-full text-muted/30 gap-2">
               <span className="text-[24px]"><Bot className="lucide-inline" /></span>
               <span className="text-[13px]">{i18nT('pages.chat.activityViewer.no_subagents_running')}</span>
@@ -1486,6 +1374,11 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       {/* Workflows tab (M6): live dynamic-workflow runs */}
       {effectiveTab === 'workflows' && (
         <div className="flex-1 overflow-y-auto py-2 px-3 flex flex-col gap-2">
+          {/* A failed list read is not "no runs": say so above whatever the
+              cache still holds. Status panel, no draft → hand-off on. */}
+          {wfRunsError && (
+            <ErrorNotice message={i18nT('pages.chat.activityViewer.workflow_runs_load_failed')} askAgent />
+          )}
           {wfRunsForSlot.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-muted/30 gap-2">
               <span className="text-[24px]"><Workflow className="lucide-inline" /></span>
@@ -1508,24 +1401,13 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
         </div>
       )}
 
-      {/* Files tab */}
-      {effectiveTab === 'files' && (
-        <FilesTab
-          files={files}
+      {/* Links tab */}
+      {effectiveTab === 'links' && (
+        <LinksTab
           sources={sources}
           issues={issues}
           navLinks={navLinks}
           navResolving={navResolving}
-          slot={slot}
-          onFileOpen={onFileOpen}
-          onArtifactOpen={onArtifactOpen}
-          onFileRemove={onFileRemove}
-          onFileSave={onFileSave}
-          onSubmitComments={onSubmitComments}
-          onFolderOpen={onFolderOpen}
-          openDocPaths={openDocPaths}
-          previewPathValue={previewPathValue}
-          setPreviewPath={setPreviewPath}
         />
       )}
 
@@ -1536,9 +1418,46 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       {/* Sits next to Logs on purpose: both answer "what actually happened
           in THIS session" — Logs for the tool calls, this for the context
           that was injected around them. */}
-      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} />}
+      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} subagents={subagents} />}
 
-      {effectiveTab === 'side' && <SideChat slot={slot} />}
+      {/* Crew log — the five folds over this session's append-only record. Sits
+          beside Logs and Context for the same reason they sit together: all
+          three answer "what actually happened in THIS session", this one from
+          the record the gateway wrote rather than from live client state. */}
+      {/* ErrorBoundary around the lazy chunk, matching CapabilitiesPage: a stale chunk
+          request after a deploy rejects, and without a local boundary that rejection
+          would replace the whole dashboard with the app-shell error screen. */}
+      {effectiveTab === 'crewlog' && (
+        <ErrorBoundary>
+          <Suspense fallback={<ContentSkeleton rows={6} />}>
+            <CrewLogTab key={slot} slot={slot} />
+          </Suspense>
+        </ErrorBoundary>
+      )}
+
+      {/* Session summary — the goal-level view of this session, so returning to
+          it does not mean re-reading the transcript. */}
+      {effectiveTab === 'summary' && <SessionSummaryTab key={slot} slot={slot} />}
+
+      {/* Pinned messages — the user's own bookmarks in this transcript. Grouped
+          with Summary rather than given its own dock: both are ways back into
+          the conversation, and a second right-hand column competing with this
+          one is what made the standalone panel hard to place. */}
+      {effectiveTab === 'pins' && (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <PinnedMessagesPanel
+            pins={pins ?? []}
+            loading={!!pinsLoading}
+            slotKey={slot}
+            slotTitle={slotTitle}
+            mode={chatMode}
+            onJumpToMessage={onJumpToPin ?? (() => {})}
+            onUnpin={onUnpin ?? (() => {})}
+          />
+        </div>
+      )}
+
+      {effectiveTab === 'side' && <SideChat slot={slot} onFileOpen={onFileOpen} onArtifactOpen={onArtifactOpen} />}
 
       {/* Scroll to bottom button (tools tab only) */}
     </div>

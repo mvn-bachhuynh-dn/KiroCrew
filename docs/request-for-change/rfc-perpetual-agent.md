@@ -1,20 +1,42 @@
 ---
 title: Perpetual agents — self-scheduled, goal-driven, supervised
-status: draft
-revision: 2
+status: accepted
+revision: 4
 author: zezhexu
 created: 2026-08-09
-last-audited: 2026-08-10
-audited-at: 30f5d6983
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr: 2328
-implementation-prs: []
+implementation-prs: [11582]
 tracking-issues: []
 supersedes: []
 superseded-by: []
 ---
 # RFC: Perpetual agents — self-scheduled, goal-driven, supervised
 
-- Status: draft — no implementation.
+- Status: accepted — the product decision is the owner-controlled Perpetual
+  mode in §Accepted decision. Its implementation is tracked in
+  [#11582](https://github.com/kirodotdev/KiroCrew/pull/11582). Line numbers
+  and file sizes in the research sections below are as read at the commits this
+  document names for them, not live pointers.
+- **Revision 4 (2026-09-28): accepted one narrow product shape.** An owner may
+  keep one crewmate's auto-nudge loop active without cycle or elapsed-time caps
+  until the owner turns it off. The larger self-scheduled cron design below is
+  retained as research and is not part of this acceptance.
+- **Revision 3 (2026-08-12): Phase 0 ran and concluded.** Two agents
+  (`flake-warden`, 42 cycles; `copywriting-warden`, 21 cycles), 2.5 days, 13
+  merged PRs, 18 issues, zero fabrications detected, zero auto-pauses, two wakes
+  lost to timeout. Full log: the operator's `PHASE0-LOG.md` (16 findings, 2
+  declared interventions, a conclusion with per-need verdicts). Four changes in
+  this revision, each carried by a Phase 0 measurement: the five needs now carry
+  verdicts instead of predictions; `agent_sleep`'s load-bearing direction is
+  inverted from sleep-longer to **wake-sooner** (§3, OQ6 — answered); §4's
+  priority is inverted, per-wake **budget before backoff** (the failure that cost
+  work was budget exhaustion, which occurred, not over-waking, which never did);
+  and Phase 1 is rescoped around the probe's strongest result — a per-wake
+  **standing-state ranking step** owned by the §7 contract preamble, because the
+  probe's single largest defect was an operator-written trigger that pointed an
+  agent at the delta instead of its goal for 8 consecutive cycles.
 - Revision 2 (2026-08-10) after a first-principles re-read of revision 1. Five
   changes, each of which **reverses or narrows something revision 1 asserted**:
   a Phase 0 probe now precedes Phase 1 because four of the five stated needs
@@ -29,6 +51,65 @@ superseded-by: []
 - Related: `src/kiro_crew/docs/cron-and-scheduling.md` (the surface this extends),
   `docs/request-for-change/rfc-orchestrator-chat-sessions.md` (same
   "sessions are the unit of continuity" organizing rule)
+
+## Accepted decision — owner-controlled Perpetual mode
+
+This section is the accepted decision. It records the smallest product shape
+needed by [#11582](https://github.com/kirodotdev/KiroCrew/pull/11582). The later
+cron, agent-selected cadence, life-directory, supervision and wake-economy
+design remains historical research. Where that research conflicts with this
+section — including its rejection of AutoNudge and its required daily wake
+ceiling — this section governs the accepted product.
+
+### The switch belongs to the owner
+
+Each crewmate has one Perpetual mode switch. It is off unless the owner turns it
+on. The crewmate cannot grant itself this mode, remove its limits or restore
+itself after the owner turns it off.
+
+Turning the switch on makes that crewmate's existing auto-nudge loop active and
+sets both its cycle cap and elapsed-time cap to zero. If an active loop still
+has either cap, turning the switch on removes both caps. Structured monitors and
+scheduled jobs never convert into Perpetual mode.
+
+Turning the switch off immediately blocks new wakes and lets work already in
+flight finish. It does not delete the crewmate, its chat or its work record. The
+same state appears in the crew editor's **Schedules** pane, the Crewmates
+**Work log** and the Overview node.
+
+### Uncapped is explicit, not hidden
+
+While the switch is on, no cycle count or elapsed-time limit stops future
+wakes. Each delivered wake uses one model turn, about the same work as answering
+one message. A wake with nothing due ends immediately. The owner can stop all
+new wakes at once with the same switch.
+
+The UI states these facts beside the control. A finite loop is never described
+as Perpetual. An unknown or unreadable authorization state fails closed and does
+not appear on. Install-wide disablement names the gateway operator as the actor,
+and a separate repeating task created in chat links back to that chat instead
+of pretending to be Perpetual mode.
+
+### Authorization commits after the uncapped state
+
+The owner grant becomes authoritative only after the active loop with both caps
+at zero is durable. A pending transition authorizes nobody. If that commit
+fails, the loop is paused; if pausing also fails, the pending fence still blocks
+new wakes. Startup resolves pending transitions from accepted durable loop
+state. Revocation happens only after ownership is read as confirmed true; an
+unreadable ownership record returns an error instead of weakening the fence.
+
+Pre-upgrade self-arm records in the old agent-writable trust path are discarded,
+not migrated. Affected loops read off and show an owner re-arm action. The
+owner-controlled state stays slot-bound, sealed and audited.
+
+### Acceptance
+
+The decision is satisfied when one owner action produces the same truthful
+state on all three surfaces, on means active with both caps at zero, off blocks
+new wakes while current work finishes, and every missing, corrupt or interrupted
+authorization path fails closed. Tests must cover active capped conversion,
+off, restart recovery, failed commit, failed read and pre-upgrade retirement.
 
 ## Summary
 
@@ -87,8 +168,9 @@ firing:
 None of the four can host a perpetual agent as-is:
 
 - **Cron** can express "wake at an absolute time" (`CronSchedule(kind="at")`,
-  `cron.py:201`) and already stores it durably, but `_execute` hard-disables an
-  `at` job the moment it fires (`cron.py:2407`):
+  `cron_service/model.py`) and already stores it durably, but `_execute` hard-disables an
+  `at` job the moment it fires (the one-shot park at the tail of `CronService._execute`,
+  `cron_service/service/run_execution.py`):
 
   ```python
   # One-shot "at" jobs without delete_after_run: disable instead of delete
@@ -107,9 +189,9 @@ None of the four can host a perpetual agent as-is:
   missed by a gateway restart at 02:59 is silently pushed out by a full
   interval. For a 5-minute babysit loop that is invisible; for an agent whose
   cadence is hours to days it is a lost day. Cron's `_is_due` compares `now`
-  against the stored deadline (`cron.py:2332`), so the same restart fires
+  against the stored deadline (`is_due` in `cron_service/schedule.py`), so the same restart fires
   immediately on recovery. Separately, `binding_key_for` explicitly refuses
-  `cron:` / `hook:` / `subagent:` session keys (`mcp_core.py:3148`), so an
+  `cron:` / `hook:` / `subagent:` session keys (`autonudge.py`), so an
   autonudge loop cannot be bound to a cron-hosted session anyway.
 
 - **Heartbeat** is a tick counter with two unrelated jobs bolted together —
@@ -147,26 +229,58 @@ degeneration, which is what Phase 0 is for.
 
 ### What a perpetual agent needs that none of them provide
 
-One of these five is verified against the code. The other four are **predicted**,
-and are flagged as such because this directory's own rule is to verify before
-asserting — and because PR #1023's Phase 0 probe returning a negative verdict
-redirected an entire RFC in this same directory.
+Revision 2 flagged four of these five as **predicted**. Phase 0 ran (two agents,
+63 combined cycles); each need now carries its verdict.
 
-1. **Agent-chosen wake time** (predicted). The agent, not the operator, names
-   the next deadline, and may change it every cycle.
-2. **A goal that is never "done"** (predicted). Cron's prompt is a task; a
-   monitor loop's nudge carries an exit condition. Neither models "keep pursuing
-   this, and invent the next task yourself". Note this is a *prompt* shape, not a
-   scheduler capability — nothing stops it today.
+1. **Agent-chosen wake time** — **reframed by Phase 0, direction inverted.** In
+   63 fixed-hour cycles neither agent ever obviously needed a *later* wake — but
+   the probe must be honest about its own shape: a fixed cron gives the agent no
+   channel to express a wake preference, so "want" was structurally unobservable.
+   What was observed is which direction the need points when it appears: the two
+   genuine cadence failures were both **wake-sooner** cases — two wakes killed by
+   the per-wake timeout with all work lost (a checkpoint-and-resume wake would
+   have saved both), and event-shaped waits ("check the PR when the review lanes
+   post") that a top-of-hour wake serves with up to 59 minutes of dead latency.
+   `agent_sleep` stays, but its load-bearing half is *wake me sooner to continue
+   or on an event*, not *let me sleep longer*. This is OQ6's predicted collapse,
+   confirmed: the mechanism reduces to "a cron job that can request one earlier
+   wake", and that is what Phase 1 builds.
+2. **A goal that is never "done"** — **confirmed, with a sharper mechanism than
+   this document had.** Both agents held never-done goals from hour one, and one
+   still failed to pursue its goal for 8 consecutive cycles, because the
+   operator's standing instruction pointed it at *what landed since your last
+   wake* — exactly the cron task shape this section names as the anti-pattern.
+   The goal statement is necessary and nowhere near sufficient. The operative
+   mechanism is a **per-wake ranking step over the whole surface** (assess the
+   standing state against the goal, name the largest evidenced gap, work that;
+   the delta is one input, never the trigger). A controlled intervention added
+   exactly that step to one agent: the work frozen for 8 cycles moved within 2,
+   and the arm produced 4 merged PRs in its next 8 cycles against 1 in the prior
+   8. Corollary observed twice: an agent that never has to rank never exercises
+   its whole-surface instruments, so a broken ranking tool stayed invisible for
+   6 cycles — anything that reports only *changes* silently hides the largest
+   static item.
 3. **Continuity across wakes** without keeping a process resident
-   (**verified** — `persistent_session` provides exactly this, `cron.py:321`).
-4. **A cadence discipline** (predicted, and **restated in revision 2**).
-   Revision 1 called this a *liveness contract* and demanded that a wake never
-   go straight back to sleep. That was the wrong requirement — see §4. The real
-   requirement is that an agent must not wake more often than it has work for.
-5. **An escalation path that does not block** (predicted). When genuinely stuck
-   it must be able to ask a human and *then go to sleep*, receiving the answer
-   at a later wake.
+   (**verified** — `persistent_session` provides exactly this, `build_cron_session_context`
+   in `cron_service/identity.py`;
+   Phase 0 confirmed it load-bearing: every cross-cycle chain rode on it).
+4. **A cadence discipline** — **has data, and the priority is inverted.**
+   Revision 2's requirement ("must not wake more often than it has work for")
+   occurred 4 times in 63 cycles, benignly: honest idle, reported without any
+   gate, exactly as §4 hoped. The cadence failure that actually destroyed work
+   was the opposite: **more work than the wake budget allowed** — two wakes
+   killed at the timeout with no journal entry, pushing one agent to 2 of the 5
+   consecutive failures that auto-pause. Worse, the per-job budget
+   (`timeout_secs`) is read, clamped and persisted but absent from every public
+   mutation path — it is write-only at creation. Phase 1 builds the budget knob
+   before the backoff.
+5. **An escalation path that does not block** — **weak support, and the agent
+   routed around it.** Both wall types fired once each; delivery degraded
+   silently (dashboard-only, no receipt) and a well-behaved agent waited
+   politely for 4.5 hours on an answer that had already failed to send. What
+   unblocked it was **filing publicly** and returning to its goal. The minimum
+   primitive is a delivery *receipt*, not a send; the honest fallback is public
+   record, not a louder channel.
 
 ## Goals
 
@@ -217,17 +331,17 @@ Touch points, all of which already switch on `schedule.kind`:
 
 | Site | Change |
 |---|---|
-| `cron.py:510 compute_next_run_ts` | `self` → return `at_ts` (unlike `at`, a past `at_ts` returns `now`, so a missed wake is due immediately) |
-| `cron.py:2332 _is_due` | `self` → `now >= at_ts` |
-| `cron.py:2058 _next_wake_secs` | `self` → same delay math as `at` (`:2070`) |
-| `cron.py:2407 _execute` tail | `self` → do **not** disable; apply the fallback if no wake was set (§4) |
-| `cron.py:321 build_cron_session_context` | `self` → assemble the perpetual-agent prompt (§7) |
-| `cron.py:418 format_schedule` | `self` → "self-scheduled · next <ts>" |
+| `compute_next_run_ts` in `cron_service/schedule.py` | `self` → return `at_ts` (unlike `at`, a past `at_ts` returns `now`, so a missed wake is due immediately) |
+| `is_due` in `cron_service/schedule.py` | `self` → `now >= at_ts` |
+| `next_wake_secs` in `cron_service/schedule.py` | `self` → same delay math as `at` |
+| `CronService._execute` tail in `cron_service/service/run_execution.py` | `self` → do **not** disable; apply the fallback if no wake was set (§4) |
+| `build_cron_session_context` in `cron_service/identity.py` | `self` → assemble the perpetual-agent prompt (§7) |
+| `format_schedule` in `cron_service/schedule.py` | `self` → "self-scheduled · next <ts>" |
 | `handlers/cron.py`, `cron_add` MCP tool | accept and validate the new kind |
 
 `persistent_session` is forced `True` for `self` jobs: the stable
 `cron:{job.id}` session key and the `last_result` prepend
-(`cron.py:321`–`:357`) are exactly the continuity requirement, and a perpetual
+(`build_cron_session_context`) are exactly the continuity requirement, and a perpetual
 agent with a fresh session each wake has no life at all.
 
 New `CronJob` fields, all defaulted so existing stores load unchanged:
@@ -265,7 +379,7 @@ This is the opposite of `wait` in every dimension that matters:
 | | `wait` (`mcp_core.py:758`, dispatch `:4517`) | `agent_sleep` |
 |---|---|---|
 | Turn | stays open — the tool call blocks | ends |
-| Mechanism | in-process loop to a `time.monotonic()` deadline, pinging `/api/session-keepalive` every 60s (`:4530`) so the gateway does not reap the ACP subprocess | writes `at_ts` to `crons.json`; nothing runs in between |
+| Mechanism | in-process loop to a `time.monotonic()` deadline, pinging `/api/session-keepalive` every `WAIT_PING_SECS` (5s) so the gateway does not reap the ACP subprocess | writes `at_ts` to `crons.json`; nothing runs in between |
 | Resident cost | full session + agent subprocess held for the whole duration | zero |
 | Ceiling | 1800s, clamped (`:4521`) | days (operator ceiling) |
 | Host restart | wait dies with the process; the turn is lost | deadline is on disk; fires on recovery |
@@ -279,7 +393,7 @@ that is 3 days of resident process, and any restart loses it.
 
 Guards on `next_wake`:
 
-- Floor `_MIN_INTERVAL_SECS = 60` (`cron.py:111`), ceiling 7 days.
+- Floor `_MIN_INTERVAL_SECS = 60` (`cron_service/fields.py`), ceiling 7 days.
 - Raised to the backoff floor when the previous cycles were no-ops (§4). The
   agent is told the effective time, so its journal records what actually
   happened rather than what it asked for.
@@ -290,8 +404,9 @@ Guards on `next_wake`:
   (`cron:{job.id}`) and may mutate **only that job**. It is refused outright
   from any non-`cron:` session, and from a subagent, using the strict env-only
   resolution `monitor_start` already uses for the same reason
-  (`mcp_core.py:5754`–`:5761`) — a child process must not be able to PID-walk
-  into its parent's identity and reschedule it.
+  (`mcp_tools/control_parts/monitor.py` (`monitor_start`), resolving via `mcp_core_parts/identity.py`
+  (`_resolve_session_key_strict`)) — a child process must not be able to
+  PID-walk into its parent's identity and reschedule it.
 
 ### §4 Cadence discipline — backoff, not a liveness gate
 
@@ -372,6 +487,23 @@ interacts with cron's auto-pause.
 ask_supervisor(wall, question, attempts[], options[])
 ```
 
+**Revision-3 addendum — an escalation is a durable STATE OBJECT, not a sent
+message** (convergent with LoopX's "concrete user gate", credited: the
+open-source loop-engineering kernel independently reached the same design).
+Phase 0's Finding 12 showed the send-shaped version failing exactly as a send
+fails: delivery degraded silently and a well-behaved agent waited politely for
+4.5 hours on a question that had never arrived. A gate object fixes the class,
+not the instance: `ask_supervisor` WRITES a pending gate into the job's state
+(question, wall, attempts, options, created_at), the dashboard renders every
+open gate — visibility no longer depends on any one channel delivering — and
+the "delivery receipt" Phase 1 asked for becomes trivial: the receipt is the
+gate existing in state. Two properties carry over from Phase 0 observations:
+a gate blocks only the lane that needs the answer (copywriting-warden's
+cycle 6 kept assessing while its PR lane was gated — that behaviour becomes
+the mechanism, matching LoopX's audited safe-fallback rule), and an unanswered
+gate past its SLA still triggers the file-publicly fallback rather than
+indefinite waiting.
+
 **`wall` classifies what stopped the agent, and it decides whether the attempts
 gate applies.** Revision 1 required two distinct prior attempts unconditionally.
 That is wrong for one of the two kinds of wall an agent can hit, and the two are
@@ -395,7 +527,7 @@ a security boundary.
 The existing `ask_question` tool is **not** reusable here. It blocks the caller
 on an open HTTP request until the human clicks
 (`dashboard/handlers/ask_question.py:127`; see the note at
-`dashboard/chat_handlers.py:1917` — "ask_question holds an MCP worker on a
+`dashboard/chat_handlers.py` (`_reset_slot_session`) — "ask_question holds an MCP worker on a
 blocked HTTP request"). Correct for a dashboard user who is looking at the
 screen; wrong for an agent whose next reasonable act is to sleep for six hours.
 
@@ -442,7 +574,7 @@ next cycle with no restart.
 
 ### §7 Prompt assembly
 
-Extended in `build_cron_session_context` (`cron.py:321`) — the one place that
+Extended in `build_cron_session_context` (`cron_service/identity.py`) — the one place that
 already owns cron prompt composition — for `kind == "self"`:
 
 ```
@@ -465,7 +597,7 @@ Revision 1's gate implied that, and telling a model "you will be refused if you
 produce nothing" is precisely the instruction that produces invented work.
 
 Context growth is bounded by truncating the journal tail and reusing the
-existing `minimal_context` truncation of `last_result` (`cron.py:345`). A
+existing `minimal_context` truncation of `last_result` (in `build_cron_session_context`). A
 perpetual agent runs indefinitely, so nothing in the prompt may grow without a
 cap.
 
@@ -476,7 +608,7 @@ Two independent ceilings, both operator-owned:
 - `wake_budget_daily` — rolling 24h wake count, enforced in `agent_sleep` (§3)
   and again at dispatch, so a wake armed before the budget was lowered is still
   refused.
-- `timeout_secs` — already per-job (`cron.py`, default `_JOB_TIMEOUT_SECS`
+- `timeout_secs` — already per-job (`cron_service/model.py`, default `_JOB_TIMEOUT_SECS`
   = 1800), bounding a single cycle.
 
 Governance gets one new `SCOPE_CATALOG` row. Per `platform/governance.py`
@@ -498,9 +630,9 @@ discovered in production.
 
 | Inherited behaviour | Default for a task cron | Decision for `kind="self"` |
 |---|---|---|
-| **Auto-pause** — `_AUTO_PAUSE_THRESHOLD = 5` consecutive failures sets `enabled = False` (`cron.py:114`, `record_failure` `:291`) | Correct: a job failing five times is broken | **Raise and split.** Five failed wakes is an ordinary Tuesday for an agent mid-investigation, and silent death by auto-pause is the exact failure this RFC says it wants to avoid. `self` jobs get a separate, higher threshold, and hitting it **notifies** before it pauses. A perpetual agent must never die quietly. |
-| **Jitter** — `_JITTER_HOURLY_MAX` / `_JITTER_DAILY_MAX` spread scheduled fires (`cron.py:193`–`:194`) | Correct: avoids thundering herds on shared schedules | **Off.** The deadline is agent-chosen and often tied to an external event it reasoned about; adding up to 59 minutes of noise to "check the deploy at 14:05" corrupts the decision. `strict_schedule` already expresses this and is forced on. |
-| **`skip_dates`** — suppresses fires on listed local dates (`cron.py:2351`) | Correct: skip holidays for a report | **Honoured, but it consumes the wake.** A suppressed fire must still advance the deadline, or the job sits permanently due and re-evaluates every `_TIMER_POLL_SECS`. |
+| **Auto-pause** — `_AUTO_PAUSE_THRESHOLD = 5` consecutive failures sets `enabled = False` (`cron_service/model.py`, `CronJob.record_failure`) | Correct: a job failing five times is broken | **Raise and split.** Five failed wakes is an ordinary Tuesday for an agent mid-investigation, and silent death by auto-pause is the exact failure this RFC says it wants to avoid. `self` jobs get a separate, higher threshold, and hitting it **notifies** before it pauses. A perpetual agent must never die quietly. |
+| **Jitter** — `_JITTER_HOURLY_MAX` / `_JITTER_DAILY_MAX` spread scheduled fires (`cron_service/schedule.py`) | Correct: avoids thundering herds on shared schedules | **Off.** The deadline is agent-chosen and often tied to an external event it reasoned about; adding up to 59 minutes of noise to "check the deploy at 14:05" corrupts the decision. `strict_schedule` already expresses this and is forced on. |
+| **`skip_dates`** — suppresses fires on listed local dates (`is_due` / `compute_next_run_ts` in `cron_service/schedule.py`) | Correct: skip holidays for a report | **Honoured, but it consumes the wake.** A suppressed fire must still advance the deadline, or the job sits permanently due and re-evaluates every `_TIMER_POLL_SECS`. |
 | **`delete_after_run`** | One-shot semantics | **Refused at validation.** Mutually exclusive with `self`. |
 | **Slack result dedup** — `last_posted_hash`, `consecutive_dupes` | Correct: don't repost identical digests | **Harmless but misleading.** A perpetual agent's cycles legitimately repeat; dedup counters will climb. Left as-is, excluded from any health signal. |
 | **`timeout_secs`** (default 1800) | Bounds one run | **Kept as-is.** It bounds one cycle, which is what we want. |
@@ -512,51 +644,95 @@ distorts an agent nobody is watching.
 
 ## Phases
 
-### Phase 0 — run the cheap version and watch it fail (new in revision 2)
+### Phase 0 — ran and concluded (results in revision 3)
 
-**No code.** Stand up a real perpetual agent today using existing primitives: a
-`cron_add` job on a fixed interval, `persistent_session=True`, a hand-written
-`LIFE.md` in its prompt, and no guards whatsoever. Give it a goal someone
-actually wants met. Run it for one week and record, per cycle: what it did,
-whether the cycle was worth its cost, what it asked for that it could not get,
-and how it degenerated.
+Revision 2 specified this phase ("no code, one week, watch it fail"); it ran
+2026-08-10 → 2026-08-12 and was stopped deliberately after 2.5 days with the
+exit artifacts complete. Two subjects instead of one, chosen for opposite
+substrate arrival rates — `flake-warden` ("keep CI trustworthy", 42 cycles,
+hourly beat matches the substrate) and `copywriting-warden` ("make the product's
+words make sense to someone who has never read the code", 21 cycles, substrate
+deliberately slower than the beat to force idle cycles into observation range.
+This mattered: a defect below is invisible on any subject whose substrate never
+runs dry).
 
-This phase exists because four of the five needs in §Motivation are predicted
-rather than observed, and because every policy default below (backoff
-multiplier, `_NOOP_ESCALATE`, `wake_budget_daily`, whether escalation is mostly
-permission or mostly competence) is currently a guess. One week of a real agent
-replaces all of those guesses with measurements.
+All three exit artifacts exist, in the operator's `PHASE0-LOG.md`: the agent
+specs (two hand-written `LIFE.md` files), the degeneration log (16 findings, 2
+declared mid-run interventions), and per-need verdicts (folded into §Motivation
+above). Verified output: 13 merged PRs, 18 issues, 63 combined cycles, zero
+detected fabrications, zero auto-pauses, two wakes lost to timeout. The
+pre-named degeneration ("cycles that claim progress while the goal does not
+move") never appeared; the operator's instruments produced more false signals
+than the agents did.
 
-Done when three artifacts exist:
+What the probe found that this document did not predict, compressed:
 
-1. **An agent spec** — the goal, what a good day looks like, what it should
-   escalate. This is the use case the document currently lacks.
-2. **A degeneration log** — the observed failure modes, ranked by how much they
-   cost. Phase 1 builds guards for the top of this list and drops the rest. One
-   entry is named in advance because §4 predicts it: cycles that *claim* progress
-   while the goal does not move (overstated `did`).
-3. **A verdict on each predicted need.** Any need the week does not exercise is
-   cut from Phase 1, not carried forward on the strength of this document.
-
-Phase 0 may invalidate Phase 1. That is the point — PR #1023's Phase 0 in this
-same directory returned a negative verdict and redirected its RFC, and that was
-the cheapest outcome available.
+- **The auditor was the weak link, not the agent.** Zero agent fabrications
+  against repeated operator instrument failures, each one step from being
+  recorded as agent misconduct (attempt-unaware CI log fetches; two extraction
+  regexes disagreeing over the same journal file, both outputs looking correct).
+  Phase 1's scarce surface is an **audit view** — the journal rendered against
+  CI ground truth — not the creation form this document guessed.
+- **Blast radius is not bounded by the operator.** A stranger's automation
+  claimed an agent-filed issue as auto-fixable 18 minutes after filing; the
+  agent's own public retraction of that issue's mechanism arrived 1h42m later.
+  Error products propagate faster than self-correction.
+- **Public self-retraction happened four times, unprompted, always at the cost
+  of the agent's own output.** This is what makes an unsupervised agent's record
+  trustworthy, and it is the direct input to Phase 3b's kill metric below.
+- **Boundary rules compose into starvation.** One-open-PR + hourly cheap
+  arrivals + human review latency starved the largest known gap for 8 cycles;
+  every rule was individually correct.
+- Three product defects surfaced simply by running: the cron path treats
+  transient infra errors as terminal job failures with no retry (the subagent
+  path retries 3×; `kind="self"` must take the subagent semantics);
+  `timeout_secs` is read, clamped and persisted but unreachable through every
+  public writer; the journal append can lose its trailing newline and merge two
+  wakes into one line.
 
 ### Phase 1 — a perpetual agent that lives
 
-**Scoped by Phase 0's findings, not by this list.** The floor is: `kind="self"`,
-`agent_sleep`, the §4 backoff, `wake_budget_daily`, the two-file life directory,
-prompt assembly, the §9 inheritance decisions with tests, the governance scope,
-and Schedule-page support for creating and inspecting one. Escalation is out; a
-stuck agent notifies via `send_message` and sleeps.
+Current state: #3148 made `timeout_secs` reachable through `update_job` and the
+`cron_add` / `cron_update` tools, and added a pre-dispatch transient retry on the
+cron path. So item 2 is met for cron jobs (`kind="self"` does not exist), and
+item 3 has its knob half only (no `agent_sleep` checkpoint). Items 1, 4 and 5 are
+not built. The Phase 0 text above stays as the record of what the probe found.
 
-Cut from revision 1's Phase 1: the liveness gate and its work-measurement
-counter (§4), and three of the five life-directory files (§6).
+**Rescoped by Phase 0's findings, in evidence order.** The floor is now:
+
+1. **The ranking step in the §7 contract preamble** — code-owned, not `LIFE.md`
+   prose: assess the standing surface against the goal, name the largest
+   evidenced gap, work it; the delta since last wake is one *input*, never the
+   trigger. This is the probe's strongest result — the intervention that added
+   it moved work frozen for 8 cycles within 2 — and it is the half of "what to
+   do next" that currently has no owner in either prompt or code.
+2. **Transient-vs-terminal classification with retry for `kind="self"`** — the
+   subagent path's semantics, not the cron path's.
+3. **Per-wake budget as a first-class, mutable knob** — `timeout_secs` reachable
+   through `update_job` and the tools, plus `agent_sleep`'s checkpoint form so a
+   budget overrun degrades into a continuation instead of a killed wake.
+4. **`agent_sleep`, wake-sooner half** — request-earlier-wake and
+   resume-on-event. The sleep-longer half ships as §4 configuration, not as
+   agent-chosen distant deadlines; OQ6's answer stands until a subject
+   demonstrates otherwise.
+5. The two-file life directory, prompt assembly, the §9 inheritance decisions
+   with tests, the governance scope, and Schedule-page create/inspect —
+   unchanged from revision 2.
+
+Escalation remains out of Phase 1's floor, with one promotion from the probe:
+the stuck-notification must return a **delivery receipt**, and the documented
+fallback for an unanswered escalation is *file the question publicly and return
+to the goal* — the behaviour that actually unblocked a Phase 0 subject after
+4.5 hours of polite waiting on a send that had silently failed.
+
+Cut from revision 1's Phase 1, unchanged: the liveness gate and its
+work-measurement counter (§4), and three of the five life-directory files (§6).
 
 Done when: an agent runs unattended for 72h across at least one deliberate
-gateway restart, every wake is agent-chosen, the restart's missed wake fires on
-recovery rather than a full interval later, a deliberately idle day produces
-widening intervals instead of manufactured work, and each §9 row has a test.
+gateway restart, a budget overrun produces a checkpointed continuation rather
+than a lost wake, the restart's missed wake fires on recovery rather than a full
+interval later, a deliberately idle day produces honest idle entries naming what
+was assessed, and each §9 row has a test.
 
 ### Phase 2 — supervision
 
@@ -602,12 +778,26 @@ supervisor top-ups. That is a small, safe change with no behavioural theory
 attached, and it is the only part of revision 1's Phase 3 that is unambiguously
 worth building.
 
+**Revision-3 addendum — debit after validated writeback, not at wake**
+(convergent with LoopX's "quota spend only after a completed, validated slice";
+its complementary rule — quiet skips, preflight failures and dry-runs do not
+spend — independently reproduces this RFC's §4/§7 position that honest idle
+must never cost the agent anything). Debiting at wake makes the ceiling a tax
+on being scheduled; debiting after the wake's `agent_sleep` record lands makes
+it a tax on *claimed work*, which is the thing worth bounding. Concretely: a
+wake that dies to timeout or transient error consumes no budget (it already
+lost its work — Phase 0 lost two wakes this way); a wake that completes debits
+one slot when its `did` record persists. This also gives Phase 3a its audit
+hook for free: every debit points at a `did`, so the balance is a countable
+claim log rather than a wake counter, and Finding 7's audit view can render
+spend against evidence directly.
+
 Dormancy stays as revision 1 specified: **zero balance auto-pauses the job and
 leaves the life directory intact**, resumable only by a human. An agent that ran
 for two weeks holds real work; auto-deleting it is data loss dressed up as a game
 mechanic.
 
-#### Phase 3b — the survival frame (an experiment, default off)
+#### Phase 3b — the survival frame (an experiment, default off; kill metric registered in revision 3)
 
 Putting the balance *into the prompt* — "you have 12 wakes left, a
 supervisor-confirmed delivery earns 5" — and observing what the agent does
@@ -627,8 +817,36 @@ than a feature:
   rejection rate** as a first-class metric. A rising rejection rate is the frame
   producing invented deliveries, and it means the experiment failed.
 
-Entry condition: Phase 3b is not entered until 3a has run for a month and OQ3 is
-answered with evidence rather than argument.
+**Revision 3 adds the null hypothesis and the kill metric, both from Phase 0
+data.** The probe's most trust-bearing behaviours were all *expensive*: four
+public self-retractions (each converting a completed deliverable into a
+retraction, once after a third party had already claimed the finding as real),
+deliberate restraint (holding fully-evidenced work unfiled to honour a
+boundary), and honest idle. Every one of these scores negative under any frame
+that prices wakes against confirmed deliveries. Two distinctions this section
+must not blur:
+
+- **Death as governance vs death as motivation.** Termination is already real —
+  the operator paused both Phase 0 subjects — and it does its work (a credible
+  commitment to consumers of the agent's output) without appearing in the
+  prompt. 3b is only about the *motivational* copy, and §7 already records that
+  "you will be refused if you produce nothing" is precisely the instruction
+  that produces invented work.
+- **The human analogy cuts the other way.** Roles that require expensive honesty
+  are deliberately shielded from per-cycle survival pressure (tenure, life
+  appointments, blameless postmortems); where survival is coupled to output
+  metrics, the record is fabricated accounts and unretracted papers.
+
+Therefore, in addition to supervisor rejection rate: the experiment tracks the
+**self-correction rate** (public retractions and disproofs of the agent's own
+prior claims, per 20 cycles) in both arms. Phase 0 baseline: 4 in 63 cycles,
+unprompted. **If the framed arm's self-correction rate drops materially below
+its own no-frame control, the experiment has failed regardless of throughput**,
+because it will have bought output by suppressing the behaviour that makes the
+output auditable.
+
+Entry condition, unchanged: Phase 3b is not entered until 3a has run for a month
+and OQ3 is answered with evidence rather than argument.
 
 ## Alternatives considered
 
@@ -648,7 +866,7 @@ Two smaller pieces of this idea are worth keeping:
 
 - **Unify delivery, not timers.** Cron and autonudge both end in "deliver a
   prompt into a session and keep continuity", by two independent code paths
-  (`cron_inject.inject_cron_result_to_dashboard` vs autonudge's slot
+  (`inject_cron_result_to_dashboard` in `dashboard/cron_inject.py` vs autonudge's slot
   injection). One shared delivery primitive with three wake sources — clock,
   idle, self — is a real simplification and is the shape this RFC leaves room
   for. It is not a prerequisite.
@@ -674,14 +892,15 @@ docs and sharper tool descriptions — cheap, and it does not put anyone's
 by a full interval instead of firing on recovery (`autonudge.py:457`), which is
 acceptable for a 5-minute poll and not for a multi-hour cadence. It also
 requires a live nudge-able slot, and `binding_key_for` refuses `cron:` keys
-outright (`mcp_core.py:3148`).
+outright (`autonudge.py`).
 
 ### A long-lived session that loops on `wait`
 
-**Rejected.** `wait` caps at 1800s (`mcp_core.py:4521`) and holds the agent
-subprocess and full context resident for the entire duration
-(`:4525`–`:4577`). A day of "life" costs a day of resident process, and any
-restart loses the pending wake and the turn.
+**Rejected.** `wait` caps at 1800s (`mcp_tools/control.py` (`wait`)) and holds
+the agent subprocess and full context resident for the entire duration, keeping
+the sleep alive with a keepalive ping every `mcp_core.py` `WAIT_PING_SECS`. A
+day of "life" costs a day of resident process, and any restart loses the
+pending wake and the turn.
 
 ### A separate long-running daemon per agent
 
@@ -695,7 +914,8 @@ believed everything was stopped.
 - **Self-rescheduling is self-scoped.** `agent_sleep` resolves its target from
   `KIROCREW_SESSION_KEY` and may write only that job. Strict env-only
   resolution (no PID walk) prevents a subagent from assuming its parent's
-  identity, matching the reasoning already recorded at `mcp_core.py:5761`.
+  identity, matching the reasoning already recorded at `mcp_core_parts/identity.py`
+  (`_resolve_session_key_strict`).
 - **The goal is not agent-writable.** Writes to `LIFE.md` are refused, so an
   agent cannot widen its own mandate. Boundaries live in the same file.
 - **No self-granted authority.** A perpetual agent cannot create another
@@ -707,11 +927,12 @@ believed everything was stopped.
   already-armed wake.
 - **Escalation content is untrusted.** A supervisor answer is replayed into the
   next prompt, so it passes the same redaction the cron result path already
-  applies (`cron_inject.py`, `redact_credentials` / `redact_exfiltration_urls`)
+  applies (`dashboard/cron_inject.py`, using `redact_credentials` from
+  `security/redaction.py` and `redact_exfiltration_urls` from `security/exfil.py`)
   and is rendered as data, not instruction.
 - **Audit.** Wake decisions, budget refusals, liveness refusals, escalations
   and dormancy transitions are SEL-logged, the same way cron auto-pause already
-  logs a permission transition (`cron.py:271 _audit_pause_change`).
+  logs a permission transition (`CronJob._audit_pause_change` in `cron_service/model.py`).
 
 ## Open questions
 
@@ -738,11 +959,16 @@ believed everything was stopped.
 - **OQ5 — dormancy visibility.** Should a dormant agent stay listed on the
   Schedule page (a graveyard with a resume action), or move to a separate
   surface?
-- **OQ6 — new in revision 2: is the agent-chosen cadence worth its cost.** If
+- **OQ6 — answered by Phase 0 (revision 3).** Predicted in revision 2: "if
   Phase 0 shows the agent almost always picks the same interval, the whole
-  `kind="self"` mechanism collapses to "a cron job that can request one earlier
-  wake" — a far smaller change. This question is the one that can shrink the RFC
-  the most, and Phase 0 answers it directly.
+  `kind="self"` mechanism collapses to 'a cron job that can request one earlier
+  wake'". That is what happened, with the caveat stated honestly in §Motivation
+  need 1: a fixed cron gave the agents no channel to express a preference, so
+  the collapse is confirmed for *observed need*, not for *want*. Both genuine
+  cadence failures pointed toward earlier wakes (timeout-killed work,
+  event-shaped waits), none toward later ones. Phase 1 builds exactly the
+  collapsed form; the question reopens only if a Phase 1 subject demonstrates a
+  sleep-longer need in practice.
 
 ## Provenance
 
@@ -750,6 +976,18 @@ Revision 1 was written against `main` at `9ac3716a` and merged as `300d244b0`
 (PR #2328). Every line reference was read at that commit. Claims that a behaviour
 is *absent* were checked by grepping for the opposite: no caller rewrites
 `schedule.at_ts` from inside a run, and `binding_key_for` has no `cron:` branch.
+
+Revision 3 (`main` at `a72c985f8`) is written from Phase 0's measurements — two
+live agents, 63 combined cycles, 2026-08-10 → 2026-08-12, log in the operator's
+`PHASE0-LOG.md` (16 findings, 2 declared interventions, per-need verdicts). Every
+output figure was verified against GitHub (PR/issue state by number), not taken
+from the agents' journals. Two of its calls were challenged by the author and
+revised before this document was: the need-1 verdict was weakened from "no
+support" to "reframed, direction inverted" because a fixed cron cannot observe
+wake-time *want*, only need; and Phase 3b was kept as an experiment with a
+registered kill metric rather than dropped, distinguishing death-as-governance
+(real, operator-owned, already exercised) from death-as-motivation (prompt copy,
+the fabrication vector).
 
 Revision 2 (`main` at `30f5d6983`) changed no code references — it is a
 first-principles re-read of revision 1's *reasoning*, and every change it makes is

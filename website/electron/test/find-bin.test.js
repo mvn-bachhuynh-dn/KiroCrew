@@ -2,7 +2,7 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");
 const fs = require("fs");
-const { findKirocrewBin } = require("../find-bin");
+const { findKirocrewBin, findSshBin } = require("../find-bin");
 
 const HOME = "/mock/home";
 const RESOURCES = "/mock/resources";
@@ -21,29 +21,11 @@ const none = {
 };
 
 describe("findKirocrewBin", () => {
-  it("returns bundled path when it exists", () => {
-    const bundled = path.join(RESOURCES, "backend-dist", "kirocrew-backend", "kirocrew-backend");
-    const fakeFs = only(bundled);
-    const result = findKirocrewBin(fakeFs, fakeOs, path, RESOURCES, DIRNAME);
-    assert.equal(result, bundled);
-  });
-
-  it("returns bundled venv layout (backend-dist/.../bin/kirocrew) when the flat PyInstaller exe is absent", () => {
+  it("returns the bundled backend launcher (backend-dist/.../bin/kirocrew) when it exists", () => {
     const venvLayout = path.join(RESOURCES, "backend-dist", "kirocrew-backend", "bin", "kirocrew");
     const fakeFs = only(venvLayout);
     const result = findKirocrewBin(fakeFs, fakeOs, path, RESOURCES, DIRNAME);
     assert.equal(result, venvLayout);
-  });
-
-  it("prefers the flat PyInstaller exe over the venv-layout bin/kirocrew", () => {
-    const bundled = path.join(RESOURCES, "backend-dist", "kirocrew-backend", "kirocrew-backend");
-    const venvLayout = path.join(RESOURCES, "backend-dist", "kirocrew-backend", "bin", "kirocrew");
-    const fakeFs = {
-      accessSync: (p) => { if (p !== bundled && p !== venvLayout) throw new Error("ENOENT"); },
-      constants: { X_OK: fs.constants.X_OK },
-    };
-    const result = findKirocrewBin(fakeFs, fakeOs, path, RESOURCES, DIRNAME);
-    assert.equal(result, bundled);
   });
 
   it("returns ~/.toolbox/bin/kirocrew when bundled paths don't exist", () => {
@@ -163,7 +145,7 @@ describe("findKirocrewBin", () => {
   });
 
   it("returns first match when multiple candidates exist", () => {
-    const bundled = path.join(RESOURCES, "backend-dist", "kirocrew-backend", "kirocrew-backend");
+    const bundled = path.join(RESOURCES, "backend-dist", "kirocrew-backend", "bin", "kirocrew");
     const localBin = path.join(HOME, ".local", "bin", "kirocrew");
     const fakeFs = {
       accessSync: (p) => { if (p !== bundled && p !== localBin) throw new Error("ENOENT"); },
@@ -181,7 +163,7 @@ describe("findKirocrewBin", () => {
   });
 
   it("resolves dirname-relative dev path correctly", () => {
-    const devBin = path.resolve(DIRNAME, "backend-dist", "kirocrew-backend", "kirocrew-backend");
+    const devBin = path.resolve(DIRNAME, "backend-dist", "kirocrew-backend", "bin", "kirocrew");
     const fakeFs = only(devBin);
     const result = findKirocrewBin(fakeFs, fakeOs, path, RESOURCES, DIRNAME);
     assert.equal(result, devBin);
@@ -244,5 +226,82 @@ describe("findKirocrewBin", () => {
     const result = findKirocrewBin(fakeFs, fakeOs, path, RESOURCES, DIRNAME, "ia32");
     assert.equal(result, unsuffixed);
     assert.deepStrictEqual(probed.filter((p) => p.includes("kirocrew-backend-")), []);
+  });
+});
+
+describe("findSshBin", () => {
+  const executable = (...present) => ({
+    accessSync: (p) => { if (!present.includes(p)) throw new Error("ENOENT"); },
+    constants: { X_OK: fs.constants.X_OK },
+  });
+
+  it("takes /usr/bin/ssh and never consults PATH on POSIX", () => {
+    const planted = executable("/home/u/.local/bin/ssh", "/usr/bin/ssh");
+    assert.equal(findSshBin(planted, path.posix, false), "/usr/bin/ssh");
+  });
+
+  it("finds a NixOS system ssh in the trusted system profile", () => {
+    const nix = "/run/current-system/sw/bin/ssh";
+    assert.equal(findSshBin(executable(nix), path.posix, false), nix);
+  });
+
+  it("ignores an ssh that exists only in a PATH-only directory", () => {
+    const result = findSshBin(executable("/opt/homebrew/bin/ssh"), path.posix, false);
+    assert.equal(result, "/usr/bin/ssh");
+  });
+
+  // `realpathSync.native` stands in for the kernel's answer about
+  // `\\?\GLOBALROOT\SystemRoot`; `resolved` is what it returns, or an Error it throws.
+  const kernelRoot = (resolved) => {
+    const probed = [];
+    return {
+      probed,
+      realpathSync: {
+        native: (p) => {
+          probed.push(p);
+          if (resolved instanceof Error) throw resolved;
+          return resolved;
+        },
+      },
+    };
+  };
+
+  it("takes the in-box client under the Windows directory the kernel names", () => {
+    const fsMod = kernelRoot("D:\\Windows");
+    assert.equal(findSshBin(fsMod, path, true), "D:\\Windows\\System32\\OpenSSH\\ssh.exe");
+    assert.deepStrictEqual(fsMod.probed, ["\\\\?\\GLOBALROOT\\SystemRoot"]);
+  });
+
+  it("strips a namespaced prefix from the kernel's answer", () => {
+    assert.equal(
+      findSshBin(kernelRoot("\\\\?\\C:\\WINDOWS"), path, true),
+      "C:\\WINDOWS\\System32\\OpenSSH\\ssh.exe",
+    );
+  });
+
+  it("ignores SystemRoot, which HKCU\\Environment can rewrite", () => {
+    const saved = process.env.SystemRoot;
+    process.env.SystemRoot = "C:\\Planted";
+    try {
+      assert.equal(
+        findSshBin(kernelRoot("D:\\Windows"), path, true),
+        "D:\\Windows\\System32\\OpenSSH\\ssh.exe",
+      );
+    } finally {
+      if (saved === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = saved;
+    }
+  });
+
+  it("refuses on Windows when the kernel's answer is not a plain X:\\Windows", () => {
+    for (const resolved of [
+      new Error("EINVAL"),
+      "\\\\?\\Volume{0b1e5a8c-0000-0000-0000-100000000000}\\Windows",
+      "C:\\Users\\u\\Windows",
+      "C:\\WINNT",
+      "",
+    ]) {
+      assert.equal(findSshBin(kernelRoot(resolved), path, true), null, String(resolved));
+    }
   });
 });

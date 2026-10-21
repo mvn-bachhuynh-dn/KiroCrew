@@ -22,6 +22,7 @@ import {
 import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import Clickable from '../../../components/Clickable'
+import ErrorNotice from '../../../components/ErrorNotice'
 
 import EmptyState from '../components/EmptyState'
 import ListSkeleton from '../components/ListSkeleton'
@@ -30,6 +31,7 @@ import { relativeAge } from '../lib/format'
 
 import { useDialogFocusTrap } from '../../../hooks/useDialogFocusTrap'
 import { i18nT } from '../../../i18n/t'
+import { useImeGuard } from '../../../hooks/useImeGuard'
 
 /** One selectable repo row, shared by both lists. */
 function RepoRow({
@@ -88,7 +90,8 @@ function SectionHead({ title, hint }: { title: string; hint?: string }) {
 }
 
 /** `gh` isn't installed or signed in — a normal first-run state, not an error. */
-function GhNotice({ message }: { message?: string }) {
+/** `bare` drops the add-by-URL hint for surfaces that have no URL field. */
+export function GhNotice({ message, bare }: { message?: string; bare?: boolean }) {
   return (
     <div className="rounded-lg border border-border bg-bg-elevated px-3 py-2.5 text-[12.5px] leading-[1.6]">
       <span className="inline-flex items-center gap-1.5 text-warn font-medium">
@@ -98,7 +101,7 @@ function GhNotice({ message }: { message?: string }) {
         {/* One sentence in one key, with the command on its own line: the copy
             used to be four sibling keys wrapped around two <code> elements,
             which no translator could reorder. */}
-        {i18nT('apps.codeReviewSage.components.addReposModal.setup_hint')}
+        {!bare && i18nT('apps.codeReviewSage.components.addReposModal.setup_hint')}
         <div className="mt-1">
           <code className="font-mono">
             {i18nT('apps.codeReviewSage.components.addReposModal.gh_auth_login')}
@@ -111,6 +114,7 @@ function GhNotice({ message }: { message?: string }) {
 }
 
 export default function AddReposModal({ onClose }: { onClose: () => void }) {
+  const ime = useImeGuard()
   const {
     pinnedRepos, pinRepo, pinRepoUrl, pinError, unpinRepo,
     recent, recentLoading, recentError,
@@ -167,7 +171,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
         * semantics. `absolute` (not `fixed`) scopes the blur to the app area. */}
       <div className="absolute inset-0 z-50 flex items-center justify-center p-4">
         <Clickable
-          className="absolute inset-0 bg-bg/50 backdrop-blur-sm"
+          className="absolute inset-0 bg-bg/50 backdrop-blur-xs"
           onClick={requestClose}
           aria-label={i18nT('apps.codeReviewSage.components.addReposModal.close_add_repos_dialog')}
         />
@@ -181,10 +185,10 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: 8, scale: 0.98 }}
           transition={{ duration: 0.18, ease: 'easeOut' }}
-          className="relative w-[680px] max-w-full h-[620px] max-h-full border border-border rounded-[14px] bg-card flex flex-col shadow-2xl outline-none overflow-hidden"
+          className="relative w-[680px] max-w-full h-[620px] max-h-full border border-border rounded-[14px] bg-card flex flex-col shadow-2xl outline-hidden overflow-hidden"
           onKeyDown={(e) => e.stopPropagation()}
         >
-          <header className="px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
+          <header className="px-4 md:px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
             <h1 className="text-[19px] font-bold leading-tight text-text-strong pr-8">
               {i18nT('apps.codeReviewSage.components.addReposModal.add_repos')}
             </h1>
@@ -202,7 +206,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
 
           {/* Inputs stay pinned; only the lists scroll, so the manual field and
               the filter are always reachable however long the lists get. */}
-          <div className="px-6 pt-4 pb-3 flex flex-col gap-2.5 flex-shrink-0">
+          <div className="px-4 md:px-6 pt-4 pb-3 flex flex-col gap-2.5 flex-shrink-0">
             {/* Manual entry FIRST: it always works, even with no gh, and it is
                 the answer when a repo is missing from both capped lists. */}
             <div className="flex items-center gap-2">
@@ -211,10 +215,10 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
                 <input
                   value={manual}
                   onChange={(e) => setManual(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') submitManual() }}
+                  {...ime.bindEnter({ onEnter: submitManual })}
                   aria-label={i18nT('apps.codeReviewSage.components.addReposModal.repository_or_pull_request_url_or_owner_repo')}
                   placeholder={i18nT('apps.codeReviewSage.components.addReposModal.owner_repo_a_repo_url_or_paste_a_pull_request_li')}
-                  className="flex-1 min-w-0 bg-transparent border-0 py-2 text-[13px] font-mono text-text outline-none"
+                  className="flex-1 min-w-0 bg-transparent border-0 py-2 text-[13px] font-mono text-text outline-hidden"
                 />
               </div>
               <button
@@ -235,7 +239,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
                   onChange={(e) => setQuery(e.target.value)}
                   aria-label={i18nT('apps.codeReviewSage.components.addReposModal.filter_your_repos')}
                   placeholder={i18nT('apps.codeReviewSage.components.addReposModal.filter_your_repos')}
-                  className="flex-1 min-w-0 bg-transparent border-0 py-1.5 text-[13px] text-text outline-none"
+                  className="flex-1 min-w-0 bg-transparent border-0 py-1.5 text-[13px] text-text outline-hidden"
                 />
               </div>
               <button
@@ -254,10 +258,12 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
             </div>
           </div>
 
-          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-6 pb-5 flex flex-col gap-2.5">
+          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-4 md:px-6 pb-5 flex flex-col gap-2.5">
             {setupRequired && <GhNotice message={recent?.error ?? mine?.error} />}
+            {/* No hand-off: the manual repo-URL input below is unsaved — the
+                navigation would take what was typed with the modal. */}
             {err && !setupRequired && (
-              <div className="text-[12.5px] text-danger">{err.message}</div>
+              <ErrorNotice message={err.message} variant="inline" />
             )}
 
             {loading && !setupRequired && (

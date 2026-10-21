@@ -1,17 +1,52 @@
-"""Tests for _sync_mcp_to_agent and _sync_mcp_to_agent_batch in mcp.py."""
+"""Tests for _sync_mcp_to_agent and _sync_mcp_to_agent_batch in mcp_agent_sync.py."""
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew.dashboard.handlers.agents import (
     api_capability_mcp_install,
     api_capability_mcp_uninstall,
 )
+from kiro_crew.dashboard.handlers.mcp import _mcp_hot_reload_active as _REAL_GATE
+from kiro_crew.mcp_provenance import without_marker
+
+
+@pytest.fixture(autouse=True)
+def _owner_caller(monkeypatch):
+    """Run as the dashboard owner: these tests exercise handler behavior PAST
+    the owner boundary on the agents module's mutating endpoints, which has
+    its own enumerate-the-invariant coverage in
+    test_agents_endpoints_owner_auth.py."""
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
+        lambda request: True,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_hot_reload(monkeypatch):
+    """Run against live sessions that cannot be shown to reconcile, so every
+    sync here takes the reset path these tests were written for. The gate is
+    keyed to the request's session registry, which these MagicMock requests do
+    not carry; failing closed there is the production behaviour too.
+    ``TestApiMcpSyncHotReload`` overrides it per test."""
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.mcp._mcp_hot_reload_active",
+        lambda request: False,
+    )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -55,16 +90,31 @@ def _load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-async def _sync_one_remote(remote, mcp_env, *, owned: bool = True) -> dict:
+async def _sync_one_remote(remote, mcp_env, *, owned: bool = True, marked: bool = True) -> dict:
     """Run api_mcp_sync over one remote server and return its written global entry.
 
     ``owned`` marks the name as managed by Kiro Crew, which is the regime every caller
     here exercises: writes to the kiro-global mcp.json are gated on ownership, so
     an unowned name is deliberately left untouched (see
     TestGlobalWritesAreOwnershipGated).
+
+    ``marked`` stamps the authorship marker onto whatever this server already has
+    in the global file, so the default regime is "re-syncing an entry we wrote" --
+    the case the sync behaviour tests are about. Pass ``marked=False`` to control
+    the marker from the test body, which the collision and reclamation tests do
+    because the marker's presence is the thing under test there.
     """
     from kiro_crew.dashboard.handlers.mcp import api_mcp_sync
     from kiro_crew.mcp_discovery import SCOPE_KIROCREW
+    from kiro_crew.mcp_provenance import stamp
+
+    _, mcp_json = mcp_env
+    if marked:
+        data = _load(mcp_json)
+        current = data.get("mcpServers", {}).get(remote.name)
+        if isinstance(current, dict):
+            data["mcpServers"][remote.name] = stamp(current)
+            mcp_json.write_text(json.dumps(data))
 
     req = MagicMock()
     req.app = {"state": MagicMock()}
@@ -102,9 +152,8 @@ class TestGlobalWritesAreOwnershipGated:
     ``discover_servers_to_sync``, which merges every scope -- so a name the user
     configured only in their own global file arrives exactly like a managed one.
 
-    Parametrized on purpose: the gate was previously reasoned about one write site
-    at a time, so a per-site test lets the next site ship ungated. This asserts
-    the property across all of them at once.
+    Parametrized on purpose: a per-site test would let the next write site ship
+    ungated, so this asserts the property across all of them at once.
     """
 
     @staticmethod
@@ -117,18 +166,29 @@ class TestGlobalWritesAreOwnershipGated:
             return_value={SCOPE_KIROCREW: {n: {"url": "https://store"} for n in names}},
         )
 
-    async def _kiro_global(self, *, managed: bool, mcp_env) -> dict:
-        """Sync a remote whose url differs from the user's global entry."""
+    async def _kiro_global(self, *, managed: bool, mcp_env, marked: bool | None = None) -> dict:
+        """Sync a remote whose url differs from the user's global entry.
+
+        ``marked`` defaults to ``managed``: the managed case represents an entry
+        THIS emitter wrote, so it carries the authorship marker, while the
+        unmanaged case represents one the user typed and carries none. Pass it
+        explicitly to build the third state -- a managed name whose global entry
+        we cannot prove we wrote.
+        """
         from kiro_crew.mcp_discovery import McpServerInfo
+        from kiro_crew.mcp_provenance import stamp
 
         _, mcp_json = mcp_env
         data = _load(mcp_json)
-        data["mcpServers"]["handmade"] = {
+        entry = {
             "url": "https://user.example.com/mcp",
             "headers": {"Authorization": "Bearer user-typed"},
             "oauthScopes": ["user:scope"],
             "oauth": {"clientId": "user-client", "issuer": "https://user-issuer"},
         }
+        data["mcpServers"]["handmade"] = (
+            stamp(entry) if (managed if marked is None else marked) else entry
+        )
         mcp_json.write_text(json.dumps(data))
         remote = McpServerInfo(
             name="handmade",
@@ -137,7 +197,7 @@ class TestGlobalWritesAreOwnershipGated:
             client_id="kirocrew-client",
             source="discovered",
         )
-        return await _sync_one_remote(remote, mcp_env, owned=managed)
+        return await _sync_one_remote(remote, mcp_env, owned=managed, marked=False)
 
     def _cc_sidecar(self, *, managed: bool, tmp_path) -> dict:
         """Register a remote into the CC sidecar."""
@@ -191,6 +251,23 @@ class TestGlobalWritesAreOwnershipGated:
         assert cc["scopes"] == ["kirocrew:scope"]
         assert cc["clientId"] == "kirocrew-client"
 
+    @pytest.mark.asyncio
+    async def test_a_managed_name_with_an_unmarked_entry_is_left_to_the_user(self, mcp_env):
+        """The third state: the name is ours, the ENTRY is not provably ours.
+
+        Managing a name is necessary but not sufficient. Here the sync would
+        change the entry and nothing on it says we wrote it, so it reads as
+        hand-authored and survives untouched -- including the credential header,
+        which the name-only gate would have dropped on the url change.
+        """
+        entry = await self._kiro_global(managed=True, mcp_env=mcp_env, marked=False)
+        assert entry == {
+            "url": "https://user.example.com/mcp",
+            "headers": {"Authorization": "Bearer user-typed"},
+            "oauthScopes": ["user:scope"],
+            "oauth": {"clientId": "user-client", "issuer": "https://user-issuer"},
+        }
+
     def test_a_malformed_store_value_does_not_make_a_name_managed(self, tmp_path):
         """Same discriminator as the agent-spec path: a non-dict is not ownership."""
         from kiro_crew.mcp_discovery import SCOPE_KIROCREW, kirocrew_managed_names
@@ -202,134 +279,186 @@ class TestGlobalWritesAreOwnershipGated:
             assert kirocrew_managed_names() == {"good"}
 
 
-class TestExactNameOwnershipIsHistoryDependent:
-    """The exact-name gate cannot separate "ours, moved" from "the user's, colliding".
+class TestExactNameCollisionIsDecidedByTheMarker:
+    """The marker separates "ours, moved" from "the user's, colliding".
 
-    Ownership is name presence in the store, so both of these reach the write with
-    the SAME on-disk state -- a global entry at url A, that name in the store, and
-    a discovered url B:
+    Both of these arrive at the write as the SAME input -- a global entry
+    at url A, that name in the store, and a discovered url B:
 
     * LEGITIMATE: a managed server whose store url moved A -> B. The global entry
-      at A is our own earlier emit and MUST be rewritten, or the re-sync this
-      change exists to deliver never propagates and kiro-cli keeps running a url
-      the dashboard no longer shows.
+      at A is our own earlier emit and MUST be rewritten, or the re-sync never
+      propagates and kiro-cli keeps running a url the dashboard does not show.
     * HARMFUL: the user hand-authored a global server at A whose name collides
       with a managed one. Rewriting destroys config we did not author.
 
-    No content test separates them, because the minimal entry ``{"url": ...}`` is
-    exactly what BOTH produce: our emitter writes it for a managed server carrying
-    no OAuth hints, and it is also the smallest thing a user can type for a remote
-    server. The difference is authorship history, which nothing on disk records --
-    see the module note on the escalation. These tests pin today's behaviour so a
-    future change to it is deliberate rather than incidental.
+    No CONTENT test separates them -- the minimal entry ``{"url": ...}`` is
+    exactly what both produce. The difference is authorship, so authorship is now
+    recorded rather than inferred: our writes carry ``x-kirocrew``, and an entry
+    without it is the user's. These tests pin both directions, and that stripping
+    the marker reclaims an entry for good.
     """
 
     @staticmethod
-    async def _sync_over_global(entry: dict, mcp_env) -> dict:
-        """Sync a managed remote at url B over an existing global ``entry``."""
+    async def _sync_over_global(
+        entry: object, mcp_env, *, url: str = "https://b.example.net/mcp"
+    ) -> Any:
+        """Sync a managed remote at ``url`` over an existing global ``entry``.
+
+        ``entry`` is deliberately untyped: a hand-edited file can hold a string
+        or ``null`` under a server name, and that shape has to reach the write.
+        """
         from kiro_crew.mcp_discovery import McpServerInfo
 
         _, mcp_json = mcp_env
         data = _load(mcp_json)
         data["mcpServers"]["collide"] = entry
         mcp_json.write_text(json.dumps(data))
-        remote = McpServerInfo(
-            name="collide", url="https://b.example.net/mcp", source="discovered"
-        )
-        return await _sync_one_remote(remote, mcp_env, owned=True)
+        remote = McpServerInfo(name="collide", url=url, source="discovered")
+        return await _sync_one_remote(remote, mcp_env, owned=True, marked=False)
 
     @pytest.mark.asyncio
     async def test_a_managed_url_move_propagates(self, mcp_env):
-        """Direction (b): the case that MUST keep working (round-16 contract)."""
-        written = await self._sync_over_global({"url": "https://a.example.com/mcp"}, mcp_env)
+        """Direction (b): the case that MUST keep working (round-16 contract).
+
+        The entry carries our marker, so the move is provably ours to make.
+        """
+        from kiro_crew.mcp_provenance import stamp
+
+        written = await self._sync_over_global(
+            stamp({"url": "https://a.example.com/mcp"}), mcp_env
+        )
         assert written["url"] == "https://b.example.net/mcp", (
             "a managed server's url legitimately moves; refusing to write it "
             "would strand kiro-cli on the old transport"
         )
 
     @pytest.mark.asyncio
-    async def test_a_colliding_hand_authored_global_entry_is_rewritten(self, mcp_env):
-        """Direction (a): the harm, recorded as current behaviour.
+    async def test_a_colliding_hand_authored_global_entry_is_preserved(self, mcp_env):
+        """Direction (a): the harm, now prevented.
 
-        Reachability is bounded but not closed: ``POST /api/mcp/custom`` refuses a
-        name that ``_find_server_spec_anywhere`` finds in ANY scope -- the kiro
-        global file included -- so no dashboard path creates a store entry on top
-        of a hand-authored global one. What remains is the user editing their own
-        global file AFTER the managed entry exists.
+        Reachability was already bounded -- ``POST /api/mcp/custom`` refuses a
+        name that ``_find_server_spec_anywhere`` finds in ANY scope, the kiro
+        global file included -- but the residual case, a user editing their own
+        global file AFTER the managed entry exists, is what this closes.
         """
-        written = await self._sync_over_global(
-            {
-                "url": "https://a.example.com/mcp",
-                "oauthScopes": ["user:scope"],
-                "oauth": {"clientId": "user-client", "issuer": "https://user-issuer"},
-            },
-            mcp_env,
-        )
-        assert written["url"] == "https://b.example.net/mcp"
-        assert written.get("oauthScopes") != ["user:scope"], "the user's hint is not kept"
-        assert written["oauth"]["issuer"] == "https://user-issuer", (
-            "a sub-key we never owned still survives the surgical edit"
-        )
+        entry = {
+            "url": "https://a.example.com/mcp",
+            "oauthScopes": ["user:scope"],
+            "oauth": {"clientId": "user-client", "issuer": "https://user-issuer"},
+        }
+        written = await self._sync_over_global(dict(entry), mcp_env)
+        assert written == entry, "an unmarked entry is the user's, verbatim"
 
     @pytest.mark.asyncio
     async def test_a_non_hint_oauth_subkey_is_not_authorship_evidence(self, mcp_env):
-        """Why "preserve an entry carrying ``issuer``" is not the fix here.
+        """Why "preserve an entry carrying ``issuer``" is still not the fix.
 
-        A non-hint sub-key looks like a fingerprint -- no writer here emits one,
-        and the custom-server editor refuses a submission that introduces one. It
-        is still not authorship: a MANAGED entry legitimately carries ``issuer``
-        once a user adds it, which is the entire reason ``apply_kiro_oauth_hints``
+        A non-hint sub-key looks like a fingerprint -- no writer here emits one.
+        It is still not authorship: a MANAGED entry legitimately carries
+        ``issuer`` once a user adds it, which is why ``apply_kiro_oauth_hints``
         edits ``oauth`` surgically instead of replacing it. Preserving on that
         signal would strand every managed server whose ``oauth`` a user has ever
-        touched, so the same state has to keep syncing --
-        ``test_a_managed_name_still_syncs_at_every_global_write_site`` and
-        ``test_sync_keeps_unrelated_oauth_subkeys_while_rewriting_client_id`` pin
-        it from the other side.
+        touched, so a MARKED entry carrying one must still sync. The marker, not
+        the sub-key, is what decides.
         """
+        from kiro_crew.mcp_provenance import stamp
+
         written = await self._sync_over_global(
-            {"url": "https://a.example.com/mcp", "oauth": {"issuer": "https://i"}},
+            stamp({"url": "https://a.example.com/mcp", "oauth": {"issuer": "https://i"}}),
             mcp_env,
         )
         assert written["url"] == "https://b.example.net/mcp"
         assert written["oauth"] == {"issuer": "https://i"}
 
     @pytest.mark.asyncio
-    async def test_a_bare_url_collision_remains_undecidable(self, mcp_env):
-        """The residual case, unchanged and deliberately so.
+    async def test_an_unmarked_bare_url_collision_is_preserved(self, mcp_env):
+        """The residual case from the base ref, now decided.
 
         A minimal ``{"url": ...}`` entry is both what this emitter writes for a
         managed server carrying no OAuth hints and the smallest thing a user can
-        hand-type, and nothing on disk records authorship -- ``McpServerInfo``
-        carries discovery origin, not authorship. So the managed url still
-        propagates, which is what keeps ``test_a_managed_url_move_propagates``
-        true. Closing this needs a provenance record, an on-disk format change.
+        hand-type. On the base ref the managed url propagated over it, because
+        nothing on disk recorded authorship. The marker records it, so the same
+        bytes now read as the user's and are left alone -- while
+        ``test_a_managed_url_move_propagates`` shows the marked spelling of the
+        same shape still propagating.
         """
         written = await self._sync_over_global({"url": "https://a.example.com/mcp"}, mcp_env)
-        assert written == {"url": "https://b.example.net/mcp"}
+        assert written == {"url": "https://a.example.com/mcp"}
+
+    @pytest.mark.asyncio
+    async def test_stripping_the_marker_reclaims_the_entry_for_good(self, mcp_env):
+        """Reclamation is durable across syncs, which is what forbids migration.
+
+        The marker promises a user can strip it and we stop rewriting. Stripping
+        it off one of our own entries leaves exactly our emit behind, so the
+        obvious migration for pre-marker entries -- stamp an unmarked entry the
+        sync would not change -- reads this reclaimed entry as legacy and takes it
+        back, after which a later url move rewrites it. The two states are
+        indistinguishable on disk, so no unmarked entry is written at all: legacy
+        entries stay unmanaged (re-established with Disconnect then Connect, which
+        creates stamped) and reclamation holds.
+        """
+        from kiro_crew.mcp_provenance import is_marked, stamp, without_marker
+
+        settled = await self._sync_over_global(
+            stamp({"url": "https://b.example.net/mcp"}), mcp_env
+        )
+        assert is_marked(settled), "precondition: an entry we wrote and re-synced"
+
+        reclaimed = without_marker(settled)
+        after = await self._sync_over_global(dict(reclaimed), mcp_env)
+        assert not is_marked(after), "the marker must not come back on its own"
+        assert after == reclaimed, "and nothing else may change either"
+
+        # The step that makes re-stamping harmful: a stamped entry is rewritable,
+        # so had the previous sync taken it back, this url move would land on it.
+        moved = await self._sync_over_global(dict(after), mcp_env, url="https://c.example.org/mcp")
+        assert moved == reclaimed, "a reclaimed entry outlives a later store-side move"
+
+    @pytest.mark.asyncio
+    async def test_a_marked_entry_does_not_re_write_on_every_sync(self, mcp_env):
+        """The marker must not make a settled entry look permanently divergent.
+
+        The rendered agent spec carries no marker while the shared file does, so a
+        divergence check that saw the key would report this server as changed on
+        every pass and re-write the file forever. ``McpServerInfo`` has explicit
+        fields, so an unknown key never reaches it -- this pins that, because the
+        failure mode is silent write amplification rather than a wrong value.
+        """
+        from kiro_crew.mcp_provenance import is_marked, stamp
+
+        first = await self._sync_over_global(stamp({"url": "https://b.example.net/mcp"}), mcp_env)
+        assert is_marked(first)
+        second = await self._sync_over_global(first, mcp_env)
+        assert second == first, "a settled marked entry is byte-stable across syncs"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("site", ["kiro_global", "cc_sidecar"])
-    async def test_a_managed_url_move_reaches_only_the_surface_that_re_syncs(
+    async def test_a_marked_managed_url_move_reaches_both_surfaces(
         self, site, mcp_env, tmp_path
     ):
-        """Both global surfaces are asserted together so neither drifts silently.
+        """Both global surfaces re-sync a marked entry, and are asserted together.
 
-        The exact-name shape exists at both, but they answer it differently.
-        The kiro-global file re-syncs, so a managed server's moved url reaches
-        disk there -- without that this slice's scope fix never propagates. The
-        Claude Code sidecar is add-only for remotes, so an entry already present
-        keeps what it holds; re-syncing it needs a record of which entries we
-        wrote. Pinning both here means a change to either one has to say so.
+        The base ref answered the exact-name shape differently at each: the
+        kiro-global file re-synced, the Claude Code sidecar stayed add-only for
+        remotes because re-syncing needed a record of which entries we wrote.
+        That record now exists, so both surfaces propagate. Pinning them together
+        means a change to either one has to say so.
         """
+        from kiro_crew.mcp_provenance import stamp
+
         if site == "kiro_global":
-            written = await self._sync_over_global({"url": "https://a.example.com/mcp"}, mcp_env)
-            assert written["url"] == "https://b.example.net/mcp"
+            written = await self._sync_over_global(
+                stamp({"url": "https://a.example.com/mcp"}), mcp_env
+            )
         else:
             from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
 
             sidecar = tmp_path / "cc.json"
             sidecar.write_text(
-                json.dumps({"mcpServers": {"collide": {"url": "https://a.example.com/mcp"}}})
+                json.dumps(
+                    {"mcpServers": {"collide": stamp({"url": "https://a.example.com/mcp"})}}
+                )
             )
             remote = McpServerInfo(
                 name="collide", url="https://b.example.net/mcp", source="discovered"
@@ -337,7 +466,7 @@ class TestExactNameOwnershipIsHistoryDependent:
             with TestGlobalWritesAreOwnershipGated._own({"collide"}):
                 register_servers_for_cc([remote], mcp_json_path=sidecar)
             written = json.loads(sidecar.read_text())["mcpServers"]["collide"]
-            assert written == {"url": "https://a.example.com/mcp"}
+        assert written["url"] == "https://b.example.net/mcp"
 
     def test_an_unmanaged_remote_keeps_its_sidecar_entry(self, tmp_path, monkeypatch):
         """The sidecar is add-only for remotes, so a present entry is untouched.
@@ -384,20 +513,20 @@ class TestExactNameOwnershipIsHistoryDependent:
         written = json.loads(sidecar.read_text())["mcpServers"]["handmade"]
         assert written == user_entry, "url and credential header survive the sync"
 
-    def test_a_managed_remote_is_not_re_synced_to_the_sidecar(
+    def test_a_managed_remote_re_syncs_to_the_sidecar_only_when_marked(
         self, tmp_path, monkeypatch
     ):
-        """Ownership is name-only, so even a server we own does not rewrite here.
+        """A marked entry re-syncs here; an unmarked one still does not.
 
-        The divergence still has to reach the surfaces that can act on it -- the
-        agent config and the kiro-global file -- so the server does enter the sync
-        set. The sidecar simply declines it: with ownership established by name
-        alone, "our managed server moved" and "a different server the user named
-        the same" are the same input, and this writer replaces an entry rather
-        than merging into it. Propagating a changed remote shape to this surface
-        arrives with the provenance record that makes the two distinguishable.
+        The base ref declined both, because ownership was name-only: "our managed
+        server moved" and "a different server the user named the same" were the
+        same input, and this writer replaces an entry rather than merging into it.
+        The marker separates them, so the divergence that already had to reach the
+        agent config and the kiro-global file now reaches this surface too --
+        unless the entry carries no marker, in which case add-only still holds.
         """
         from kiro_crew import mcp_discovery as md
+        from kiro_crew.mcp_provenance import stamp, without_marker
 
         agents = tmp_path / "agents"
         agents.mkdir()
@@ -428,18 +557,30 @@ class TestExactNameOwnershipIsHistoryDependent:
 
         stale = {"url": "https://old.example/mcp", "disabledTools": ["danger"]}
         sidecar = tmp_path / "cc.json"
-        sidecar.write_text(json.dumps({"mcpServers": {"owned": stale}}))
-        changed = md.register_servers_for_cc(to_sync, mcp_json_path=sidecar)
-        assert changed is False
+
+        # Unmarked: nothing proves we wrote it, so add-only still applies.
+        sidecar.write_text(json.dumps({"mcpServers": {"owned": dict(stale)}}))
+        assert md.register_servers_for_cc(to_sync, mcp_json_path=sidecar) is False
         assert json.loads(sidecar.read_text())["mcpServers"]["owned"] == stale
+
+        # Marked: ours, so the moved url propagates. ``disabledTools`` is NOT
+        # merged back -- this writer rebuilds a remote entry from scratch, which is
+        # exactly why it may only ever touch an entry it wrote.
+        sidecar.write_text(json.dumps({"mcpServers": {"owned": stamp(dict(stale))}}))
+        assert md.register_servers_for_cc(to_sync, mcp_json_path=sidecar) is True
+        written = json.loads(sidecar.read_text())["mcpServers"]["owned"]
+        assert without_marker(written) == {"url": "https://new.example.net/mcp"}
 
     def test_a_remote_with_no_sidecar_entry_is_still_registered(self, tmp_path):
         """Add-only is not no-op: a name absent here is registered as base does.
 
         The hints ride along on this path only, so a first registration still
-        carries the scopes the card asked for.
+        carries the scopes the card asked for -- and the entry is stamped, because
+        we are the ones authoring it. That stamp is what lets the next sync tell
+        this entry apart from one the user typed.
         """
         from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+        from kiro_crew.mcp_provenance import is_marked, without_marker
 
         sidecar = tmp_path / "cc.json"
         sidecar.write_text(json.dumps({"mcpServers": {}}))
@@ -452,11 +593,119 @@ class TestExactNameOwnershipIsHistoryDependent:
         )
         with TestGlobalWritesAreOwnershipGated._own({"fresh"}):
             assert register_servers_for_cc([remote], mcp_json_path=sidecar) is True
-        assert json.loads(sidecar.read_text())["mcpServers"]["fresh"] == {
+        written = json.loads(sidecar.read_text())["mcpServers"]["fresh"]
+        assert is_marked(written)
+        assert without_marker(written) == {
             "url": "https://fresh.example.net/mcp",
             "scopes": ["read:me"],
             "clientId": "cid",
         }
+
+
+class TestAPresentButUnreadableEntryIsNotACreate:
+    """A malformed entry occupies the name, so writing over it is not a create.
+
+    Both shared files are hand-edited, so a name can hold a string, a ``null`` or
+    a list. Such a value cannot carry the marker, so by the invariant it is
+    unmarked -- the user's -- and the create branch must not claim it. Absence
+    gets its own signal (``ABSENT``) precisely because ``None`` is a value the
+    user can type.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_kiro_global_entry_survives_a_managed_sync(self, mcp_env):
+        written = await TestExactNameCollisionIsDecidedByTheMarker._sync_over_global(
+            "not-a-dict", mcp_env
+        )
+        assert written == "not-a-dict"
+
+    def test_a_malformed_sidecar_entry_survives_a_managed_sync(self, tmp_path):
+        from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+
+        sidecar = tmp_path / "cc.json"
+        sidecar.write_text(json.dumps({"mcpServers": {"collide": "not-a-dict"}}))
+        remote = McpServerInfo(
+            name="collide", url="https://b.example.net/mcp", source="discovered"
+        )
+        with TestGlobalWritesAreOwnershipGated._own({"collide"}):
+            assert register_servers_for_cc([remote], mcp_json_path=sidecar) is False
+        assert json.loads(sidecar.read_text())["mcpServers"]["collide"] == "not-a-dict"
+
+    def test_a_null_sidecar_entry_is_not_mistaken_for_absence(self, tmp_path):
+        """The shape that made ``None`` unusable as the absence signal."""
+        from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+
+        sidecar = tmp_path / "cc.json"
+        sidecar.write_text(json.dumps({"mcpServers": {"collide": None}}))
+        remote = McpServerInfo(
+            name="collide", url="https://b.example.net/mcp", source="discovered"
+        )
+        with TestGlobalWritesAreOwnershipGated._own({"collide"}):
+            assert register_servers_for_cc([remote], mcp_json_path=sidecar) is False
+        assert json.loads(sidecar.read_text())["mcpServers"]["collide"] is None
+
+
+class TestSidecarStdioWritesAreGatedToo:
+    """The gate is per ENTRY, not per transport.
+
+    ``register_servers_for_cc`` rewrites a diverging stdio entry in place, so the
+    same collision the marker exists to prevent for remotes -- a user's own server
+    sharing a managed name -- reaches this branch as well. Nothing about a
+    ``command`` makes authorship knowable, so it resolves the same way.
+    """
+
+    @staticmethod
+    def _sync_stdio(sidecar: Path, on_disk: object, managed: bool = True) -> bool:
+        from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+
+        sidecar.write_text(json.dumps({"mcpServers": {"collide": on_disk}}))
+        local = McpServerInfo(name="collide", command="/opt/ours", source="discovered")
+        with TestGlobalWritesAreOwnershipGated._own({"collide"} if managed else set()):
+            return register_servers_for_cc([local], mcp_json_path=sidecar)
+
+    def test_a_colliding_hand_authored_stdio_entry_is_preserved(self, tmp_path, caplog):
+        theirs = {"command": "/usr/local/bin/theirs", "args": ["--their-flag"]}
+        sidecar = tmp_path / "cc.json"
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_provenance"):
+            assert self._sync_stdio(sidecar, dict(theirs)) is False
+        assert json.loads(sidecar.read_text())["mcpServers"]["collide"] == theirs
+        assert "collide" in caplog.text
+
+    def test_a_marked_stdio_entry_still_re_syncs(self, tmp_path):
+        """The propagation the gate must not break."""
+        from kiro_crew.mcp_provenance import stamp, without_marker
+
+        sidecar = tmp_path / "cc.json"
+        assert self._sync_stdio(sidecar, stamp({"command": "/opt/old"})) is True
+        written = json.loads(sidecar.read_text())["mcpServers"]["collide"]
+        assert without_marker(written) == {"command": "/opt/ours", "args": [], "type": "stdio"}
+
+    def test_an_absent_stdio_name_is_created_stamped(self, tmp_path):
+        from kiro_crew.mcp_provenance import is_marked
+
+        sidecar = tmp_path / "cc.json"
+        sidecar.write_text(json.dumps({"mcpServers": {}}))
+        from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+
+        local = McpServerInfo(name="fresh", command="/opt/ours", source="discovered")
+        with TestGlobalWritesAreOwnershipGated._own({"fresh"}):
+            assert register_servers_for_cc([local], mcp_json_path=sidecar) is True
+        assert is_marked(json.loads(sidecar.read_text())["mcpServers"]["fresh"])
+
+    def test_an_unmanaged_stdio_name_is_never_stamped(self, tmp_path):
+        """Add-only for a name we do not manage, and no marker claiming it."""
+        from kiro_crew.mcp_provenance import is_marked
+
+        sidecar = tmp_path / "cc.json"
+        sidecar.write_text(json.dumps({"mcpServers": {}}))
+        from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+
+        local = McpServerInfo(name="theirs", command="/opt/ours", source="discovered")
+        with TestGlobalWritesAreOwnershipGated._own(set()):
+            assert register_servers_for_cc([local], mcp_json_path=sidecar) is True
+        written = json.loads(sidecar.read_text())["mcpServers"]["theirs"]
+        assert not is_marked(written)
+        assert written == {"command": "/opt/ours", "args": [], "type": "stdio"}
 
 
 class TestSyncMcpToAgent:
@@ -506,6 +755,58 @@ class TestSyncMcpToAgent:
         assert "@builder-mcp" not in cfg["tools"]
         assert "@builder-mcp" not in cfg["allowedTools"]
 
+    def test_disable_marks_the_agent_entry_disabled(self, mcp_env):
+        """Dropping the ref alone leaves a running server's tools mounted under
+        kiro-cli's live reconcile; ``disabled: true`` on the entry is what stops
+        the process — and spares a cold session the spawn."""
+        agent_cfg, _ = mcp_env
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False)
+        cfg = _load(agent_cfg)
+        assert cfg["mcpServers"]["builder-mcp"]["disabled"] is True
+        assert cfg["mcpServers"]["builder-mcp"]["command"] == "builder-mcp"
+
+    def test_disable_marks_both_alias_and_legacy_key(self, mcp_env):
+        agent_cfg, mcp_json = mcp_env
+        cfg = _load(agent_cfg)
+        cfg["mcpServers"]["ns/tool-mcp"] = {"command": "legacy"}
+        cfg["mcpServers"]["ns-tool-mcp"] = {"command": "alias"}
+        agent_cfg.write_text(json.dumps(cfg))
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("ns/tool-mcp", enabled=False)
+        cfg = _load(agent_cfg)
+        assert cfg["mcpServers"]["ns/tool-mcp"]["disabled"] is True
+        assert cfg["mcpServers"]["ns-tool-mcp"]["disabled"] is True
+
+    def test_disable_leaves_a_non_mapping_entry_alone(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        cfg = _load(agent_cfg)
+        cfg["mcpServers"]["builder-mcp"] = "builder-mcp"
+        agent_cfg.write_text(json.dumps(cfg))
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False)
+        assert _load(agent_cfg)["mcpServers"]["builder-mcp"] == "builder-mcp"
+
+    def test_reenable_lifts_the_disabled_marker(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False)
+        _sync_mcp_to_agent("builder-mcp", enabled=True)
+        cfg = _load(agent_cfg)
+        assert "disabled" not in cfg["mcpServers"]["builder-mcp"]
+        assert "@builder-mcp" in cfg["tools"]
+
+    def test_remove_does_not_leave_a_disabled_ghost(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False, remove=True)
+        assert "builder-mcp" not in _load(agent_cfg)["mcpServers"]
+
     def test_remove_deletes_server_entry(self, mcp_env):
         agent_cfg, _ = mcp_env
         from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
@@ -543,6 +844,23 @@ class TestSyncMcpToAgentBatch:
         _sync_mcp_to_agent_batch(["builder-mcp"], enabled=False)
         cfg = _load(agent_cfg)
         assert "@builder-mcp" not in cfg["tools"]
+
+    def test_batch_disable_marks_entries_and_reenable_lifts(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent_batch
+
+        _sync_mcp_to_agent_batch(["slack-mcp"], enabled=True)
+        _sync_mcp_to_agent_batch(["builder-mcp", "slack-mcp"], enabled=False)
+        cfg = _load(agent_cfg)
+        assert cfg["mcpServers"]["builder-mcp"]["disabled"] is True
+        assert cfg["mcpServers"]["slack-mcp"]["disabled"] is True
+
+        _sync_mcp_to_agent_batch(["builder-mcp", "slack-mcp"], enabled=True)
+        cfg = _load(agent_cfg)
+        assert "disabled" not in cfg["mcpServers"]["builder-mcp"]
+        assert "disabled" not in cfg["mcpServers"]["slack-mcp"]
+        assert "@builder-mcp" in cfg["tools"]
+        assert "@slack-mcp" in cfg["tools"]
 
     def test_enable_with_missing_mcp_json_still_adds_tool_refs(self, mcp_env):
         """Post #15 fix: existing servers get tool refs even when mcp.json missing."""
@@ -864,7 +1182,7 @@ class TestApiMcpSyncToolsUpdate:
             source="discovered",
         )
         written = await _sync_one_remote(remote, mcp_env)
-        assert written == {
+        assert without_marker(written) == {
             "url": "https://mcp.example.com/v2",
             "headers": {"Authorization": "Bearer current"},
             "disabled": True,
@@ -890,7 +1208,7 @@ class TestApiMcpSyncToolsUpdate:
             source="discovered",
         )
         written = await _sync_one_remote(remote, mcp_env)
-        assert written == {
+        assert without_marker(written) == {
             "url": "https://api.githubcopilot.com/mcp/",
             "oauthScopes": ["read:user", "read:org"],
             "oauth": {"clientId": "public-client-id"},
@@ -914,7 +1232,7 @@ class TestApiMcpSyncToolsUpdate:
             name="remote", url="https://mcp.example.com/v1", source="discovered"
         )
         written = await _sync_one_remote(remote, mcp_env)
-        assert written == {
+        assert without_marker(written) == {
             "url": "https://mcp.example.com/v1",
             "disabledTools": ["write"],
         }
@@ -1033,6 +1351,94 @@ class TestApiMcpSyncToolsUpdate:
         mock_batch.assert_not_called()
 
 
+class TestApiMcpSyncHotReload:
+    """The post-sync reset is skipped exactly when every live process reconciles
+    the agent file itself. Both arms are pinned: a gate that silently stayed
+    False would keep every restart the change exists to remove, and one that
+    stayed True over a stale process would leave the new server unmounted with
+    nothing red to say why."""
+
+    @staticmethod
+    def _provider(hot: bool) -> SimpleNamespace:
+        """A provider carrying the ``LLMProvider.mcp_config_hot_reload`` declaration."""
+        return SimpleNamespace(mcp_config_hot_reload=hot)
+
+    @staticmethod
+    async def _run(
+        monkeypatch, *, active: list, warm: list | None = None
+    ) -> tuple[dict, AsyncMock]:
+        from kiro_crew.dashboard.handlers.mcp import api_mcp_sync
+
+        # The real gate over the request's session registry; the autouse
+        # short-circuit is lifted so this class exercises it.
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp._mcp_hot_reload_active", _REAL_GATE)
+        sessions = MagicMock()
+        sessions.active_providers.return_value = list(active)
+        sessions.warm_providers.return_value = list(warm or [])
+        state = MagicMock()
+        state.sessions = sessions
+        req = MagicMock()
+        req.app = {"state": state}
+        reset = AsyncMock(return_value=3)
+        with (
+            patch("kiro_crew.mcp_discovery.discover_servers_to_sync", return_value=[]),
+            patch("kiro_crew.mcp_discovery.sync_to_agent_config", return_value=False),
+            patch("kiro_crew.dashboard.handlers.mcp._sync_mcp_to_agent_batch"),
+            patch("kiro_crew.dashboard.handlers.sessions._reset_all_sessions", reset),
+        ):
+            resp = await api_mcp_sync(req)
+        assert resp.status == 200
+        return json.loads(resp.body), reset
+
+    @pytest.mark.asyncio
+    async def test_all_live_sessions_reconciling_skips_the_reset(self, monkeypatch, mcp_env):
+        body, reset = await self._run(
+            monkeypatch, active=[self._provider(True)], warm=[self._provider(True)]
+        )
+        reset.assert_not_awaited()
+        assert body["sessions_reset"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_live_process_skips_the_reset(self, monkeypatch, mcp_env):
+        """Nothing running means nothing a reset could reach."""
+        body, reset = await self._run(monkeypatch, active=[], warm=[])
+        reset.assert_not_awaited()
+        assert body["sessions_reset"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stale_warm_pool_process_still_resets(self, monkeypatch, mcp_env):
+        """Version skew: the pool holds a process spawned before an in-place
+        upgrade, which declares False on its own handshake version, so the gate
+        resets even though every registered session reconciles."""
+        body, reset = await self._run(
+            monkeypatch, active=[self._provider(True)], warm=[self._provider(False)]
+        )
+        reset.assert_awaited_once()
+        assert body["sessions_reset"] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_non_declaring_session_still_resets(self, monkeypatch, mcp_env):
+        """One provider that does not declare the capability -- another harness,
+        the ABC default -- forces the reset for everyone."""
+        body, reset = await self._run(
+            monkeypatch, active=[self._provider(True), self._provider(False)]
+        )
+        reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_mocked_provider_never_reads_as_a_skip(self, monkeypatch, mcp_env):
+        """Only a literal ``True`` counts: a MagicMock provider's truthy attribute
+        must fall on the reset side."""
+        _body, reset = await self._run(monkeypatch, active=[MagicMock()])
+        reset.assert_awaited_once()
+
+    def test_gate_fails_closed_on_error(self):
+        """A gate that cannot answer must not skip the reset."""
+        req = MagicMock()
+        req.app = {}  # no state -> KeyError inside the gate
+        assert _REAL_GATE(req) is False
+
+
 class TestOffloadedSyncHoldsTheConfigLock:
     """`_sync_mcp_to_agent*` does a read-modify-write of kirocrew.json. Offloading
     it to a worker thread means two concurrent MCP requests can interleave, so
@@ -1041,11 +1447,19 @@ class TestOffloadedSyncHoldsTheConfigLock:
     """
 
     def test_every_offloaded_sync_is_under_the_config_lock(self) -> None:
-        from pathlib import Path
 
-        lines = (
-            Path("src/kiro_crew/dashboard/handlers/mcp.py").read_text(encoding="utf-8").splitlines()
-        )
+        import importlib
+
+        from kiro_crew.dashboard.handlers import mcp
+
+        # The handler facade and its owners, each file's lines in turn.
+        lines = [
+            line
+            for m in (mcp.__name__, *mcp._OWNERS)
+            for line in Path(importlib.import_module(m).__file__)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
         offenders: list[str] = []
         for i, ln in enumerate(lines):
             if "asyncio.to_thread(" in ln and "_sync_mcp_to_agent" in ln:
@@ -1218,3 +1632,181 @@ class TestCapabilityInstallOffloadsTheLockedSync:
         from kiro_crew.dashboard.handlers import mcp_discover
 
         self._assert_offloaded(mcp_discover._install_via_capability)
+
+
+class TestCcSidecarEnvEmission:
+    """The sidecar is a consumed surface — a declared PATH must be complete."""
+
+    def test_stdio_env_path_is_expanded_on_write(self, tmp_path, monkeypatch):
+        from kiro_crew import mcp_discovery as md
+
+        # Spelled for the host (conftest.host_abs): the declared entry passes
+        # through the ``os.path.isabs`` filter in env._spec_path_entries, and from
+        # Python 3.13 a bare ``/opt/shims`` is not absolute under ntpath.
+        shims, usr_bin = host_abs("opt", "shims"), host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", usr_bin)
+        srv = md.McpServerInfo(
+            name="tooling",
+            command="/opt/bin/tooling",
+            args=["--stdio"],
+            env={"PATH": shims, "TOKEN": "t"},
+            source="discovered",
+        )
+        sidecar = tmp_path / "cc.json"
+        assert md.register_servers_for_cc([srv], mcp_json_path=sidecar) is True
+
+        written = json.loads(sidecar.read_text())["mcpServers"]["tooling"]
+        entries = written["env"]["PATH"].split(os.pathsep)
+        assert entries[0] == shims, "spec-authored entries stay first"
+        assert usr_bin in entries, "inherited PATH must survive the override"
+        assert written["env"]["TOKEN"] == "t"
+
+    def test_source_env_object_is_not_mutated(self, tmp_path, monkeypatch):
+        from kiro_crew import mcp_discovery as md
+
+        monkeypatch.setenv("PATH", "/usr/bin")
+        source_env = {"PATH": "/opt/shims"}
+        srv = md.McpServerInfo(
+            name="tooling", command="/opt/bin/tooling", env=source_env, source="discovered"
+        )
+        md.register_servers_for_cc([srv], mcp_json_path=tmp_path / "cc.json")
+        assert source_env == {"PATH": "/opt/shims"}, "emit must not write back into the source"
+
+
+class TestSyncDiscoveredServers:
+    """The one serialized discover→write entry point both handlers share."""
+
+    def test_runs_full_sequence_when_servers_found(self):
+        from unittest.mock import patch
+
+        from kiro_crew import mcp_discovery as md
+
+        fake = md.McpServerInfo(name="srv", command="x")
+        with (
+            patch.object(md, "discover_servers_to_sync", return_value=[fake]) as disc,
+            patch.object(md, "sync_to_agent_config") as sync,
+            patch.object(md, "register_servers_for_cc") as cc,
+        ):
+            out = md.sync_discovered_servers()
+        assert out == [fake]
+        disc.assert_called_once()
+        sync.assert_called_once_with([fake])
+        cc.assert_called_once_with([fake])
+
+    def test_empty_delta_still_reconciles(self):
+        """No new/diverged servers is NOT "nothing to do": a source entry
+        gaining ``disabled: true`` yields an empty delta but must still remove
+        the server from the agent config — install_agent() is the idempotent
+        reconciler, so it runs unconditionally. The additive-only sidecar
+        write is the one thing skipped."""
+        from unittest.mock import patch
+
+        from kiro_crew import mcp_discovery as md
+
+        with (
+            patch.object(md, "discover_servers_to_sync", return_value=[]),
+            patch.object(md, "sync_to_agent_config") as sync,
+            patch.object(md, "register_servers_for_cc") as cc,
+        ):
+            out = md.sync_discovered_servers()
+        assert out == []
+        sync.assert_called_once_with([])
+        cc.assert_not_called()
+
+    def test_concurrent_callers_serialize(self):
+        """Two threads running the sequence must not interleave — the mutex is
+        the fix for the two-handler read-modify-write race."""
+        import threading
+        from unittest.mock import patch
+
+        from kiro_crew import mcp_discovery as md
+
+        active = []
+        overlap = []
+        gate = threading.Barrier(2, timeout=5)
+
+        def slow_discover():
+            if active:
+                overlap.append(True)
+            active.append(1)
+            import time as _t
+
+            _t.sleep(0.05)
+            active.pop()
+            return []
+
+        def run():
+            gate.wait()
+            md.sync_discovered_servers()
+
+        with patch.object(md, "discover_servers_to_sync", side_effect=slow_discover):
+            t1, t2 = threading.Thread(target=run), threading.Thread(target=run)
+            t1.start(), t2.start()
+            t1.join(), t2.join()
+        assert not overlap, "the sync mutex must serialize concurrent callers"
+
+
+def _seed_per_tool_grants(agent_cfg: Path) -> None:
+    """Give builder-mcp per-tool grants next to its bare ref, plus a duplicate
+    and a prefix-sharing sibling the removal must leave alone."""
+    cfg = _load(agent_cfg)
+    cfg["mcpServers"]["builder-mcp-extra"] = {"command": "extra"}
+    cfg["tools"] = ["@builder-mcp", "@builder-mcp/search", "@builder-mcp-extra"]
+    cfg["allowedTools"] = [
+        "@builder-mcp",
+        "@builder-mcp/search",
+        "@builder-mcp/search",
+        "@builder-mcp/read",
+        "@builder-mcp-extra",
+        "@builder-mcp-extra/run",
+        "fs_read",
+    ]
+    agent_cfg.write_text(json.dumps(cfg))
+
+
+class TestRemovalDropsPerToolGrants:
+    """Disabling or removing a server drops its ``@server/tool`` grants from
+    ``allowedTools`` as well as the bare ``@server`` ref."""
+
+    @pytest.mark.parametrize("remove", [False, True])
+    def test_single_server_path(self, mcp_env, remove):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False, remove=remove)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+        assert "@builder-mcp" not in cfg["tools"]
+        assert "@builder-mcp-extra" in cfg["tools"]
+
+    def test_batch_path(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent_batch
+
+        _sync_mcp_to_agent_batch(["builder-mcp"], enabled=False)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+
+    def test_withheld_auto_approve_drops_per_tool_grants(self, mcp_env, monkeypatch):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.may_skip_gate_now",
+            lambda ref: not ref.startswith("@builder-mcp") or ref.startswith("@builder-mcp-"),
+        )
+        from kiro_crew.dashboard.handlers.mcp import (
+            _sync_mcp_to_agent,
+            _sync_mcp_to_agent_batch,
+        )
+
+        _sync_mcp_to_agent("builder-mcp", enabled=True)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+        assert "@builder-mcp" in cfg["tools"]
+
+        _seed_per_tool_grants(agent_cfg)
+        _sync_mcp_to_agent_batch(["builder-mcp"], enabled=True)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]

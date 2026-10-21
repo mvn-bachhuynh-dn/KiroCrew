@@ -2,14 +2,14 @@
 
 Three landed fixes are pinned here:
 
-1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch.py``): an
+1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch_parts/tool_call_identity.py``): an
    ``AcpEvent`` now carries the NON-model-authored tool identity from
    ``_meta.kiro`` — ``tool_name`` (``_kiro_tool_name``) and ``mcp_server_name``
    (``_kiro_mcp_server_name``). A non-empty ``mcp_server_name`` is the trusted
    "this was a real MCP tool call" discriminator; both are ``""`` when the
    backend emits no ``_meta`` (fail-closed).
 
-2. **chat_runner directive gate** (``dashboard/chat_runner.py``): the
+2. **chat_runner directive gate** (``chat_turn/tool_rows.py``, ``tool_results.py``): the
    ``EVENT_TOOL_CALL`` handler records ``_pending_dir_tool[id]`` ONLY when
    ``event.mcp_server_name`` is set AND ``session_directive.match_tool`` resolves
    a directive tool; the ``EVENT_TOOL_RESULT`` gate applies a directive only for
@@ -31,6 +31,7 @@ from chat_test_helpers import _make_state
 from kiro_crew import session_directive
 from kiro_crew.acp._dispatch import _build_tool_call_event, _kiro_mcp_server_name
 from kiro_crew.acp.types import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
@@ -39,6 +40,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_RESULT,
     AcpEvent,
 )
+from kiro_crew.dashboard.session_directive_apply import DirectiveOutcome
 
 # ── Part 1: ACP identity plumbing ─────────────────────────────────────────────
 
@@ -88,6 +90,10 @@ class TestBuildToolCallEventIdentity:
         assert event.kind == EVENT_TOOL_CALL
         assert event.tool_name == "monitor_start"
         assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_identity_trusted is True
+        # This builder populates the identity pair exclusively from _meta.kiro
+        # (non-model-authored), so it earns the explicit provenance flag.
+        assert event.mcp_identity_trusted is True
 
     def test_identity_is_meta_not_title(self) -> None:
         """The title is LLM prose; a shell tool could title itself "monitor_start"
@@ -111,8 +117,76 @@ class TestBuildToolCallEventIdentity:
         event = _build_tool_call_event(shell_update, None)
         assert event.tool_name == ""
         assert event.mcp_server_name == ""
+        assert event.tool_identity_trusted is False
+        # No _meta.kiro → nothing was populated, so no provenance is asserted.
+        assert event.mcp_identity_trusted is False
         # is_shell must still be derived from the kind (unrelated to identity).
         assert event.is_shell is True
+
+
+class TestClientToolCallEventIdentityProvenance:
+    """``AcpClient._extract_tool_event``'s inline tool_call builder is the
+    legacy sibling of ``_build_tool_call_event``: it also populates the
+    identity pair exclusively from ``_meta.kiro`` and must earn the same
+    explicit ``mcp_identity_trusted`` provenance flag — a drop here would
+    silently revoke the verified-identity half on the legacy client path."""
+
+    def test_inline_tool_call_builder_sets_identity_flag(self) -> None:
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import AcpPromptStats, JsonRpcMessage
+
+        client = AcpClient.__new__(AcpClient)  # avoid spawning a real process
+        client._tool_call_inputs = {}
+        client._tool_call_input_redacted = {}
+        client._tool_call_params = {}
+        client._tool_call_is_shell = {}
+        client._tool_call_mcp_server = {}
+        client._tool_call_tool_name = {}
+        client.last_prompt_stats = AcpPromptStats()
+        msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-meta-1",
+                    "kind": "other",
+                    "title": "Arming a monitor loop",
+                    "rawInput": {"message": "check PR"},
+                    "_meta": {
+                        "kiro": {
+                            "toolName": "monitor_start",
+                            "mcpServerName": "kirocrew-core",
+                        }
+                    },
+                }
+            },
+        )
+        event = client._extract_tool_event(msg)
+        assert event is not None
+        assert event.tool_name == "monitor_start"
+        assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_identity_trusted is True
+        assert event.mcp_identity_trusted is True
+        # Counterfactual: a frame with no _meta.kiro populates nothing, so the
+        # builder asserts no provenance.
+        msg_no_meta = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-no-meta",
+                    "kind": "execute",
+                    "title": "Running: echo hi",
+                    "rawInput": {"command": "echo hi"},
+                }
+            },
+        )
+        event_no_meta = client._extract_tool_event(msg_no_meta)
+        assert event_no_meta is not None
+        assert event_no_meta.tool_name == ""
+        assert event_no_meta.mcp_server_name == ""
+        assert event_no_meta.tool_identity_trusted is False
+        assert event_no_meta.mcp_identity_trusted is False
 
 
 # ── Part 3: chat_runner directive gate (security regression, integration) ─────
@@ -121,7 +195,7 @@ class TestBuildToolCallEventIdentity:
 # ACP client that streams ``AcpEvent``s (``LLMEvent`` is an alias of
 # ``AcpEvent``), exercising the actual ``_pending_dir_tool`` / ``_native_tc_card``
 # gate — not a reimplementation. The harness mirrors
-# ``test_dashboard_chat.TestKiroReadinessQueueHandoff``.
+# ``test_dashboard_chat_history.TestKiroReadinessQueueHandoff``.
 
 
 def _stub_state(tmp_path):
@@ -138,8 +212,16 @@ def _stub_state(tmp_path):
     return state
 
 
-async def _drive(state, slot, events, monkeypatch):
-    """Stream *events* through _run_chat; return the apply_session_directive spy."""
+async def _drive(
+    state,
+    slot,
+    events,
+    monkeypatch,
+    *,
+    directive_user_origin: bool = True,
+    applied_result: str | None = "[applied]",
+):
+    """Stream *events* through _run_chat; optionally stub the directive applier."""
     from kiro_crew.dashboard import chat_runner
 
     async def _stream(_msg):
@@ -153,10 +235,17 @@ async def _drive(state, slot, events, monkeypatch):
     client.client = None
     state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
-    spy = AsyncMock(return_value="[applied]")
-    monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+    spy = None
+    if applied_result is not None:
+        spy = AsyncMock(return_value=DirectiveOutcome(applied_result))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
 
-    await chat_runner._run_chat(state, slot, "go")
+    await chat_runner._run_chat(
+        state,
+        slot,
+        "go",
+        _directive_user_origin=directive_user_origin,
+    )
     # Drain any follow-up turn the runner queued so no coroutine is left
     # un-awaited (mirrors TestKiroReadinessQueueHandoff).
     task = getattr(slot, "task", None)
@@ -212,9 +301,7 @@ class TestProviderConversionPreservesIdentity:
         )
         out = AcpProvider._to_llm_event(src)
         dropped = [
-            f.name
-            for f in dataclasses.fields(src)
-            if getattr(src, f.name) != getattr(out, f.name)
+            f.name for f in dataclasses.fields(src) if getattr(src, f.name) != getattr(out, f.name)
         ]
         assert not dropped, f"_to_llm_event dropped fields: {dropped}"
 
@@ -256,6 +343,64 @@ class TestChatRunnerDirectiveSeam:
         call = spy.call_args
         assert call.args[3] == "monitor_start"  # kind
         assert call.args[4] == args  # decoded, validated args
+        assert call.kwargs["producer_is_user_facing"] is True
+
+    @pytest.mark.asyncio
+    async def test_automation_provenance_reaches_directive_applier(self, tmp_path, monkeypatch):
+        """The turn producer survives destination-key normalization, so a cron
+        turn targeting a user slot remains structurally distinguishable."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("slack:C123.456")
+        slot._titled = True
+        args = {"project": "/tmp/project", "clear": False}
+        marker = session_directive.encode("set_project", args, "switching")
+        events = [
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-automation",
+                title="Switching project",
+                tool_name="set_project",
+                mcp_server_name="kirocrew-core",
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-automation",
+                tool_output=marker,
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        spy = await _drive(
+            state,
+            slot,
+            events,
+            monkeypatch,
+            directive_user_origin=False,
+        )
+        spy.assert_called_once()
+        assert spy.call_args.args[2] == "dashboard:slack_C123.456"
+        assert spy.call_args.kwargs["producer_is_user_facing"] is False
+
+    @pytest.mark.asyncio
+    async def test_queued_automation_provenance_reaches_next_turn(self, tmp_path, monkeypatch):
+        """A busy app-owned request cannot become user-origin when its queue
+        entry is drained after the destination slot becomes idle."""
+        from kiro_crew.dashboard import chat_runner
+
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("app-slot")
+        slot.queue_append("automated follow-up", directive_user_origin=False)
+        seen: list[bool] = []
+
+        async def _run(_state, _slot, _message, **kwargs):
+            seen.append(kwargs["_directive_user_origin"])
+
+        monkeypatch.setattr(chat_runner, "_run_chat", _run)
+        assert await chat_runner._start_next_queued_turn(state, slot) is True
+        assert slot.task is not None
+        await slot.task
+        assert seen == [False]
 
     @pytest.mark.asyncio
     async def test_forged_shell_result_is_not_applied(self, tmp_path, monkeypatch):
@@ -310,9 +455,7 @@ class TestChatRunnerDirectiveSeam:
                 mcp_server_name="kirocrew-core",
             ),
             # Same tool_call_id delivered twice — the duplicate frame.
-            AcpEvent(
-                kind=EVENT_TOOL_RESULT, tool_call_id="tc-dup", tool_output=marker
-            ),
+            AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-dup", tool_output=marker),
             AcpEvent(
                 kind=EVENT_TOOL_RESULT,
                 tool_call_id="tc-dup",
@@ -463,3 +606,113 @@ class TestChatRunnerDirectiveSeam:
         spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_called_once()
         assert "[applied]" in seen, f"applier output not re-redacted; saw {seen!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_argument_is_reported_as_a_refusal_not_a_lost_marker(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A directive tool's ARGUMENT rejection must not fire the lost-marker
+        WARNING. The tool's result is produced by really calling it, so
+        the test cannot drift from what the tool actually returns; the rejection
+        happens in the dispatch wrapper ahead of the handler, which is why the
+        refusal tag is applied at the server's outermost return.
+
+        Before the fix this logged ``decode FAILED … effect dropped`` ~10x/day on
+        this host -- a line whose purpose is to catch a rawOutput-envelope
+        escaping regression."""
+        from kiro_crew.mcp_core import _call_tool
+
+        rejection = _call_tool("monitor_start", {"message": "x" * 9000})
+        assert rejection.startswith("Error:")
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("rejected-arg")
+        slot._titled = True
+        events = [
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-reject",
+                title="Arming monitor",
+                tool_name="monitor_start",
+                mcp_server_name="kirocrew-core",
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-reject",
+                tool_output=rejection,
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        with caplog.at_level("INFO"):
+            spy = await _drive(state, slot, events, monkeypatch)
+        spy.assert_not_called()
+        assert "decode FAILED" not in caplog.text
+        assert "session-directive REFUSED" in caplog.text
+        # The sentinel is a wire detail: the transcript shows the tool's own text.
+        outputs = _tool_result_outputs(state)
+        assert any(o.startswith("Error:") for o in outputs), outputs
+        assert not any("KIROCREW_SESSION_DIRECTIVE" in o for o in outputs), outputs
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_lost_marker_still_warns(self, tmp_path, monkeypatch, caplog):
+        """The diagnostic must keep working for the case it exists for: an
+        authenticated directive tool whose final frame carries neither a marker
+        nor a refusal tag."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("lost-marker")
+        slot._titled = True
+        events = [
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-lost",
+                title="Arming monitor",
+                tool_name="monitor_start",
+                mcp_server_name="kirocrew-core",
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-lost",
+                tool_output="Monitor loop requested.",
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        with caplog.at_level("INFO"):
+            spy = await _drive(state, slot, events, monkeypatch)
+        spy.assert_not_called()
+        assert "session-directive decode FAILED" in caplog.text
+
+
+class TestInTurnAgentSwitchPreservesTheModelPin:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("same_agent", [False, True])
+    async def test_provider_reported_switch_preserves_the_pin(
+        self, tmp_path, monkeypatch, same_agent
+    ):
+        from kiro_crew.dashboard import chat_runner
+
+        monkeypatch.setattr(chat_runner, "record_provider_agent_switch", MagicMock())
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("in-turn-switch")
+        # The turn resolves both agent names against the fixture config.
+        others = [n for n in KiroCrewConfig.load().agents if n != slot.agent]
+        assert others, "the fixture must offer a different agent"
+        new_agent = slot.agent if same_agent else others[0]
+        slot.model = "claude-opus-5"
+        slot._fallback_primary_model = "claude-opus-5"
+        gen_before = slot._model_pick_gen
+        await _drive(
+            state,
+            slot,
+            [
+                AcpEvent(kind=EVENT_AGENT_SWITCHED, text=new_agent),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ],
+            monkeypatch,
+        )
+        assert slot.agent == new_agent
+        assert slot.model == "claude-opus-5"
+        assert slot._model_pick_gen == gen_before
+        assert slot._fallback_primary_model == "claude-opus-5"

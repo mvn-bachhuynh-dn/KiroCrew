@@ -12,6 +12,7 @@ import type { Settings } from '../lib/types'
 
 import SimpleSelect from '../../../components/SimpleSelect'
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 function Field({ label, hint, children }: {
   label: string
   hint: string
@@ -30,9 +31,10 @@ function Field({ label, hint, children }: {
   )
 }
 
+// One literal, not a `+` concatenation: the design-system lint reads a const's
+// string initializer but not an expression built from several.
 const SELECT_CLASS =
-  'text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border '
-  + 'outline-none focus:border-accent cursor-pointer'
+  'text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border outline-hidden focus:border-accent cursor-pointer'
 
 export default function SettingsView() {
   const qc = useQueryClient()
@@ -54,7 +56,7 @@ export default function SettingsView() {
   const s = data?.settings
 
   return (
-    <div className="h-full overflow-y-auto scrollbar-none px-6 py-6">
+    <div className="h-full overflow-y-auto scrollbar-none px-4 md:px-6 py-6">
       <div className="max-w-[720px]">
         <h1 className="text-[22px] font-bold leading-tight text-text-strong flex items-center gap-2">
           <SettingsIcon size={18} className="text-accent" aria-hidden="true" /> {i18nT('apps.codeReviewSage.views.settingsView.settings')}
@@ -70,9 +72,7 @@ export default function SettingsView() {
           </div>
         )}
         {settingsQuery.error && (
-          <div className="mt-6 text-[13px] text-danger">
-            {(settingsQuery.error as Error).message}
-          </div>
+          <ErrorNotice message={(settingsQuery.error as Error).message} askAgent className="mt-6" />
         )}
 
         {data && s && (
@@ -123,10 +123,10 @@ export default function SettingsView() {
           </div>
         )}
 
+        {/* Every control above commits on change (saveMut.mutate in onChange), so
+            nothing here is an unsaved draft — the hand-off loses nothing. */}
         {saveMut.error && (
-          <div className="mt-3 text-[12.5px] text-danger">
-            {(saveMut.error as Error).message}
-          </div>
+          <ErrorNotice message={(saveMut.error as Error).message} askAgent className="mt-3" />
         )}
       </div>
     </div>

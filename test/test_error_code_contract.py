@@ -51,8 +51,9 @@ the only form that tells the converter where to start.
                    there; this scan cannot see it, so it is counted separately and
                    never reported as a violation.
 ``dynamic_status`` ``status=`` is an expression (``status=code``,
-                   ``status=500 if ... else 400``). Whether the response is even
-                   an error depends on runtime state, so no static rule applies.
+                   ``status=500 if ... else 400``) without an explicit,
+                   unshadowed ``code`` in a dict-literal body. A transparent
+                   coded body is compliant for every possible error status.
 
 Ratcheting all three matters: without a cap on ``opaque_body`` and
 ``dynamic_status`` the gate is trivially defeated by hoisting the body into a
@@ -64,10 +65,10 @@ refactoring in review.
 Named honestly, because every filter above buys a blind spot:
 
   * **Indirect sinks.** ``_err("...", 400)`` and ``_err500(exc)`` wrappers
-    (``handlers/artifacts.py``, ``handlers/agents.py``) are ordinary calls -- the
-    ``json_response`` inside the helper is a single site, so N call sites count as
-    one. Converting a helper fixes all of its callers at once, which is why this
-    is an acceptable blind spot rather than a hole to plug.
+    (``handlers/artifacts_parts/route_plumbing.py``, ``handlers/agents.py``) are
+    ordinary calls -- the ``json_response`` inside the helper is a single site, so
+    N call sites count as one. Converting a helper fixes all of its callers at
+    once, which is why this is an acceptable blind spot rather than a hole to plug.
   * **Non-``json_response`` sinks.** ``web.Response(text=json.dumps(...))``,
     ``HTTPBadRequest(reason=...)``, raised aiohttp exceptions, and every
     catalog-less target (Slack, Discord, CLI, cron) are out of scope here.
@@ -214,7 +215,14 @@ def _scan_uncached(src: pathlib.Path) -> tuple[_Finding, ...]:
             if kind == "absent":
                 continue  # defaults to 200
             if kind == "dynamic":
-                findings.append(_Finding(rel, node.lineno, "dynamic_status"))
+                body = _body(node)
+                transparent, has_code, value = (
+                    _dict_code(body) if isinstance(body, ast.Dict) else (False, False, None)
+                )
+                if transparent and has_code:
+                    findings.append(_Finding(rel, node.lineno, "compliant", value))
+                else:
+                    findings.append(_Finding(rel, node.lineno, "dynamic_status"))
                 continue
             if status is None or status < 400:
                 continue
@@ -361,6 +369,34 @@ def test_the_scan_actually_reaches_the_backend() -> None:
     findings = scan()
     assert len(findings) > 1000, f"expected the backend error surface, got {len(findings)} sites"
     assert any(f.bucket == "compliant" for f in findings), "no compliant site found - scan broken?"
+
+
+def test_dynamic_status_requires_an_explicit_unshadowed_code(tmp_path) -> None:
+    """Computed status cannot hide an uncoded or opaque error response."""
+    (tmp_path / "handler.py").write_text(
+        "\n".join(
+            [
+                'web.json_response({"error": message}, status=status)',
+                "web.json_response(payload, status=status)",
+                'web.json_response({"code": "invalid", **payload}, status=status)',
+                'web.json_response({"error": message, "code": "invalid"}, status=status)',
+                'web.json_response({"error": message, "code": "Bad request!"}, status=status)',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    findings = scan(tmp_path)
+    assert [finding.bucket for finding in findings] == [
+        "dynamic_status",
+        "dynamic_status",
+        "dynamic_status",
+        "compliant",
+        "compliant",
+    ]
+    assert findings[3].code_value == "invalid"
+    # The identifier-shape gate must see dynamic-status literals too.
+    assert findings[4].code_value == "Bad request!"
+    assert not _CODE_VALUE_RE.match(findings[4].code_value)
 
 
 if __name__ == "__main__":  # pragma: no cover - developer entry point

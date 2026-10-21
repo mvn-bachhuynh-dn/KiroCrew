@@ -20,6 +20,9 @@ name: Docker Smoke Test
 
 on:
   pull_request:
+    # The default types plus `ready_for_review`: jobs below skip while the PR
+    # is a draft, so leaving draft must start a fresh run on the same head.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "docker/**"
       - ".dockerignore"
@@ -31,6 +34,7 @@ on:
       # (handlers/core.py). A regression in ANY of them must fire this gate.
       - "src/kiro_crew/dashboard/origin.py"
       - "src/kiro_crew/dashboard/server.py"
+      - "src/kiro_crew/dashboard/server_runtime/**"
       - "src/kiro_crew/dashboard/handlers/core.py"
   workflow_dispatch:
 
@@ -44,10 +48,15 @@ concurrency:
 jobs:
   smoke:
     name: Build image + host-reachability probe
+    # Skip while the PR is a draft; `ready_for_review` above runs it once the
+    # PR is ready. Non-PR events have no pull_request, so they always run.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -195,10 +204,15 @@ jobs:
   # surface on the PR instead of at publish time. Parallel to the smoke job.
   arm64-build:
     name: Build image (arm64 cross-build)
+    # Skip while the PR is a draft; `ready_for_review` above runs it once the
+    # PR is ready. Non-PR events have no pull_request, so they always run.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -224,10 +238,10 @@ jobs:
           python -m build --wheel
 
       - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Build image (arm64, no load)
         run: |

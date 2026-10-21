@@ -1,5 +1,40 @@
 import { describe, it, expect } from 'vitest'
-import { slotChannelLabel, slotChannelNamespace } from './channelOrigin'
+import { channelBrandLabel, slotChannelLabel, slotChannelNamespace } from './channelOrigin'
+
+describe.each([
+  ['imessage', 'iMessage'],
+  ['feishu', 'Feishu'],
+])('%s channel origin', (namespace, brand) => {
+  it.each([':', '_'])('recognizes keys using %s and preserves the brand spelling', (separator) => {
+    const key = [namespace, 'kirocrew', 'direct', 'U1'].join(separator)
+    expect(slotChannelNamespace(key)).toBe(namespace)
+    expect(slotChannelLabel(key)).toBe(brand)
+  })
+
+  it('resolves the channel type to its brand label', () => {
+    expect(channelBrandLabel(namespace)).toBe(brand)
+  })
+
+  it.each([':', '_'])('rejects case and prefix lookalikes using %s', (separator) => {
+    for (const prefix of [brand, namespace.toUpperCase(), `${namespace}ish`, `other_${namespace}`]) {
+      const key = [prefix, 'thread', 'triage'].join(separator)
+      expect(slotChannelNamespace(key), key).toBe('')
+      expect(slotChannelLabel(key), key).toBe('')
+    }
+  })
+
+  it.each(['', '-thread'])('rejects keys without a namespace separator: %s', (suffix) => {
+    const key = `${namespace}${suffix}`
+    expect(slotChannelNamespace(key)).toBe('')
+    expect(slotChannelLabel(key)).toBe('')
+  })
+
+  it('requires an exact lowercase channel type for brand lookup', () => {
+    for (const type of [brand, namespace.toUpperCase(), `${namespace}ish`, `${namespace}:U1`, `${namespace}_U1`]) {
+      expect(channelBrandLabel(type), type).toBe('')
+    }
+  })
+})
 
 describe('slotChannelLabel', () => {
   it('labels every channel namespace', () => {
@@ -75,5 +110,26 @@ describe('slotChannelNamespace', () => {
     for (const key of ['slack:1.1', 'unified_kirocrew', 'dashboard:chat-1', 'Slack_x', '']) {
       expect(Boolean(slotChannelNamespace(key))).toBe(Boolean(slotChannelLabel(key)))
     }
+  })
+})
+
+describe('isChatPageSurface — member exclusion', () => {
+  it('never admits member DM threads into chat-page surfaces', async () => {
+    // This predicate is the ONE gate keeping member-<slug> threads out of the
+    // Sessions sidebar and the resume paths — the Crew Members page is their
+    // only home. Adding 'member' to the admit set silently leaks every DM
+    // thread into Sessions; this pin is what makes that change visible.
+    const { isChatPageSurface } = await import('./channelOrigin')
+    expect(isChatPageSurface('member')).toBe(false)
+    // The admitted set, pinned exactly: growing it is a deliberate act.
+    expect(isChatPageSurface('')).toBe(true)
+    expect(isChatPageSurface(undefined)).toBe(true)
+    // A legacy Autopilot slot (retired 'orchestrator' mode) renders as an ordinary chat.
+    const { LEGACY_AUTOPILOT_MODE } = await import('./channelOrigin')
+    expect(LEGACY_AUTOPILOT_MODE).toBe('orchestrator')
+    expect(isChatPageSurface(LEGACY_AUTOPILOT_MODE)).toBe(true)
+    // Crew Mode retired: a persisted `crew` slot is restored server-side as
+    // the default surface, so the predicate no longer admits the value.
+    expect(isChatPageSurface('crew')).toBe(false)
   })
 })

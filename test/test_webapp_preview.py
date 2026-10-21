@@ -18,6 +18,7 @@ from aiohttp import web
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
 from kiro_crew.dashboard.handlers import webapp_preview as wp
+from kiro_crew.deploy import handlers as deploy_handlers
 from kiro_crew.deploy.webapp_types import webapp_metadata_from_dict
 
 
@@ -34,7 +35,11 @@ def env(tmp_path: Path, monkeypatch):
     (app_dir / "public" / ".kirocrew-deploy.json").write_text("{}")
     (app_dir / "api" / "secret").mkdir(parents=True)
     (app_dir / "api" / "secret" / "keys.py").write_text("SECRET = 1")
-    monkeypatch.setattr(wp, "_allowed_local_roots", lambda: [ws.resolve()])
+    # The web-root resolution (and its allow-list check) lives in
+    # deploy.handlers.resolve_webapp_public_dir, which the preview channel
+    # delegates to so the publish path and the preview cannot disagree about
+    # what is servable. Patch the roots where that check reads them.
+    monkeypatch.setattr(deploy_handlers, "_allowed_local_roots", lambda: [ws.resolve()])
     return store, app_dir
 
 
@@ -49,11 +54,14 @@ def _mk_webapp(store: ArtifactStore, app_dir: Path, slug: str = "terrace-app"):
                         content="app", webapp_metadata=meta)
 
 
-def _req(match: dict, remote: str = "127.0.0.1") -> MagicMock:
+def _req(match: dict, remote: str = "127.0.0.1", headers: dict | None = None) -> MagicMock:
     req = MagicMock()
     req.match_info = match
-    req.headers = {}
+    # A real mapping: the served CSP derives its frame-ancestors origin from
+    # Host, so a MagicMock header bag would exercise nothing.
+    req.headers = dict(headers) if headers is not None else {}
     req.remote = remote
+    req.scheme = "http"
     req.app = {"state": MagicMock()}
     return req
 
@@ -124,7 +132,7 @@ def _mint(store, app_dir, slug="terrace-app", client="127.0.0.1") -> str:
     _mk_webapp(store, app_dir, slug=slug)
     webroot = wp._resolve_webroot(slug)
     assert webroot is not None
-    return wp._make_token(slug, str(webroot), client=client)
+    return wp._signer.mint(slug, str(webroot), client)
 
 
 class TestPreviewServe:
@@ -183,7 +191,7 @@ class TestPreviewServe:
         # Expired: mint with a past exp using the module's own MAC.
         exp = int(time.time()) - 10
         webroot = wp._resolve_webroot("terrace-app")
-        stale = f"{exp}.{wp._mac('terrace-app', str(webroot), exp, '127.0.0.1')}"
+        stale = f"{exp}.{wp._signer._mac(exp, ('terrace-app', str(webroot), '127.0.0.1'))}"
         with pytest.raises(web.HTTPNotFound):
             await wp.serve_artifact_app_file(
                 _req({"slug": "terrace-app", "token": stale, "path": ""}))
@@ -262,10 +270,78 @@ class TestRound2Fixes:
         csp = resp.headers["Content-Security-Policy"]
         assert "sandbox allow-scripts" in csp
         assert "default-src 'self'" in csp
-        assert "https:" not in csp  # no wildcard egress
+        # No wildcard egress. Scoped to the egress directive on purpose: the
+        # frame-ancestors origin is a full origin and legitimately carries
+        # `https:` on a TLS deployment, so a whole-header scan would conflate
+        # the two and fail for the wrong reason.
+        egress = csp.split("frame-ancestors")[0]
+        assert "https:" not in egress
         # Round-4 F1: ACAO is scoped by content type — the HTML document
         # itself must NOT be cross-origin readable.
         assert "Access-Control-Allow-Origin" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_csp_blocks_js_eval_but_allows_wasm(self, env) -> None:
+        """eval()/new Function are gated by 'unsafe-eval' alone, which must
+        be absent. WebAssembly.compile/instantiate are gated by
+        'unsafe-eval' OR 'wasm-unsafe-eval', so the narrower token must be
+        present or the .wasm this channel serves cannot run. Pins the exact
+        egress directive so a later edit cannot quietly widen it."""
+        store, app_dir = env
+        token = _mint(store, app_dir, slug="eval-app")
+        resp = await wp.serve_artifact_app_file(
+            _req({"slug": "eval-app", "token": token, "path": ""}))
+        csp = resp.headers["Content-Security-Policy"]
+        directives = [d.strip() for d in csp.split(";") if d.strip()]
+        sources = directives[1].split()
+        # JS eval / new Function: blocked.
+        assert "'unsafe-eval'" not in sources
+        assert "'unsafe-eval'" not in csp.replace("'wasm-unsafe-eval'", "")
+        # WebAssembly.compile: allowed.
+        assert "'wasm-unsafe-eval'" in sources
+        assert directives[:2] == [
+            "sandbox allow-scripts",
+            "default-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' data: blob:",
+        ]
+        # No script-src override that could re-grant or drop either token.
+        assert not any(d.startswith("script-src") for d in directives)
+
+    @pytest.mark.asyncio
+    async def test_frame_ancestors_uses_self_plus_embedding_ancestors(self, env) -> None:
+        """``'self'`` names the serving origin; extras name what it cannot.
+
+        ``'self'`` is resolved browser-side against the frame's real URL, so it
+        survives a tunnel that rewrites ``Host``. It is not sufficient alone because
+        the directive is matched against EVERY ancestor and the Instances embed
+        nests one dashboard inside another.
+        """
+        store, app_dir = env
+        token = _mint(store, app_dir, slug="fa-app")
+        resp = await wp.serve_artifact_app_file(
+            _req(
+                {"slug": "fa-app", "token": token, "path": ""},
+                headers={"Host": "localhost:5476"},
+            )
+        )
+        csp = resp.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'self'" in csp
+        assert "localhost:5476" not in csp, "a rewritable Host reached the header"
+
+    @pytest.mark.asyncio
+    async def test_an_injecting_ancestor_cannot_reach_the_header(self, env, monkeypatch) -> None:
+        """The ancestor producer is not trusted to have made its values safe."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.server._extra_frame_ancestors",
+            lambda request, app: ["http://localhost:5476; default-src *"],
+        )
+        store, app_dir = env
+        token = _mint(store, app_dir, slug="fa-junk")
+        resp = await wp.serve_artifact_app_file(
+            _req({"slug": "fa-junk", "token": token, "path": ""})
+        )
+        csp = resp.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'self'" in csp
+        assert "default-src *" not in csp
 
     @pytest.mark.asyncio
     async def test_unsupported_platform_reports_unavailable(self, env, monkeypatch) -> None:

@@ -68,15 +68,22 @@
  * Exit codes: 0 clean · 1 regression · 2 cannot run (build missing, no browser,
  * pseudolocale not active).
  */
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, symlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync } from 'node:fs'
 import { spawnSync, execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { serveDist } from './lib/serve-dist.mjs'
 import { stubDashboardApi, logPageProblems, json } from './lib/stub-dashboard-api.mjs'
-import { SURFACES, LOCALES, VIEWPORTS, FIXTURE_DETAIL_APP } from './lib/i18n-surfaces.mjs'
+import { SURFACES, LOCALES, VIEWPORTS, FIXTURE_DETAIL_APP, FIXTURE_DETAIL_DESCRIPTION, partitionBaseSurfaces } from './lib/i18n-surfaces.mjs'
 import { browserBundle } from './lib/render-scan.mjs'
+import { baseUiAutoArgs, linkNodeModulesView } from './lib/base-node-modules.mjs'
+import {
+  SETTLE_POLL_MS,
+  SETTLE_TIMEOUT_MS,
+  createInflightUrls,
+  createSettleTracker,
+} from './lib/render-settle.mjs'
 import {
   BUCKETS,
   BUCKET_MEANING,
@@ -187,6 +194,12 @@ const groupForDisplay = records => {
 /** Repo root — `website/`'s parent, where every git call is rooted. */
 const REPO = fileURLToPath(new URL('../..', import.meta.url))
 
+/**
+ * This checkout's `website/node_modules`. The base bundle is built against it, so it
+ * is also what decides whether a base tree is buildable at all.
+ */
+const NODE_MODULES = join(fileURLToPath(new URL('..', import.meta.url)), 'node_modules')
+
 const argv = process.argv.slice(2)
 const has = f => argv.includes(f)
 const opt = (f, d) => {
@@ -284,7 +297,7 @@ const FIXTURE_APPS = [
       name: FIXTURE_DETAIL_APP,
       version: '1.0.0',
       displayName: 'Fixture Research Lab',
-      description: 'Runs research campaigns unattended.',
+      description: FIXTURE_DETAIL_DESCRIPTION,
       author: '0008',
       tags: ['research', 'automation'],
       highlights: [
@@ -335,6 +348,25 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
   if (path === '/api/agents' || path === '/api/chat/agents') {
     return done([{ name: '0001', source: 'builtin' }])
   }
+  if (path === '/api/memory/stores') {
+    return done({
+      active: 'default',
+      stores: [
+        { name: 'default', is_default: true, exists: true, lineage: 'v1', memory_version: 1, semantic_count: 0, episodic_count: 0, lessons_count: 0 },
+        { name: 'member-fixture-0011', owner_member: '0011', is_default: false, exists: true, lineage: 'crew', memory_version: 2, semantic_count: 1, episodic_count: 1, lessons_count: 0, facets_supported: true, backup_count: 0, newest_backup: null },
+      ],
+    })
+  }
+  if (path === '/api/memory/records') {
+    return done({
+      entries: [
+        { kind: 'fact', id: '0011', key: '0011', text: '0011', value_json: '0011', source: 'user_explicit', revision: '1111111111111111111111111111111111111111111111111111111111111111', updated_at: '2026-01-01T00:00:00Z' },
+        { kind: 'episode', id: 'fixture-episode', text: '0012', source: 'member_session', revision: '2222222222222222222222222222222222222222222222222222222222222222', updated_at: '2026-01-02T00:00:00Z' },
+      ],
+      total: 2,
+      has_more: false,
+    })
+  }
   if (path === '/api/recent-projects') return done({ dirs: ['/0002'] })
   if (path === '/api/dashboard/branding') return done({ bot_name: 'Kiro', avatar: '' })
   if (path === '/api/chat/slots') return done(FIXTURE_SLOTS)
@@ -345,6 +377,38 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
     return done({ builtins: [], user_added: [], policy_pinned: [] })
   }
   if (path === '/api/security/posture') return done({ posture: {} })
+  // The speech-to-text panel's model rows and its download line come from here.
+  // The fallback `{}` renders neither, so the surface would be scanned without the
+  // model names, the byte units and the availability sentence that are most of its
+  // localisable copy. A model deliberately marked absent keeps the "not on this
+  // machine yet" line in the frame, which is the one a first-run user reads.
+  if (path === '/api/stt/status') {
+    return done({
+      provider: 'local',
+      available: true,
+      code: '',
+      detail: '',
+      model: 'base',
+      model_present: false,
+      model_bytes: 147951465,
+      engine_loaded: false,
+      models: [
+        { name: 'tiny', size_bytes: 77691713, present: false },
+        { name: 'base', size_bytes: 147951465, present: false },
+        { name: 'small', size_bytes: 487601967, present: false },
+        { name: 'large-v3-turbo', size_bytes: 1624555275, present: false },
+      ],
+      download: { step: 'idle', model: '', downloaded_bytes: 0, total_bytes: 0, error: '' },
+    })
+  }
+  // KnowledgePage treats any resolved value as a stats object. The shared stub's
+  // unknown-path fallback is `[]`, which is truthy: depending on whether its query
+  // settles before the scanner runs, the stats row appears in only one of the HEAD
+  // and base sweeps and creates a false diff. Use the real endpoint shape so both
+  // bundles deterministically expose the same translated row to the scanner.
+  if (path === '/api/knowledge/stats') {
+    return done({ items: 35, entities: 120, relations: 88, sources: 3 })
+  }
   // BUILTIN APP COLLECTION SHAPES. `handleBootRoute`'s fallback answers an
   // unknown path with `[]` (or `{}` for a config-ish name), and for most app
   // endpoints that is fine — the panel renders its empty state, which is exactly
@@ -402,7 +466,7 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
   if (path === '/api/config/stt') {
     return done({
       enabled: false, provider: '0007', model: '', mlx_model: '',
-      available: false, docker_mode: false, models: {}, mlx_models: {},
+      available: false, models: {}, mlx_models: {},
     })
   }
   // APP STORE + APP DETAIL. `handleBootRoute`'s fallback answers `/api/apps` and
@@ -569,6 +633,34 @@ function resolveBaseScope() {
   if (!renderable.length) {
     return { run: false, reason: `no renderable file changed vs ${sha.slice(0, 8)} (${changed.length} file(s) in diff)` }
   }
+
+  // The base bundle is built against HEAD's `node_modules` (see `buildBaseBundle`),
+  // so a branch that REMOVES a frontend dependency the base still imports leaves the
+  // base tree unbuildable — and the failure lands on code that is not in the diff.
+  // Skip rather than die: policing the base's dependency set is explicitly not this
+  // gate's job, and exiting 2 here fails a branch for tidying a dependency up.
+  //
+  // Read from the base commit instead of the exported tree, so this costs one
+  // `git show` rather than an archive that is about to be thrown away.
+  let baseDeps = {}
+  try {
+    const basePkg = JSON.parse(git(['show', `${sha}:website/package.json`]))
+    baseDeps = { ...(basePkg.dependencies || {}), ...(basePkg.devDependencies || {}) }
+  } catch {
+    // A base with no readable manifest is the pre-existing `buildBaseBundle` failure
+    // mode, not this one; leave it to report there.
+  }
+  const missing = Object.keys(baseDeps).filter(
+    name => !existsSync(join(NODE_MODULES, ...name.split('/'), 'package.json')),
+  )
+  if (missing.length) {
+    return {
+      run: false,
+      fallback: true,
+      reason: `base tree ${sha.slice(0, 8)} needs ${missing.join(', ')}, which this branch's `
+        + 'lockfile removes, and the base bundle builds against this branch\'s node_modules',
+    }
+  }
   return { run: true, sha, changed: renderable.length }
 }
 
@@ -592,10 +684,17 @@ function resolveBaseScope() {
  * cross-tree import, every base build died with `Could not resolve …` and the gate
  * exited 2 on EVERY pull request, because the breakage lived in the base tree
  * rather than in anyone's diff. Archiving the commit costs a few seconds of tar
- * next to two ~45s vite builds and cannot rot. `node_modules` is symlinked rather
+ * next to two ~45s vite builds and cannot rot. `node_modules` is linked rather
  * than installed — a second `npm ci` would cost minutes, and the base's dependency
  * set only matters if the lockfile changed, which a render gate is not the right
  * place to police.
+ *
+ * Linked per entry, never as one directory link, because `node_modules/.cache`
+ * holds build outputs rather than packages, and one of them is the auto stamp
+ * manifest the base's `vite.config.ts` reads. HEAD's manifest describes HEAD's
+ * text, so sharing it fails the base build on every branch that edits a stamped
+ * file. The base gets an empty `.cache` and its own generator fills it (see
+ * scripts/lib/base-node-modules.mjs).
  */
 function buildBaseBundle(sha) {
   const dir = join(tmpdir(), `i18n-render-base-${sha.slice(0, 12)}`)
@@ -631,19 +730,37 @@ function buildBaseBundle(sha) {
   if (!existsSync(join(baseWeb, 'package.json'))) {
     die(`base tree ${sha} has no website/ — cannot render it`)
   }
-  // `junction`, not `dir`, on Windows: creating a directory SYMLINK there needs
-  // elevated privileges or Developer Mode, so a plain `dir` link fails with EPERM on
-  // a stock Windows dev box and takes the whole gate down with exit 2. A junction
-  // needs no privilege. It requires an absolute target, which this already is.
-  symlinkSync(
-    join(fileURLToPath(new URL('..', import.meta.url)), 'node_modules'),
-    join(baseWeb, 'node_modules'),
-    process.platform === 'win32' ? 'junction' : 'dir',
-  )
+  // HEAD's packages, but the base's own `.cache` and auto stamp manifest. The view
+  // links directories as junctions on Windows, where a directory symlink needs
+  // elevated privileges and would take the whole gate down with EPERM.
+  linkNodeModulesView(NODE_MODULES, join(baseWeb, 'node_modules'))
+  writeBaseUiAuto(baseWeb, dir, sha)
 
   runViteDevBuild(baseWeb, 'dist-dev', `base ${sha.slice(0, 8)}`)
   TEMP_DIRS.push(dir)
   return { dist: join(baseWeb, 'dist-dev'), baseWeb }
+}
+
+/**
+ * Write the base tree's OWN auto stamp manifest and auto tier, with the base
+ * tree's own generator, into the empty `.cache` its `node_modules` view has.
+ *
+ * Without them the base build would stamp nothing and still pass, but it would
+ * no longer be the bundle the base commit ships: the comparison must measure the
+ * same kind of build on both sides. A base from before the auto tier existed has
+ * no stamp plugin to feed, so there is nothing to write.
+ */
+function writeBaseUiAuto(baseWeb, dir, sha) {
+  if (!existsSync(join(baseWeb, 'scripts', 'lib', 'ui-auto-stamp.mjs'))) return
+  const res = spawnSync(
+    process.execPath,
+    [join('scripts', 'gen-ui-index.mjs'), ...baseUiAutoArgs(join(dir, 'ui-index.scratch.json'))],
+    { cwd: baseWeb, encoding: 'utf-8' },
+  )
+  if (res.status !== 0) {
+    out(`${res.stdout || ''}\n${res.stderr || ''}`.trim().split('\n').slice(-25).join('\n'))
+    die(`[base ${sha.slice(0, 8)}] could not write the base tree's auto stamp manifest (exit ${res.status})`)
+  }
 }
 
 /**
@@ -706,6 +823,11 @@ async function main() {
   const locales = ONLY_LOCALE ? LOCALES.filter(l => l.code === ONLY_LOCALE) : LOCALES
   if (!surfaces.length) die(`unknown --surface ${ONLY_SURFACE}`)
   if (!locales.length) die(`unknown --locale ${ONLY_LOCALE}`)
+  for (const surface of surfaces) {
+    if (surface.sourceFile && !existsSync(join(REPO, 'website', surface.sourceFile))) {
+      die(`surface ${surface.id} requires missing HEAD source ${surface.sourceFile}`)
+    }
+  }
 
   const browser = await chromium.launch()
   let head
@@ -723,12 +845,14 @@ async function main() {
       const { dist: baseDist, baseWeb } = buildBaseBundle(scope.sha)
       const baseIds = baseSurfaceIds(baseWeb)
       const unregistered = surfaces.map(x => x.id).filter(id => !baseIds.has(id))
-      // Deliberately the SAME scanScript, surfaces and locales as the HEAD run —
+      const basePlan = partitionBaseSurfaces(surfaces, baseIds,
+        sourceFile => existsSync(join(baseWeb, sourceFile)))
+      // Deliberately the SAME scanScript, surface definitions and locales as HEAD.
       // they come from this checkout, not from the base tree. Only the BUNDLE is
       // base's. If the base tree's own scanner were used instead, any change to the
       // detector would read as a product regression (or mask one).
       const baseSweep = await sweep(browser, baseDist, {
-        scanScript, dnt, surfaces, locales, label: `base ${scope.sha.slice(0, 8)}`,
+        scanScript, dnt, surfaces: basePlan.measurable, locales, label: `base ${scope.sha.slice(0, 8)}`,
       })
       baseAll = baseSweep.all
       // A surface is NEW — base 0 — only when the base bundle had no route for its
@@ -744,15 +868,15 @@ async function main() {
       // (`BuiltinAppRoute` -> `<Navigate to="/chat">`, or `ChatRedirect`), so a
       // final URL that is not the requested one is proof the route was absent.
       //
-      // Residual gap, stated: a query-param surface (`/settings?tab=x`) whose tab
-      // the base does not know renders the DEFAULT panel at the same URL, so it
-      // reads as resolved and its base count describes the wrong panel. Adding such
-      // a surface in the same commit as the tab it addresses is what avoids that;
-      // the redirect check cannot see it.
-      newSurfaces = new Set(unregistered.filter(id => baseSweep.unresolved.has(id)))
-      const measured = unregistered.filter(id => !baseSweep.unresolved.has(id))
+      // A new query-param panel may keep its URL while displaying the old default
+      // panel. Its required source file plus missing registration establishes
+      // absence before any HEAD-only readyText assertion can time out on the base.
+      // Panels without that source declaration still use the redirect signal.
+      newSurfaces = new Set([...basePlan.absent,
+        ...unregistered.filter(id => baseSweep.unresolved.has(id))])
+      const measured = unregistered.filter(id => !newSurfaces.has(id))
       if (newSurfaces.size) {
-        out(`[i18n-render] [vs-base] ${newSurfaces.size} surface(s) have no route on the base`
+        out(`[i18n-render] [vs-base] ${newSurfaces.size} surface(s) have no route or panel implementation on the base`
           + ` — their base count is 0, not measured: ${[...newSurfaces].join(', ')}`)
       }
       if (measured.length) {
@@ -782,6 +906,8 @@ async function main() {
  */
 async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label }) {
   const { srv, base } = await serveDist(dist)
+  /** The only origin a capture may load from; see the context route below. */
+  const servedOrigin = new URL(base).origin
   /** @type {Array<{surface: string, locale: string, viewport: string, finding: object}>} */
   const all = []
   /**
@@ -818,6 +944,17 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
           // this gate reports would otherwise be a race.
           reducedMotion: 'reduce',
         })
+        // Nothing a capture waits on may live off the loopback origin it is served
+        // from: one slow third-party answer would hold a surface past
+        // SETTLE_TIMEOUT_MS and fail the run for nothing in its diff. The brand
+        // faces are served from the same origin, so every off-origin request is
+        // refused and settles at once as `requestfailed`. The quiet wait still
+        // counts every request, so a loopback request that never answers still
+        // fails by name.
+        await context.route(
+          url => /^https?:$/.test(url.protocol) && url.origin !== servedOrigin,
+          route => route.abort('blockedbyclient'),
+        )
         await context.addInitScript(code => {
           localStorage.setItem('mc-lang', code)
           localStorage.setItem('mc-onboarded', '1')
@@ -834,6 +971,20 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
         // (exit 2) rather than as findings.
         const pageErrors = []
         page.on('pageerror', err => pageErrors.push(String(err.message || err)))
+        // Cumulative counters, deliberately never reset per surface. A request that
+        // outlives the surface that started it still settles, so the difference
+        // stays honest across the loop; resetting would strand those stragglers and
+        // leave the count permanently short. `open` names the requests still in
+        // flight so a timeout can say WHICH one it was waiting on, not just how
+        // many -- the diagnostic the quiet-wait failure needs to be actionable.
+        const open = createInflightUrls()
+        const net = {
+          started: 0, settled: 0, open,
+          get inflight() { return this.started - this.settled },
+        }
+        page.on('request', request => { net.started += 1; open.start(request) })
+        page.on('requestfinished', request => { net.settled += 1; open.finish(request) })
+        page.on('requestfailed', request => { net.settled += 1; open.finish(request) })
         await stubDashboardApi(page, {
           theme: 'dark',
           extra: (path, route) => FIXTURE_OVERRIDES(locale.code, path, route),
@@ -867,14 +1018,26 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
               + 'the wrong shape for this surface (see lib/boot-api.mjs for the two shapes that '
               + 'error-boundary the whole shell). Re-run with --verbose to see the page errors.')
           }
-          // Panels that fetch after mount need a beat more; a half-rendered surface
-          // under-reports rather than failing loudly.
-          await page.waitForTimeout(surface.settle || 250)
+          // Shell text does not prove a fetched panel is ready. App Details
+          // resolves several requests before mounting its manifest; comparing a
+          // loading frame with a populated frame invents a branch regression.
+          if (surface.readyText) {
+            await page.getByText(surface.readyText, { exact: true }).waitFor({ state: 'visible', timeout: 15000 })
+          }
+          // Panels that fetch after mount need a beat more. `settle` stays as the
+          // FLOOR for that beat, but it is no longer the whole of it: a fixed sleep
+          // made the wait a race whose loss was silent, so the surface now has to
+          // actually go quiet before it is scanned (lib/render-settle.mjs has the
+          // two conditions and the `app-detail` regression that came from checking
+          // neither). The floor and the quiet window OVERLAP rather than stack, so a
+          // surface that was already settled during its old sleep waits no longer
+          // than it did before.
+          await waitForSurfaceQuiet(page, net, surface, label)
           // Every width this gate reports is a text measurement, and text measures
-          // differently in the fallback face than in the real one. Scanning before
-          // the webfonts land made the layout bucket differ by 2 between identical
-          // runs (artifacts.layout 4 vs 2), which would have made the whole gate
-          // flaky rather than wrong. Two rAF ticks after that let the resulting
+          // differently while a face is still loading than once it has. The remote
+          // webfont never loads here (the context route answers its stylesheet
+          // empty), but the faces index.css declares itself still load on first
+          // use, so wait for them. Two rAF ticks after that let the resulting
           // reflow finish before anything is read.
           await page.evaluate(() => document.fonts.ready)
           await page.evaluate(() => new Promise(r => requestAnimationFrame(
@@ -929,6 +1092,52 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
   // required a real locale precisely so this assertion could not go quiet; that
   // requirement now belongs to that script, which the i18n runner fails closed on.
   return { all, unresolved }
+}
+
+/**
+ * Hold until the surface stops changing, or fail saying it never did.
+ *
+ * The old wait was `surface.settle` milliseconds and nothing else, which made every
+ * post-mount fetch a race the gate could lose without saying so -- the scan just
+ * measured the loading skeleton and charged the surface a smaller number. `[vs-base]`
+ * then read one lost race on the base sweep as findings the branch had added.
+ *
+ * `settle` survives as a MINIMUM, because a page that has not dispatched its fetch
+ * yet is indistinguishable from one that never will. It runs CONCURRENTLY with the
+ * quiet window rather than ahead of it: sampling starts immediately, so a surface
+ * that settles inside its old sleep returns at the same moment it always did, and
+ * only a surface that needed longer costs longer.
+ *
+ * Reaching the cap is INFRASTRUCTURE broken, in the same sense as a surface that
+ * never painted: a page that keeps mutating cannot be measured twice and compared,
+ * so the run must say which surface it was rather than quietly scan it mid-flight.
+ */
+async function waitForSurfaceQuiet(page, net, surface, label) {
+  const tracker = createSettleTracker()
+  const started = Date.now()
+  const floor = started + (surface.settle || 250)
+  const deadline = started + SETTLE_TIMEOUT_MS
+  for (;;) {
+    const shot = await page.evaluate(() => ({
+      chars: document.body.innerText.trim().length,
+      nodes: document.querySelectorAll('*').length,
+    }))
+    const quiet = tracker.observe({ ...shot, inflight: net.inflight })
+    if (quiet && Date.now() >= floor) return
+    if (Date.now() >= deadline) break
+    await page.waitForTimeout(SETTLE_POLL_MS)
+  }
+  const seen = tracker.last || { chars: 0, nodes: 0 }
+  const stuck = net.open ? net.open.urls() : []
+  const stuckLine = stuck.length
+    ? `\n    Still in flight: ${stuck.join(', ')}.`
+    : ''
+  die(`[${label}] ${surface.url} never went quiet in ${SETTLE_TIMEOUT_MS}ms `
+    + `(${net.inflight} request(s) in flight, ${seen.chars} chars, ${seen.nodes} nodes).`
+    + stuckLine + ' '
+    + 'A surface that keeps changing cannot be compared against a second sweep. Give it a '
+    + 'deterministic fixture in FIXTURE_OVERRIDES, or drop it from lib/i18n-surfaces.mjs '
+    + 'with a comment saying why.')
 }
 
 /**

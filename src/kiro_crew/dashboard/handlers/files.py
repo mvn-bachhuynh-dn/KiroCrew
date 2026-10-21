@@ -1,46 +1,388 @@
-"""File I/O, outbox, upload, workspace CRUD, and file search handlers."""
+"""Dashboard file HTTP handlers: the facade over :mod:`kiro_crew.dashboard.file_api`.
+
+Routes, the handlers package and tests import and patch every file handler through
+this module. The handler families live in the ``file_api`` owners -- ``uploads``,
+``workspaces``, ``pinned_io``, ``transfer``, ``office_preview``, ``sheet``,
+``search``, ``path_complete``, ``grep``, ``browse``, ``project_dirs``,
+``git_panel``, ``project_tree``, ``dashboard_config``, ``path_probe`` (the
+``_run_path_probe`` chokepoint), ``outbox``, ``channel_upload`` (the Slack and channel
+uploads with their shared admission gate), ``desktop`` (reveal, the native picker and
+screenshot) and ``editor`` (file read, raw, write and diff) -- and ``_facade_compose.compose``
+runs them on this module's globals, so a patch of ``files.<name>`` reaches them.
+
+This module keeps the imports, constants and seams the owners read: the SEL accessor,
+the file-send audit, the sub-agent session mapping, the request-body error code, the
+search walk's clock, and ``_owner_view_bypasses_credential_pass``, the file viewer's
+one owner-view verdict per request. The directory-picker routes ``api_browse_dirs``
+and ``api_browse_files`` stay here too, over the ``browse`` listings: their skip sets
+hold a literal the internal content scan refuses on an added line. New work goes to
+the owner of its family; ``docs/system-specs/modules/learn-cron-dashboard.md`` records
+the map.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import errno
-import hashlib
+import contextlib  # noqa: F401
+import datetime as _dt  # noqa: F401
+import errno  # noqa: F401
+import functools  # noqa: F401
+import hashlib  # noqa: F401
+import io  # noqa: F401
 import json
 import logging
 import mimetypes
+import ntpath  # noqa: F401
 import os
+import posixpath  # noqa: F401
+import queue  # noqa: F401
 import re
-import subprocess
-import sys
+import shutil  # noqa: F401
+import stat as _stat_mod  # noqa: F401
+import subprocess  # noqa: F401
+import sys  # noqa: F401
+import tempfile  # noqa: F401
+import threading  # noqa: F401
 import time
-import urllib.parse
-import uuid
-import zipfile
-from pathlib import Path
+import urllib.parse  # noqa: F401
+import uuid  # noqa: F401
+import zipfile  # noqa: F401
+from dataclasses import asdict  # noqa: F401
+from pathlib import Path, PurePath  # noqa: F401
+from typing import BinaryIO, Callable, NamedTuple, TypeVar  # noqa: F401
 
 from aiohttp import web
-from aiohttp.client_exceptions import ClientConnectionResetError
-from aiohttp.multipart import BodyPartReader
+from aiohttp.client_exceptions import ClientConnectionResetError  # noqa: F401
+from aiohttp.multipart import BodyPartReader  # noqa: F401
 
-from kiro_crew import platform_compat
-from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
-from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.hooks import safe_read_prefix
-from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.security import (
+from kiro_crew import executors, file_delivery_consent, pinned_fs, platform_compat  # noqa: F401
+from kiro_crew._facade_compose import compose as _facade_compose
+from kiro_crew.atomic_write import (  # noqa: F401
+    atomic_write,
+    open_access_control_source,
+    pinned_parent_replace_supported,
+)
+from kiro_crew.config import loader as config_loader  # noqa: F401
+from kiro_crew.config.loader import (  # noqa: F401
+    KiroCrewConfig,
+    WorkspaceConfig,
+    WorkspaceDirUnusable,
+    coerce_dict_section,
+    config_dir,
+    data_home,
+    materialize_workspace_dir,
+    update_config_locked,
+)
+from kiro_crew.config.sections import (  # noqa: F401
+    LINK_PATTERN_PATTERN_MAX_LEN,
+    LINK_PATTERN_URL_MAX_LEN,
+    LINK_PATTERNS_MAX,
+    link_pattern_url_ok,
+)
+from kiro_crew.dashboard import git_repo_touches as _git_repo_touches  # noqa: F401
+from kiro_crew.dashboard import part_stream, upload_destination  # noqa: F401
+from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async  # noqa: F401
+from kiro_crew.dashboard.chat_utils import (  # noqa: F401
+    dashboard_slot_key,
+    drained_to_thread,
+    run_config_write,
+)
+from kiro_crew.dashboard.default_session_folder import (  # noqa: F401
+    default_session_folder_choosable,
+)
+from kiro_crew.dashboard.file_api import browse as _owner_browse
+from kiro_crew.dashboard.file_api import channel_upload as _owner_channel_upload
+from kiro_crew.dashboard.file_api import dashboard_config as _owner_dashboard_config
+from kiro_crew.dashboard.file_api import desktop as _owner_desktop
+from kiro_crew.dashboard.file_api import editor as _owner_editor
+from kiro_crew.dashboard.file_api import git_panel as _owner_git_panel
+from kiro_crew.dashboard.file_api import grep as _owner_grep
+from kiro_crew.dashboard.file_api import office_preview as _owner_office_preview
+from kiro_crew.dashboard.file_api import outbox as _owner_outbox
+from kiro_crew.dashboard.file_api import path_complete as _owner_path_complete
+from kiro_crew.dashboard.file_api import path_probe as _owner_path_probe
+from kiro_crew.dashboard.file_api import pinned_io as _owner_pinned_io
+from kiro_crew.dashboard.file_api import project_dirs as _owner_project_dirs
+from kiro_crew.dashboard.file_api import project_tree as _owner_project_tree
+from kiro_crew.dashboard.file_api import search as _owner_search
+from kiro_crew.dashboard.file_api import sheet as _owner_sheet
+from kiro_crew.dashboard.file_api import transfer as _owner_transfer
+from kiro_crew.dashboard.file_api import uploads as _owner_uploads
+from kiro_crew.dashboard.file_api import workspaces as _owner_workspaces
+from kiro_crew.dashboard.file_api.browse import (  # noqa: F401
+    _browse_dirs_sync,
+    _browse_drives_sync,
+    _browse_entry_is_dir,
+    _browse_files_sync,
+    _browse_parent,
+    _is_windows_drive_root,
+)
+from kiro_crew.dashboard.file_api.channel_upload import (  # noqa: F401
+    _gate_upload_file,
+    api_channel_upload_file,
+    api_slack_upload_file,
+)
+from kiro_crew.dashboard.file_api.dashboard_config import (  # noqa: F401
+    api_dashboard_config,
+)
+from kiro_crew.dashboard.file_api.desktop import (  # noqa: F401
+    _screenshot_dir,
+    api_reveal_path,
+    api_screenshot,
+    api_upload,
+)
+from kiro_crew.dashboard.file_api.editor import (  # noqa: F401
+    _read_safe_end,
+    _resolve_diff_path,
+    api_file_diff,
+    api_file_raw,
+    api_file_read,
+    api_file_write,
+)
+from kiro_crew.dashboard.file_api.git_panel import (  # noqa: F401
+    _GIT_PANEL_STDOUT_CAP,
+    _git_repo_listing,
+    _is_not_a_repo_verdict,
+    _porcelain_unquote,
+    _probe_git_dir,
+    _project_directory_absent,
+    _repo_filter_refusal_cause,
+    _run_git_bounded,
+    _worktree_probe_failure_is_empty_scope,
+    api_project_git_log,
+    api_project_git_repos,
+    api_project_git_status,
+)
+from kiro_crew.dashboard.file_api.grep import (  # noqa: F401
+    _grep_doc_segments,
+    _grep_docs,
+    _grep_hit,
+    _grep_pdf_segments,
+    _grep_python,
+    _grep_resolve_root,
+    _grep_rg,
+    _grep_rg_argv,
+    _grep_rg_executable,
+    _grep_rg_hit_of,
+    _grep_rg_teardown,
+    _grep_sensitive_globs,
+    _grep_xlsx_segments,
+    api_file_grep,
+)
+from kiro_crew.dashboard.file_api.office_preview import (  # noqa: F401
+    _cap_slides,
+    _PreviewUnsupported,
+    _redact_block,
+    _redact_blocks,
+    _redact_value,
+    api_file_office_preview,
+)
+from kiro_crew.dashboard.file_api.outbox import (  # noqa: F401
+    _audit_consented_download,
+    _audit_owner_grant_refusal,
+    _owner_grant_releases_flagged,
+    _read_outbox_file,
+    api_outbox_download,
+    api_outbox_list,
+    api_outbox_notify,
+)
+from kiro_crew.dashboard.file_api.path_complete import (  # noqa: F401
+    _complete_path_listing,
+    _completion_segments,
+    _open_completion_dir,
+    _scan_completion_dir,
+    api_path_complete,
+)
+from kiro_crew.dashboard.file_api.path_probe import (  # noqa: F401
+    _path_probe_prefix_wedged,
+    _path_probe_stall_key,
+    _PathProbe,
+    _PathProbeBusy,
+    _probe_busy_response,
+    _probe_request_path,
+    _run_path_probe,
+    _tracked_path_probe,
+    _validate_dashboard_path,
+)
+from kiro_crew.dashboard.file_api.pinned_io import (  # noqa: F401
+    _batch_stall_path,
+    _CheckedFile,
+    _classify_request_paths,
+    _file_write_blocking,
+    _open_checked,
+    _open_checked_file,
+    _open_rb_nofollow,
+    _OpenDenied,
+    _OpenedFile,
+    _OpenRefusal,
+    _project_relative_stall_path,
+    _read_request_path,
+    _resolve_project_relative,
+    _TextRead,
+    api_file_kinds,
+)
+from kiro_crew.dashboard.file_api.project_dirs import (  # noqa: F401
+    _git_head_path,
+    _known_project_dirs,
+    _match_known_project,
+    _match_known_project_for,
+    _project_git_branch,
+    _read_git_meta_prefix,
+    _redact_project_path,
+    _resolve_project_git,
+    _slot_git_repo_snapshot,
+    _slot_project_snapshot,
+    api_project_git,
+)
+from kiro_crew.dashboard.file_api.project_tree import (  # noqa: F401
+    _project_tree_allot,
+    _project_tree_body,
+    _project_tree_fence,
+    _project_tree_file_quotas,
+    _project_tree_git_layout,
+    _project_tree_identity,
+    _project_tree_is_link,
+    _project_tree_listing,
+    _project_tree_pin,
+    _project_tree_rebase,
+    _project_tree_scandir,
+    _project_tree_scandir_entries,
+    _project_tree_subdir,
+    _project_tree_walk,
+    _project_tree_walk_pinned,
+    _ProjectTreeFolderMoved,
+    api_project_tree,
+)
+from kiro_crew.dashboard.file_api.search import (  # noqa: F401
+    _audit_file_search_exit,
+    _fuzzy_score,
+    _resolve_search_root,
+    _subsequence_run,
+    api_file_search,
+)
+from kiro_crew.dashboard.file_api.sheet import (  # noqa: F401
+    _load_sheet_payload,
+    _parse_workbook_grid,
+    _sheet_cell_json,
+    _sheet_formula_text,
+    _SheetRefusal,
+    _vet_zip_eocd,
+    api_file_sheet,
+)
+from kiro_crew.dashboard.file_api.transfer import (  # noqa: F401
+    _parse_range_header,
+    api_file_download,
+    api_file_stream,
+    api_file_watch,
+)
+from kiro_crew.dashboard.file_api.uploads import (  # noqa: F401
+    _content_matches_ext,
+    _content_mismatch_message,
+    _log_upload_diagnostic,
+    _resolve_raster_ext,
+    _sniff_media_type,
+    _stream_media_part,
+    _upload_dir,
+    _write_file_restricted,
+    api_upload_file,
+)
+from kiro_crew.dashboard.file_api.workspaces import (  # noqa: F401
+    _resolve_ws_dir,
+    _WorkspaceConflict,
+    api_workspaces,
+    api_workspaces_create,
+    api_workspaces_delete,
+    api_workspaces_update,
+)
+from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS  # noqa: F401
+from kiro_crew.dashboard.git_repo_touches import _GIT_ROOT_WALK_LIMIT  # noqa: F401
+from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
+    _probe_persisted_session,
+    read_bounded_json,
+    require_owner_dashboard_request,
+)
+from kiro_crew.dashboard.handlers.messaging import _resolve_session_target  # noqa: F401
+from kiro_crew.dashboard.origin import is_direct_local_request  # noqa: F401
+from kiro_crew.dashboard.session_folders import (  # noqa: F401
+    SESSION_FOLDER_ROOT_MAX_CHARS,
+    validate_session_folder_root,
+)
+from kiro_crew.dashboard.slot_ownership import (  # noqa: F401
+    app_owns_slot_session,
+    deny_app_slot_session_access,
+    slot_not_found,
+)
+from kiro_crew.dashboard.slot_projection import summary_rows  # noqa: F401
+from kiro_crew.dashboard.state import (  # noqa: F401
+    VALID_MEMORY_MODES,
+    DashboardState,
+    append_and_surface,
+    load_window_off_loop,
+)
+from kiro_crew.dashboard.upload_limits import (  # noqa: F401
+    bytes_to_mb_figure,
+    knowledge_ceiling_bytes,
+    upload_max_bytes,
+)
+from kiro_crew.doc_blocks import extract_blocks  # noqa: F401
+from kiro_crew.doc_parser import extract_slides, extract_text, join_slides  # noqa: F401
+from kiro_crew.git_config_hooks import (  # noqa: F401
+    ConfigHookScanError,
+    config_hook_disable_args_sandboxed,
+)
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope  # noqa: F401
+from kiro_crew.github_runner import validate_provider_executable  # noqa: F401
+from kiro_crew.hooks import (  # noqa: F401
+    FileTooLargeError,
+    is_unc_shape,
+    safe_read_file_bytes,
+    safe_read_prefix,
+)
+from kiro_crew.messaging.display_safety import redact_for_display  # noqa: F401
+from kiro_crew.messaging.outbound_files import OutboundFile  # noqa: F401
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime  # noqa: F401
+from kiro_crew.owner_only_files import ensure_directory  # noqa: F401 - owner: uploads
+from kiro_crew.pdf_extract import PdfExtraction, extract_pdf_segments  # noqa: F401
+from kiro_crew.platform import binary_content_is_flagged  # noqa: F401
+from kiro_crew.platform import wide_content_is_flagged  # noqa: F401
+from kiro_crew.platform import redact_via_context as redact  # noqa: F401
+from kiro_crew.platform.context import (  # noqa: F401
+    redact_log_via_context,
+    redact_owner_view_via_context,
+)
+from kiro_crew.sandbox import (  # noqa: F401
+    cgroup_scope_argv,
+    popen_limited,
+    sandboxed_spawn_argv,
+    wrap_argv,
+)
+from kiro_crew.security import (  # noqa: F401
+    _CRED_CLASS,
+    _STREAM_HOLDBACK_JWT_MAX,
+    _STREAM_HOLDBACK_MAX,
     BINARY_MIME_ALLOWLIST,
+    _stall_prefix,
+    is_sensitive_canonical_path,
     is_sensitive_path,
+    is_sensitive_resolved_path,
+    path_contains_sensitive,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_path_segments,
+    redaction_switch,
+    sandbox_credential_targets,
 )
-from kiro_crew.slack.handler import is_tracked_channel
-from kiro_crew.validation import (
+from kiro_crew.validation import (  # noqa: F401
     FILE_READ_SCHEMA,
-    FILE_SEND_SCHEMA,
+    MODEL_ID_RE,
+    MODEL_PICKER_HIDDEN_MODEL_ID_RE,
+    MODEL_PICKER_HIDDEN_MODELS_MAX,
     ValidationError,
     validate_tool_args,
+)
+from kiro_crew.zip_vet import (  # noqa: F401
+    ZipInventoryRejected,
+    vet_zip_inventory_bytes,
 )
 
 # Register OOXML office MIME types explicitly. The system mimetypes
@@ -61,8 +403,77 @@ mimetypes.add_type(
 
 _INLINE_DISPOSITION_PREFIXES = frozenset({"audio/", "video/", "image/", "application/pdf"})
 
+#: Session-key namespace of a sub-agent run. A sub-agent has no tab of its own, so
+#: its file card belongs to the PARENT's tab — the surface every other sub-agent
+#: output already routes to (``subagent_manager.monitoring``'s completion
+#: injection, ``chat_utils.subagent_event_slot``'s WS frames).
+_SUBAGENT_SESSION_PREFIX = "subagent:"
+
 
 logger = logging.getLogger(__name__)
+
+
+# The Slack probe a channel upload hands to the destination oracle, defined in the
+# ``channel_upload`` owner. Bound by attribute: the one ``import`` of this name stays the
+# function-local one from ``kiro_crew.slack.handler``.
+is_tracked_channel = _owner_channel_upload.is_tracked_channel
+
+
+def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str:
+    """The parent session key of the sub-agent running under *session_key*, or ``""``.
+
+    Matches on BOTH spellings a run can be keyed by — its ``conversation_key`` (a
+    continuable run) and ``subagent:<id>`` — the same comparison
+    ``subagent_manager.continuation`` makes, because a continuable run's key is not
+    derivable from its id. Returns ``""`` when the manager is absent or the run is
+    unknown, so the caller SUPPRESSES the card rather than guessing a tab.
+    """
+    manager = getattr(state, "subagents", None)
+    if manager is None:
+        return ""
+    try:
+        # A PROPERTY, not a method (``subagent.py`` ``@property all_agents``).
+        # Calling it invoked the returned LIST, so every lookup raised TypeError,
+        # the except below swallowed it, and the card was suppressed for every
+        # sub-agent -- the routing this function exists to do never happened once.
+        agents = list(manager.all_agents)
+    except Exception:
+        logger.warning("outbox notify: sub-agent roster unavailable", exc_info=True)
+        return ""
+    matches = [
+        info
+        for info in agents
+        if (getattr(info, "conversation_key", "") or f"{_SUBAGENT_SESSION_PREFIX}{info.id}")
+        == session_key
+    ]
+    if not matches:
+        return ""
+    # More than one record can carry ONE key: a continuation is minted as a new run
+    # whose ``conversation_key`` is the original's ``subagent:<id>``, and the
+    # original (spawned with an empty conversation_key) resolves to that same
+    # string. Their parents differ whenever a DIFFERENT session continued the
+    # conversation -- so taking the first match routes the card to whichever chat
+    # happens to sit earlier in the roster, which is the PREVIOUS owner's tab.
+    #
+    # Newest ACTIVE run wins: a live run is the one the card belongs to, and among
+    # equals the most recently started. Ranked rather than filtered so a roster of
+    # only-finished records still answers with the latest instead of nothing.
+
+    def _rank(info: object) -> tuple[int, float]:
+        # Defensive reads: a stubbed manager can hand back non-bool/non-number here,
+        # and a comparison against those raises inside the sort rather than routing.
+        done = getattr(info, "done", False)
+        started = getattr(info, "started", 0.0)
+        return (
+            0 if (done is True) else 1,
+            float(started) if isinstance(started, (int, float)) else 0.0,
+        )
+
+    best = max(matches, key=_rank)
+    parent = getattr(best, "parent_session_key", "")
+    # isinstance, not truthiness: a stubbed manager can hand back a
+    # non-str here and dashboard_slot_key would treat it as a key.
+    return parent if isinstance(parent, str) else ""
 
 
 def _sel():
@@ -71,686 +482,72 @@ def _sel():
     return _pkg.sel()
 
 
-async def api_reveal_path(request: web.Request) -> web.Response:
-    """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
-    import shutil  # noqa: F811
-    import subprocess  # noqa: F811
-    import sys  # noqa: F811
+def _audit_file_send(
+    *,
+    leg: str,
+    outcome: str,
+    error: str | None = None,
+    downstream: str | None = None,
+    resources: str | None = None,
+) -> None:
+    """The one audit shape both ``file_send`` delivery legs write.
 
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    path = body.get("path", "")
-    action = body.get("action", "reveal")  # "reveal" or "open"
-    if not path or ".." in Path(path).parts:
-        return web.json_response({"error": "invalid path"}, status=400)
-    if is_sensitive_path(path):
-        _sel().log_tool_invocation(
-            session_key="api", source="api", tool_name="reveal_path",
-            outcome="denied", error="sensitive_path",
-            resources=path, metadata={"action": action})
-        return web.json_response({"error": "access denied"}, status=403)
-    if action == "open":
-        if not os.path.isfile(path):
-            return web.json_response({"error": "not a regular file"}, status=400)
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        elif shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", path])
-        else:
-            return web.json_response({"ok": True, "copy": path})
-    else:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        elif shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", str(Path(path).parent)])
-        else:
-            return web.json_response({"ok": True, "copy": path})
-    _sel().log_tool_invocation(
-        session_key="api", source="api", tool_name="reveal_path",
-        outcome="success", resources=path, metadata={"action": action})
-    return web.json_response({"ok": True})
-
-
-async def api_outbox_notify(request: web.Request) -> web.Response:
-    """POST /api/outbox/notify — agent sent a file, notify the user."""
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="notify",
-            outcome="denied",
-            error="invalid_json_body",
-        )
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-
-    raw_path = body.get("path", "")
-    raw_filename = body.get("filename", "")
-    raw_desc = body.get("description", "")
-    # Reject files whose names/paths contain sensitive patterns
-    if redact(raw_filename) != raw_filename or redact(raw_path) != raw_path:
-
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="notify",
-            outcome="denied",
-            error="sensitive_filename_rejected",
-        )
-        return web.json_response(
-            {"error": "filename or path contains sensitive content"}, status=400
-        )
-    file_data = {
-        "filename": raw_filename,
-        "path": raw_path,
-        "description": redact(raw_desc),
-        "size": body.get("size", 0),
-        "content_type": mimetypes.guess_type(raw_filename)[0] or "application/octet-stream",
-    }
-    # Validate file is readable + UTF-8 before creating a persistent card
-    from pathlib import Path  # noqa: F811
-
-    from kiro_crew.config.loader import outbox_dir  # noqa: F811
-    from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
-
-    resolved = Path(file_data["path"]).resolve()
-    if not resolved.is_relative_to(outbox_dir().resolve()):
-
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="notify",
-            outcome="denied",
-            error="path_outside_outbox",
-        )
-        return web.json_response({"error": "path must be inside outbox"}, status=403)
-    try:
-        raw = safe_read_file_bytes(str(resolved))
-    except FileTooLargeError as e:
-
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="notify",
-            outcome="denied",
-            error=f"file_too_large: {e}",
-        )
-        return web.json_response({"error": str(e)}, status=413)
-    if raw is None:
-
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="notify",
-            outcome="denied",
-            error="file_not_found_or_access_denied",
-        )
-        return web.json_response({"error": "File not found or access denied"}, status=404)
-    # Text files: check for sensitive content. Binary files: skip content scan
-    # and validate MIME against the shared BINARY_MIME_ALLOWLIST.
-    try:
-        text = raw.decode("utf-8")
-        if redact(text) != text:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="notify",
-                outcome="denied",
-                error="sensitive_content_detected",
-            )
-            return web.json_response({"error": "file content contains sensitive data"}, status=400)
-    except UnicodeDecodeError:
-        # Binary file — only allow known-safe media types
-        guessed_type = mimetypes.guess_type(raw_filename)[0] or ""
-        if guessed_type not in BINARY_MIME_ALLOWLIST:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="notify",
-                outcome="denied",
-                error=f"binary_mime_not_allowed: {guessed_type}",
-            )
-            return web.json_response(
-                {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
-            )
-    # Inject into the caller's chat slot so the card persists in the correct session
-    if state._slots:
-        # Prefer the caller's own slot via X-Session-Key header
-        session_key = request.headers.get("X-Session-Key", "").strip()
-        active = None
-        if session_key.startswith("cron:"):
-            # A cron slot is named cron-<id>, which is not the session key folded.
-            active = state.get_slot(f"cron-{session_key.removeprefix('cron:')}")
-        else:
-            # A channel-born conversation keeps its channel key (slack:<ts>)
-            # while its tab is open, so the slot name comes from the surface
-            # lookup — stripping a "dashboard:" prefix would miss it and drop the
-            # card into whichever tab happened to be active last.
-            slot_key = dashboard_slot_key(session_key)
-            if slot_key:
-                active = state.get_slot(slot_key)
-        # An explicitly header-targeted slot receives the file even when empty
-        header_targeted = active is not None
-        # Fallback: most recently active slot
-        if not active:
-            active = max(
-                state._slots.values(),
-                key=lambda s: s.messages[-1]["ts"] if s.messages else "",
-            )
-        if active and (active.messages or header_targeted):
-            # Route through the context-aware redact() so a loaded companion's
-            # extra credential regexes scrub the broadcast file JSON too — the
-            # same overlay-aware pass the filename/path/description gates use.
-            redacted_file_json = redact(json.dumps(file_data))
-            active.append("file", redacted_file_json)
-            # Only broadcast explicitly when _has_reader suppresses append's
-            # built-in _on_message callback. Avoids duplicate file cards.
-            if getattr(active, "_has_reader", False):
-                state.broadcast_ws("chat_message", {
-                    "slot": active.key,
-                    "role": "file",
-                    "content": redacted_file_json,
-                    "ts": active.messages[-1]["ts"],
-                })
-
+    Every record the Slack and channel endpoints emit is the same tool
+    invocation under a different ``tool_kind`` (the leg), so the shape lives
+    here rather than being spelled out at each of the dozen decision sites that
+    write it -- a copy per site puts a drifted field one edit away. Optional
+    fields are OMITTED when unset: skips carry no ``downstream_service``,
+    refusals and deliveries do.
+    """
+    extra: dict[str, str] = {}
+    if error is not None:
+        extra["error"] = error
+    if downstream is not None:
+        extra["downstream_service"] = downstream
+    if resources is not None:
+        extra["resources"] = resources
     _sel().log_tool_invocation(
         session_key="api",
         source="api",
         tool_name="file_send",
-        tool_kind="notify",
-        outcome="completed",
-        resources=f"filename={file_data['filename']}",
-    )
-    return web.json_response({"ok": True})
-
-
-async def api_outbox_download(request: web.Request) -> web.StreamResponse:
-    """GET /api/outbox/{filename} — download a file from the outbox."""
-    import urllib.parse  # noqa: F811
-
-    from kiro_crew.config.loader import outbox_dir  # noqa: F811
-    from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
-
-    filename = request.match_info["filename"]
-    path = (outbox_dir() / filename).resolve()
-    if not path.is_relative_to(outbox_dir().resolve()):
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="download",
-            outcome="denied",
-            error=f"path_traversal: {filename}",
-        )
-        return web.json_response({"error": "forbidden"}, status=403)
-    try:
-        raw = safe_read_file_bytes(str(path))
-    except FileTooLargeError as e:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="download",
-            outcome="denied",
-            error=f"file_too_large: {e}",
-        )
-        return web.json_response({"error": str(e)}, status=413)
-    if raw is None:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="download",
-            outcome="denied",
-            error=f"safe_read_file_bytes rejected: {filename}",
-        )
-        return web.json_response({"error": "forbidden"}, status=403)
-    # For text files, scan for sensitive content; binary files served as-is
-    # against the shared BINARY_MIME_ALLOWLIST (deny-by-default).
-    is_text = True
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        is_text = False
-    if is_text:
-        redacted = redact(text)
-        if redacted != text:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="download",
-                outcome="denied",
-                error="content_redacted",
-            )
-            return web.json_response(
-                {"error": "file content was redacted; download aborted"}, status=400
-            )
-    safe_name = urllib.parse.quote(path.name, safe="")
-    content_type, _ = mimetypes.guess_type(path.name)
-    if not content_type:
-        content_type = "application/octet-stream"
-    # Binary files must be in the allowlist
-    if not is_text and content_type not in BINARY_MIME_ALLOWLIST:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="download",
-            outcome="denied",
-            error=f"binary_mime_not_allowed: {content_type}",
-        )
-        return web.json_response(
-            {"error": f"Binary file type not allowed: {content_type}"}, status=403
-        )
-    # Inline disposition for media types the browser can render
-    disposition = "inline" if any(content_type.startswith(t) for t in _INLINE_DISPOSITION_PREFIXES) else "attachment"
-    # SVG can contain scripts — never serve inline on the dashboard origin
-    if content_type == "image/svg+xml":
-        disposition = "attachment"
-    # Text files always attachment — prevents content injection via crafted filenames
-    if is_text:
-        disposition = "attachment"
-    _sel().log_tool_invocation(
-        session_key="api",
-        source="api",
-        tool_name="file_send",
-        tool_kind="download",
-        outcome="completed",
-        resources=f"filename={filename}",
-    )
-    return web.Response(
-        body=raw,
-        headers={
-            "Content-Disposition": f"{disposition}; filename*=UTF-8''{safe_name}",
-            "Content-Type": content_type,
-            "X-Content-Type-Options": "nosniff",
-        },
+        tool_kind=leg,
+        outcome=outcome,
+        **extra,
     )
 
 
-async def api_outbox_list(request: web.Request) -> web.Response:
-    """GET /api/outbox — list files in the outbox."""
-    from kiro_crew.config.loader import outbox_dir  # noqa: F811
+def _body_err_code(body_err: web.Response) -> str:
+    """SEL error label for a refused body read.
 
-    entries = []
-    odir = outbox_dir()
-    if not odir.is_dir():
-        return web.json_response({"files": []})
-    for f in odir.iterdir():
-        try:
-            st = f.stat()
-        except FileNotFoundError:
-            continue
-        if f.is_file() and redact(f.name) == f.name:
-            entries.append({"filename": f.name, "size": st.st_size, "modified": st.st_mtime})
-    entries.sort(key=lambda x: float(x["modified"]), reverse=True)  # type: ignore[arg-type,return-value]
-
-    _sel().log_tool_invocation(
-        session_key="api",
-        source="api",
-        tool_name="file_send",
-        tool_kind="list",
-        outcome="completed",
-        resources=f"count={len(entries)}",
-    )
-    return web.json_response({"files": entries[:50]})
-
-
-async def api_slack_upload_file(request: web.Request) -> web.Response:
-    """POST /api/slack/upload-file — upload a file to Slack (internal, called by file_send)."""
-    from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
-
-    state: DashboardState = request.app["state"]
-    slack = state.slack_client
-    if not slack:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="skipped",
-            error="no_slack_client",
-        )
-        return web.json_response({"ok": True, "skipped": "no_slack"})
+    Derived from the guard response's machine-readable ``code`` so the audit
+    record distinguishes a parse failure from an oversized body (413
+    ``payload_too_large``) instead of filing every refusal as a JSON error.
+    """
     try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            error="invalid_json_body",
-        )
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-    file_path_raw = body.get("file_path", "")
-    filename = body.get("filename", "")
-    thread_ts = body.get("thread_ts")
-    if not file_path_raw or not filename:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            error="missing_required_fields",
-        )
-        return web.json_response({"error": "file_path, filename required"}, status=400)
-    file_path = file_path_raw
-    resolved = Path(file_path).resolve()
-    from kiro_crew.config.loader import outbox_dir, workspace_root  # noqa: F811
-
-    allowed_outbox = outbox_dir().resolve()
-    allowed_workspace = workspace_root().resolve()
-    if not (resolved.is_relative_to(allowed_outbox) or resolved.is_relative_to(allowed_workspace)):
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"path_not_allowed: {file_path}",
-        )
-        return web.json_response({"error": "file_path must be under ~/.kirocrew/"}, status=403)
-    try:
-        raw = safe_read_file_bytes(str(resolved))
-    except FileTooLargeError as e:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"file_too_large: {e}",
-        )
-        return web.json_response({"error": str(e)}, status=413)
-    if raw is None:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"safe_read_file_bytes rejected: {file_path}",
-        )
-        return web.json_response(
-            {"error": f"File not found or access denied: {file_path}"}, status=404
-        )
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        # Binary file — only allow known-safe media types
-        guessed_type = mimetypes.guess_type(filename)[0] or ""
-        if guessed_type not in BINARY_MIME_ALLOWLIST:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error=f"binary_mime_not_allowed: {guessed_type}",
-            )
-            return web.json_response(
-                {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
-            )
-        text = None  # signal: skip text redaction path
-        # Scan binary content for embedded credentials (e.g. base64-encoded keys in PDFs)
-        binary_text = raw.decode("latin-1")
-        if redact(binary_text) != binary_text:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="binary_credential_detected",
-            )
-            return web.json_response(
-                {"error": "binary file contains embedded credentials"}, status=400
-            )
-    if text is not None:
-        try:
-            redacted = redact(text)
-            if redacted != text:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error="content_redacted",
-                )
-                return web.json_response(
-                    {"error": "file content was redacted; upload aborted"}, status=400
-                )
-        except Exception as redact_err:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="error",
-                downstream_service="slack",
-                error=f"redaction_failed: {redact_err}",
-            )
-            return web.json_response({"error": f"Redaction failed: {redact_err}"}, status=500)
-    # Resolve thread_ts and channel from linked slot when not explicitly provided
-    target_channel = body.get("channel", "")
-    channel_from_session_map = False
-    session_key = request.headers.get("X-Session-Key", "").strip()
-    # A dashboard session carries its Slack link in the session map; a
-    # channel-born one is linked under that same channel key by the Slack
-    # handler, so both resolve their thread from the one lookup. Skipping the
-    # channel case would DM the owner instead of landing the file in the thread
-    # the conversation is happening in.
-    linkable = session_key.startswith("dashboard:") or is_channel_session_key(session_key)
-    if not thread_ts and linkable and state.sessions:
-        link_ts, link_ch = state.sessions.get_slack_link(session_key)
-        if link_ts and (not target_channel or target_channel == link_ch):
-            thread_ts = link_ts
-            if not target_channel and link_ch:
-                target_channel = link_ch
-                channel_from_session_map = True
-    # Resolve channel: use explicit channel if provided, else owner DM
-    channel = ""
-    if target_channel:
-        try:
-            validate_tool_args(
-                {"path": "x", "channel": target_channel}, FILE_SEND_SCHEMA
-            )
-        except ValidationError:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="channel_validation_failed",
-            )
-            return web.json_response(
-                {"error": "invalid channel value"}, status=400
-            )
-        # Session-map-sourced channels are trusted (system created the link).
-        # Only enforce tracking check for user-supplied channels.
-        # Defense-in-depth: session-map channels must be DMs (D-prefix) or tracked.
-        if not channel_from_session_map:
-            try:
-                tracked = is_tracked_channel(target_channel)
-            except Exception:
-                tracked = False  # deny-by-default extends to uncertainty
-            if not tracked:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error=f"channel_not_tracked: {target_channel}",
-                )
-                return web.json_response(
-                    {"error": "channel not in tracked channels"}, status=403
-                )
-        else:
-            try:
-                allowed = target_channel.startswith("D") or is_tracked_channel(target_channel)
-            except Exception:
-                allowed = False  # deny-by-default extends to uncertainty
-            if not allowed:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error=f"session_map_channel_not_authorized: {target_channel}",
-                )
-                return web.json_response(
-                    {"error": "channel not authorized"}, status=403
-                )
-        channel = target_channel
-    else:
-        try:
-            creds = KiroCrewConfig.load().load_credentials()
-            owner_id = creds.get("KIROCREW_OWNER_ID", "")
-            if owner_id:
-                channel = await slack.open_dm(owner_id)
-        except Exception:
-            pass
-    if not channel:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="skipped",
-            error="no_channel",
-        )
-        return web.json_response({"ok": True, "skipped": "no_channel"})
-    try:
-        safe_filename = filename
-        if redact(safe_filename) != safe_filename:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="sensitive_filename_rejected",
-            )
-            return web.json_response({"error": "filename contains sensitive content"}, status=400)
-        await slack.upload_file(
-            channel,
-            thread_ts or "",
-            str(resolved),
-            safe_filename,
-            safe_filename,
-        )
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="completed",
-            downstream_service="slack",
-            resources=f"channel={channel} file={file_path}",
-        )
-        return web.json_response({"ok": True})
-    except Exception as e:
-        # A Slack SDK / network exception can carry file paths, host and URL
-        # fragments, or credentials embedded in a URL. Sanitize before it
-        # reaches the client or the audit record (see api_slack_pins).
-        safe_error, _ = redact_credentials(str(e))
-        safe_error, _ = redact_exfiltration_urls(safe_error)
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="error",
-            downstream_service="slack",
-            error=safe_error,
-        )
-        return web.json_response({"error": safe_error}, status=500)
-
-
-async def api_upload(request: web.Request) -> web.Response:
-    """POST /api/upload — open native file picker and return selected paths."""
-    if sys.platform != "darwin":
-        return web.json_response({"error": "File picker is only available on macOS"}, status=400)
-
-    proc = await asyncio.create_subprocess_exec(
-        "osascript",
-        "-e",
-        "set f to choose file with multiple selections allowed\n"
-        'set out to ""\n'
-        "repeat with p in f\n"
-        "  set out to out & POSIX path of p & linefeed\n"
-        "end repeat\n"
-        "return out",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.communicate()
-        return web.json_response({"error": "Finder dialog timed out"}, status=504)
-    paths = [ln for ln in stdout.decode("utf-8", errors="replace").strip().splitlines() if ln]
-
-    if not paths:
-        return web.json_response({"paths": []})
-    return web.json_response({"paths": paths})
+        parsed = json.loads(body_err.text or "")
+    except ValueError:
+        return "invalid_json_body"
+    code = parsed.get("code") if isinstance(parsed, dict) else None
+    return str(code) if code else "invalid_json_body"
 
 
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
 # test isolation. The name below is an opt-in override (None = live home) so
 # existing monkeypatch call sites keep working. See config.md "Data Home";
-# dashboard/handlers/usage.py is the reference implementation.
+# dashboard/handlers/usage_store.py is the reference implementation.
 _SCREENSHOT_DIR: Path | None = None
 
 _UPLOAD_DIR: Path | None = None
 
 
-def _screenshot_dir() -> Path:
-    """Screenshots directory, resolved against the live data home."""
-    return _SCREENSHOT_DIR if _SCREENSHOT_DIR is not None else data_home() / "screenshots"
-
-
-def _upload_dir() -> Path:
-    """Uploads directory, resolved against the live data home."""
-    return _UPLOAD_DIR if _UPLOAD_DIR is not None else data_home() / "uploads"
-
-
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB per file
+#: Video gets its own, larger ceiling: a 30-second retina screen recording is
+#: routinely 60-150 MB, so the 50 MB document cap would reject the dominant
+#: case and make the feature read as broken. Safe to raise only because video
+#: parts STREAM to disk (:func:`_stream_video_part`) instead of accumulating in
+#: memory the way every other accepted type does.
+_MAX_VIDEO_UPLOAD_BYTES = 512 * 1024 * 1024  # 512 MB per video
 _MAX_UPLOAD_FILES = 20  # max files per request
 
 # Fallback-walk budgets. ``_WALK_MAX_SCAN_*`` bounds entries scored PER KIND
@@ -762,16 +559,82 @@ _MAX_UPLOAD_FILES = 20  # max files per request
 _WALK_MAX_SCAN_SCOPED = 50_000
 _WALK_MAX_SCAN_UNSCOPED = 5_000
 _WALK_MAX_DIRS_VISITED = 20_000
+
+#: Wall-clock budget for ONE ``_walk_file_search`` pass. The scan/dirs ceilings
+#: above bound how MANY filesystem calls the walk makes, not how LONG each one
+#: takes. On local disk a ceiling-reaching walk measured 4.20s worst, so the
+#: client's own 15s deadline (``FILE_SEARCH_TIMEOUT_MS`` in ``api/client/files.ts``)
+#: has ~3.6x headroom there -- but that figure is local disk only. On an
+#: NFS/SSHFS-class mount each ``os.stat``/``scandir`` is a network round trip, so
+#: the same bounded number of calls can run many times longer and blow straight
+#: past the client's 15s; the client's Retry re-enters the same bound, so a
+#: healthy-but-slow store fails every attempt. This bounds the one term store
+#: speed inflates: when a per-directory or per-stride clock check finds the
+#: budget spent, the walk stops and returns the partial set it gathered, the
+#: same early stop the entry/dir ceilings already make for size, reached by
+#: elapsed time. The check is cooperative, so a single ``os.stat`` that blocks
+#: on a dead mount can overrun the budget before the next check runs; this
+#: shortens the common slow-but-alive case rather than guaranteeing a hard
+#: wall-clock cap. 10s is chosen to sit
+#: under the client's 15s on a store that
+#: answers each call, with room for admission and round trips.
+#: Module-level so a test can shrink it, exactly as ``_GREP_TIME_BUDGET_SECS``.
+_WALK_TIME_BUDGET_SECS = 10.0
+
+#: How many entries one ``_collect`` scans between wall-clock checks in
+#: ``_walk_file_search``. A single enormous directory could otherwise overrun the
+#: budget between the per-directory checks, so the entry loop re-reads the clock
+#: every stride -- the same trick, and for the same reason, as the grep path's
+#: ``_GREP_ROW_DEADLINE_STRIDE``. Module-level so a test can shrink it.
+_WALK_DEADLINE_STRIDE = 512
+
+
+#: The monotonic clock ``_walk_file_search`` reads for its wall-clock budget,
+#: named on the module (the facade every owner function resolves against) rather
+#: than called as ``time.monotonic`` inline. A deadline test drives the walk's
+#: clock deterministically by patching THIS name -- advancing it per yielded
+#: directory so the budget crosses on a chosen directory -- which touches only
+#: the walk and leaves the stdlib ``time`` module untouched for the event loop
+#: and every other test (tests-are-deterministic). ``time.monotonic`` is a
+#: facade name no owner captures, so the patch cannot silently miss a caller.
+def _walk_monotonic() -> float:
+    return time.monotonic()
+
+
+# Hard ceiling on the caller-supplied ``limit`` of /api/file-search. The walk
+# collects ``max_results * 10`` candidates per kind, so the limit multiplies real
+# filesystem work; a fixed server-side ceiling keeps a hostile ``?limit=`` from
+# turning the endpoint into a filesystem-walk amplifier. Mirrored client-side as
+# SEARCH_RESULT_LIMIT_MAX in FolderPanel.tsx.
+_SEARCH_LIMIT_CEILING = 60
 _ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 _ALLOWED_TEXT_EXT = {
     ".txt",
+    ".text",
+    ".xwiki",
     ".md",
     ".json",
+    ".jsonl",
+    # Excalidraw scene JSON — the composer's sketch pad attaches one per
+    # sketch, and the dashboard has a dedicated read-only renderer for it
+    # (FileRenderers routes on this exact extension). Content-wise it is
+    # ordinary JSON text.
+    ".excalidraw",
+    ".har",
     ".yaml",
     ".yml",
     ".xml",
+    # draw.io / diagrams.net XML source.
+    ".drawio",
     ".csv",
+    ".tsv",
     ".log",
+    # CNAB remittance (.rem) and return (.ret) files — the Brazilian banking
+    # (FEBRABAN) interchange format. Fixed-width ASCII/Latin-1 records, so they
+    # read as plain text; the read path and FileRenderers already treat an
+    # unknown extension as text, this just lets them past the upload boundary.
+    ".rem",
+    ".ret",
     ".py",
     ".js",
     ".ts",
@@ -806,1651 +669,451 @@ _ALLOWED_DOC_EXT = {
     ".tar",
     ".gz",
 }
-
-
-def _write_file_restricted(path: Path, data: bytes) -> None:
-    """Write file with owner-only permissions (0o600)."""
-    fd = os.open(
-        str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
-        0o600,
-    )
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
+#: Video containers accepted at the upload boundary. Deliberately narrower than
+#: ``FileRenderers``' VIDEO_EXTS: every entry here must be verifiable by
+#: :func:`_sniff_media_type` AND playable by ``<video>``, so an accepted upload
+#: is always one the chat can actually show. ``.mkv`` is excluded — it shares
+#: WebM's EBML signature but browser playback is unreliable, and accepting a
+#: file that then refuses to play is worse than refusing it at the door.
+_ALLOWED_VIDEO_EXT = {".mp4", ".m4v", ".mov", ".webm"}
+#: Media containers a browser will often play but the upload boundary does not
+#: accept. Rejecting them with the bare "Unsupported file type" reads as "video
+#: is not supported at all", when the actual remedy is a re-encode -- so the
+#: refusal for one of these names the containers that do work. VIDEO containers
+#: only: naming the video set to an audio upload (``.m4a``) would tell its
+#: sender to re-encode audio into a video container, which is worse than the
+#: bare refusal.
+_VIDEO_HINT_EXT = frozenset(
+    {".mkv", ".ogv", ".avi", ".mpg", ".mpeg", ".wmv", ".flv", ".3gp"}
+)
+#: Media type :func:`_sniff_media_type` must report for the claimed video
+#: extension. The MP4 family (mp4/m4v/mov) all carry a ``ftyp`` box at offset 4
+#: and sniff as ``video/mp4``; QuickTime's brand differs but the box does not.
+#:
+#: This gate proves the bytes are the claimed FAMILY, not the exact container:
+#: ``.webm`` and ``.mkv`` share the EBML magic, so an ``.mkv`` renamed to
+#: ``.webm`` passes here even though the ``.mkv`` extension is refused.
+#: Distinguishing them needs the EBML DocType, which is not worth parsing for
+#: this boundary -- the gate's job is to keep NON-media bytes off disk (CWE-434),
+#: and the extension set is what carries the narrower "accepted means playable"
+#: promise.
+_VIDEO_EXT_MIME: dict[str, str] = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/mp4",
+    ".webm": "video/webm",
+}
+#: Audio containers accepted at the upload boundary. Every entry must be
+#: verifiable by :func:`_sniff_media_type` and playable by ``<audio>``.
+_ALLOWED_AUDIO_EXT = {".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".flac"}
+#: Media type :func:`_sniff_media_type` must report for each audio extension.
+#: Ogg carries Vorbis and Opus alike. ``.m4a`` shares the BMFF ``ftyp`` family
+#: with MP4, which the sniffer reports as ``video/mp4`` regardless of track type.
+_AUDIO_EXT_MIME: dict[str, str] = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "video/mp4",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+}
+#: Every media extension whose bytes are gated by :func:`_sniff_media_type`.
+_MEDIA_EXT_MIME: dict[str, str] = {**_VIDEO_EXT_MIME, **_AUDIO_EXT_MIME}
 
 
 # Magic-byte signatures for content-type validation at the upload boundary
 # (CWE-434). The extension is attacker-controlled, so binary types are verified
-# against their file signature BEFORE the bytes are written. Text formats (and
+# against their file signature BEFORE the bytes are written. Raster types are
+# verified by the shared sniffer (:mod:`kiro_crew.messaging.raster`), so all
+# consumers agree on what counts as each image type (including WebP's form tag
+# at offset 8, which a bare ``RIFF`` prefix would not check). Text formats (and
 # SVG, which is XML) have no reliable magic and remain gated by the extension
 # allowlist only.
 _ZIP_CONTAINER_EXTS = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}
+#: Raster extensions and the mime :func:`sniff_raster_mime` must report for
+#: the claimed extension to be accepted.
+_RASTER_EXT_MIME: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+}
+#: Non-raster binary types that still carry a reliable leading signature.
 _MAGIC_PREFIXES: dict[str, tuple[bytes, ...]] = {
-    ".png": (b"\x89PNG\r\n\x1a\n",),
-    ".jpg": (b"\xff\xd8\xff",),
-    ".jpeg": (b"\xff\xd8\xff",),
-    ".gif": (b"GIF87a", b"GIF89a"),
-    ".bmp": (b"BM",),
     ".pdf": (b"%PDF-",),
     ".gz": (b"\x1f\x8b",),
 }
-
-
-def _content_matches_ext(ext: str, data: bytes) -> bool:
-    """Best-effort magic-byte check that ``data`` matches the claimed ``ext``.
-
-    Returns False only when the signature is KNOWN and does not match, so an
-    attacker can't store arbitrary bytes (e.g. an HTML/script payload) under an
-    allowed binary extension (CWE-434). Unknown / text extensions (and ``.svg``)
-    return True — there is no reliable signature — and stay gated by the
-    extension allowlist alone.
-    """
-    if ext in _ZIP_CONTAINER_EXTS:
-        # OOXML / ODF / zip all begin with a local-file-header, empty-archive,
-        # or spanned-archive PK signature.
-        return data[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-    if ext == ".webp":
-        return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
-    prefixes = _MAGIC_PREFIXES.get(ext)
-    if prefixes is None:
-        return True  # text / svg / unknown — nothing to enforce
-    return any(data.startswith(p) for p in prefixes)
-
-
-async def api_upload_file(request: web.Request) -> web.Response:
-    """POST /api/upload/file — cross-platform multipart file upload.
-
-    Accepts multipart form data with one or more 'file' fields.
-    Saves files to the data home's uploads/ and returns server-side paths
-    that ACP's _send_prompt() can detect for image inlining.
-    """
-
-    upload_dir = _upload_dir()
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    reader = await request.multipart()
-    paths: list[str] = []
-    allowed = _ALLOWED_IMAGE_EXT | _ALLOWED_TEXT_EXT | _ALLOWED_DOC_EXT
-    caller = request.get("user", "dashboard")
-
-    def _cleanup() -> None:
-        for p in paths:
-            Path(p).unlink(missing_ok=True)
-
-    try:
-        while True:
-            part = await reader.next()
-            if part is None:
-                break
-            if not isinstance(part, BodyPartReader):
-                continue
-            if part.name != "file":
-                continue
-            if len(paths) >= _MAX_UPLOAD_FILES:
-                _cleanup()
-                _sel().log_api_access(
-                    caller=caller,
-                    operation="upload.file",
-                    outcome="rejected",
-                    source="dashboard",
-                    resources=f"reason:too_many_files:{_MAX_UPLOAD_FILES}",
-                )
-                return web.json_response(
-                    {"error": f"Too many files (max {_MAX_UPLOAD_FILES})"},
-                    status=400,
-                )
-            fname = part.filename or "upload"
-            # Sanitize: strip path components to prevent traversal
-            safe_name = re.sub(r"[^\w.\-]", "_", Path(fname).name)
-            ext = Path(safe_name).suffix.lower()
-            if ext not in allowed:
-                _cleanup()
-                _sel().log_api_access(
-                    caller=caller,
-                    operation="upload.file",
-                    outcome="rejected",
-                    source="dashboard",
-                    resources=f"file:{fname} reason:unsupported_type:{ext}",
-                )
-                return web.json_response(
-                    {"error": f"Unsupported file type: {ext}"},
-                    status=400,
-                )
-            # Read with size limit
-            data = bytearray()
-            while True:
-                chunk = await part.read_chunk(8192)
-                if not chunk:
-                    break
-                data.extend(chunk)
-                if len(data) > _MAX_UPLOAD_BYTES:
-                    _cleanup()
-                    _sel().log_api_access(
-                        caller=caller,
-                        operation="upload.file",
-                        outcome="rejected",
-                        source="dashboard",
-                        resources=f"file:{fname} reason:too_large:{len(data)}",
-                    )
-                    return web.json_response(
-                        {"error": f"File too large (max {_MAX_UPLOAD_BYTES // 1024 // 1024}MB)"},
-                        status=413,
-                    )
-            # Content-signature gate (CWE-434): verify magic bytes match the
-            # claimed extension BEFORE writing, so an allowed extension can't
-            # smuggle arbitrary/binary content (e.g. a .png that is really HTML).
-            if not _content_matches_ext(ext, bytes(data)):
-                _cleanup()
-                _sel().log_api_access(
-                    caller=caller,
-                    operation="upload.file",
-                    outcome="rejected",
-                    source="dashboard",
-                    resources=f"file:{fname} reason:content_signature_mismatch:{ext}",
-                )
-                return web.json_response(
-                    {"error": f"File content does not match its type: {ext}"},
-                    status=400,
-                )
-            # UUID prefix guarantees uniqueness even within a single request
-            dest = upload_dir / f"{uuid.uuid4().hex}_{safe_name}"
-            if not dest.resolve().is_relative_to(upload_dir.resolve()):
-                _cleanup()
-                _sel().log_api_access(
-                    caller=caller,
-                    operation="upload.file",
-                    outcome="rejected",
-                    source="dashboard",
-                    resources=f"file:{fname} reason:path_traversal",
-                )
-                return web.json_response({"error": "Invalid filename"}, status=400)
-            try:
-                await asyncio.to_thread(_write_file_restricted, dest, bytes(data))
-            except Exception:
-                dest.unlink(missing_ok=True)
-                raise
-            # Diagnostic logging for binary uploads. Compares the bytes
-            # we received in memory against the bytes that landed on
-            # disk after _write_file_restricted, so a future report of
-            # "uploaded .docx is corrupted" can be pinned to the
-            # upload pipeline vs post-upload tampering. Logged for
-            # extensions that are binary archives (docx/xlsx/pptx/odt/
-            # zip/pdf etc.) where any byte mismatch breaks the file;
-            # text uploads aren't worth the I/O.
-            if ext in _ALLOWED_DOC_EXT or ext in _ALLOWED_IMAGE_EXT:
-                try:
-                    sent_sha = hashlib.sha256(bytes(data)).hexdigest()
-                    on_disk = dest.read_bytes()
-                    disk_sha = hashlib.sha256(on_disk).hexdigest()
-                    head_hex = on_disk[:4].hex() if on_disk else ""
-                    is_zip_ext = ext in {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}
-                    is_zip = zipfile.is_zipfile(str(dest)) if is_zip_ext else None
-                    logger.info(
-                        "upload.file diagnostic: name=%s ext=%s sent_size=%d disk_size=%d "
-                        "sent_sha256=%s disk_sha256=%s match=%s magic=%s is_zipfile=%s",
-                        safe_name,
-                        ext,
-                        len(data),
-                        len(on_disk),
-                        sent_sha,
-                        disk_sha,
-                        sent_sha == disk_sha,
-                        head_hex,
-                        is_zip,
-                    )
-                except Exception:
-                    # Diagnostic failure must never break the upload.
-                    logger.exception("upload.file diagnostic failed for %s", safe_name)
-            paths.append(str(dest))
-    except Exception:
-        _cleanup()
-        _sel().log_api_access(
-            caller=caller,
-            operation="upload.file",
-            outcome="error",
-            source="dashboard",
-            resources=f"files_written:{len(paths)}",
-        )
-        raise
-    if not paths:
-        _sel().log_api_access(
-            caller=caller,
-            operation="upload.file",
-            outcome="rejected",
-            source="dashboard",
-            resources="reason:no_files",
-        )
-        return web.json_response({"error": "No files uploaded"}, status=400)
-    _sel().log_api_access(
-        caller=caller,
-        operation="upload.file",
-        outcome="success",
-        source="dashboard",
-        resources=f"files:{len(paths)}",
-    )
-    return web.json_response({"paths": paths})
-
-
-async def api_screenshot(request: web.Request) -> web.Response:
-    """POST /api/screenshot — capture screen region and return file path.
-
-    macOS only — uses built-in screencapture. Linux cloud desktops
-    (AL2, headless) don't have a display server so this is unavailable.
-    """
-    if sys.platform != "darwin":
-        return web.json_response({"error": "Screenshot is only available on macOS"}, status=400)
-
-    screenshot_dir = _screenshot_dir()
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time())
-    dest = screenshot_dir / f"screenshot_{ts}.png"
-
-    proc = await asyncio.create_subprocess_exec(
-        "screencapture",
-        "-i",
-        str(dest),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=120)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
-        return web.json_response({"error": "screenshot timed out"}, status=504)
-    if not dest.exists():
-        return web.json_response({"path": ""})  # user cancelled
-    return web.json_response({"path": str(dest)})
-
-
-# ── Workspace API ──
-async def api_workspaces(request: web.Request) -> web.Response:
-    """GET /api/workspaces — list configured workspaces."""
-    cfg = KiroCrewConfig.load()
-    default_ws = cfg.default_workspace
-    result = []
-    for name, ws in cfg.workspaces.items():
-        result.append({"name": name, "path": ws.dir, "is_default": name == default_ws})
-    if not result:
-        result.append({"name": "default", "path": "workspace", "is_default": True})
-    return web.json_response({"workspaces": result, "default": default_ws})
-
-
-async def api_workspaces_create(request: web.Request) -> web.Response:
-    """POST /api/workspaces — create a new workspace."""
-    import asyncio  # noqa: F811
-    import shutil  # noqa: F811
-
-    from kiro_crew.validation import WORKSPACE_NAME_RE  # noqa: F811
-
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-    name = body.get("name", "").strip()
-    if not name:
-        return web.json_response({"error": "Workspace name is required"}, status=400)
-    if not WORKSPACE_NAME_RE.match(name):
-        return web.json_response(
-            {"error": "Invalid workspace name (use alphanumeric, hyphens, underscores)"},
-            status=400,
-        )
-    cfg = KiroCrewConfig.load()
-    if name in cfg.workspaces:
-        return web.json_response({"error": f"Workspace '{name}' already exists"}, status=409)
-    copy_from = body.get("copy_from", "").strip()
-    if copy_from:
-        if copy_from not in cfg.workspaces:
-            return web.json_response(
-                {"error": f"Source workspace '{copy_from}' not found"}, status=404
-            )
-        # New workspace gets its own directory, named after the workspace
-        ws_dir = body.get("dir", f"workspace-{name}")
-        # Check for directory collision with existing workspaces
-        existing_dirs = {ws.dir for ws in cfg.workspaces.values()}
-        if ws_dir in existing_dirs:
-            return web.json_response(
-                {"error": f"Directory '{ws_dir}' is already used by another workspace"},
-                status=409,
-            )
-        # Recursively copy source workspace data to the new directory
-        src_path = data_home() / cfg.workspaces[copy_from].dir
-        dst_path = data_home() / ws_dir
-        # Guard against path traversal
-        if not dst_path.resolve().is_relative_to(data_home().resolve()):
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="workspace.create",
-                outcome="denied",
-                source="dashboard",
-                resources=name,
-            )
-            return web.json_response({"error": "Invalid directory path"}, status=400)
-        if not src_path.resolve().is_relative_to(data_home().resolve()):
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="workspace.create",
-                outcome="denied",
-                source="dashboard",
-                resources=name,
-            )
-            return web.json_response({"error": "Invalid source directory path"}, status=400)
-        # Reject config root itself to avoid copying .env / config.json
-        cfg_root = data_home().resolve()
-        if src_path.resolve() == cfg_root or dst_path.resolve() == cfg_root:
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="workspace.create",
-                outcome="denied",
-                source="dashboard",
-                resources=name,
-            )
-            return web.json_response(
-                {"error": "Cannot use config root as workspace directory"}, status=400
-            )
-        if src_path.is_dir():
-            # Use is_sensitive_path to filter entries instead of hardcoded names
-            from kiro_crew.security import is_sensitive_path  # noqa: F811
-
-            def _ignore_sensitive(directory: str, entries: list[str]) -> set[str]:
-                from pathlib import Path as _Path  # noqa: F811
-
-                skip: set[str] = set()
-                for entry in entries:
-                    full = str(_Path(directory, entry).resolve())
-                    if is_sensitive_path(full):
-                        skip.add(entry)
-                return skip
-
-            await asyncio.to_thread(
-                shutil.copytree,
-                src_path,
-                dst_path,
-                dirs_exist_ok=True,
-                symlinks=True,
-                ignore=_ignore_sensitive,
-            )
-    else:
-        ws_dir = body.get("dir", f"workspace-{name}")
-    # Guard against path traversal for relative paths; absolute paths are allowed
-    from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
-
-    _abs = Path(ws_dir).expanduser().is_absolute()
-    # Path constructed for validation only (never opened/read/written); the
-    # is_relative_to + is_sensitive_path guards below reject traversals before
-    # the value is stored in config. CodeQL's taint tracker does not model the
-    # containment guard as a barrier.
-    final_path = (  # lgtm[py/path-injection]
-        Path(ws_dir).expanduser().resolve() if _abs else data_home() / ws_dir
-    )
-
-    # Check for directory collision with existing workspaces (resolve both sides)
-    def _resolve_ws_dir(d: str) -> Path:
-        p = Path(d).expanduser()
-        return p.resolve() if p.is_absolute() else (data_home() / d).resolve()
-
-    existing_resolved = {_resolve_ws_dir(ws.dir) for ws in cfg.workspaces.values()}
-    if _resolve_ws_dir(ws_dir) in existing_resolved:
-        return web.json_response(
-            {"error": f"Directory '{ws_dir}' is already used by another workspace"},
-            status=409,
-        )
-    if _isp(str(final_path.resolve())):
-        _sel().log_api_access(
-            caller=request.get("user", "dashboard"),
-            operation="workspace.create",
-            outcome="denied",
-            source="dashboard",
-            resources=name,
-        )
-        return web.json_response({"error": "Invalid directory path"}, status=400)
-    if not _abs and not final_path.resolve().is_relative_to(data_home().resolve()):
-        _sel().log_api_access(
-            caller=request.get("user", "dashboard"),
-            operation="workspace.create",
-            outcome="denied",
-            source="dashboard",
-            resources=name,
-        )
-        return web.json_response({"error": "Invalid directory path"}, status=400)
-    if final_path.resolve() == data_home().resolve():
-        _sel().log_api_access(
-            caller=request.get("user", "dashboard"),
-            operation="workspace.create",
-            outcome="denied",
-            source="dashboard",
-            resources=name,
-        )
-        return web.json_response(
-            {"error": "Cannot use config root as workspace directory"}, status=400
-        )
-    cfg.workspaces[name] = WorkspaceConfig(dir=ws_dir)
-    cfg.save()
-    _sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="workspace.create",
-        outcome="success",
-        source="dashboard",
-        resources=name,
-    )
-    return web.json_response({"ok": True, "name": name})
-
-
-async def api_workspaces_update(request: web.Request) -> web.Response:
-    """PUT /api/workspaces/{name} — update a workspace."""
-
-    name = request.match_info["name"]
-    cfg = KiroCrewConfig.load()
-    if name not in cfg.workspaces:
-        return web.json_response({"error": f"Workspace '{name}' not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-    if "dir" in body:
-        new_dir = body["dir"]
-        from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
-
-        _abs = Path(new_dir).expanduser().is_absolute()
-        # Resolved for validation only; is_relative_to + is_sensitive_path guard
-        # below reject traversals before the value is stored in config.
-        resolved = (  # lgtm[py/path-injection]
-            Path(new_dir).expanduser().resolve() if _abs
-            else (data_home() / new_dir).resolve()
-        )
-        if _isp(str(resolved)):
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="workspace.update",
-                outcome="denied",
-                source="dashboard",
-                resources=name,
-            )
-            return web.json_response({"error": "Invalid directory path"}, status=400)
-        if not _abs and not resolved.is_relative_to(data_home().resolve()):
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="workspace.update",
-                outcome="denied",
-                source="dashboard",
-                resources=name,
-            )
-            return web.json_response({"error": "Invalid directory path"}, status=400)
-        if resolved == data_home().resolve():
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="workspace.update",
-                outcome="denied",
-                source="dashboard",
-                resources=name,
-            )
-            return web.json_response(
-                {"error": "Cannot use config root as workspace directory"}, status=400
-            )
-        existing_dirs = {
-            (data_home() / ws.dir).resolve()
-            if not Path(ws.dir).expanduser().is_absolute()
-            else Path(ws.dir).expanduser().resolve()
-            for n, ws in cfg.workspaces.items() if n != name
-        }
-        if resolved in existing_dirs:
-            return web.json_response(
-                {"error": f"Directory '{new_dir}' is already used by another workspace"},
-                status=409,
-            )
-        cfg.workspaces[name].dir = new_dir
-    cfg.save()
-    _sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="workspace.update",
-        outcome="success",
-        source="dashboard",
-        resources=name,
-    )
-    return web.json_response({"ok": True, "name": name})
-
-
-async def api_workspaces_delete(request: web.Request) -> web.Response:
-    """DELETE /api/workspaces/{name} — delete a workspace."""
-
-    name = request.match_info["name"]
-    cfg = KiroCrewConfig.load()
-    if name not in cfg.workspaces:
-        return web.json_response({"error": f"Workspace '{name}' not found"}, status=404)
-    if name == cfg.default_workspace:
-        return web.json_response(
-            {"error": f"Cannot delete default workspace '{name}'. Change default_workspace first."},
-            status=409,
-        )
-    referencing = [a for a, ac in cfg.agents.items() if ac.workspace == name]
-    if referencing:
-        return web.json_response(
-            {"error": f"Workspace '{name}' is referenced by agents: {', '.join(referencing)}"},
-            status=409,
-        )
-    del cfg.workspaces[name]
-    cfg.save()
-    _sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="workspace.delete",
-        outcome="success",
-        source="dashboard",
-        resources=name,
-    )
-    return web.json_response({"ok": True})
-
-
-def _validate_dashboard_path(raw: str) -> str | None:
-    """Validate a file path through hooks.py enforcement layer."""
-    from kiro_crew.hooks import validate_file_path  # noqa: F811
-
-    return validate_file_path(raw)
-
-
-async def api_file_watch(request: web.Request) -> web.StreamResponse:
-    """GET /api/file-watch?path=... — SSE stream of file content changes."""
-
-    raw_path = request.query.get("path", "")
-    try:
-        validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
-    except ValidationError:
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_watch", outcome="denied", resources=raw_path
-        )
-        return web.json_response({"error": "invalid input"}, status=400)
-
-    path = _validate_dashboard_path(raw_path)
-    if not path:
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_watch", outcome="denied", resources=raw_path
-        )
-        return web.json_response({"error": "invalid or forbidden path"}, status=400)
-
-    if not os.path.isfile(path):
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_watch", outcome="not_found", resources=path
-        )
-        return web.json_response({"error": "not found"}, status=404)
-
-    _sel().log_tool_invocation(
-        session_key="dashboard", tool_name="file_watch", outcome="success", resources=path
-    )
-
-    resp = web.StreamResponse()
-    resp.content_type = "text/event-stream"
-    resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["X-Accel-Buffering"] = "no"
-    await resp.prepare(request)
-
-    poll_interval = 1.0
-    read_cap = 512_000
-    last_mtime: float = 0.0
-    last_content = ""
-    resolved_at_start = await asyncio.to_thread(os.path.realpath, path)
-
-    def _read_file(p: str, cap: int) -> str:
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
-            return f.read(cap)
-
-    try:
-        while not (request.transport is None or request.transport.is_closing()):
-            try:
-                stat = await asyncio.to_thread(os.stat, path)
-                mtime = stat.st_mtime
-            except FileNotFoundError:
-                await asyncio.sleep(poll_interval)
-                continue
-
-            if mtime != last_mtime:
-                last_mtime = mtime
-                current_resolved = await asyncio.to_thread(os.path.realpath, path)
-                if current_resolved != resolved_at_start:
-                    logger.warning(
-                        "file-watch: symlink changed after validation: %s -> %s",
-                        resolved_at_start,
-                        current_resolved,
-                    )
-                    _sel().log_tool_invocation(
-                        session_key="dashboard",
-                        tool_name="file_watch",
-                        outcome="denied",
-                        resources=path,
-                    )
-                    break
-                try:
-                    content = await asyncio.to_thread(_read_file, current_resolved, read_cap)
-                    content = redact(content)
-                except Exception:
-                    logger.warning("file-watch read error for %s", path, exc_info=True)
-                    await asyncio.sleep(poll_interval)
-                    continue
-
-                if content != last_content:
-                    last_content = content
-                    # ensure_ascii=False keeps multi-byte content (e.g. CJK)
-                    # inspectable as-is in DevTools instead of \uXXXX escapes,
-                    # and produces smaller payloads. Body bytes are still
-                    # valid UTF-8 because we explicitly .encode() below.
-                    payload = json.dumps({"content": content, "mtime": mtime}, ensure_ascii=False)
-                    await resp.write(f"data: {payload}\n\n".encode("utf-8"))
-
-            await asyncio.sleep(poll_interval)
-    except (ConnectionResetError, asyncio.CancelledError, ClientConnectionResetError):
-        pass
-
-    return resp
-
-
-async def api_file_read(request: web.Request) -> web.Response:
-    """GET /api/file-read?path=... — read file content for the markdown panel."""
-    import logging  # noqa: F811
-    import os  # noqa: F811
-
-    from kiro_crew.validation import (  # noqa: F811
-        FILE_READ_SCHEMA,
-        ValidationError,
-        validate_tool_args,
-    )
-
-    raw_path = request.query.get("path", "")
-    # Resolve relative paths against project dir when resolve=1
-    if request.query.get("resolve") == "1" and raw_path and not raw_path.startswith(("/", "~")):
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if not proj:
-            return web.json_response(
-                {"error": "cannot resolve: no project dir configured"},
-                status=400,
-            )
-        raw_path = os.path.join(proj, raw_path)
-        # Ensure resolved path stays within project directory
-        resolved = os.path.realpath(raw_path)
-        resolved_proj = os.path.realpath(proj)
-        if not (resolved == resolved_proj or resolved.startswith(resolved_proj + os.sep)):
-            return web.json_response(
-                {"error": "path outside project directory"},
-                status=400,
-            )
-        raw_path = resolved
-
-    try:
-        validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
-    except ValidationError:
-        _sel().log_tool_invocation(
-            session_key="dashboard",
-            tool_name="file_read",
-            outcome="denied",
-            resources=raw_path,
-        )
-        return web.json_response({"error": "invalid input"}, status=400)
-
-    path = _validate_dashboard_path(raw_path)
-    if not path:
-        _sel().log_tool_invocation(
-            session_key="dashboard",
-            tool_name="file_read",
-            outcome="denied",
-            resources=raw_path,
-        )
-        return web.json_response({"error": "invalid or forbidden path"}, status=400)
-    if not os.path.isfile(path):
-        # Both a directory and a missing path are 404 for a READ — there is no
-        # file content to return either way — but the caller needs to tell them
-        # apart. The dashboard renders a markdown path chip as a folder
-        # affordance when the path is a directory and suppresses the chip
-        # entirely when the path is not on disk; without this header both look
-        # like "file not found", which is actively wrong for a directory.
-        #
-        # Sitting ahead of the HEAD branch below, one probe covers GET and HEAD.
-        # `path` is already realpath-canonical and denylist-checked here, so
-        # isdir() discloses nothing that the status code did not already.
-        is_dir = os.path.isdir(path)
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_read", outcome="not_found", resources=path
-        )
-        return web.json_response(
-            {"error": "is a directory" if is_dir else "not found"},
-            status=404,
-            headers={"X-Path-Kind": "dir" if is_dir else "missing"},
-        )
-    if request.method == "HEAD":
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_read", outcome="success", resources=path
-        )
-        return web.Response(status=200, headers={"X-Path-Kind": "file"})
-    try:
-        read_cap = 512_000
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(read_cap + 1)
-        truncated = len(content) > read_cap
-        content = content[:read_cap]
-        content = redact(content)
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_read", outcome="success", resources=path
-        )
-        headers = {"X-Truncated": "true"} if truncated else {}
-        # Pick a sensible content_type per file extension so browsers and
-        # debuggers (DevTools "Response" preview, curl) interpret the body
-        # correctly. JSON files in particular benefit from application/json
-        # so DevTools renders the body as a tree instead of raw text.
-        # aiohttp appends "; charset=utf-8" automatically when text= is set.
-        #
-        # Security: HTML files are deliberately served as text/plain to
-        # prevent stored-XSS via <script> tags or on* attribute handlers in
-        # user/LLM-generated content. The dashboard's HtmlViewer renders
-        # HTML files via a sandboxed srcDoc iframe, so the file-read
-        # endpoint never needs to deliver executable HTML.
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".json":
-            ct = "application/json"
-        elif ext == ".jsonl":
-            # JSONL (newline-delimited JSON) is NOT a valid JSON document —
-            # the registered MIME type is application/x-ndjson. Serving it
-            # as application/json would make DevTools / JsonViewer try to
-            # parse the whole body as one JSON value and fail.
-            ct = "application/x-ndjson"
-        elif ext == ".csv":
-            ct = "text/csv"
-        elif ext in (".md", ".markdown"):
-            ct = "text/markdown"
-        else:
-            ct = "text/plain"
-        return web.Response(text=content, content_type=ct, headers=headers)
-    except Exception:
-        logging.getLogger(__name__).exception("file_read failed for %s", path)
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_read", outcome="failure", resources=path
-        )
-        return web.json_response({"error": "failed to read file"}, status=500)
-
-
-async def api_file_download(request: web.Request) -> web.Response:
-    """GET /api/file-download?path=... — download a file as raw bytes.
-
-    Sibling of /api/file-read. file-read decodes content as UTF-8 with
-    errors='replace' to render text in the markdown panel; that mode
-    corrupts binary files (.docx, .pdf, images) by replacing non-text
-    bytes with U+FFFD. This endpoint streams the original bytes, sets
-    Content-Disposition: attachment, and applies X-Content-Type-Options:
-    nosniff to keep the browser from rendering the response inline.
-
-    Security: same path-validation as file-read (validate_tool_args,
-    _validate_dashboard_path, sensitive-path filter). Symlinks rejected
-    via O_NOFOLLOW. Files larger than _MAX_UPLOAD_BYTES are rejected.
-    Text files are still scanned for sensitive content (credentials and
-    exfiltration URLs); a positive hit aborts the download. Binary
-    files are served as-is without a MIME allowlist, since attachment
-    disposition + nosniff prevents inline rendering on the dashboard
-    origin.
-    """
-    # ``_h`` is a late-binding alias for the parent ``handlers`` package so that
-    # tests can monkey-patch ``kiro_crew.dashboard.handlers._validate_dashboard_path``;
-    # this is the same pattern api_file_raw uses (legitimate circular-import
-    # workaround, listed as an exception in the top-level-imports rule).
-    import kiro_crew.dashboard.handlers as _h  # noqa: F811  # circular import
-
-    raw_path = request.query.get("path", "")
-    # Resolve relative paths against project dir when resolve=1 (mirrors api_file_read)
-    if request.query.get("resolve") == "1" and raw_path and not raw_path.startswith(("/", "~")):
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if not proj:
-            return web.json_response(
-                {"error": "cannot resolve: no project dir configured"}, status=400,
-            )
-        raw_path = os.path.join(proj, raw_path)
-        resolved = os.path.realpath(raw_path)
-        resolved_proj = os.path.realpath(proj)
-        if not (resolved == resolved_proj or resolved.startswith(resolved_proj + os.sep)):
-            return web.json_response(
-                {"error": "path outside project directory"}, status=400,
-            )
-        raw_path = resolved
-
-    try:
-        validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
-    except ValidationError:
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_download",
-            outcome="denied", resources=raw_path,
-        )
-        return web.json_response({"error": "invalid input"}, status=400)
-
-    path = _h._validate_dashboard_path(raw_path)
-    if not path:
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_download",
-            outcome="denied", resources=raw_path,
-        )
-        return web.json_response({"error": "invalid or forbidden path"}, status=400)
-    if is_sensitive_path(path):
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_download",
-            outcome="denied", resources=path, error="sensitive_path",
-        )
-        return web.json_response({"error": "sensitive path blocked"}, status=403)
-    if not os.path.isfile(path):
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_download",
-            outcome="not_found", resources=path,
-        )
-        return web.json_response({"error": "not found"}, status=404)
-
-    # Read raw bytes via O_NOFOLLOW to atomically reject symlinks (no TOCTOU race).
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as f:
-            st = os.fstat(f.fileno())
-            if st.st_size > _MAX_UPLOAD_BYTES:
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="file_download",
-                    outcome="denied", resources=path, error="file_too_large",
-                )
-                return web.json_response({"error": "file too large"}, status=413)
-            data = f.read()
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:  # symlink with O_NOFOLLOW
-            _sel().log_tool_invocation(
-                session_key="dashboard", tool_name="file_download",
-                outcome="denied", resources=path, error="symlink_rejected",
-            )
-            return web.json_response({"error": "symlinks not allowed"}, status=403)
-        logger.exception("file_download read failed for %s", path)
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_download",
-            outcome="failure", resources=path,
-        )
-        return web.json_response({"error": "cannot read file"}, status=500)
-
-    # Defense in depth: scan content for credentials / exfil URLs via the
-    # context-aware redact() shim, which runs BOTH the exfil-URL and credential
-    # passes (exfil URLs first so embedded credentials in URL fragments are
-    # caught) and additionally applies a loaded companion's extra regexes before
-    # content reaches an external surface.
-    #
-    # Mostly-binary files can still hide credential patterns in their
-    # decodable runs (e.g. an ASCII-art `AKIA...` with one stray non-UTF-8
-    # byte). Decoding with errors='replace' for the *scan only* (the served
-    # bytes are still raw) ensures the credential pass cannot be bypassed
-    # by sprinkling a single non-UTF-8 byte into the file.
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
-    # Route through the context-aware redact() so a loaded companion's extra
-    # credential regexes also abort the download; the scrubbed != text diff is
-    # the gate (no count needed).
-    scrubbed = redact(text)
-    if scrubbed != text:
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_download",
-            outcome="denied", resources=path, error="content_redacted",
-        )
-        return web.json_response(
-            {"error": "file content was redacted; download aborted"}, status=400,
-        )
-
-    safe_name = urllib.parse.quote(os.path.basename(path), safe="")
-    content_type, _ = mimetypes.guess_type(path)
-    if not content_type:
-        content_type = "application/octet-stream"
-
-    _sel().log_tool_invocation(
-        session_key="dashboard", tool_name="file_download",
-        outcome="success", resources=path,
-    )
-    return web.Response(
-        body=data,
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_name}",
-            "Content-Type": content_type,
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
-
-
-async def api_file_raw(request: web.Request) -> web.Response:
-    """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
-    import os  # noqa: F811
-
-    import kiro_crew.dashboard.handlers as _h  # noqa: F811
-
-    def _log(outcome: str, res: str) -> None:
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_raw", outcome=outcome, resources=res,
-        )
-
-    raw_path = request.query.get("path", "")
-    path = _h._validate_dashboard_path(raw_path)
-    if not path:
-        _log("denied", raw_path)
-        return web.json_response({"error": "invalid or forbidden path"}, status=400)
-    from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
-    if _isp(path):
-        _log("denied", path)
-        return web.json_response({"error": "sensitive path blocked"}, status=403)
-    if not os.path.isfile(path):
-        _log("not_found", path)
-        return web.json_response({"error": "not found"}, status=404)
-    # Open with O_NOFOLLOW to atomically reject symlinks (no TOCTOU race).
-    # Read header + full content through the same fd to avoid re-opening.
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as f:
-            st = os.fstat(f.fileno())
-            if st.st_size > _MAX_UPLOAD_BYTES:
-                _log("denied", path)
-                return web.json_response({"error": "file too large"}, status=413)
-            header = f.read(12)
-            f.seek(0)
-            data = f.read()
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:  # symlink with O_NOFOLLOW
-            _log("denied", path)
-            return web.json_response({"error": "symlinks not allowed"}, status=403)
-        _log("failure", path)
-        return web.json_response({"error": "cannot read file"}, status=500)
-    _image_magic = (
-        (b"\x89PNG", "image/png"),
-        (b"\xff\xd8\xff", "image/jpeg"),
-        (b"GIF87a", "image/gif"),
-        (b"GIF89a", "image/gif"),
-        (b"BM", "image/bmp"),
-        (b"II\x2a\x00", "image/tiff"),
-        (b"MM\x00\x2a", "image/tiff"),
-        (b"\x00\x00\x01\x00", "image/x-icon"),
-    )
-    content_type = None
-    # WebP: RIFF....WEBP compound signature
-    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-        content_type = "image/webp"
-    else:
-        for magic, mime in _image_magic:
-            if header.startswith(magic):
-                content_type = mime
-                break
-    # SVG: XML-based, no magic bytes
-    if not content_type:
-        stripped = data.lstrip(b"\xef\xbb\xbf").lstrip()
-        if stripped.startswith(b"<svg") or (
-            stripped.startswith(b"<?xml") and b"<svg" in data[:4096]
-        ):
-            content_type = "image/svg+xml"
-    # PDF: %PDF magic bytes
-    if not content_type:
-        if header.startswith(b"%PDF"):
-            content_type = "application/pdf"
-    if not content_type:
-        _log("denied", path)
-        return web.json_response({"error": "file content is not a recognized format"}, status=403)
-    _log("success", path)
-    headers = {"Content-Type": content_type, "X-Content-Type-Options": "nosniff"}
-    if content_type == "image/svg+xml":
-        headers["Content-Security-Policy"] = "script-src 'none'; style-src 'unsafe-inline'"
-    return web.Response(body=data, headers=headers)
-
-
-async def api_file_write(request: web.Request) -> web.Response:
-    """POST /api/file-write — write file content from the markdown panel."""
-    import logging  # noqa: F811
-    import os  # noqa: F811
-
-    from kiro_crew.validation import (  # noqa: F811
-        FILE_WRITE_SCHEMA,
-        ValidationError,
-        validate_tool_args,
-    )
-
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-
-    if not isinstance(body, dict):
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-
-    try:
-        validate_tool_args(
-            {"path": body.get("path", ""), "content": body.get("content", "")}, FILE_WRITE_SCHEMA
-        )
-    except ValidationError:
-        _sel().log_tool_invocation(
-            session_key="dashboard",
-            tool_name="file_write",
-            outcome="denied",
-            resources=body.get("path", ""),
-        )
-        return web.json_response({"error": "invalid input"}, status=400)
-
-    path = _validate_dashboard_path(body.get("path", ""))
-    if not path:
-        _sel().log_tool_invocation(
-            session_key="dashboard",
-            tool_name="file_write",
-            outcome="denied",
-            resources=body.get("path", ""),
-        )
-        return web.json_response({"error": "invalid or forbidden path"}, status=400)
-    if not os.path.isfile(path):
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_write", outcome="not_found", resources=path
-        )
-        return web.json_response({"error": "not found"}, status=404)
-    try:
-        import os  # noqa: F811
-        import shutil  # noqa: F811
-        import tempfile  # noqa: F811
-
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
-        try:
-            try:
-                shutil.copymode(path, tmp_path)
-            except OSError:
-                pass
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(body.get("content", ""))
-            os.replace(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_write", outcome="success", resources=path
-        )
-        return web.json_response({"ok": True})
-    except Exception:
-        logging.getLogger(__name__).exception("file_write failed for %s", path)
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="file_write", outcome="failure", resources=path
-        )
-        return web.json_response({"error": "failed to write file"}, status=500)
-
-
-def _fuzzy_score(q: str, name: str, rel: str) -> float:
-    """Score a file match. Higher = better. Returns 0 for no match."""
-    nl = name.lower()
-    rl = rel.lower()
-    score = 0.0
-
-    # Exact filename match (sans extension)
-    stem = nl.rsplit(".", 1)[0] if "." in nl else nl
-    if q == nl or q == stem:
-        score += 100.0
-    elif nl.startswith(q):
-        score += 50.0
-    elif q in nl:
-        score += 30.0
-    elif q in rl:
-        score += 10.0
-    else:
-        # Fuzzy: check if query chars appear in order in filename
-        matched_on_name = True
-        qi = 0
-        consecutive = 0
-        max_run = 0
-        for ch in nl:
-            if qi < len(q) and ch == q[qi]:
-                qi += 1
-                consecutive += 1
-                max_run = max(max_run, consecutive)
-            else:
-                consecutive = 0
-        if qi < len(q):
-            # Try path if filename didn't match all chars
-            matched_on_name = False
-            qi = 0
-            consecutive = 0
-            max_run = 0
-            for ch in rl:
-                if qi < len(q) and ch == q[qi]:
-                    qi += 1
-                    consecutive += 1
-                    max_run = max(max_run, consecutive)
-                else:
-                    consecutive = 0
-        if qi < len(q):
-            return 0.0  # not all query chars found
-        # Score based on coverage ratio and longest consecutive run
-        matched_len = len(nl) if matched_on_name else len(rl)
-        coverage = len(q) / max(matched_len, 1)
-        score += 5.0 + 15.0 * (max_run / len(q)) + 5.0 * coverage
-
-    # Bonus: shorter filenames are more relevant
-    score += max(0.0, 5.0 - len(nl) * 0.1)
-    return score
-
-
-async def api_file_search(request: web.Request) -> web.Response:
-    """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker."""
-    import os  # noqa: F811
-    import time  # noqa: F811
-
-    from kiro_crew.security import is_sensitive_path  # noqa: F811
-
-    caller = request.get("user", "dashboard")
-    query = request.query.get("q", "").strip().lower()
-    if len(query) < 2:
-        return web.json_response({"results": []})
-
-    max_results = 15
-
-    # kinds: "all" (default) returns both files and directories; "files" or
-    # "dirs" restricts the result set. Unknown values fall back to "all".
-    kinds = request.query.get("kinds", "all").strip().lower()
-    if kinds not in ("all", "files", "dirs"):
-        kinds = "all"
-    want_files = kinds in ("all", "files")
-    want_dirs = kinds in ("all", "dirs")
-
-    # Scope search to project (arbitrary path) or workspace
-    project = request.query.get("project", "")
-    ws_name = request.query.get("workspace", "")
-    search_roots: list[str] = []
-    if project:
-        project = os.path.realpath(os.path.expanduser(project))
-        if is_sensitive_path(project):
-            _sel().log_api_access(caller=caller, operation="file_search", outcome="denied", resources=project, error="sensitive path")
-            return web.json_response({"error": "Access denied"}, status=403)
-        if os.path.isdir(project):
-            search_roots.append(project)
-        else:
-            return web.json_response(
-                {"results": [], "error": "Project directory not found"}, status=404
-            )
-    elif ws_name:
-        from kiro_crew.config.loader import workspace_dir_for  # noqa: F811
-        ws_path = str(workspace_dir_for(ws_name))
-        if os.path.isdir(ws_path):
-            search_roots.append(ws_path)
-
-    scoped = bool(search_roots)
-
-    if not search_roots:
-        # Fallback: project dir, then the kirocrew workspace.
-        #
-        # Bare $HOME is deliberately NOT a fallback root. Walking it reaches
-        # every TCC-gated folder macOS knows about, and each one costs a
-        # separate consent dialog -- paid on an unscoped keystroke the user
-        # never pointed anywhere. The results did not justify it either: the
-        # walk stops at max_scan entries in os.walk order, so an unscoped home
-        # search returned whichever files happened to be reached first rather
-        # than the best matches. Callers that genuinely want home can still
-        # ask for it explicitly with ?project=$HOME, which is scoped and
-        # searched in full.
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if proj and os.path.isdir(proj):
-            search_roots.append(proj)
-        mc_workspace = str(data_home() / "workspace")
-        if os.path.isdir(mc_workspace):
-            search_roots.append(mc_workspace)
-
-    # Filter out sensitive roots
-    safe_roots: list[str] = []
-    for r in search_roots:
-        if is_sensitive_path(r):
-            _sel().log_api_access(caller=caller, operation="file_search", outcome="denied", resources=r, error="sensitive path")
-        else:
-            safe_roots.append(r)
-
-    # Fast path: use in-memory index when available for a single scoped project
-    state: DashboardState = request.app["state"]
-    if scoped and len(safe_roots) == 1:
-        idx = state.file_indexes.get(safe_roots[0])
-        if idx and idx.is_ready and not idx.truncated:
-            results = await asyncio.to_thread(idx.search, query, _fuzzy_score, max_results, kinds)
-            trimmed = [{k: v for k, v in r.items() if k != "_score"} for r in results]
-            _sel().log_api_access(caller=caller, operation="file_search", outcome="allowed", resources=f"q={query} kinds={kinds} indexed=true entries={idx.entry_count} results={len(trimmed)}")
-            return web.json_response({"results": trimmed, "root": safe_roots[0]})
-
-    # Fallback: walk filesystem per request
-    # Dot-prefixed dirs (.kirocrew, .kiro, .aim) excluded by startswith(".") guard below.
-    skip_dirs = {
-        ".git", "node_modules", "__pycache__", ".cache", ".venv", "venv",
-        "dist", "build", "env", "out", "target",
+#: Read-path extras the shared raster table does not cover (served by
+#: ``api_file_raw`` but never accepted at the upload boundary).
+_READ_PATH_EXTRA_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"II\x2a\x00", "image/tiff"),
+    (b"MM\x00\x2a", "image/tiff"),
+    (b"\x00\x00\x01\x00", "image/x-icon"),
+)
+
+
+#: Canonical upload extension per sniffed raster type: the suffix a mislabelled
+#: raster is stored under so every downstream consumer that infers the mime
+#: from the path (ACP image inlining, /api/file-raw) reads the true type.
+_RASTER_MIME_EXT: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+}
+#: ISO-BMFF brands of still-image containers (HEIF/HEIC/AVIF). An iPhone photo
+#: that reaches the browser as ``IMG_1234.jpeg`` is routinely one of these, and
+#: the generic "not really a .jpeg" sentence leaves the user guessing why.
+_HEIF_BRANDS = frozenset(
+    {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"avif", b"avis"}
+)
+
+
+#: Every control character: C0, DEL, and the C1 block.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+_ProbeT = TypeVar("_ProbeT")
+
+#: How long a request waits for a free worker before it is refused with 503.
+#: Sized to absorb a burst of healthy probes (each takes milliseconds), not to
+#: outwait a dead mount; the same figure the sensitive-path resolver's own budget
+#: uses.
+_PATH_PROBE_ADMIT_TIMEOUT_SECS = 2.0
+#: Execution ceiling handed to ``run_in_cron_pool``, which requires one. It is
+#: deliberately NOT a request timeout: this change bounds how many probes can be
+#: wedged, not how long a client waits on one, and a shorter figure here would
+#: add a second refusal class this endpoint family does not yet define. Large
+#: enough that no healthy transfer under the module's own caps reaches it.
+_PATH_PROBE_EXEC_CEILING_SECS = 3600.0
+#: How long a probe may run before its path prefix counts as wedged. A healthy
+#: probe takes milliseconds; the figure matches the sensitive-path resolver's
+#: own budget. While ``_PATH_PROBE_STUCK_TO_REFUSE`` probes under a prefix are
+#: each past it, new probes under that prefix are refused without taking a
+#: worker (:func:`_path_probe_prefix_wedged`).
+_PATH_PROBE_STALL_SECS = 2.0
+#: How many stuck probes under one prefix it takes to refuse that prefix. Two,
+#: so one stray request to a dead share costs a worker and refuses nothing,
+#: while a caller that keeps asking holds at most two of the pool's workers.
+_PATH_PROBE_STUCK_TO_REFUSE = 2
+#: Probes running right now: stall prefix -> {token: monotonic start}. Written
+#: only by the worker thread that runs the probe (:func:`_tracked_path_probe`),
+#: so an entry lives exactly as long as its thread is busy, and the map never
+#: holds more entries than the probe pool has workers.
+_path_probe_inflight: dict[str, dict[object, float]] = {}
+_path_probe_inflight_lock = threading.Lock()
+
+
+#: Most paths one ``POST /api/file-kinds`` request may name. A transcript view
+#: asks for a few dozen; the cap bounds how long one request holds its probe
+#: worker, and the client splits a larger set across requests.
+_FILE_KINDS_MAX_PATHS = 100
+
+
+#: How much of a file /api/file-read returns, in CHARACTERS -- the unit matters,
+#: because the decode is a text wrapper over a byte descriptor and a byte count
+#: here would mis-set ``X-Truncated`` on multi-byte content.
+_FILE_READ_CAP = 512_000
+
+#: One credential-class character (the streaming redactor's ``_CRED_CLASS``).
+#: Matched against the REVERSED read, so finding the trailing run is linear.
+_CRED_RUN_REVERSED_RE = re.compile("[" + "".join(re.escape(c) for c in sorted(_CRED_CLASS)) + "]*")
+
+
+#: How much of a file the binary sniff reads before deciding, in BYTES. 8 KiB is
+#: the window the Files app already uses (``_is_binary_file`` in
+#: ``apps/builtins/file_explorer/server.py``); the two surfaces disagreeing about
+#: what "binary" means is a worse outcome than either window being wrong.
+_FILE_READ_SNIFF_BYTES = 8192
+
+#: Extensions that are binary by format, answered BEFORE the NUL sniff.
+#:
+#: The sniff alone is not sufficient: a NUL-free binary format reads as text and
+#: opens an editable buffer over bytes a save would corrupt -- a GNU thin `.a`
+#: archive stores only ASCII member-header references, so its first 8 KiB can
+#: hold no NUL at all. The sniff still runs after this check and remains what
+#: catches an extension-LESS binary, which is why neither half is redundant.
+#:
+#: Kept byte-identical to ``BINARY_EXTS`` in
+#: ``src/kiro_crew/apps/builtins/file_explorer/server.py`` -- the Files app and
+#: this endpoint must answer "is this binary" the same way, and
+#: ``test_dashboard_file_io.py`` fails if the two sets ever diverge.
+_FILE_READ_BINARY_EXTS = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff", ".pdf",
+        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+        ".so", ".dylib", ".dll", ".exe", ".class", ".jar", ".war", ".o", ".a",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv", ".webm",
+        ".sqlite", ".db", ".duckdb",
+        ".ttf", ".otf", ".woff", ".woff2", ".eot",
     }
-
-    max_scan = _WALK_MAX_SCAN_SCOPED if scoped else _WALK_MAX_SCAN_UNSCOPED
-    max_collect = max_results * 10  # collect enough candidates for good scoring, then stop
-
-    def _walk_file_search() -> list[dict]:
-        """Blocking file-system walk — offloaded via asyncio.to_thread.
-
-        Files and directories are collected into SEPARATE candidate lists, each
-        with its own ``max_collect`` allowance. A shared list would let a burst
-        of matching directories fill the cap before the files in the same
-        directory are even examined, dropping the likely target before the
-        file-before-dir tie-break ever runs. Files are also scanned first at each
-        level, so under a tight scan budget the file candidates are the ones that
-        survive.
-
-        An independent ``_WALK_MAX_DIRS_VISITED`` ceiling bounds how many
-        directories the walk descends into, so no request can traverse a whole
-        large tree.
-        """
-        found: dict[str, list[dict]] = {"file": [], "dir": []}
-        walked: dict[str, int] = {"file": 0, "dir": 0}
-        dirs_visited = 0
-        wanted = {"file": want_files, "dir": want_dirs}
-
-        def _done(kind: str) -> bool:
-            return (
-                not wanted[kind]
-                or walked[kind] >= max_scan
-                or len(found[kind]) >= max_collect
-            )
-
-        def _full() -> bool:
-            return dirs_visited >= _WALK_MAX_DIRS_VISITED or (_done("file") and _done("dir"))
-
-        def _collect(kind: str, dirpath: str, names: list[str], root_dir: str) -> None:
-            """Score and collect one kind of entry from a single directory level."""
-            for name in names:
-                if _done(kind):
-                    return
-                walked[kind] += 1
-                if kind == "file" and name.startswith("."):
-                    continue
-                full = os.path.join(dirpath, name)
-                score = _fuzzy_score(query, name, os.path.relpath(full, root_dir))
-                if score <= 0:
-                    continue
-                # Resolve symlinks before the sensitivity check so a link into a
-                # sensitive tree cannot slip through.
-                if is_sensitive_path(os.path.realpath(full)):
-                    continue
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                found[kind].append({
-                    "path": full,
-                    "name": name,
-                    "kind": kind,
-                    "size": st.st_size if kind == "file" else 0,
-                    "mtime": int(st.st_mtime),
-                    "_score": score,
-                })
-
-        for root_dir in safe_roots:
-            if _full():
-                break
-            # macOS: prune the TCC-gated folders. Reaching into them would pop
-            # one consent modal PER folder. ``scoped`` means the user NAMED
-            # this root (?project= / ?workspace=), so even ``project=$HOME``
-            # is deliberate and is searched in full.
-            for dirpath, dirnames, filenames in os.walk(root_dir):
-                # Bounds the traversal; the per-kind counters stop advancing once
-                # their kind is done.
-                dirs_visited += 1
-                pruned = [
-                    d for d in dirnames
-                    if not d.startswith(".") and d not in skip_dirs
-                ]
-                dirnames[:] = pruned if scoped else platform_compat.tcc_prune_walk_dirs(
-                    root_dir, dirpath, pruned
-                )
-                # Files first: under a tight scan budget the file candidates are
-                # the ones that survive.
-                _collect("file", dirpath, filenames, root_dir)
-                _collect("dir", dirpath, dirnames, root_dir)
-                if _full():
-                    break
-        return found["file"] + found["dir"]
-
-    results = await asyncio.to_thread(_walk_file_search)
-
-    # Sort by score descending, files before dirs on a tie, then shorter name, then recency
-    now = time.time()
-    results.sort(key=lambda r: (
-        -r["_score"], r["kind"] == "dir", len(r["name"]), now - r["mtime"],
-    ))
-
-    # Strip internal scoring field before response
-    trimmed = [{k: v for k, v in r.items() if k != "_score"} for r in results[:max_results]]
-
-    _sel().log_api_access(caller=caller, operation="file_search", outcome="allowed", resources=f"q={query} kinds={kinds} roots={len(safe_roots)} results={len(trimmed)}")
-    return web.json_response({
-        "results": trimmed,
-        "root": safe_roots[0] if scoped and safe_roots else "",
-    })
+)
 
 
-async def api_file_diff(request: web.Request) -> web.Response:
-    """GET /api/file-diff?path=... — returns git diff and HEAD content for a file."""
-    raw_path = request.query.get("path", "").strip()
-    if not raw_path:
-        _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources="empty_path")
-        return web.json_response({"diff": "", "original": ""})
-    raw_path = os.path.realpath(os.path.expanduser(raw_path))
-    if not os.path.isfile(raw_path):
-        _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}", error="not_found")
-        return web.json_response({"diff": "", "original": ""})
-    if is_sensitive_path(raw_path):
-        _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="denied", resources=raw_path, error="sensitive path")
-        return web.json_response({"error": "Access denied"}, status=403)
+async def _owner_view_bypasses_credential_pass(request: web.Request) -> bool:
+    """Whether THIS request renders the owner's own view with the credential pass
+    stood down: the requester is the dashboard owner AND the owner's switch is OFF.
 
-    dirpath = os.path.dirname(raw_path)
+    The two handlers that feed the file viewer -- ``api_file_read`` (the buffer)
+    and ``api_file_diff`` (the ``original`` it is compared against) -- call this
+    with the same request, so both sides of one render carry the same verdict.
+    A non-owner never bypasses; the verdict is read off the event loop per
+    request, so it is never older than the response it shapes. The keystone is a
+    fixed, trusted path (not caller-supplied), so the default executor is the
+    right one.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+        owner_view_for_request,
+    )
 
-    def _run() -> dict:
-        # Disable textconv/filter drivers and fsmonitor to prevent code execution
-        # via .gitattributes or .git/config in untrusted repos.
-        _git = ["git", "-c", "diff.textconv=", "-c", "core.attributesFile=/dev/null", "-c", "core.fsmonitor="]
-        _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
-        try:
-            subprocess.run(
-                [*_git, "rev-parse", "--git-dir"],
-                cwd=dirpath, capture_output=True, timeout=5, check=True, env=_env,
-            )
-            # Get HEAD content
-            root = subprocess.run(
-                [*_git, "rev-parse", "--show-toplevel"],
-                cwd=dirpath, capture_output=True, text=True, timeout=5, env=_env,
-            ).stdout.strip()
-            rel = os.path.relpath(raw_path, root)
-            head = subprocess.run(
-                [*_git, "show", "--no-textconv", f"HEAD:{rel}"],
-                cwd=dirpath, capture_output=True, text=True, timeout=10, env=_env,
-            )
-            original = head.stdout if head.returncode == 0 else ""
-            # Get diff
-            r = subprocess.run(
-                [*_git, "diff", "--no-textconv", "--no-ext-diff", "HEAD", "--", raw_path],
-                cwd=dirpath, capture_output=True, text=True, timeout=10, env=_env,
-            )
-            diff = r.stdout.strip() if r.returncode == 0 else ""
-            if not diff:
-                # Check for untracked file
-                r2 = subprocess.run(
-                    [*_git, "status", "--porcelain", "--", raw_path],
-                    cwd=dirpath, capture_output=True, text=True, timeout=5, env=_env,
-                )
-                if r2.returncode == 0 and r2.stdout.strip().startswith("??"):
-                    r3 = subprocess.run(
-                        [*_git, "diff", "--no-textconv", "--no-ext-diff", "--no-index", "/dev/null", raw_path],
-                        cwd=dirpath, capture_output=True, text=True, timeout=10, env=_env,
-                    )
-                    diff = r3.stdout if r3.stdout else ""
-                    return {"diff": diff, "original": "", "status": "untracked"}
-            status = "modified" if diff else "clean"
-            return {"diff": diff, "original": original, "status": status}
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
-            return {"diff": "", "original": "", "status": "not_git"}
+    if not owner_view_for_request(request):
+        return False
+    switch = await asyncio.to_thread(redaction_switch.read_state)
+    return not switch.enabled
 
-    result = await asyncio.to_thread(_run)
-    _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}")
-    return web.json_response(result)
+
+# Extensions previewable via kiro_crew.doc_parser (OOXML docx/pptx). Legacy
+# binary formats (.doc, .ppt), the OpenDocument family (.odt/.ods/.odp), and
+# spreadsheet formats (.xls/.xlsx) fall through to the download card because
+# doc_parser only understands ZIP+XML OOXML, and adding openpyxl or a legacy
+# OLE reader would grow the dependency tree noticeably for a preview feature.
+_OFFICE_PREVIEWABLE_EXT = {".docx", ".pptx"}
+# Cap the returned text so a huge .docx doesn't blow the JSON payload / DOM.
+# Mirrors api_file_read's 512 KB read cap. Anything larger is truncated and
+# the frontend shows a "Download for full contents" affordance.
+_OFFICE_PREVIEW_CAP = 512_000
+
+#: Block keys whose value is structure, not document text: a fixed vocabulary the
+#: frontend switches on, a nesting level, or a formatting flag. None can carry a
+#: secret, and rewriting one could only corrupt the shape.
+_BLOCK_STRUCTURAL_KEYS = frozenset({"type", "level", "ordered", "bold", "italic"})
+
+
+# ── /api/file-stream: Range-capable audio/video serving (file_api/transfer.py) ─
+# The media cap is deliberately larger than _MAX_UPLOAD_BYTES: screen
+# recordings routinely exceed 50 MB, and unlike file-raw this endpoint never
+# materializes the file in memory -- Range streaming reads bounded chunks, so
+# the cap only bounds what one URL can address, not per-request memory.
+_STREAM_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_STREAM_CHUNK_BYTES = 256 * 1024
+# Text-exfiltration probe window. Real media is binary within the first
+# bytes; content that decodes as UTF-8 text this deep is a text file wearing
+# a media magic, which the redaction scan in ``api_file_stream`` must see.
+_STREAM_TEXT_PROBE_BYTES = 64 * 1024
+
+
+# Container signature -> Content-Type. Sniffed from the file's first bytes so
+# the endpoint serves media by CONTENT, not by extension claim (CWE-434 shape,
+# same posture as file-raw's image allowlist). Entries are (offset, magic,
+# mime). MP4-family uses the ftyp box at offset 4 (bytes 0-3 are the box
+# size); WebM and Matroska share the EBML magic and both play in <video>.
+_MEDIA_MAGIC: tuple[tuple[int, bytes, str], ...] = (
+    (4, b"ftyp", "video/mp4"),          # mp4 / m4v / m4a / mov (BMFF family)
+    (0, b"\x1a\x45\xdf\xa3", "video/webm"),  # webm / mkv (EBML)
+    (0, b"OggS", "audio/ogg"),          # ogg audio or video; <audio>/<video> both accept
+    (0, b"fLaC", "audio/flac"),
+    (0, b"ID3", "audio/mpeg"),          # mp3 with ID3v2 tag
+    (0, b"\xff\xfb", "audio/mpeg"),     # bare mp3 frame sync (MPEG1 layer3)
+    (0, b"\xff\xf3", "audio/mpeg"),
+    (0, b"\xff\xf2", "audio/mpeg"),
+)
+
+
+# ── Path completion (/api/path-complete; file_api/path_complete.py) ──────────
+#
+# The chat composer's shell-style `./` / `../` completion. A sibling of
+# ``api_file_search`` rather than a mode of it, for two reasons that are
+# not cosmetic:
+#
+# * ``/api/file-search`` answers "which files ANYWHERE under this root fuzzily
+#   match these characters"; completion answers "what is IN this one directory".
+#   A recursive fuzzy hit cannot be turned back into the path the user is typing
+#   -- the entry name alone is not the path -- so the row set has to come from a
+#   single directory level.
+# * ``?project=`` on the search endpoint is any path on the host, by design.
+#   Completion must be the opposite: the caller names a KNOWN project directory
+#   (the same allow-list ``api_project_git`` / ``api_project_tree`` use) and the
+#   ``../`` segments are resolved and then re-checked for containment, so no
+#   token typed in the composer can enumerate a directory outside the project.
+
+#: Rows returned by one completion request. The composer popup shows a handful;
+#: this bounds the response for a directory with thousands of entries, which is
+#: also where a shell's own completion stops being useful.
+_PATH_COMPLETE_MAX_ENTRIES = 50
+
+#: Either separator ends a segment of a typed path token. Both, on every platform:
+#: a backslash IS a separator on Windows, so a token carrying one must be SPLIT
+#: rather than appended as a single literal name that the OS then re-interprets at
+#: the open -- which is how `..\..\etc` escaped a root that had already been
+#: checked. The composer's own grammar is POSIX-style, so on POSIX this only
+#: refuses to treat a backslash as part of a filename, which no completion token
+#: means it to be.
+_PATH_TOKEN_SEPARATORS = re.compile(r"[/\\]+")
+
+#: Directory entries EXAMINED per request, independent of how many survive the
+#: prefix filter. The listing is one level deep, so this is the only ceiling
+#: needed -- it bounds ``node_modules``-sized directories, where the scan (not
+#: the response) is the cost.
+_PATH_COMPLETE_MAX_SCAN = 5000
+
+
+# ── Content search (/api/file-grep; engines in file_api/grep.py) ──────────────
+#
+# The side-panel Files rail's Content mode: "which files CONTAIN this text".
+# ``POST``, because the query travels in the body -- see ``api_file_grep``.
+# Filename search is ``api_file_search``. The Files app's own search
+# (``apps/builtins/file_explorer/server.py``) answers the same question in a
+# separate process with its own allow-root model; the row shape is shared with
+# it (``file``/``line``/``preview``; see `_grep_hit` for why there is no column)
+# but nothing is shared at runtime -- gating here goes through this module's
+# ``_validate_dashboard_path`` / ``is_sensitive_path`` chokepoint.
+
+#: Wall-clock budget for ONE request, shared by the text and document passes.
+#: The rail queries on a keystroke debounce, so a partial answer that SAYS it is
+#: partial (``truncated``) beats a complete one that arrives after the user
+#: stopped waiting.
+_GREP_TIME_BUDGET_SECS = 2.0
+#: Ceiling on returned hits. Both engines report one hit per file, so this also
+#: bounds how many files a response names.
+_GREP_MAX_RESULTS = 200
+#: Per-file read ceiling for the python fallback; ripgrep gets the same number
+#: via ``--max-filesize`` so both engines skip the same files.
+_GREP_MAX_FILE_BYTES = 2 * 1024 * 1024
+#: Preview length, matching the Files app's search rows.
+_GREP_PREVIEW_CHARS = 400
+#: A location label is a few words, but a workbook's sheet title is author text
+#: of any length, so it is bounded like the preview.
+_GREP_LABEL_CHARS = 120
+#: A one-character query is a whole-tree read, not a search. Same floor as
+#: ``api_file_search``.
+_GREP_MIN_QUERY_CHARS = 2
+_GREP_MAX_QUERY_CHARS = 200
+#: Directories either pass may descend into. The deadline alone does not bound
+#: traversal: a tree of empty directories advances the walk without reading a
+#: file.
+_GREP_MAX_DIRS_VISITED = 20_000
+
+#: Containers the document pass extracts. Their bytes hold no searchable plain
+#: text, so the text pass skips them and this pass owns them -- no file is
+#: reported twice. ``.pdf`` is extracted in a memory-bounded child
+#: (``kiro_crew.pdf_extract``), never in this process: ``pdfplumber`` exposes no
+#: length limit, so the only ceiling that can precede its allocation is a kernel
+#: one on a process the gateway can afford to lose.
+_GREP_DOC_EXTS = frozenset({".docx", ".pdf", ".pptx", ".xlsx"})
+#: Largest document the pass will open. Extraction is CPU-bound parsing, so
+#: this is about parse cost, not read cost.
+_GREP_DOC_MAX_BYTES = 25 * 1024 * 1024
+#: Extracted text per document, handed to ``extract_text``'s ``max_chars``.
+_GREP_DOC_MAX_CHARS = 400_000
+#: How often the worksheet row loop reads the clock. An empty row yields no text,
+#: so the character cap cannot see it and only the deadline can; a stride bounds
+#: the overshoot to a fixed row count without paying ``monotonic()`` per row.
+_GREP_ROW_DEADLINE_STRIDE = 512
+
+#: How long teardown waits for the reader thread and the killed child. Short:
+#: a search must not hold a transfer-pool worker on something being torn down.
+_GREP_RG_TEARDOWN_SECS = 2.0
+#: How long the record loop blocks on one ``get`` before re-checking the deadline
+#: and whether the reader died. Bounds only how long a FINISHED search whose
+#: sentinel was dropped goes unnoticed; the search's budget is the deadline.
+_GREP_RG_POLL_SECS = 0.05
+#: Stands in for a record too large to queue. A real ``rg --json`` record starts
+#: with ``{``, so a NUL-led string cannot be one.
+_GREP_RG_OVERSIZE = "\0oversize"
+#: Lines held between the rg reader thread and the parse loop. Small on purpose:
+#: the reader blocks on a full queue, so a fast rg cannot buffer ahead of the
+#: deadline check.
+_GREP_RG_QUEUE_LINES = 64
+#: Largest ``rg --json`` record the reader queues. ``--max-count 1`` bounds
+#: records per FILE and ``--max-filesize`` bounds the file, but a matching line
+#: in a minified blob is one multi-megabyte record, and a queue of those is
+#: hundreds of MB. A record past this is skipped and marks the answer short.
+_GREP_RG_MAX_RECORD_BYTES = 64 * 1024
+
+#: Header ``doc_parser._extract_pptx`` writes before each slide's text.
+_GREP_PPTX_SLIDE_RE = re.compile(r"^-{3}\s*Slide\s+(\d+)\s*-{3}$")
+
+#: One document's extracted ``((label, text), ...)`` plus ``whole``: did the
+#: reader see all of its text? False after the deadline, a mid-read failure or
+#: the character cap -- any of them can hide a match, so the answer says it is
+#: short.
+_DocSegments = tuple[tuple[tuple[str, str], ...], bool]
+
+
+# Whole-text diff budget, independent of the file preview's smaller read cap.
+_FILE_DIFF_MAX_BYTES = 32 * 1024 * 1024
+
+
+#: A Windows drive root -- ``C:``, ``C:\\`` or ``C:/`` -- with nothing after it.
+#: Only such a path has a parent the filesystem cannot name: ``ntpath.dirname``
+#: answers ``C:\\`` for ``C:\\``, which the browser reads as "no parent" and
+#: hides its Back control on, stranding the user on one drive.
+_WIN_DRIVE_ROOT_RE = re.compile(r"[A-Za-z]:[\\/]?")
 
 
 async def api_browse_dirs(request: web.Request) -> web.Response:
-    """GET /api/browse-dirs?path=... — list subdirectories for directory browser."""
-    import os  # noqa: F811
+    """GET /api/browse-dirs?path=... — list subdirectories for directory browser.
 
-    from kiro_crew.security import is_sensitive_path  # noqa: F811
-
+    ``?drives=1`` (Windows only) lists the mounted drive roots instead, as the
+    virtual level above every ``X:\\``; the response carries ``path: ""`` --
+    the one listing that is not a directory -- and ``parent: ""`` so the picker
+    knows it is at the top. On other platforms the flag is a 400: there is no
+    such level to show.
+    """
+    owner_denied = await require_owner_dashboard_request(request, "browse_dirs")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
+    if request.query.get("drives") == "1":
+        if not platform_compat.IS_WINDOWS:
+            return web.json_response({"error": "Drive listing is only available on Windows", "code": "drives_windows_only"}, status=400)
+        try:
+            drives = await _run_path_probe(_browse_drives_sync, transfer=True)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource="drives", operation="browse_dirs", caller=caller)
+        _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources="drives")
+        return web.json_response({"path": "", "parent": "", "dirs": drives})
     raw = request.query.get("path", "").strip()
-    base = os.path.realpath(os.path.expanduser(raw)) if raw else os.path.realpath(os.path.expanduser("~"))
-    if not os.path.isdir(base):
-        return web.json_response({"error": "Not a directory", "path": base}, status=400)
+    # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
+    # shared resolver answers $HOME for an unnamed one). is_sensitive_path below
+    # resolves on its own bounded pool, so it cannot wedge the loop.
+    try:
+        base, base_is_dir = await _run_path_probe(_resolve_search_root, raw)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw, operation="browse_dirs", caller=caller)
+    if not base_is_dir:
+        # Coded so the UI can name a permanent path refusal: without `code` the
+        # cause classifier degrades this to the recoverable arm and offers a
+        # Refresh that can never succeed.
+        return web.json_response(
+            {"error": "Not a directory", "code": "not_a_directory", "path": base},
+            status=400,
+        )
     if is_sensitive_path(base):
         _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="denied", resources=base, error="sensitive path")
-        return web.json_response({"error": "Access denied"}, status=403)
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
     skip = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "env", ".kirocrew", ".kiro", ".aim"}
-    dirs: list[dict] = []
+    skip |= _HIDDEN_TOOL_DIRS
     try:
-        for entry in sorted(os.scandir(base), key=lambda e: e.name.lower()):
-            if entry.is_dir(follow_symlinks=True) and entry.name not in skip and not entry.name.startswith("."):
-                # Resolve symlinks before the sensitivity check — a symlink in
-                # a benign dir pointing at ~/.aws would otherwise pass through.
-                if is_sensitive_path(os.path.realpath(entry.path)):
-                    continue
-                dirs.append({"name": entry.name, "path": entry.path})
-    except PermissionError:
-        pass
+        dirs = await _run_path_probe(_browse_dirs_sync, base, skip, transfer=True)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=base, operation="browse_dirs", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources=base)
-    return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs})
+    return web.json_response({"path": base, "parent": _browse_parent(base), "dirs": dirs})
 
-
-#: Depth ceiling for the walk-up that looks for a repository root. A project
-#: directory nested deeper than this below its repo root is reported as
-#: not-a-repo rather than paying an unbounded number of stat calls per request.
-_GIT_ROOT_WALK_LIMIT = 40
 
 #: A HEAD file is one short line; cap the read so a hostile symlink to something
 #: enormous cannot be slurped into memory.
 _HEAD_READ_LIMIT = 4096
 
 
-def _read_git_meta_prefix(path: str) -> str | None:
-    """Read a bounded prefix of a git metadata file through the hooks gate.
-
-    ``.git`` and ``.git/HEAD`` are ordinary filesystem paths inside a directory
-    the caller chose, so either can be a symlink pointing at something the
-    gateway must never read — a secret whose first line happens to look like a
-    ref, or a 40-64 char hex blob that would match the detached-HEAD shape.
-    ``hooks.safe_read_prefix`` canonicalises via realpath, refuses sensitive
-    resolved targets, and opens with ``O_NOFOLLOW`` as TOCTOU defence against a
-    final-component swap. A refused or unreadable path returns ``None`` and the
-    caller degrades to "no branch".
-    """
-    data = safe_read_prefix(path, _HEAD_READ_LIMIT)
-    if data is None:
-        return None
-    return data.decode("utf-8", errors="replace").strip()
-
-
-def _git_head_path(root: str) -> str | None:
-    """Resolve the HEAD file for the repo at *root*.
-
-    A linked worktree's ``.git`` is a FILE containing ``gitdir: <path>``, and that
-    directory holds the worktree's own HEAD — so the pointer has to be followed
-    rather than assuming ``<root>/.git`` is a directory.
-    """
-    dot = os.path.join(root, ".git")
-    if os.path.isdir(dot):
-        return os.path.join(dot, "HEAD")
-    pointer = _read_git_meta_prefix(dot)
-    if pointer is None or not pointer.startswith("gitdir:"):
-        return None
-    gitdir = pointer.split(":", 1)[1].strip()
-    if not gitdir:
-        return None
-    if not os.path.isabs(gitdir):
-        gitdir = os.path.join(root, gitdir)
-    return os.path.join(gitdir, "HEAD")
-
-
-def _slot_project_snapshot(state: DashboardState) -> list[str]:
-    """Copy every live slot's project dir. MUST run on the event loop.
-
-    Slots are created and deleted by other coroutines on the loop, so the copy
-    has to happen where those mutations are serialised against it. Doing it in a
-    worker thread would iterate a dict that the loop can mutate underneath.
-    Pure in-memory, no I/O — safe to call inline.
-    """
-    dirs: list[str] = []
-    for slot in list(getattr(state, "_slots", {}).values()):
-        proj = getattr(slot, "project", "") or ""
-        if proj:
-            dirs.append(proj)
-    return dirs
-
-
-def _known_project_dirs(slot_projects: list[str]) -> list[str]:
-    """Server-held project directories a branch lookup may be asked about.
-
-    The caller's slot snapshot plus the recorded recent-projects list —
-    directories the gateway itself set or the user already picked through the
-    project picker. Nothing in the returned list comes from the current request.
-    Reads a file, so this belongs in a worker thread.
-    """
-    dirs: list[str] = list(slot_projects)
-    fp = config_dir() / "recent_projects.json"
-    try:
-        recent = json.loads(fp.read_text(encoding="utf-8")) if fp.is_file() else []
-    except (json.JSONDecodeError, OSError, ValueError):
-        recent = []
-    if isinstance(recent, list):
-        dirs.extend(d for d in recent if isinstance(d, str) and d)
-    return dirs
-
-
-def _match_known_project(raw: str, known: list[str]) -> str | None:
-    """Map a request-supplied path onto the matching known project directory.
-
-    Returns the SERVER-HELD string, never the caller's, so request data is only
-    ever a comparison operand and never reaches a filesystem call. Matching is
-    pure string normalisation (expanduser + normpath) with no filesystem access
-    on the untrusted value — deliberately not realpath, which would stat a
-    caller-controlled path and reintroduce the probe this guard removes.
-    """
-    want = os.path.normpath(os.path.expanduser(raw))
-    for cand in known:
-        if os.path.normpath(os.path.expanduser(cand)) == want:
-            return cand
-    return None
-
-
-def _project_git_branch(base: str) -> dict:
-    """Resolve the checked-out branch for ``base``.
-
-    Returns ``{"repo": False}`` when ``base`` is not inside a git repository.
-    For a repository, returns the repo root plus either a ``branch`` name or,
-    on a detached HEAD, ``detached: True`` with the short commit in ``head``.
-    """
-    root: str | None = None
-    cur = base
-    for _ in range(_GIT_ROOT_WALK_LIMIT):
-        # A worktree's .git is a FILE (a gitdir pointer), not a directory, so
-        # probe for existence rather than is_dir() — otherwise every KiroCrew
-        # worktree reports as not-a-repo.
-        if os.path.exists(os.path.join(cur, ".git")):
-            root = cur
-            break
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    if root is None:
-        return {"repo": False}
-    # ``root`` is derived from an allow-listed project directory, but a directory
-    # NAME is itself agent-influenceable via set_project and this value is echoed
-    # to the dashboard, so it goes through the same egress redaction as the branch
-    # label. A normal path is unchanged.
-    out: dict = {"repo": True, "repoRoot": redact(root)}
-    head_path = _git_head_path(root)
-    if head_path is None:
-        return out
-    raw = _read_git_meta_prefix(head_path)
-    if raw is None:
-        # Unreadable, absent, or refused by the sensitive-path gate: still a
-        # repo, just no label.
-        return out
-    if raw.startswith("ref:"):
-        ref = raw[len("ref:"):].strip()
-        prefix = "refs/heads/"
-        if ref.startswith(prefix) and len(ref) > len(prefix):
-            # Branch names are attacker/agent-controllable content that this route
-            # renders in the dashboard AND makes copyable, so it goes through the
-            # canonical egress redaction like any other echoed string. Ordinary
-            # branch names are unchanged; one that embeds something matching a
-            # credential pattern is masked rather than displayed.
-            out["branch"] = redact(ref[len(prefix):])
-        return out
-    # A bare object id in HEAD means detached (mid-rebase, bisect, explicit
-    # --detach). Surface a short form so the caller shows something truthful
-    # instead of an empty label. This is a fixed 7-char prefix rather than git's
-    # dynamic uniqueness-based abbreviation — for a decorative label that is an
-    # acceptable difference, and it needs no repository query.
-    if re.fullmatch(r"[0-9a-fA-F]{40,64}", raw):
-        out["detached"] = True
-        out["head"] = redact(raw[:7])
-    return out
-
-
-def _match_known_project_for(slot_projects: list[str], raw: str) -> str | None:
-    """Build the allow-list and match *raw* against it. Worker-thread only.
-
-    Takes an already-taken slot snapshot rather than the live state, so nothing
-    here touches structures the event loop mutates. Both remaining halves must
-    stay off the loop: reading the recent-projects file does I/O, and
-    ``expanduser`` on a ``~user`` form does a passwd lookup, which can block on
-    NSS/LDAP for an authenticated caller passing ``?path=~x/y``.
-    """
-    return _match_known_project(raw, _known_project_dirs(slot_projects))
-
-
-def _resolve_project_git(project: str) -> tuple[str, str, dict]:
-    """Vet *project* and read its branch. Runs entirely in a worker thread.
-
-    Every filesystem touch for the request lives here: ``realpath``,
-    the directory check, and ``is_sensitive_path`` all stat, so a project on a
-    stalled network mount would block the event loop for the whole probe if any
-    of them ran inline.
-
-    Returns ``(status, base, info)`` with status ``"ok"``, ``"not_a_dir"``, or
-    ``"sensitive"``; ``info`` is populated only for ``"ok"``.
-    """
-    base = os.path.realpath(os.path.expanduser(project))
-    if not os.path.isdir(base):
-        return "not_a_dir", base, {}
-    if is_sensitive_path(base):
-        return "sensitive", base, {}
-    return "ok", base, _project_git_branch(base)
-
-
-async def api_project_git(request: web.Request) -> web.Response:
-    """GET /api/project/git?path=... — checked-out branch for a project dir.
-
-    ``path`` is matched against the gateway's own set of known project
-    directories and the matched server-held value is what gets stat'd, so this
-    route cannot be used to probe arbitrary filesystem paths for existence or
-    git metadata. An unrecognised directory is refused outright.
-    """
-    state: DashboardState = request.app["state"]
-    caller = request.get("user", "dashboard")
-    raw = request.query.get("path", "").strip()
-    if not raw:
-        return web.json_response({"error": "path required"}, status=400)
-    project = await asyncio.to_thread(
-        _match_known_project_for, _slot_project_snapshot(state), raw
-    )
-    if project is None:
-        _sel().log_api_access(
-            caller=caller,
-            operation="project_git",
-            outcome="denied",
-            resources=raw,
-            error="not a known project directory",
-        )
-        return web.json_response({"error": "Unknown project directory"}, status=403)
-    status, base, info = await asyncio.to_thread(_resolve_project_git, project)
-    if status == "not_a_dir":
-        # Redacted like every other echoed path: this arm is reachable whenever a
-        # known project directory is deleted or replaced between the allow-list
-        # match and the stat, so it is a live egress surface, not a dead branch.
-        return web.json_response(
-            {"error": "Not a directory", "path": redact(base)}, status=400
-        )
-    if status == "sensitive":
-        _sel().log_api_access(
-            caller=caller,
-            operation="project_git",
-            outcome="denied",
-            resources=base,
-            error="sensitive path",
-        )
-        return web.json_response({"error": "Access denied"}, status=403)
-    _sel().log_api_access(
-        caller=caller, operation="project_git", outcome="allowed", resources=base
-    )
-    # The SEL audit above records the real path; the response body is an egress
-    # surface the dashboard renders, so the echoed path is redacted like the rest.
-    return web.json_response({"path": redact(base), **info})
+_MACOS_TEMP_PROJECT_PREFIX_RE = re.compile(
+    r"\A/private/var/folders/[a-z0-9]{2}/[a-z0-9_]{30}/T(?=/|\Z)"
+)
 
 
 async def api_browse_files(request: web.Request) -> web.Response:
@@ -2461,255 +1124,168 @@ async def api_browse_files(request: web.Request) -> web.Response:
     are sorted dirs-first then alphabetically; hidden files and common build dirs
     are skipped.
     """
+    owner_denied = await require_owner_dashboard_request(request, "browse_files")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     raw = request.query.get("path", "").strip()
-    base = os.path.realpath(os.path.expanduser(raw)) if raw else os.path.realpath(os.path.expanduser("~"))
-    if not os.path.isdir(base):
-        return web.json_response({"error": "Not a directory", "path": base}, status=400)
+    # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
+    # shared resolver answers $HOME for an unnamed one). is_sensitive_path below
+    # resolves on its own bounded pool, so it cannot wedge the loop.
+    try:
+        base, base_is_dir = await _run_path_probe(_resolve_search_root, raw)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw, operation="browse_files", caller=caller)
+    if not base_is_dir:
+        # Same code as browse_dirs: the folder panel classifies both listings.
+        return web.json_response(
+            {"error": "Not a directory", "code": "not_a_directory", "path": base},
+            status=400,
+        )
     if is_sensitive_path(base):
         _sel().log_api_access(caller=caller, operation="browse_files", outcome="denied", resources=base, error="sensitive path")
-        return web.json_response({"error": "Access denied"}, status=403)
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
     skip = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "env", ".kirocrew", ".kiro", ".aim", "build", "dist", ".next"}
-    dirs: list[dict] = []
-    files: list[dict] = []
+    skip |= _HIDDEN_TOOL_DIRS
     try:
-        # Sort: dirs before files, then alphabetical
-        for entry in sorted(os.scandir(base), key=lambda e: (not e.is_dir(follow_symlinks=True), e.name.lower())):
-            if entry.name.startswith("."):
-                continue
-            # Resolve symlinks before the sensitivity check — a symlink in a
-            # benign dir pointing at ~/.aws would otherwise pass through.
-            if is_sensitive_path(os.path.realpath(entry.path)):
-                continue
-            # Capture mtime so the activity-panel browser can offer a
-            # sort-by-date option; fall back to 0 on a race (entry removed
-            # mid-scan) so one unstattable entry never breaks the listing.
-            try:
-                mtime = int(entry.stat(follow_symlinks=True).st_mtime)
-            except OSError:
-                mtime = 0
-            if entry.is_dir(follow_symlinks=True):
-                if entry.name not in skip:
-                    dirs.append({"name": entry.name, "path": entry.path, "mtime": mtime})
-            elif entry.is_file(follow_symlinks=True):
-                files.append({"name": entry.name, "path": entry.path, "mtime": mtime})
-    except PermissionError:
-        pass
+        dirs, files = await _run_path_probe(_browse_files_sync, base, skip, transfer=True)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=base, operation="browse_files", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_files", outcome="allowed", resources=base)
-    return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs, "files": files})
+    return web.json_response({"path": base, "parent": _browse_parent(base), "dirs": dirs, "files": files})
 
 
-async def api_dashboard_config(request: web.Request) -> web.Response:
-    """GET/PUT /api/dashboard/config — read or write dashboard settings."""
-    from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
+# ── /api/file-sheet: xlsx → JSON cell grid (file_api/sheet.py) ───────────────
+# Caps bound what one request can materialize server-side and ship to the
+# browser. 500 rows matches CsvViewer's display cap so the two table viewers
+# truncate consistently. The member/expansion caps bound zip inflation: the
+# on-disk size cap only limits the COMPRESSED archive, and a crafted workbook
+# can expand orders of magnitude larger than it stores.
+_SHEET_MAX_SHEETS = 20
+_SHEET_MAX_ROWS = 500
+_SHEET_MAX_COLS = 100
+_SHEET_MAX_MEMBERS = 4096
+_SHEET_MAX_EXPANDED_BYTES = 200 * 1024 * 1024
+# Text amplification caps. Shared strings are stored once in the archive but
+# referenced per cell, so the expansion cap above does not bound the RESPONSE:
+# one 32 KiB string referenced by every cell would amplify into gigabytes of
+# JSON. Cells truncate individually, and the whole workbook gets a cumulative
+# text budget past which the preview refuses (the frontend degrades to the
+# download card).
+_SHEET_MAX_CELL_CHARS = 2000
+_SHEET_MAX_TEXT_CHARS = 5 * 1000 * 1000
 
-    # Offloaded: KiroCrewConfig.load() stats, reads, parses, and validates config
-    # files. The client now polls this endpoint on an interval to pick up
-    # externally edited dashboard.gitlab_hosts, so a slow or network-backed config
-    # directory would otherwise stall the sole event loop on every poll.
-    try:
-        cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    except asyncio.CancelledError:
-        # A cancellation at this await (client disconnect mid-poll, gateway
-        # shutdown) would otherwise unwind the handler before either the
-        # read-success or the write-success/failure audit below, leaving an
-        # authorized config access attempt entirely absent from the
-        # tamper-evident SEL chain. Pair the landed request with an explicit
-        # failure event, then re-raise so cancellation still propagates.
-        _sel().log_tool_invocation(
-            session_key="dashboard",
-            tool_name=(
-                "dashboard_config_write" if request.method == "PUT" else "dashboard_config_read"
-            ),
-            outcome="failure",
-            error="request_cancelled",
-        )
-        raise
-    if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            _sel().log_tool_invocation(
-                session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-            )
-            return web.json_response({"error": "invalid JSON"}, status=400)
-        if not isinstance(body, dict):
-            _sel().log_tool_invocation(
-                session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-            )
-            return web.json_response({"error": "request body must be a JSON object"}, status=400)
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "folder_suggestions_enabled"}
-        # One-release backward-compat shim for removed key; delete after all clients update.
-        deprecated_ignored_keys = {"tail_fork_head_handling"}
-        # Read-only keys the GET exposes: both settings surfaces save with
-        # `mutate({ ...dashCfg, ...patch })`, so every GET field comes back in the
-        # PUT body. Drop them here instead of listing them in _allowed -- they
-        # stay unwritable, but a round-tripped read-only field must not 400 an
-        # unrelated toggle save.
-        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts"}
-        body = {
-            k: v
-            for k, v in body.items()
-            if k not in deprecated_ignored_keys and k not in read_only_ignored_keys
-        }
-        unknown = set(body.keys()) - _allowed
-        if unknown:
-            _sel().log_tool_invocation(
-                session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-            )
-            return web.json_response({"error": f"Unknown fields: {unknown}"}, status=400)
-        if "restore_sessions" in body:
-            val = body["restore_sessions"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "restore_sessions must be a boolean"}, status=400
-                )
-            cfg.dashboard.restore_sessions = val
-        try:
-            if "restore_window_minutes" in body:
-                cfg.dashboard.restore_window_minutes = max(
-                    0, min(1440, int(body["restore_window_minutes"]))
-                )
-        except (TypeError, ValueError):
-            _sel().log_tool_invocation(
-                session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-            )
-            return web.json_response(
-                {"error": "restore_window_minutes must be an integer"}, status=400
-            )
-        if "merge_queued_messages" in body:
-            val = body["merge_queued_messages"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "merge_queued_messages must be a boolean"}, status=400
-                )
-            cfg.dashboard.merge_queued_messages = val
-        if "widget_density" in body:
-            val = body["widget_density"]
-            if val not in ("more", "less"):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "widget_density must be 'more' or 'less'"}, status=400
-                )
-            cfg.dashboard.widget_density = val
-        if "verbosity" in body:
-            val = body["verbosity"]
-            if val not in ("default", "concise", "ultra"):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "verbosity must be 'default', 'concise' or 'ultra'"}, status=400
-                )
-            cfg.dashboard.verbosity = val
-        if "tail_fork_enabled" in body:
-            val = body["tail_fork_enabled"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "tail_fork_enabled must be a boolean"}, status=400
-                )
-            cfg.dashboard.tail_fork_enabled = val
-        if "folder_suggestions_enabled" in body:
-            val = body["folder_suggestions_enabled"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {
-                        "error": "folder_suggestions_enabled must be a boolean",
-                        "code": "invalid_folder_suggestions_enabled",
-                    },
-                    status=400,
-                )
-            cfg.dashboard.folder_suggestions_enabled = val
-        if "link_previews" in body:
-            val = body["link_previews"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {
-                        "error": "link_previews must be a boolean",
-                        "code": "invalid_link_previews",
-                    },
-                    status=400,
-                )
-            cfg.dashboard.link_previews = val
-        if "quick_send" in body:
-            val = body["quick_send"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "quick_send must be a boolean"}, status=400
-                )
-            cfg.dashboard.quick_send = val
-        if "session_grid" in body:
-            val = body["session_grid"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {"error": "session_grid must be a boolean"}, status=400
-                )
-            cfg.dashboard.session_grid = val
-        if "mcp_app_panel" in body:
-            val = body["mcp_app_panel"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {
-                        "error": "mcp_app_panel must be a boolean",
-                        "code": "invalid_mcp_app_panel",
-                    },
-                    status=400,
-                )
-            cfg.dashboard.mcp_app_panel = val
-        cfg.save()
-        _sel().log_tool_invocation(
-            session_key="dashboard", tool_name="dashboard_config_write", outcome="success"
-        )
-        return web.json_response({"ok": True})
-    _sel().log_tool_invocation(
-        session_key="dashboard", tool_name="dashboard_config_read", outcome="success"
-    )
-    return web.json_response(
-        {
-            "restore_sessions": cfg.dashboard.restore_sessions,
-            "restore_window_minutes": cfg.dashboard.restore_window_minutes,
-            "merge_queued_messages": cfg.dashboard.merge_queued_messages,
-            "widget_density": cfg.dashboard.widget_density,
-            "verbosity": cfg.dashboard.verbosity,
-            "quick_send": cfg.dashboard.quick_send,
-            "session_grid": cfg.dashboard.session_grid,
-            "mcp_app_panel": cfg.dashboard.mcp_app_panel,
-            "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
-            "link_previews": cfg.dashboard.link_previews,
-            "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
-            # Read-only here (absent from the PUT allowlist above): authorizing a
-            # self-managed GitLab instance is a config-file decision, not a
-            # dashboard toggle. The client uses it only to decide which pasted
-            # links become source tabs; the provider handler re-checks every URL.
-            "gitlab_hosts": list(cfg.dashboard.gitlab_hosts),
-            # Same discipline for Jira: Atlassian Cloud (*.atlassian.net) is
-            # auto-recognized; self-hosted instances need explicit allowlisting.
-            "jira_hosts": list(cfg.dashboard.jira_hosts),
-        }
-    )
+
+# Generous per-entry allowance for the central-directory size preflight: a
+# record is 46 bytes plus name/extra/comment, and OOXML part names are short.
+_SHEET_MAX_CDIR_ENTRY_BYTES = 512
+
+
+# ── Git status & log endpoints (file_api/git_panel.py) ──────────────────────
+
+
+_GIT_PROBE_STDERR_CAP = 4096
+
+
+# Repo-scoped config keys that hand git a program to run when it touches file
+# content (status re-hashes modified files through ``filter.<name>.clean``).
+# ``-c`` cannot neutralize arbitrary driver names, so a repo declaring one is
+# refused outright — the same fail-closed stance as worktree.py's
+# ``_checkout_filter``.
+#
+# The refusal message says the config DECLARES a driver and that policy refuses
+# the check. It must not claim the program runs: matching is deliberately wider
+# than execution. ``smudge`` fires on checkout, not on the status re-hash; and a
+# driver no ``.gitattributes`` path maps to never runs at all. A probe that
+# merely FAILS is a DIFFERENT fact -- no driver is known to exist there -- so it
+# refuses under its own ``"unreadable"`` cause rather than borrowing this one.
+# Refusing both is correct, since neither can be proven safe, but telling the
+# reader a program ran is not, and neither is handing them both causes at once.
+_GIT_FILTER_KEY_RE = re.compile(
+    r"^filter\..+\.(process|smudge|clean)$", re.IGNORECASE
+)
+
+
+# Cap on the ROWS api_project_tree returns -- files and directory rows
+# together (``_project_tree_allot``). One number for both kinds, because every
+# row costs the same to redact, serialize and render, and the dashboard asks
+# for this listing every 10 s while a tree is open: the work per poll has to be
+# bounded by this number, not by the size of the project.
+_PROJECT_TREE_MAX_ENTRIES = 10_000
+
+# Directory entries the non-git walk may READ per listing, shared across the
+# folders of each depth (``_project_tree_walk``). This is what makes the walk's
+# cost a function of this number instead of the size of the tree: reading an
+# entry costs about half a microsecond, so the whole budget is a fraction of a
+# second in the worker thread. It is larger than the row cap so the walk can
+# see past the rows it will show -- the subfolders of a large folder, and files
+# for the round-robin sampling to share out -- and a folder cut by it is named
+# as truncated, whether or not the row cap was also reached.
+_PROJECT_TREE_SCAN_LIMIT = 20 * _PROJECT_TREE_MAX_ENTRIES
+
+# Whether this platform lists a directory through a descriptor. Read once: it is
+# a property of the platform, and a test seam that wraps ``os.scandir`` must not
+# silently turn it off and move every read onto the by-name branch.
+_PROJECT_TREE_SCANDIR_TAKES_FD = os.scandir in os.supports_fd
+
+
+# Directories never worth listing in a workspace tree. Applied only on the
+# non-git fallback walk — git listings already honor .gitignore.
+_PROJECT_TREE_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "dist",
+        "build",
+        ".next",
+        ".cache",
+        "target",
+        ".gradle",
+        ".idea",
+        # Kiro Crew state, hidden as in the Open/Browse picker.
+        ".kiro",
+        ".kirocrew",
+    }
+)
+# The dot-named tool folders of the tree's set, also hidden by the Open/Browse
+# picker and the file browser.
+_HIDDEN_TOOL_DIRS = frozenset(d for d in _PROJECT_TREE_SKIP_DIRS if d.startswith("."))
+
+
+# Every function the owners define runs on this module's globals, so a patch of
+# ``kiro_crew.dashboard.handlers.files.<name>`` reaches it wherever it lives;
+# see ``kiro_crew.dashboard.file_api``. Run once, after this body has bound every
+# name.
+_facade_compose(
+    globals(),
+    (
+        _owner_uploads,
+        _owner_workspaces,
+        _owner_pinned_io,
+        _owner_transfer,
+        _owner_office_preview,
+        _owner_sheet,
+        _owner_search,
+        _owner_path_complete,
+        _owner_grep,
+        _owner_browse,
+        _owner_project_dirs,
+        _owner_git_panel,
+        _owner_project_tree,
+        _owner_dashboard_config,
+        _owner_path_probe,
+        _owner_outbox,
+        _owner_channel_upload,
+        _owner_desktop,
+        _owner_editor,
+    ),
+)

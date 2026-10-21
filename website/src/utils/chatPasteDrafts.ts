@@ -37,8 +37,6 @@ export const PASTE_DRAFT_MAX_ENTRIES = DRAFT_MAX_ENTRIES
 /** Discard blocks not touched within this window (shared with text drafts). */
 export const PASTE_DRAFT_TTL_MS = DRAFT_TTL_MS
 
-export type PasteDrafts = Record<string, PasteBlock[]>
-
 /** A value is a valid PasteBlock iff it carries all four fields with the right
  *  primitive types. Anything else is corruption and is dropped. */
 function isPasteBlock(v: unknown): v is PasteBlock {
@@ -50,8 +48,10 @@ function isPasteBlock(v: unknown): v is PasteBlock {
 
 /** Coerce a stored value into a clean PasteBlock[] deep copy (dropping invalid
  *  members), or `null` if it isn't a non-empty array of blocks. The copy
- *  isolates the store from caller mutations and vice versa. */
-function sanitizeBlocks(v: unknown): PasteBlock[] | null {
+ *  isolates the store from caller mutations and vice versa. Shared with the
+ *  pane's parked-draft store (`chatPaneDrafts`), which holds the same block
+ *  shape under its own key and must reject the same corruption. */
+export function sanitizePasteBlocks(v: unknown): PasteBlock[] | null {
   if (!Array.isArray(v)) return null
   const arr: PasteBlock[] = []
   for (const item of v) {
@@ -66,7 +66,7 @@ const store = createSlotDraftStore<PasteBlock[]>({
   ttlMs: PASTE_DRAFT_TTL_MS,
   maxEntries: PASTE_DRAFT_MAX_ENTRIES,
   maxStoreBytes: DRAFT_MAX_STORE_BYTES,
-  sanitize: sanitizeBlocks,
+  sanitize: sanitizePasteBlocks,
 })
 
 export const loadPasteDrafts = store.load

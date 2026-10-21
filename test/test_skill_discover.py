@@ -15,11 +15,16 @@ The provider is faked end-to-end so tests stay hermetic — no network.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
+
+from conftest import make_dir_link
+from kiro_crew import platform_compat
 
 
 @pytest.fixture
@@ -87,6 +92,10 @@ def _make_app(state, provider):
 
     app = web.Application()
     app["state"] = state
+    # Install is owner-gated; the owner identity is plumbing so these tests stay on
+    # the branch each one names (the gate itself: test_non_owner_file_and_skill_writes).
+    state.owner_id = ""
+    as_owner(app)
     app.router.add_get("/api/skills/-/discover", discover_mod.api_skills_discover)
     app.router.add_get(
         "/api/skills/-/discover/preview", discover_mod.api_skills_discover_preview
@@ -132,6 +141,25 @@ class TestDiscoverInstall:
             assert data["kind"] == "created"
             assert (skills_dir / "fakeprov" / "fake-skill" / "SKILL.md").exists()
             assert (skills_dir / "fakeprov" / "fake-skill" / "rules" / "extra.md").exists()
+        finally:
+            await client.close()
+
+    async def test_install_preserves_bundle_bytes(self, fake_home, reset_registry):
+        """Installed files carry the provider's exact bytes: platform newline
+        translation is disabled on write, so a CRLF-authored SKILL.md does
+        not become \\r\\r\\n on Windows — which would make the installed
+        parse diverge from the preview's."""
+        skill_md = "---\r\nname: crlf-skill\r\ndescription: from windows\r\n---\r\n# Fake"
+        provider = FakeProvider(bundle=[("SKILL.md", skill_md)])
+        client, skills_dir = await self._client(fake_home, provider)
+        try:
+            resp = await client.post(
+                "/api/skills/-/discover/install",
+                json={"provider": "fakeprov", "skill_id": "fake-skill"},
+            )
+            assert resp.status == 200
+            installed = skills_dir / "fakeprov" / "fake-skill" / "SKILL.md"
+            assert installed.read_bytes() == skill_md.encode("utf-8")
         finally:
             await client.close()
 
@@ -234,6 +262,172 @@ class TestDiscoverInstall:
         finally:
             await client.close()
 
+    async def test_install_overwrite_replaces_junctioned_skill_dir(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        """The same regression as the test above, spelled the way Windows spells it.
+
+        `skill_dir.is_symlink()` is False for a junction, so the leaf-link defence
+        never fires. With `overwrite=True` the next line is
+        `shutil.rmtree(skill_dir)`, and `rmtree` REFUSES a junction exactly as it
+        refuses a symlink — an uncaught `OSError` out of
+        `asyncio.to_thread(_write_bundle)`, which has no `except` in scope.
+
+        A junction is not an exotic spelling of this layout: a *directory* symlink
+        on Windows needs `SeCreateSymbolicLinkPrivilege`, a junction needs none, so
+        it is the shape an unprivileged process can actually plant.
+        """
+        client, skills_dir = await self._client(fake_home)
+        try:
+            outside = tmp_path / "outside-target"
+            outside.mkdir()
+            provider_dir = skills_dir / "fakeprov"
+            provider_dir.mkdir(parents=True, exist_ok=True)
+            link = provider_dir / "fake-skill"
+            make_dir_link(link, outside)
+
+            # Guard the guard, through an oracle OUTSIDE the module under test:
+            # if this were an ordinary directory the test would prove nothing.
+            assert platform_compat.is_link_or_junction(link)
+            assert link.exists(), "the link must be followable, or rmtree never runs"
+
+            resp = await client.post(
+                "/api/skills/-/discover/install",
+                json={
+                    "provider": "fakeprov",
+                    "skill_id": "fake-skill",
+                    "overwrite": True,
+                },
+            )
+            assert resp.status == 200
+            assert not platform_compat.is_link_or_junction(link)
+            assert (link / "SKILL.md").exists()
+            # ...and NOTHING landed at the old link target.
+            assert list(outside.iterdir()) == []
+        finally:
+            await client.close()
+
+    async def test_the_junctions_target_survives_being_replaced(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        """Removing the link must not remove what it pointed at.
+
+        This is the property `unlink_link_or_junction` exists for and the reason
+        the defence cannot simply be `shutil.rmtree`: a junction is a directory
+        reparse point, so it is unlinked with `rmdir` — which detaches the
+        junction and never touches the target's contents.
+
+        The sibling test above proves nothing was WRITTEN outside the root; this
+        one proves nothing was DELETED outside it either.
+        """
+        client, skills_dir = await self._client(fake_home)
+        try:
+            outside = tmp_path / "outside-target"
+            outside.mkdir()
+            bystander = outside / "keep-me.txt"
+            bystander.write_text("not ours to delete", encoding="utf-8")
+            provider_dir = skills_dir / "fakeprov"
+            provider_dir.mkdir(parents=True, exist_ok=True)
+            link = provider_dir / "fake-skill"
+            make_dir_link(link, outside)
+            assert platform_compat.is_link_or_junction(link)
+
+            resp = await client.post(
+                "/api/skills/-/discover/install",
+                json={
+                    "provider": "fakeprov",
+                    "skill_id": "fake-skill",
+                    "overwrite": True,
+                },
+            )
+            assert resp.status == 200
+            assert bystander.read_text(encoding="utf-8") == "not ours to delete"
+            assert (link / "SKILL.md").exists()
+            assert not (outside / "SKILL.md").exists()
+        finally:
+            await client.close()
+
+
+_OVERWRITE = {"provider": "fakeprov", "skill_id": "fake-skill", "overwrite": True}
+
+
+@pytest.mark.asyncio
+class TestDiscoverInstallStagedSwap:
+    """An overwrite builds the new bundle aside and swaps it in only once it verifies."""
+
+    async def _installed(self, fake_home):
+        provider = FakeProvider()
+        client, skills_dir = await TestDiscoverInstall()._client(fake_home, provider)
+        resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+        assert resp.status == 200
+        skill_dir = skills_dir / "fakeprov" / "fake-skill"
+        (skill_dir / "my-notes.md").write_text("local edit", encoding="utf-8")
+        return client, provider, skill_dir
+
+    @staticmethod
+    def _assert_old_intact(skill_dir):
+        assert (skill_dir / "my-notes.md").read_text(encoding="utf-8") == "local edit"
+        assert (skill_dir / "rules" / "extra.md").read_text(encoding="utf-8") == "# Extra rules"
+        assert [p.name for p in skill_dir.parent.iterdir()] == ["fake-skill"]
+
+    async def test_success_replaces_and_leaves_no_staging_dir(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            provider._bundle = [("SKILL.md", "---\nname: fake-skill\n---\n# v2")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 200
+            assert (skill_dir / "SKILL.md").read_text(encoding="utf-8").endswith("# v2")
+            assert sorted(p.name for p in skill_dir.iterdir()) == ["SKILL.md"]
+            assert [p.name for p in skill_dir.parent.iterdir()] == ["fake-skill"]
+        finally:
+            await client.close()
+
+    async def test_failed_write_keeps_the_old_install(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            # "rules" as a file, then as a directory: unwritable on every OS.
+            provider._bundle = [("SKILL.md", "# v2"), ("rules", "x"), ("rules/a.md", "y")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "bundle_write_failed"
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
+    async def test_bundle_without_skill_md_keeps_the_old_install(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            provider._bundle = [("README.md", "# no skill here")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert "SKILL.md" in (await resp.json())["error"]
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
+    async def test_refused_swap_rename_keeps_the_old_install(
+        self, fake_home, reset_registry, monkeypatch
+    ):
+        # A Windows directory rename can fail under AV or an open handle.
+        from kiro_crew.dashboard.handlers import discover as discover_mod
+
+        client, provider, skill_dir = await self._installed(fake_home)
+
+        def _publish(src, dst):
+            raise PermissionError(13, "Access is denied", str(dst))
+
+        # Patch the module's own `platform_compat` name only, never the shared module.
+        fake = SimpleNamespace(**{**vars(platform_compat), "publish_dir_noreplace": _publish})
+        monkeypatch.setattr(discover_mod, "platform_compat", fake)
+        try:
+            provider._bundle = [("SKILL.md", "# v2")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "bundle_write_failed"
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
 
 @pytest.mark.asyncio
 class TestDiscoverPreview:
@@ -255,6 +449,112 @@ class TestDiscoverPreview:
             assert data["content"].startswith("---\nname: fake-skill")
             assert data["files"] == ["SKILL.md", "rules/extra.md"]
             assert data["file_count"] == 2
+        finally:
+            await client.close()
+
+    async def test_preview_description_matches_installed_skill(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        """The preview parses SKILL.md with the same grammar the skills
+        loader applies after install (SKILL_LOADER), so what the user sees
+        in the preview panel is what the installed skill will show: quotes
+        stripped from plain values and block-scalar descriptions resolved
+        from their continuation lines — not the raw indicator character.
+        The expectation is derived from the loader itself, not hardcoded,
+        so a future loader-dialect change breaks this pin instead of
+        silently reopening the preview/install divergence."""
+        from kiro_crew.skills import SkillsLoader
+
+        skill_md = (
+            "---\n"
+            'name: "fake-skill"\n'
+            "description: >\n"
+            "  folded first\n"
+            "  folded second\n"
+            "---\n# Fake"
+        )
+        oracle_path = tmp_path / "SKILL.md"
+        oracle_path.write_text(skill_md, encoding="utf-8")
+        expected = SkillsLoader._parse_frontmatter(oracle_path)
+        assert expected["description"]  # the oracle resolved the scalar
+
+        provider = FakeProvider(bundle=[("SKILL.md", skill_md)])
+        state, _ = _state_with_skills_loader(fake_home)
+        app = _make_app(state, provider)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.get(
+                "/api/skills/-/discover/preview",
+                params={"provider": "fakeprov", "id": "fake-skill"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["name"] == expected["name"]
+            assert data["description"] == expected["description"]
+        finally:
+            await client.close()
+
+    async def test_preview_parses_crlf_skill_md_like_the_loader(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        """Provider content arrives verbatim, so a Windows-authored bundle
+        carries CRLF line endings the loader never sees (Path.read_text's
+        universal-newline mode collapses them before parsing). The preview
+        must mirror that translation, or a CRLF SKILL.md previews as empty
+        metadata while installing fine."""
+        from kiro_crew.skills import SkillsLoader
+
+        skill_md = "---\r\nname: crlf-skill\r\ndescription: from windows\r\n---\r\n# Fake"
+        oracle_path = tmp_path / "SKILL.md"
+        # newline="" so the CRLF bytes land on disk unmangled, like a real
+        # Windows-authored file; read_text then normalizes them on read.
+        with oracle_path.open("w", encoding="utf-8", newline="") as f:
+            f.write(skill_md)
+        expected = SkillsLoader._parse_frontmatter(oracle_path)
+        assert expected == {"name": "crlf-skill", "description": "from windows"}
+
+        provider = FakeProvider(bundle=[("SKILL.md", skill_md)])
+        state, _ = _state_with_skills_loader(fake_home)
+        app = _make_app(state, provider)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.get(
+                "/api/skills/-/discover/preview",
+                params={"provider": "fakeprov", "id": "fake-skill"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["name"] == expected["name"]
+            assert data["description"] == expected["description"]
+        finally:
+            await client.close()
+
+    async def test_preview_prefers_agents_md_like_install(
+        self, fake_home, reset_registry
+    ):
+        """A bundle without SKILL.md installs AGENTS.md as the SKILL.md, so
+        the preview must parse AGENTS.md too — not whichever markdown file
+        happens to be listed first (e.g. a README.md)."""
+        agents_md = "---\nname: agents-skill\ndescription: from agents\n---\n# Agents"
+        readme_md = "---\nname: readme\ndescription: from readme\n---\n# Readme"
+        provider = FakeProvider(
+            bundle=[("README.md", readme_md), ("AGENTS.md", agents_md)]
+        )
+        state, _ = _state_with_skills_loader(fake_home)
+        app = _make_app(state, provider)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.get(
+                "/api/skills/-/discover/preview",
+                params={"provider": "fakeprov", "id": "fake-skill"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["name"] == "agents-skill"
+            assert data["description"] == "from agents"
         finally:
             await client.close()
 
@@ -432,7 +732,7 @@ class TestDiscoverInstallHumanOnly:
 
 @pytest.mark.asyncio
 class TestDiscoverInstallLogSanitization:
-    """Regression for CWE-117 log forging in the install handler's error logs.
+    """CWE-117 log forging must not be possible in the install handler's error logs.
 
     Both the timeout path and the failure path log a provider-influenced
     ``skill_id`` (and, on failure, the scrubbed exception text). These must be

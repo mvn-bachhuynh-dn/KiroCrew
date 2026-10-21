@@ -6,7 +6,7 @@
  *   → addSlotOptimistic → switchSlot → slot state updates.
  *
  * Complements unit tests in src/test/AssistantMessage.test.tsx (button rendering)
- * and src/test/chatSlice.test.ts (thunk isolated).
+ * and src/test/chatSlice.slots.test.ts (thunk isolated).
  */
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
@@ -17,6 +17,10 @@ import AssistantMessage from '../src/pages/chat/AssistantMessage'
 import { forkSlot } from '../src/store/chatSlice'
 
 describe('Fork Session Integration', () => {
+  /* A loaded window (forkIndex defined) keeps fork as an in-place row button; only the
+   * UNAVAILABLE state sits behind the overflow menu. */
+  const forkBtn = () => screen.getByTitle('Fork conversation from here')
+
   it('fork button click → API call → optimistic slot added to store', async () => {
     const store = createTestStore()
     server.use(
@@ -39,7 +43,7 @@ describe('Fork Session Integration', () => {
       </Provider>,
     )
 
-    fireEvent.click(screen.getByTitle('Fork conversation from here'))
+    fireEvent.click(forkBtn())
 
     await waitFor(() => {
       const slots = store.getState().dashboard.slots
@@ -53,7 +57,7 @@ describe('Fork Session Integration', () => {
     const store = createTestStore()
     server.use(
       http.post('/api/chat/slots/chat-1-100/fork', () =>
-        HttpResponse.json({ ok: false, error: 'cannot fork an ephemeral session' }, { status: 400 }),
+        HttpResponse.json({ ok: false, error: 'slot cap reached (64)', code: 'slot_cap_reached' }, { status: 429 }),
       ),
     )
 
@@ -71,7 +75,7 @@ describe('Fork Session Integration', () => {
       </Provider>,
     )
 
-    fireEvent.click(screen.getByTitle('Fork conversation from here'))
+    fireEvent.click(forkBtn())
 
     await waitFor(() => {
       expect(store.getState().dashboard.slots.length).toBe(before)
@@ -91,7 +95,10 @@ describe('Fork Session Integration', () => {
         />
       </Provider>,
     )
-    expect(screen.queryByTitle('Fork conversation from here')).not.toBeInTheDocument()
+    // The footer is not rendered at all while streaming, so there is no overflow
+    // trigger and fork is unreachable -- assert the trigger, not the old title.
+    expect(screen.queryByTitle('More actions')).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /Fork conversation from here/ })).not.toBeInTheDocument()
   })
 
   it('fork button disabled while fork in flight (prevents double-click)', async () => {
@@ -118,20 +125,19 @@ describe('Fork Session Integration', () => {
       </Provider>,
     )
 
-    const btn = screen.getByTitle('Fork conversation from here') as HTMLButtonElement
-    fireEvent.click(btn)
+    fireEvent.click(forkBtn())
 
-    await waitFor(() => expect(btn).toBeDisabled())
+    await waitFor(() => expect(forkBtn()).toBeDisabled())
 
     resolve(null)
-    await waitFor(() => expect(btn).not.toBeDisabled())
+    await waitFor(() => expect(forkBtn()).not.toBeDisabled())
   })
 
   it('fork never auto-submits the unsent composer draft', async () => {
     // Option B: forking must NOT pick up the composer text. The fork request
     // carries no prompt, so nothing is auto-submitted into the new session and
     // the unsent draft stays parked in the source slot. Mirrors the post-fix
-    // ChatPage.handleFork (fork + switchSlot only — the composer is untouched).
+    // useForkSession.handleFork (fork + switchSlot only — the composer is untouched).
     const store = createTestStore()
     let forkBody: Record<string, unknown> | null = null
     server.use(
@@ -154,7 +160,7 @@ describe('Fork Session Integration', () => {
       </Provider>,
     )
 
-    fireEvent.click(screen.getByTitle('Fork conversation from here'))
+    fireEvent.click(forkBtn())
 
     await waitFor(() => {
       expect(store.getState().dashboard.slots).toContainEqual(

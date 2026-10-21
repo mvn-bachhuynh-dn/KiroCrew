@@ -1,7 +1,9 @@
 import * as React from 'react'
+import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as SelectPrimitive from '@radix-ui/react-select'
 import { Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '../../lib/utils'
+import { MountAfterCommit, useCloseWhenCrewHidden, useOverlayRoot } from '../overlayRoot'
 
 /**
  * shadcn-style wrapper around Radix Select, themed to match ui/dropdown-menu.tsx.
@@ -12,7 +14,21 @@ import { cn } from '../../lib/utils'
  * match.
  */
 
-const Select = SelectPrimitive.Root
+/** Radix `Select.Root`. An open list closes when its Crew is hidden behind a
+ *  remote one, as a click outside would close it (see components/overlayRoot). The
+ *  value is untouched. */
+function Select({ open: openProp, defaultOpen, onOpenChange, ...rest }: React.ComponentProps<typeof SelectPrimitive.Root>) {
+  const isControlled = openProp !== undefined
+  const [inner, setInner] = React.useState(defaultOpen ?? false)
+  const open = isControlled ? openProp : inner
+  const handleOpenChange = React.useCallback((next: boolean) => {
+    if (!isControlled) setInner(next)
+    onOpenChange?.(next)
+  }, [isControlled, onOpenChange])
+  const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
+  useCloseWhenCrewHidden(open, close)
+  return <SelectPrimitive.Root open={open} onOpenChange={handleOpenChange} {...rest} />
+}
 const SelectGroup = SelectPrimitive.Group
 const SelectValue = SelectPrimitive.Value
 
@@ -24,8 +40,12 @@ const SelectTrigger = React.forwardRef<
     ref={ref}
     className={cn(
       'flex items-center justify-between w-full px-3 py-2 rounded-md text-sm border border-border bg-bg-elevated text-text',
-      'hover:border-border-strong transition-all cursor-pointer outline-none',
+      'hover:border-border-strong transition-all cursor-pointer outline-hidden',
+      // data-[disabled] fires only via the Radix `disabled` prop; an ancestor
+      // <fieldset disabled> disables the native button without Radix knowing,
+      // so the same look must also hang off the native :disabled state.
       'focus-visible:border-accent data-[disabled]:opacity-40 data-[disabled]:pointer-events-none',
+      'disabled:opacity-40 disabled:pointer-events-none',
       '[&>span]:truncate [&>span]:text-left [&>span]:min-w-0',
       className
     )}
@@ -67,13 +87,26 @@ const SelectScrollDownButton = React.forwardRef<
 ))
 SelectScrollDownButton.displayName = SelectPrimitive.ScrollDownButton.displayName
 
+// Portals into the owning pane's overlay root, so content opened in the local
+// dashboard hides with it behind a remote Crew (see components/overlayRoot).
+function SelectPortal(props: React.ComponentProps<typeof SelectPrimitive.Portal>) {
+  return (
+    <MountAfterCommit>
+      <SelectPrimitive.Portal container={useOverlayRoot()} {...props} />
+    </MountAfterCommit>
+  )
+}
+
 const SelectContent = React.forwardRef<
   React.ComponentRef<typeof SelectPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof SelectPrimitive.Content>
->(({ className, children, position = 'popper', onEscapeKeyDown, ...props }, ref) => (
-  <SelectPrimitive.Portal>
+>(({ className, children, position = 'popper', onEscapeKeyDown, ...props }, ref) => {
+  const trustRoot = useGuideTrustRootAttrs()
+  return (
+  <SelectPortal>
     <SelectPrimitive.Content
       ref={ref}
+      {...trustRoot}
       position={position}
       sideOffset={4}
       // Escape must dismiss ONLY the select, not the surface hosting it. Radix
@@ -87,7 +120,11 @@ const SelectContent = React.forwardRef<
       }}
       className={cn(
         'z-[9999] max-h-[240px] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+        // Entry animation only. Radix suspends unmount until an exit animation
+        // finishes, and the still-mounted dismissable layer consumes the next
+        // pointer-down — so an exit animation makes a re-click on the trigger a
+        // no-op for the animation's whole duration.
+        'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
         'data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2',
         // Popper mode: the panel is EXACTLY the trigger's width. No `min-w`
         // here on purpose — a floor wider than the trigger makes the popup
@@ -105,8 +142,9 @@ const SelectContent = React.forwardRef<
       </SelectPrimitive.Viewport>
       <SelectScrollDownButton />
     </SelectPrimitive.Content>
-  </SelectPrimitive.Portal>
-))
+  </SelectPortal>
+  )
+})
 SelectContent.displayName = SelectPrimitive.Content.displayName
 
 const SelectItem = React.forwardRef<
@@ -116,7 +154,7 @@ const SelectItem = React.forwardRef<
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex cursor-pointer select-none items-center justify-between gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
+      'relative flex cursor-pointer select-none items-center justify-between gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       // Themed selected state (user preference): accent wash + accent text
       // instead of stock shadcn's check-only look.

@@ -51,6 +51,7 @@ from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     json_body,
 )
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact
 
 logger = logging.getLogger("kirocrew.app.meetings")
@@ -76,7 +77,7 @@ def task_mutation_transaction() -> "threading.Lock":
 
     Hold it only from a worker thread. Meeting deletion takes the same lock so
     an in-flight mutation either finishes before the directory is removed or
-    observes that the meeting no longer exists.
+    observes that the meeting does not exist.
     """
     return _TASKS_LOCK
 
@@ -94,10 +95,10 @@ def task_mutation_transaction() -> "threading.Lock":
 #: an await rather than concurrent worker threads. The terminal-`pushed` re-check
 #: inside it is the other half: the lock orders the two filings, and the re-read is
 #: what makes the SECOND one a no-op instead of a duplicate.
-_FILING_LOCK = asyncio.Lock()
+_FILING_LOCK = LoopBoundLock()
 
 
-def task_filing_transaction() -> "asyncio.Lock":
+def task_filing_transaction() -> LoopBoundLock:
     """Return the lock spanning an external filing and its local record."""
     return _FILING_LOCK
 
@@ -163,7 +164,7 @@ def _normalize_task(raw: Any) -> dict[str, Any] | None:
         # which is exactly how a credential-shaped id would have crossed the
         # boundary while `description` beside it was scrubbed. Redact BEFORE the
         # truncation, so a marker cannot be sliced in half into something the
-        # scanner no longer recognises.
+        # scanner does not recognise.
         "id": redact(str(raw.get("id") or f"t{uuid.uuid4().hex[:8]}"))[:64],
         "description": description[:_MAX_DESCRIPTION],
         "assignee": redact(str(raw.get("assignee") or "").strip())[:200],

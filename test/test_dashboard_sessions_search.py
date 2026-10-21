@@ -35,10 +35,10 @@ class TestSessionsSearchHandler:
     @pytest.mark.asyncio
     async def test_matches_content(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        log.append("alpha", "user", "discussed CR-1234567 today")
+        log.append("alpha", "user", "discussed TICKET-1234567 today")
         log.append("beta", "user", "unrelated")
         async with TestClient(TestServer(_make_app(log))) as client:
-            resp = await client.get("/api/sessions/search?q=CR-1234567")
+            resp = await client.get("/api/sessions/search?q=TICKET-1234567")
             keys = [s["key"] for s in (await resp.json())["sessions"]]
             assert keys == ["alpha"]
 
@@ -80,23 +80,16 @@ class TestSessionsSearchHandler:
         # Inject a title with a credential-like pattern via monkeypatch
         calls = []
 
-        def _fake_redact_creds(text):
-            calls.append(("creds", text))
-            return ("[REDACTED]", [])
+        def _fake_compose(text):
+            calls.append(text)
+            return ("[REDACTED]", [], [])
 
-        def _fake_redact_urls(text):
-            calls.append(("urls", text))
-            return (text, [])
-
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.handlers.redact_credentials", _fake_redact_creds
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.handlers.redact_exfiltration_urls", _fake_redact_urls
-        )
+        # Patched on the one composed pass that `security.redact` runs: it finds
+        # credential and outbound-URL spans together, so this one fake standing in
+        # for it is what proves the title goes through both.
+        monkeypatch.setattr("kiro_crew.security.pass_compose.compose", _fake_compose)
         async with TestClient(TestServer(_make_app(log))) as client:
             resp = await client.get("/api/sessions/search?q=matches")
             sessions = (await resp.json())["sessions"]
             assert sessions and sessions[0]["title"] == "[REDACTED]"
-            assert any(c[0] == "creds" for c in calls)
-            assert any(c[0] == "urls" for c in calls)
+            assert calls

@@ -14,388 +14,99 @@ Milestone 3 when the full bridge ships.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
+import base64  # noqa: F401
+import binascii  # noqa: F401
 import contextlib
-import json
+import importlib as _importlib
+import json  # noqa: F401
 import logging
-import os
-import re
+import os  # noqa: F401
+import sys as _sys
 import time
-from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+import uuid  # noqa: F401
+from dataclasses import dataclass, field, replace  # noqa: F401
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Awaitable, Mapping, Optional  # noqa: F401
 
-from kiro_crew import platform_compat
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
-from kiro_crew.executors import maintenance_executor
-from kiro_crew.mcp_caller import (
+from kiro_crew import _facade_mirror, platform_compat
+from kiro_crew.constants import (  # noqa: F401
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+    SUBAGENT_TIMEOUT_SECS,
+)
+from kiro_crew.executors import image_executor, maintenance_executor  # noqa: F401
+from kiro_crew.install_liveness import (
+    POOLED_BACKEND_ENV,
+    POOLED_BACKEND_VALUE,
+    POOLED_RESPAWN_COMMAND_ENV,
+)
+from kiro_crew.json_line import (  # noqa: F401
+    ID_PROBE_BYTES,
+    parse_json_object_line,
+    recover_line_id,
+    recover_top_level_id,
+)
+from kiro_crew.mcp_caller import (  # noqa: F401
     CALLER_CAPABILITY_KEY,
     CALLER_META_KEY,
+    INFLIGHT_CAPABILITY_KEY,
+    INFLIGHT_NOTIFICATION,
+    TENANT_META_KEY,
     CallerContext,
     build_caller_meta,
+    build_tenant_meta,
 )
-from kiro_crew.mcp_gateway.apps import (
+from kiro_crew.mcp_gateway import backend_handshake as _backend_handshake
+from kiro_crew.mcp_gateway import backend_leases as _backend_leases
+from kiro_crew.mcp_gateway import backend_liveness as _backend_liveness
+from kiro_crew.mcp_gateway import backend_mcp_apps as _backend_mcp_apps
+from kiro_crew.mcp_gateway import backend_routing as _backend_routing
+from kiro_crew.mcp_gateway import backend_stubs as _backend_stubs
+from kiro_crew.mcp_gateway import hazards, lifecycle_log  # noqa: F401
+from kiro_crew.mcp_gateway.apps import (  # noqa: F401
+    WithheldTools,
     append_marker,
     extract_declared_ui_uris,
     extract_ui_resource_uri,
+    strip_model_hidden_tools,
     write_spool,
 )
-from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, RESPONSE_SPILL_THRESHOLD_BYTES
-from kiro_crew.mcp_gateway.spill import maybe_spill_response
+from kiro_crew.mcp_gateway.backend_handshake import (
+    _DEFAULT_INITIALIZE_TIMEOUT_SECS,
+    _effective_initialize_timeout_secs,
+)
+from kiro_crew.mcp_gateway.backend_tmp import (
+    allocate_backend_tmp,
+    record_owner,
+    sweep_backend_tmp,
+    tmp_env,
+)
+from kiro_crew.mcp_gateway.backend_wire import _PendingRequest
+from kiro_crew.mcp_gateway.image_budget import (  # noqa: F401
+    line_may_carry_image_block,
+    parse_image_bearing_frame,
+    rewrite_image_frame,
+)
+from kiro_crew.mcp_gateway.pool import (  # noqa: F401
+    READ_BUFFER_LIMIT_BYTES,
+    RESPONSE_SPILL_THRESHOLD_BYTES,
+)
+from kiro_crew.mcp_gateway.spill import maybe_spill_response  # noqa: F401
+from kiro_crew.mcp_gateway.tool_surface import ToolSurface, project_tool_surface  # noqa: F401
+from kiro_crew.process_identity import failure_name, with_kill_failure  # noqa: F401
+from kiro_crew.sandbox import (
+    CANONICAL_TEMP_KEYS,
+    classify_declared_temp_env,
+    declared_temp_refusal_reasons,
+    format_declared_temp_refusals,
+)
 from kiro_crew.security import redact
-from kiro_crew.sel import SecurityEventLog
+from kiro_crew.sel import SecurityEventLog  # noqa: F401
 
 if False:  # typing-only import guard
     from kiro_crew.mcp_gateway.pool import PoolKey
 
 logger = logging.getLogger(__name__)
-
-# --- Per-request latency metrics ----------------------------------------
-#
-# When ``MCP_GATEWAY_CALL_METRICS_PATH`` is set, every completed request
-# (any method — tools/call, tools/list, initialize, etc.) appends one
-# JSON line with the exact gateway-e2e duration (``forward_from_stub``
-# receive → backend stdout response routed). This is the only measurement
-# in the system that isolates MCP gateway + backend wall time with zero
-# LLM inference mixed in.
-#
-# Schema (one JSONL record per completed request):
-#   {"ts": epoch_ms_int, "method": "tools/call", "dur_ms": 2.34,
-#    "pool": "example-mcp::kirocrew::...", "pid": 12345, "ok": true}
-#
-# Ring-buffer-free — we trust log rotation on the consumer side.
-_METRICS_PATH = os.environ.get("MCP_GATEWAY_CALL_METRICS_PATH")
-
-
-def _write_metric_line(record: dict[str, Any]) -> None:
-    """Synchronous jsonl append. Always run off the event loop via
-    :func:`_emit_call_metric` — never call directly from a coroutine."""
-    if _METRICS_PATH is None:  # narrows for mypy; also guarded in the caller
-        return
-    try:
-        line = json.dumps(record, separators=(",", ":"))
-        with open(_METRICS_PATH, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        # Disk full, permission denied, rotation race — drop silently.
-        pass
-
-
-async def _emit_call_metric(record: dict[str, Any]) -> None:
-    """Best-effort append to the metrics jsonl. Silent on any IO error —
-    latency instrumentation MUST NOT affect request routing correctness.
-
-    The blocking ``open()``/``write()`` is offloaded via ``asyncio.to_thread``
-    so a slow or NFS-backed metrics volume cannot stall the event loop (and
-    thus all request routing). When disabled (no path configured) this is a
-    cheap early return with no thread hop.
-    """
-    if not _METRICS_PATH:
-        return
-    await asyncio.to_thread(_write_metric_line, record)
-
-
-# Default handshake deadline. Real MCP backends reply to ``initialize``
-# within tens of milliseconds; 10s is generous slack for a cold-spawning
-# backend on a loaded host.
-_DEFAULT_INITIALIZE_TIMEOUT_SECS = 10.0
-
-# Upper bound on a single ``_write_json_line`` drain (writing a forwarded
-# request to a backend's stdin). A backend that has stopped reading its stdin
-# must not hang the forwarding coroutine — and the shared heartbeat sweeper —
-# forever. On timeout the write raises a pipe error so the caller recycles the
-# wedged backend. Mirrors gatewayd's bounded reply drain.
-_WRITE_DRAIN_TIMEOUT_SECS = 30.0
-
-# JSON-RPC initialize id the gateway uses on behalf of the first stub.
-# Real stubs' ``initialize`` requests are cached and replayed from the
-# gateway-side ``init_cache``; this id only matters for the one-shot
-# handshake in :func:`send_initialize`.
-_GATEWAY_INIT_ID = "mcp-gateway-init-0"
-
-# Reserved JSON-RPC id for gateway-internal liveness pings.
-# A positive integer well inside the JSON-RPC safe-integer range (2**53-1) so
-# backends that round-trip ids through a float Number type cannot truncate it,
-# and trivially distinct from forwarded request ids which are
-# ``"gw-<pid>-<n>"`` strings. Responses bearing this id are swallowed in
-# :meth:`Backend._route_backend_line` and never delivered to a stub.
-HEARTBEAT_PING_ID = 0x6D63_6862  # 1835100258 ("mchb")
-
-# An in-flight request is considered *potentially* wedged if outstanding longer
-# than this. However, shared backends (kirocrew-core) host legitimately long
-# tools: ``wait`` (60-1800s) and ``spawn_sub_agents`` (blocking). A backend is
-# only recycled when BOTH the oldest pending request exceeds this age AND the
-# backend has not responded to a heartbeat ping within PING_STALE_SECS — a
-# backend that answers pings is slow, not wedged.
-#
-# Exceeding this threshold alone must not force an immediate recycle: that
-# would kill a high-refcount kirocrew-core backend that is still answering
-# fresh pings.
-HEARTBEAT_TIMEOUT_SECS = 300.0
-
-# A backend's ping response is considered stale if no ping response has arrived
-# within 2.5x the gatewayd heartbeat sweep interval (60s). This ensures at
-# least 2 full sweep cycles pass before concluding the backend is unresponsive.
-PING_STALE_SECS = 150.0
-
-# Absolute ceiling: recycle regardless of ping freshness. Protects against a
-# pathological case where the tool itself is stuck but the MCP server's read
-# loop still services ping requests. Set to wait_max (1800s) + 5-min margin.
-HARD_WEDGE_CEILING_SECS = 2100.0
-
-# Upper bound on a single stub's pending-delivery inbox. Backend->stub frames
-# are enqueued by the stdout pump without awaiting the stub's socket drain, so
-# a stub that has stopped reading must not let a chatty backend grow gateway
-# RSS without bound. Past this many undrained frames the slow stub is dropped
-# (see ``Backend._enqueue_to_stub``) so co-pooled sessions are protected.
-# Generous enough that normal bursts (large tools/list, rapid tool calls)
-# never trip it.
-_STUB_INBOX_MAXSIZE = 4096
-
-# Server->client notifications that reflect backend-wide state identical for
-# every co-pooled tenant, so they are safe to fan out when we cannot attribute
-# them to a single owning stub. Everything else (progress, logging/message,
-# cancelled, resource-update) is request- or subscription-scoped: broadcasting
-# an unattributable one would leak one tenant's content to co-tenants — a
-# disclosure the non-pooled baseline never had — so those are dropped instead.
-_GLOBAL_BROADCAST_NOTIFICATIONS: frozenset[str] = frozenset({
-    "notifications/tools/list_changed",
-    "notifications/prompts/list_changed",
-    "notifications/resources/list_changed",
-})
-
-
-def _is_heartbeat_id(msg_id: Any) -> bool:
-    """True if ``msg_id`` is the reserved heartbeat ping id (int or its
-    string form, since some backends stringify response ids)."""
-    return msg_id == HEARTBEAT_PING_ID or str(msg_id) == str(HEARTBEAT_PING_ID)
-
-
-class BackendGone(RuntimeError):
-    """Raised when a caller tries to forward into a backend that is dead
-    or has lost its stdin pipe. The connection handler catches this and
-    emits a clean JSON-RPC error to the originating stub."""
-
-
-@dataclass
-class _PendingRequest:
-    """Tracks an in-flight request so the stdout pump can restore the
-    stub's original JSON-RPC id on the response. ``stub_uuid`` can also
-    be the sentinel ``"__init__"`` for the gateway's upstream initialize
-    request — that case is handled separately in :meth:`Backend._route_backend_line`.
-
-    ``t_start_ms`` is the monotonic clock at forward time. The stdout
-    pump uses it to compute an authoritative gateway-e2e duration for
-    every completed request — the only point where we can claim "this is
-    MCP gateway wall time" without LLM inference mixed in.
-    """
-
-    stub_uuid: str
-    original_id: Any
-    method: str
-    t_start_ms: float = 0.0
-    # The request's ``params._meta.progressToken`` if it set one, so a
-    # server-emitted ``notifications/progress`` can be routed back to the
-    # owning stub instead of broadcast across co-pooled tenants.
-    progress_token: Any = None
-    # MCP Apps: captured at forward time so the response-interception path can
-    # populate the spool record without the original request params (which are
-    # not otherwise retained). ``session_key`` is the authoritative caller id;
-    # ``tool_name`` is ``params.name`` for a tools/call. Both empty for
-    # non-tools/call requests and gateway-internal sentinels.
-    session_key: str = ""
-    tool_name: str = ""
-    # The tools/call ``params.arguments`` object, captured so an intercepted
-    # app render can forward the ORIGINATING inputs to the app (SEP-1865
-    # ``ui/notifications/tool-input``). ``None`` for non-tools/call requests.
-    tool_arguments: Optional[dict] = None
-    # Set only on the gateway-originated ``resources/read`` pending (stub_uuid
-    # == ``_APPS_STUB_SENTINEL``): the future the stdout pump resolves with the
-    # backend's resources/read response so the parked fetch coroutine wakes.
-    apps_future: Optional["asyncio.Future[dict[str, Any]]"] = None
-
-
-def _strip_caller_meta(msg: dict[str, Any]) -> dict[str, Any]:
-    """Return a shallow copy of ``msg`` with any stub-supplied
-    ``params._meta.kirocrew.caller`` unconditionally removed.
-
-    The gateway is the trust boundary: stubs are untrusted clients and must
-    never be able to forge their caller identity by pre-populating
-    ``_meta.kirocrew.caller`` in the request. This function is called on
-    EVERY forwarded request regardless of method so a malicious stub cannot
-    sneak a forged caller block through non-tools/call methods.
-    """
-    out = dict(msg)
-    params = out.get("params")
-    if not isinstance(params, dict):
-        return out
-    meta_raw = params.get("_meta")
-    if not isinstance(meta_raw, dict) or CALLER_META_KEY not in meta_raw:
-        return out
-    # The caller block is a FLAT ``params._meta[CALLER_META_KEY]`` key
-    # ("kirocrew.caller") — exactly the shape build_caller_meta writes and
-    # CallerContext.from_meta reads. Strip that flat key. (An earlier nested
-    # "_meta[kirocrew][caller]" strip was a no-op against the real wire format,
-    # so a stub-forged block survived whenever no authoritative identity was
-    # injected over it — e.g. a stub that registered without a session_key —
-    # enabling cross-tenant identity forgery. Stripping on EVERY forwarded
-    # request closes that regardless of whether injection happens.)
-    params = dict(params)
-    meta = dict(meta_raw)
-    del meta[CALLER_META_KEY]
-    if meta:
-        params["_meta"] = meta
-    else:
-        del params["_meta"]
-    out["params"] = params
-    return out
-
-
-# MCP Apps (SEP-1865): extension key + MIME profile the gateway advertises to
-# backends when the feature flag is on. kiro-cli sends empty client
-# capabilities, so UI-enabled tools would otherwise degrade to text-only.
-# The gateway is the actual Apps host (it fetches/renders the ui:// resource
-# out-of-band), so it — not kiro-cli — advertises the capability.
-MCP_APPS_EXTENSION_KEY = "io.modelcontextprotocol/ui"
-MCP_APPS_MIME_TYPE = "text/html;profile=mcp-app"
-MCP_APPS_ENV_FLAG = "KIROCREW_MCP_APPS"
-#: Tokens the env flag recognises. Module constants rather than literals inline
-#: in the gate, because the dashboard's write path has to recognise the SAME set
-#: to refuse a config write the env would override — two copies would drift.
-MCP_APPS_ENV_TRUE = ("1", "true", "yes")
-MCP_APPS_ENV_FALSE = ("0", "false", "no", "off")
-
-# Sentinel ``stub_uuid`` for a gateway-originated ``resources/read`` issued to
-# fetch a ui:// app resource. Its response is routed to the parked future in
-# :meth:`Backend._read_ui_resource` instead of any stub — mirrors the
-# ``"__init__"`` sentinel used for the gateway-driven initialize handshake.
-_APPS_STUB_SENTINEL = "__apps__"
-
-# Deadline for the out-of-band ``resources/read`` round-trip. On timeout the
-# original tools/call response is delivered unmodified — the app render is
-# best-effort and MUST NOT wedge or drop the tool result.
-_APPS_RESOURCE_READ_TIMEOUT_SECS = 10.0
-
-
-def mcp_apps_env_override() -> bool | None:
-    """The env flag's verdict, or ``None`` when it does not pin the feature.
-
-    Public because the dashboard's write path needs the same answer: with the env
-    pinning this, a config write is inert, and reporting success for an inert
-    write is precisely the false-success the switch exists to prevent.
-
-    Reads the CURRENT process's environment. The dashboard and gatewayd normally
-    agree — ``env_target_resolver`` hands the backend a copy of the gateway's own
-    env and this flag is not a credential, so it is inherited — but an operator
-    who exported it into only one of the two would defeat the check. It is a
-    best-effort guard against the common case, not a proof.
-    """
-    raw = os.environ.get(MCP_APPS_ENV_FLAG, "").strip().lower()
-    if raw in MCP_APPS_ENV_FALSE:
-        return False
-    if raw in MCP_APPS_ENV_TRUE:
-        return True
-    return None
-
-
-def _mcp_apps_enabled() -> bool:
-    """Feature gate for MCP Apps. **Tightest-wins**: any explicit off disables.
-
-    1. ``KIROCREW_MCP_APPS`` off -> disabled. Absolute kill switch.
-    2. ``mcp_gateway.apps_enabled = false`` -> disabled, EVEN with the env flag
-       on. This is what makes the dashboard opt-out trustworthy across process
-       boundaries: a daemon that outlives its gateway keeps its own environment,
-       so an env-first precedence let an *adopted* daemon carry on rendering
-       after the user had switched the feature off. Deciding it here, in the
-       process that actually renders, needs no cross-process probe of anyone's
-       environment.
-    3. ``KIROCREW_MCP_APPS`` on -> enabled (explicit override for tests and the
-       e2e harness), having cleared the opt-out above.
-    4. Otherwise ``mcp_gateway.enabled`` — the broker must be running, because
-       the render and callback paths live inside it, so ``apps_enabled`` alone
-       can never grant the feature.
-
-    ``apps_enabled`` defaults True when absent, so step 2 fires only on a value
-    an operator actually wrote: "not configured" is not an opt-out.
-
-    Fails CLOSED: if config cannot be read, the feature is disabled. An
-    unreadable config in gatewayd is an abnormal state, and silently disabling
-    an optional rendering feature is the low-harm outcome versus rendering
-    against an operator preference we could not confirm.
-
-    Read per-call (``KiroCrewConfig.load`` is fingerprint-cached, so this is a
-    dict lookup in the common case) so the gateway reflects a config change
-    without a daemon restart — including a daemon this gateway merely adopted
-    and therefore cannot restart.
-    """
-    override = mcp_apps_env_override()
-    if override is False:
-        return False
-    try:
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        gw = KiroCrewConfig.load().mcp_gateway
-    except Exception:  # pragma: no cover - defensive; fail closed
-        logger.debug("mcp-apps: config unreadable; treating feature as disabled", exc_info=True)
-        return False
-    if not gw.apps_enabled:
-        return False
-    if override is True:
-        return True
-    return bool(gw.enabled)
-
-
-def _inject_client_extensions(msg: dict[str, Any]) -> dict[str, Any]:
-    """Return ``msg`` with ``capabilities.extensions["io.modelcontextprotocol/ui"]``
-    deep-merged into an ``initialize`` frame — or ``msg`` unchanged when the
-    MCP Apps flag is off or the frame is not a well-formed initialize.
-
-    Copy discipline mirrors :func:`_strip_caller_meta`: every dict on the
-    mutated path (``params`` → ``capabilities`` → ``extensions``) is shallow-
-    copied before mutation so the stub's captured frame is never aliased.
-    Pre-existing extension entries are preserved; an existing ui-extension
-    entry is left untouched (the caller declared it deliberately).
-    """
-    if not _mcp_apps_enabled():
-        return msg
-    params = msg.get("params")
-    if not isinstance(params, dict):
-        return msg
-    out = dict(msg)
-    params = dict(params)
-    caps_raw = params.get("capabilities")
-    caps = dict(caps_raw) if isinstance(caps_raw, dict) else {}
-    ext_raw = caps.get("extensions")
-    extensions = dict(ext_raw) if isinstance(ext_raw, dict) else {}
-    if MCP_APPS_EXTENSION_KEY not in extensions:
-        extensions[MCP_APPS_EXTENSION_KEY] = {"mimeTypes": [MCP_APPS_MIME_TYPE]}
-    caps["extensions"] = extensions
-    params["capabilities"] = caps
-    out["params"] = params
-    return out
-
-
-def _inject_caller_meta(msg: dict[str, Any], caller: CallerContext) -> dict[str, Any]:
-    """Return a shallow copy of ``msg`` with ``params._meta.kirocrew.caller``
-    unconditionally set from ``caller``.
-
-    Assumes any pre-existing stub-supplied caller block has already been
-    stripped by :func:`_strip_caller_meta`. Other ``_meta`` fields
-    (``progressToken`` etc.) pass through unchanged.
-    """
-    out = dict(msg)
-    params = out.get("params")
-    if isinstance(params, dict):
-        params = dict(params)
-    else:
-        params = {}
-    meta_raw = params.get("_meta")
-    meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
-    # Inject the authoritative caller block from the gateway.
-    meta.update(build_caller_meta(caller))
-    params["_meta"] = meta
-    out["params"] = params
-    return out
 
 
 @dataclass
@@ -426,6 +137,23 @@ class Backend:
     created_at: float
     last_used_at: float
     supports_caller_identity: bool = False
+    # The backend advertised ``mcp_shared.INFLIGHT_CAPABILITY_KEY``: it sends
+    # ``notifications/kirocrew/inflight`` for its parked calls, so the wedge
+    # detector holds it to PROGRESS_WEDGE_CEILING_SECS instead of the 3h ceiling.
+    reports_inflight: bool = False
+    # True only when the spawn that produced this process was Kiro Crew's own
+    # packaged control plane -- the resolved command and args matched what the
+    # managed spec emits, not merely a reserved server NAME. It gates the one
+    # thing a pooled backend is ever handed beyond the caller's identity: the
+    # session's bearer token. A server that merely calls itself
+    # ``kirocrew-core`` stays False.
+    control_plane: bool = False
+    # Why ``control_plane`` is False for a backend spawned under a RESERVED name
+    # (empty for a third-party name, and for an accepted control plane). Carried
+    # to that backend on every forwarded frame as the caller's ``identity_denial``
+    # so its ``identity_unattested`` refusal can say what the daemon saw; the
+    # daemon's own log line is the only other place the reason exists.
+    control_plane_denial: str = ""
     _shutdown_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # --- Sharing boundary state (Milestone 2) -------------------------------
     # Each attached stub appears in ``_stub_inboxes`` keyed by stub_uuid; the
@@ -434,8 +162,23 @@ class Backend:
     # ``len(_stub_inboxes)`` as a fast read-only integer so the idle-sweep
     # does not have to acquire the inbox lock on every pass.
     _stub_inboxes: dict[str, "asyncio.Queue[bytes]"] = field(default_factory=dict)
+    # The agent each attached stub declared on its Register frame, keyed by the
+    # same stub_uuid. ONE reader: ``_fetch_and_deliver_ui`` stamps it into the
+    # spool record so an app callback can be governed by the agent that actually
+    # produced the render (``app_call._agent_for_call``). It is per stub and not
+    # a key field because the agent is not a pool dimension (see the ``pool``
+    # module docstring), so a shared backend has several and a key field could
+    # hold none of them. Kept in step with ``_stub_inboxes`` by
+    # ``attach_stub``/``detach_stub`` under the same lock, which bounds it.
+    _stub_agents: dict[str, str] = field(default_factory=dict)
     _inbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     refcount: int = 0
+    # Non-empty on a backend bound to a single connection, holding that
+    # connection's ``stub_uuid``. It makes ``storage_digest`` unique per
+    # connection: PoolKey is identical across connections to the same server, so
+    # without this discriminator two private backends would share a digest and
+    # an app callback could resolve onto the wrong session's process.
+    exclusive_token: str = ""
     # ``pinned`` marks a backend that the warm-pool prewarmer created ahead of
     # any stub. Such a backend sits at ``refcount == 0`` indefinitely (no stub
     # stays attached to it between chats), so the ordinary idle/LRU rules would
@@ -453,6 +196,80 @@ class Backend:
     # original id restored.
     _forward_id_seq: int = 0
     _pending_requests: dict[str, "_PendingRequest"] = field(default_factory=dict)
+    # Resource-subscription routing table: ``uri -> {stub_uuid}``, the set of
+    # stubs whose ``resources/subscribe`` the server ACCEPTED. Grants are
+    # recorded on the server's response, never at forward time, so an update
+    # racing an unconfirmed subscribe fails closed (dropped) instead of being
+    # delivered on a subscription the server may yet refuse — including a
+    # refusal made on per-caller authorization grounds. The notification
+    # carries only the URI — never resource content — so delivering it to a
+    # stub whose subscription for that URI was accepted discloses nothing
+    # across tenants.
+    _resource_subscriptions: dict[str, set[str]] = field(default_factory=dict)
+    # Lease bookkeeping for the coalesced (identity-less) path. A URI in
+    # ``_lease_awaiting_grant`` has its first subscribe forwarded and not yet
+    # answered; stubs joining during that window are parked in
+    # ``_lease_pending_riders`` as ``(stub_uuid, original_id)`` and answered
+    # with the server's actual verdict, so no stub is ever told "subscribed"
+    # on the strength of a lease that then fails to materialize. A URI in
+    # ``_lease_awaiting_release`` has its final unsubscribe forwarded and not
+    # yet answered; routing keeps the leaving stub until the server confirms,
+    # because a failed unsubscribe means the server retained the subscription
+    # and dropping routing early would silently discard live updates.
+    _lease_awaiting_grant: set[str] = field(default_factory=set)
+    _lease_awaiting_release: set[str] = field(default_factory=set)
+    _lease_pending_riders: dict[str, list[tuple[str, Any]]] = field(default_factory=dict)
+    # Final unsubscribes arriving while a URI's release is already in flight
+    # park here as ``(stub_uuid, original_id)`` — the release need not belong
+    # to the parking stub (its owner may have detached), so refusing would
+    # dead-end a legitimate leave. Exactly one release stays in flight per
+    # URI; every waiter settles on that one verdict: success drops the
+    # waiter from routing and answers it, refusal keeps it routed and hands
+    # it the server's error so it knows the unsubscribe did not take effect.
+    _lease_release_waiters: dict[str, list[tuple[str, Any]]] = field(default_factory=dict)
+    # Subscribes arriving while a URI's release is in flight park here. The
+    # ordered stream only orders the WRITES; the server may ANSWER out of
+    # order, so forwarding a replacement subscribe beside the release could
+    # land a grant the release then destroys upstream while local routing
+    # keeps the subscriber — silent update loss. A confirmed release drains
+    # these into one fresh forwarded subscribe (first parker as forwarder,
+    # the rest as riders); a refusal means the server retained the lease, so
+    # they join the still-live entry locally.
+    _lease_replacement_subscribes: dict[str, list[tuple[str, Any]]] = field(
+        default_factory=dict)
+    # Identity-capable servers only: the caller whose subscribe the server
+    # GRANTED, keyed ``(uri, stub_uuid)`` and recorded at response time — the
+    # only moment the grant principal is known for certain. A release for a
+    # departing stub is sent as THIS caller (never the connection's caller at
+    # teardown, and never a last-writer map: a claim rekey after the grant
+    # makes both identify the wrong principal and revoke a co-tenant's live
+    # subscription). Dropped when the grant is released or the entry pruned.
+    _grant_callers: dict[tuple[str, str], "CallerContext"] = field(
+        default_factory=dict)
+    # URIs whose upstream subscription is known RETAINED with no subscriber
+    # left to route to — a gateway-originated release was refused. Updates for
+    # these are dropped WITHOUT recording a hazard: the frames are a
+    # consequence of the broker's own lease handling, and recording them
+    # would withdraw the server's pooling recommendation for behaviour that
+    # is correct. Cleared when a later release succeeds or a new grant makes
+    # the URI attributable again.
+    _orphaned_leases: set[str] = field(default_factory=set)
+    # Replay-target URIs preserved at death. An in-flight replay lives only
+    # in ``_pending_requests`` (routing commits on the server's grant), so a
+    # replacement that dies before its replay responses arrive would erase
+    # those URIs in the backend-gone cleanup — and the NEXT respawn's
+    # ``resource_subscription_uris`` capture would find them nowhere,
+    # permanently darkening the subscription. Written once by
+    # ``_broadcast_backend_gone`` (terminal state, size bounded by the
+    # pending table it snapshots), read by the capture.
+    _gone_replay_uris: dict[str, set[str]] = field(default_factory=dict)
+    # Per-stub rekey generation, bumped by ``evict_stub_subscriptions``. A
+    # multi-URI replay awaits between writes; a claim landing mid-loop
+    # evicts the pendings written SO FAR, but the loop would keep writing
+    # the remaining URIs under the old owner — this counter lets the replay
+    # notice the rekey between writes and stop (fail closed: the new owner
+    # subscribes on its own).
+    _rekey_generation: dict[str, int] = field(default_factory=dict)
     # Initialize-cache state — first stub triggers an upstream handshake,
     # later stubs receive a synthesized response built from the cached result.
     _init_result: Optional[dict[str, Any]] = None
@@ -460,11 +277,31 @@ class Backend:
     _init_pending: list[tuple[str, Any]] = field(default_factory=list)
     _init_first_stub: Optional[str] = None
     _init_first_id: Any = None
+    # The ``initialize`` frame this backend was handshaken with, as forwarded
+    # upstream minus its id. Kept so a backend whose server lost its MCP session
+    # behind the pipe can be handshaken again (``_retry_after_rehandshake``):
+    # kiro-cli sends ``initialize`` once per session and the cache above answers
+    # every later stub, so no stub will ever send another one.
+    _upstream_init_frame: Optional[dict[str, Any]] = None
     # Set once the upstream initialize resolves (ready OR failed). The
     # transparent-respawn path (gatewayd) awaits this after re-priming a
     # freshly spawned backend so stub traffic only resumes when the new
     # backend is handshake-complete.
     _init_done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Bounds the FIRST upstream handshake. A backend that is alive but never
+    # answers ``initialize`` leaves ``_init_state`` at "in_flight" forever:
+    # every queued stub waits on a reply that never comes, and because the
+    # process has not died no death-driven recovery (breaker, zombie sweep)
+    # observes it. The timer turns that silence into the terminal "failed"
+    # state and reaps the process group. Respawn priming carries its own
+    # bounded wait, so only the lazy first handshake arms this.
+    _init_deadline_task: Optional[asyncio.Task[None]] = None
+    # Bound on the first ``initialize`` window, set at construction from the
+    # daemon's configured value (``mcp_gateway.initialize_timeout_secs``). A
+    # field rather than a module constant so the configured value reaches every
+    # backend spawned by this daemon; the spawn-gate watcher reads the same
+    # field, which is what keeps its permit window and this deadline aligned.
+    initialize_timeout_secs: float = _DEFAULT_INITIALIZE_TIMEOUT_SECS
     _dead_reason: Optional[str] = None
     # Idempotency guard for _broadcast_backend_gone (see there): the terminal
     # "backend gone" broadcast is reachable near-simultaneously from several
@@ -476,6 +313,13 @@ class Backend:
     # loop and (b) outlives shutdown if the process survives SIGKILL, leaking
     # its stderr pipe fd across LRU-eviction churn.
     _stderr_task: Optional[asyncio.Task[None]] = None
+    # The process's start id, read once right after spawn, while nothing can
+    # have reaped it yet. The out-of-band backend record publishes this, not a
+    # fresh read at heartbeat time: by then the backend may have exited and
+    # its pid been handed to an unrelated process, whose start id a fresh read
+    # would publish as this backend's. ``None`` when it could not be read; the
+    # record then carries a bare pid, which no reap signals.
+    start_id: Optional[str] = None
     # Quarantine: no new stubs may attach; kill when refcount drains to 0.
     quarantined: bool = False
     # Ping-gated wedge detection: updated each time the heartbeat ping response
@@ -508,6 +352,33 @@ class Backend:
     # (see test_declared_only_server_still_intercepted). Keying this map per
     # session would drop the association and break rendering.
     _apps_declared_uris: dict[str, str] = field(default_factory=dict)
+    # The tool set this backend TOLD each stub about, projected by
+    # ``tool_surface`` from that stub's most recent model-facing tools/list
+    # response. A missing entry = nothing was ever served to that stub, which is
+    # NOT an empty tool set: it is the absence of any claim a replacement could
+    # contradict.
+    #
+    # Keyed PER STUB, not per backend. A pool key carries no caller identity, so
+    # one backend legitimately serves several sessions; a single scalar would let
+    # the last listing served to ANY of them stand in for what a particular
+    # session was told. For a server that answers every caller alike the two are
+    # the same value, but the comparison must be about the session being
+    # recovered, not about whichever tenant listed most recently.
+    #
+    # Bounded by the attached-stub set: ``detach_stub`` prunes an entry with the
+    # rest of that stub's per-stub state, which is also why the respawn path
+    # reads the anchor BEFORE it detaches.
+    #
+    # Read only by the respawn adoption path. Deliberately not an
+    # authorization input — see the module docstring of
+    # :mod:`kiro_crew.mcp_gateway.tool_surface` for why a snapshot must never
+    # become one.
+    _served_tool_surfaces: dict[str, ToolSurface] = field(default_factory=dict)
+
+    # Log join keys (``lifecycle_log``): one generation per process, one
+    # attempt per launch or re-sent ``initialize``. Never read by any decision.
+    backend_generation_id: str = field(default_factory=lifecycle_log.new_lifecycle_id)
+    attempt_id: str = field(default_factory=lifecycle_log.new_lifecycle_id)
 
     def __post_init__(self) -> None:
         # Serialize concurrent writes to the SHARED backend stdin. Every
@@ -521,6 +392,15 @@ class Backend:
     @property
     def pid(self) -> Optional[int]:
         return self.process.pid
+
+    def lifecycle_fields(self, event: str, reason: Optional[str] = None) -> str:
+        """This backend's log join fields for ``event`` (see ``lifecycle_log``)."""
+        return lifecycle_log.lifecycle_fields(
+            event,
+            reason,
+            generation=self.backend_generation_id,
+            attempt=self.attempt_id,
+        )
 
     @property
     def is_alive(self) -> bool:
@@ -564,6 +444,19 @@ class Backend:
         unfinished_apps = sum(1 for task in self._apps_tasks if not task.done())
         return len(self._pending_requests) + unfinished_apps + queued
 
+    @property
+    def storage_digest(self) -> str:
+        """The pool's key for this backend, and the identity an app callback
+        resolves against.
+
+        Equal to the PoolKey digest for a shared backend -- two connections that
+        may share a process resolve to the same entry, which is the point. A
+        connection-private backend appends its ``exclusive_token`` so it is
+        addressable without being reachable from any other connection.
+        """
+        base = self.pool_key.stable_hash()
+        return f"{base}:{self.exclusive_token}" if self.exclusive_token else base
+
     @staticmethod
     def _now() -> float:
         return time.monotonic()
@@ -574,1341 +467,80 @@ class Backend:
         real traffic from accumulated stragglers."""
         self.last_used_at = now if now is not None else time.monotonic()
 
-    async def attach_stub(self, stub_uuid: str) -> "asyncio.Queue[bytes]":
-        """Register ``stub_uuid`` as an active consumer of this backend.
+    def agent_for_stub(self, stub_uuid: str) -> str:
+        """The agent ``stub_uuid`` attached under, or ``""``.
 
-        Returns a fresh inbox queue the connection handler must drain. The
-        refcount bumps so the idle-sweep skips this backend.
+        The governance identity of any app render this stub's calls produce (see
+        :meth:`_fetch_and_deliver_ui`). ``""`` is a refusing answer downstream,
+        never a default agent. A transparent respawn also reads it to carry the
+        label onto the replacement backend, which holds no Register frame of its
+        own.
+
+        Lock-free on purpose — ``dict`` reads are atomic under the one event
+        loop every mutation also runs on, and the interception path must not
+        queue behind an attach.
         """
-        inbox: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=_STUB_INBOX_MAXSIZE)
-        async with self._inbox_lock:
-            if stub_uuid in self._stub_inboxes:
-                raise RuntimeError(
-                    f"stub_uuid={stub_uuid} already attached to backend pid={self.pid}"
-                )
-            self._stub_inboxes[stub_uuid] = inbox
-            self.refcount = len(self._stub_inboxes)
-        self.touch()
-        logger.debug(
-            "attach_stub pool=%s stub=%s refcount=%d",
-            self.pool_key.human_readable(), stub_uuid, self.refcount,
-        )
-        return inbox
+        return self._stub_agents.get(stub_uuid, "")
 
-    async def detach_stub(self, stub_uuid: str) -> int:
-        """Drop ``stub_uuid``'s inbox and clean up any pending requests
-        owned by it. Returns the remaining refcount so the caller can
-        decide whether to trigger a drain.
-        """
-        async with self._inbox_lock:
-            self._stub_inboxes.pop(stub_uuid, None)
-            self.refcount = len(self._stub_inboxes)
-        # Drop any pending-request entries owned by the departing stub
-        # so the stdout pump does not try to send into a dead inbox.
-        stale = [fid for fid, p in self._pending_requests.items() if p.stub_uuid == stub_uuid]
-        for fid in stale:
-            self._pending_requests.pop(fid, None)
-        # Initialize-cache cleanup: if the departing stub was mid-wait for
-        # a cached initialize reply, drop it from the pending list.
-        self._init_pending = [
-            entry for entry in self._init_pending if entry[0] != stub_uuid
-        ]
-        if self.refcount == 0:
-            self.touch()  # start the idle clock fresh
-        logger.debug(
-            "detach_stub pool=%s stub=%s refcount=%d",
-            self.pool_key.human_readable(), stub_uuid, self.refcount,
-        )
-        return self.refcount
-
-    def _next_forward_id(self) -> str:
-        """Return a monotonic gateway-scoped id for rewriting stub requests."""
-        self._forward_id_seq += 1
-        return f"gw-{self.pid}-{self._forward_id_seq}"
-
-    async def forward_from_stub(
-        self,
-        stub_uuid: str,
-        msg: dict[str, Any],
-        *,
-        caller: Optional[CallerContext] = None,
-    ) -> None:
-        """Forward one JSON-RPC message from ``stub_uuid`` to the backend.
-
-        Implements the three pieces of Milestone 2 correctness:
-
-        1. Initialize caching — only the first stub's ``initialize`` reaches
-           the backend. Later stubs receive the cached result locally so
-           the backend state machine does not see a double-initialize.
-        2. Id rewriting — the stub's id is replaced with a gateway-scoped
-           monotonic id. The mapping survives in ``_pending_requests`` so
-           the stdout pump can put the original id back on the response.
-        3. Caller-identity injection — ``tools/call`` requests get a
-           ``params._meta.kirocrew.caller`` block when the backend
-           advertised the capability at initialize time. The block is
-           built via :func:`kiro_crew.mcp_caller.build_caller_meta` so
-           gateway + backend share exactly one wire format.
-        """
-        if not self.is_alive:
-            raise BackendGone(self._dead_reason or "backend is not alive")
-
-        method = msg.get("method") if isinstance(msg, dict) else None
-
-        if method == "initialize":
-            await self._handle_initialize(stub_uuid, msg)
-            return
-        if method == "notifications/initialized":
-            # ALWAYS suppress stub-originated
-            # ``notifications/initialized``. The gateway sends exactly one
-            # synthetic notification to the backend from
-            # ``_on_upstream_initialize`` once the handshake completes. A stub
-            # cannot emit this until it has received its initialize response,
-            # which is only delivered AFTER ``_init_state`` is already
-            # ``"ready"`` — so the previous "let the first stub through during
-            # in_flight" branch was unreachable and the real backend never
-            # received the notification at all. A spec-compliant backend that
-            # gates tool processing on it would hang forever. Suppressing every
-            # stub echo here + one synthetic upstream send preserves the
-            # one-initialized-per-backend invariant.
-            return
-
-        # Request/response rewrite: only requests carry both method AND id.
-        # Pure notifications (method, no id) and pure responses (id, no
-        # method) pass through without rewrite. Pure responses are kiro-cli
-        # answering a server-to-client request — the backend owns that id
-        # table, not us.
-        if isinstance(msg, dict):
-            orig_id = msg.get("id")
-            has_method = "method" in msg
-            if has_method and orig_id is not None:
-                fid = self._next_forward_id()
-                msg = dict(msg)  # shallow copy — we mutate id + maybe _meta
-                msg["id"] = fid
-                progress_token = None
-                tool_name = ""
-                tool_arguments = None
-                _params = msg.get("params")
-                if isinstance(_params, dict):
-                    _meta = _params.get("_meta")
-                    if isinstance(_meta, dict):
-                        progress_token = _meta.get("progressToken")
-                    if method == "tools/call":
-                        _name = _params.get("name")
-                        if isinstance(_name, str):
-                            tool_name = _name
-                        _args = _params.get("arguments")
-                        if isinstance(_args, dict):
-                            tool_arguments = _args
-                self._pending_requests[fid] = _PendingRequest(
-                    stub_uuid=stub_uuid, original_id=orig_id, method=str(method or ""),
-                    t_start_ms=time.monotonic() * 1000.0,
-                    progress_token=progress_token,
-                    session_key=(caller.session_key if caller is not None else ""),
-                    tool_name=tool_name,
-                    tool_arguments=tool_arguments,
-                )
-            elif method == "notifications/cancelled":
-                # A cancellation is a notification (method, no top-level id);
-                # its target lives in params.requestId and still holds the
-                # STUB's original id. The backend tracks that request under our
-                # gateway-scoped fid, so forwarding verbatim makes the cancel a
-                # silent no-op (the tool call keeps running, pinning the shared
-                # backend). Remap params.requestId to the fid we assigned this
-                # stub's request (scoped to this stub, so no cross-tenant
-                # mis-cancel).
-                _cparams = msg.get("params")
-                if isinstance(_cparams, dict) and "requestId" in _cparams:
-                    orig_req = _cparams["requestId"]
-                    cancel_fid = next(
-                        (f for f, pend in self._pending_requests.items()
-                         if pend.stub_uuid == stub_uuid
-                         and pend.original_id == orig_req),
-                        None,
-                    )
-                    if cancel_fid is not None:
-                        msg = dict(msg)
-                        new_params = dict(_cparams)
-                        new_params["requestId"] = cancel_fid
-                        msg["params"] = new_params
-            # Trust boundary: unconditionally strip any stub-supplied caller
-            # identity on EVERY forwarded request regardless of method, then
-            # inject the authoritative caller block when known.
-            msg = _strip_caller_meta(msg)
-            if self.supports_caller_identity and caller is not None:
-                msg = _inject_caller_meta(msg, caller)
-
-        self.touch()
-        try:
-            await _write_json_line(self.stdin, msg)
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self._dead_reason = f"stdin closed: {exc}"
-            raise BackendGone(self._dead_reason) from exc
-
-    async def _handle_initialize(
-        self,
-        stub_uuid: str,
-        msg: dict[str, Any],
-    ) -> None:
-        original_id = msg.get("id")
-        if original_id is None:
-            raise ValueError("initialize without id")
-        if self._init_state == "ready":
-            assert self._init_result is not None
-            await self._deliver_cached_initialize(stub_uuid, original_id, self._init_result)
-            return
-        if self._init_state == "failed":
-            raise BackendGone(self._dead_reason or "backend initialize failed")
-        if self._init_state == "in_flight":
-            self._init_pending.append((stub_uuid, original_id))
-            return
-        # First time: forward upstream under a gateway id so the stdout pump
-        # can route the result to ``_on_upstream_initialize`` instead of the
-        # stub (which would still be waiting under the gateway id).
-        self._init_state = "in_flight"
-        self._init_first_stub = stub_uuid
-        self._init_first_id = original_id
-        self._init_pending.append((stub_uuid, original_id))
-        fid = self._next_forward_id()
-        self._pending_requests[fid] = _PendingRequest(
-            stub_uuid="__init__", original_id=None, method="initialize",
-            t_start_ms=time.monotonic() * 1000.0,
-        )
-        # Trust boundary: strip any stub-supplied caller identity from the
-        # initialize forward too. forward_from_stub strips it on every other
-        # forwarded request, but ``initialize`` returns early through this
-        # path — without this a stub could forge _meta.kirocrew.caller at init.
-        forward_msg = _strip_caller_meta(msg)
-        # MCP Apps: advertise the ui extension to the backend (no-op unless
-        # the KIROCREW_MCP_APPS flag is on). Must follow the strip so the
-        # injected frame is our copy, never the stub's.
-        forward_msg = _inject_client_extensions(forward_msg)
-        forward_msg["id"] = fid
-        self.touch()
-        try:
-            await _write_json_line(self.stdin, forward_msg)
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self._dead_reason = f"stdin closed: {exc}"
-            raise BackendGone(self._dead_reason) from exc
-
-    async def _deliver_cached_initialize(
-        self,
-        stub_uuid: str,
-        original_id: Any,
-        cached_result: dict[str, Any],
-    ) -> None:
-        """Synthesize a cached-initialize response and drop it into the stub's
-        inbox. The stub sees a reply shaped exactly like one from a real
-        backend — same ``result`` object, the stub's own ``id`` restored.
-        """
-        response = {"jsonrpc": "2.0", "id": original_id, "result": cached_result}
-        async with self._inbox_lock:
-            inbox = self._stub_inboxes.get(stub_uuid)
-        if inbox is not None:
-            await self._enqueue_to_stub(
-                stub_uuid, inbox,
-                (json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"),
-            )
-
-    async def prime_initialize(
-        self,
-        init_msg: dict[str, Any],
-        *,
-        timeout: float = 15.0,
-    ) -> None:
-        """Re-drive the MCP ``initialize`` handshake on a freshly respawned
-        backend using a stub's captured ``initialize`` request, WITHOUT
-        delivering any response to a stub.
-
-        Used by the gatewayd bridge's transparent-respawn path: when a shared
-        backend dies, a fresh one is spawned and primed here so it reaches
-        ``_init_state == "ready"`` before stub traffic resumes. kiro-cli never
-        re-sends ``initialize`` after a backend dies, so the gateway must
-        replay it on kiro-cli's behalf and swallow the reply.
-
-        Concurrency-safe: if several stubs re-acquire the same fresh backend
-        at once, the first drives the upstream handshake and the rest await
-        the shared completion event. Raises :class:`BackendGone` if the
-        backend is not alive, the handshake fails, or it times out.
-        """
-        if not self.is_alive:
-            raise BackendGone(self._dead_reason or "backend not alive")
-        if self._init_state == "ready":
-            return
-        if self._init_state == "failed":
-            raise BackendGone(self._dead_reason or "backend initialize failed")
-        if self._init_state == "unsent":
-            # We are the first to prime this fresh backend. Forward the
-            # captured initialize upstream under a gateway id routed to the
-            # ``__init__`` sentinel so the stdout pump feeds the reply to
-            # ``_on_upstream_initialize`` (which caches it + sets the done
-            # event) rather than to any stub. No ``_init_pending`` entry is
-            # added, so no stub ever receives this synthetic reply.
-            self._init_state = "in_flight"
-            fid = self._next_forward_id()
-            self._pending_requests[fid] = _PendingRequest(
-                stub_uuid="__init__", original_id=None, method="initialize",
-                t_start_ms=time.monotonic() * 1000.0,
-            )
-            # Strip a stub-forged caller block from the respawn init forward
-            # too (mirrors _handle_initialize). captured_init is a shallow copy
-            # taken before forward_from_stub's strip, so it can still carry a
-            # forged flat CALLER_META_KEY.
-            forward_msg = _strip_caller_meta(init_msg)
-            # MCP Apps: same injection as _handle_initialize so a respawned
-            # backend sees the identical ui capability (flag-gated no-op).
-            forward_msg = _inject_client_extensions(forward_msg)
-            forward_msg["id"] = fid
-            self.touch()
-            try:
-                await _write_json_line(self.stdin, forward_msg)
-            except (BrokenPipeError, ConnectionResetError) as exc:
-                self._dead_reason = f"stdin closed: {exc}"
-                raise BackendGone(self._dead_reason) from exc
-        # Either we just sent it, or another stub's prime is in flight — wait
-        # for _on_upstream_initialize / _fail_init to resolve the handshake.
-        try:
-            await asyncio.wait_for(self._init_done_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            self._dead_reason = self._dead_reason or "initialize timed out on respawn"
-            # The backend answered neither the handshake nor EOF within the
-            # window: it is wedged (process alive, initialize never completing).
-            # Mark init failed + wake any co-primer so they fail fast instead of
-            # each waiting the full timeout, and reap the wedged process now
-            # rather than leaving it marked-dead-but-running until the idle
-            # sweep reclaims it. shutdown() is idempotent and self-contained —
-            # it kills the process group but touches no pool bookkeeping, so
-            # there is no reserve/evict race with a concurrent acquirer.
-            self._init_state = "failed"
-            self._init_done_event.set()
-            with contextlib.suppress(Exception):
-                await self.shutdown()
-            raise BackendGone(self._dead_reason) from exc
-        if self._init_state != "ready":
-            raise BackendGone(
-                self._dead_reason or "backend initialize failed on respawn"
-            )
-
-    async def _broadcast_backend_gone(self, reason: str) -> None:
-        """Send a synthetic JSON-RPC error to every attached stub before
-        closing. Preserves the existing correlation between in-flight ids
-        and stubs: each pending request gets its own error reply.
-        """
-        # Idempotent: reachable near-simultaneously from the stdout-pump
-        # finally, _heartbeat_once, _fail_oversize_request and the init-fail
-        # paths. Without this guard each invocation snapshots pending/init and
-        # double-delivers error replies to every stub. The check+set has no
-        # await between the two statements, so it is atomic on the event loop.
-        if self._gone_broadcast:
-            return
-        self._gone_broadcast = True
-        # Fast-fail any in-flight prime_initialize() waiter. If the backend
-        # dies mid-handshake (stdout EOF before it answered initialize),
-        # neither _on_upstream_initialize nor _fail_init fires, so a
-        # transparent-respawn primer awaiting _init_done_event would otherwise
-        # block for the full timeout before raising BackendGone. Mark init
-        # failed and wake the waiter immediately.
-        if self._init_state == "in_flight":
-            self._init_state = "failed"
-            self._dead_reason = self._dead_reason or reason
-            self._init_done_event.set()
-        async with self._inbox_lock:
-            inboxes = dict(self._stub_inboxes)
-        for fid, pending in list(self._pending_requests.items()):
-            if pending.stub_uuid == _APPS_STUB_SENTINEL:
-                # Wake a parked ui:// fetch immediately so its coroutine falls
-                # back to delivering the original response rather than blocking
-                # for the full resources/read timeout after the backend died.
-                fut = pending.apps_future
-                if fut is not None and not fut.done():
-                    fut.set_exception(BackendGone(f"backend gone: {reason}"))
-                continue
-            if pending.stub_uuid == "__init__":
-                # Each queued initialize waiter gets its own rejection so
-                # the originating stub sees an error against its own id.
-                for stub_uuid, original_id in self._init_pending:
-                    inbox = inboxes.get(stub_uuid)
-                    if inbox is None:
-                        continue
-                    err = {
-                        "jsonrpc": "2.0",
-                        "id": original_id,
-                        "error": {"code": -32000, "message": f"backend gone: {reason}"},
-                    }
-                    await self._enqueue_to_stub(
-                        stub_uuid,
-                        inbox,
-                        (json.dumps(err, separators=(",", ":")) + "\n").encode("utf-8"),
-                    )
-                continue
-            inbox = inboxes.get(pending.stub_uuid)
-            if inbox is None:
-                continue
-            err = {
-                "jsonrpc": "2.0",
-                "id": pending.original_id,
-                "error": {"code": -32000, "message": f"backend gone: {reason}"},
-            }
-            await self._enqueue_to_stub(
-                pending.stub_uuid, inbox,
-                (json.dumps(err, separators=(",", ":")) + "\n").encode("utf-8"),
-            )
-        self._pending_requests.clear()
-        self._init_pending.clear()
-
-    async def run_stdout_pump(self) -> None:
-        """Read backend stdout line-by-line and route each line back to the
-        originating stub. Exits on EOF (backend crash or clean exit). Never
-        wrapped in a timeout — the learned correction explicitly warns
-        against that pattern because it kills healthy long-lived sessions.
-        """
-        try:
-            while True:
-                try:
-                    line = await self.stdout.readuntil(b"\n")
-                except asyncio.IncompleteReadError as exc:
-                    if exc.partial:
-                        logger.warning(
-                            "backend pid=%s closed stdout mid-line (%d bytes)",
-                            self.pid, len(exc.partial),
-                        )
-                    break
-                except asyncio.LimitOverrunError:
-                    # Drain the oversize line up to AND
-                    # INCLUDING its terminating newline WITHOUT consuming bytes
-                    # of the following frame. ``readuntil`` stops exactly at the
-                    # newline and leaves the remainder buffered; while the
-                    # not-yet-terminated prefix still exceeds the limit it
-                    # re-raises LimitOverrunError, so we consume that prefix
-                    # (``exc.consumed``) and retry. The previous ``read(8192)``
-                    # drain discarded post-newline bytes of the next response,
-                    # hanging the next request. The reader ``limit`` is
-                    # ``READ_BUFFER_LIMIT_BYTES`` (1 MiB); a longer line is
-                    # pathological and dropped.
-                    # Keep only the first _OVERSIZE_KEEP bytes — enough for
-                    # _fail_oversize_request to parse the JSON-RPC id — while
-                    # still draining the whole line off the pipe. Accumulating
-                    # the entire (possibly multi-GB) line would itself be the
-                    # memory blow-up this guard exists to prevent.
-                    _OVERSIZE_KEEP = 512
-                    oversize_head = b""
-                    try:
-                        while True:
-                            try:
-                                tail = await self.stdout.readuntil(b"\n")
-                                if len(oversize_head) < _OVERSIZE_KEEP:
-                                    oversize_head += tail[:_OVERSIZE_KEEP - len(oversize_head)]
-                                break
-                            except asyncio.LimitOverrunError as exc:
-                                chunk = await self.stdout.readexactly(exc.consumed)
-                                if len(oversize_head) < _OVERSIZE_KEEP:
-                                    oversize_head += chunk[:_OVERSIZE_KEEP - len(oversize_head)]
-                    except (asyncio.IncompleteReadError, Exception):  # noqa: BLE001
-                        pass
-                    logger.warning(
-                        "backend pid=%s dropped oversize stdout line (>%d bytes)",
-                        self.pid, READ_BUFFER_LIMIT_BYTES,
-                    )
-                    # Fail the pending request so the waiting stub is not left
-                    # dangling. Without this the heartbeat eventually kills the
-                    # shared backend for ALL co-pooled sessions.
-                    await self._fail_oversize_request(oversize_head)
-                    continue
-                if not line:
-                    break
-                # Spill oversized (but under the read limit) responses to a
-                # sidecar file and truncate inline, so a large-but-legitimate
-                # tool result doesn't balloon the shared daemon's memory or the
-                # agent's context. Offloaded to the maintenance executor (short
-                # filesystem I/O); a spill failure falls back to the raw line.
-                if len(line) > RESPONSE_SPILL_THRESHOLD_BYTES:
-                    try:
-                        line = await asyncio.get_running_loop().run_in_executor(
-                            maintenance_executor(),
-                            maybe_spill_response,
-                            line,
-                            self.pool_key.server_name,
-                            RESPONSE_SPILL_THRESHOLD_BYTES,
-                        )
-                    except Exception:
-                        logger.debug("spill-to-file failed; routing raw line", exc_info=True)
-                await self._route_backend_line(line)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # pragma: no cover — defensive
-            logger.exception("backend stdout pump crashed pid=%s", self.pid)
-        finally:
-            reason = self._dead_reason or (
-                f"exit rc={self.process.returncode}"
-                if self.process.returncode is not None
-                else "stdout EOF"
-            )
-            self._dead_reason = reason
-            await self._broadcast_backend_gone(reason)
-
-    async def _route_backend_line(self, line: bytes) -> None:
-        try:
-            msg = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            logger.debug("backend non-JSON stdout line dropped: %r", line[:200])
-            return
-        if not isinstance(msg, dict):
-            return
-        msg_id = msg.get("id")
-        method = msg.get("method")
-        if msg_id is not None and method is None:
-            # Gateway-internal liveness pong: the heartbeat
-            # ping is sent under HEARTBEAT_PING_ID and its reply (result or
-            # error) is consumed here, never routed to a stub.
-            if _is_heartbeat_id(msg_id):
-                self._last_ping_response_mono = time.monotonic()
-                return
-            # Response to a previously-forwarded request.
-            pending = self._pending_requests.pop(str(msg_id), None)
-            if pending is None:
-                logger.warning(
-                    "backend pid=%s response to unknown id=%r; dropping",
-                    self.pid, msg_id,
-                )
-                return
-            if pending.t_start_ms:
-                # Fire-and-forget: awaiting the emit here (even with its file
-                # I/O offloaded to a thread) yields the shared stdout pump,
-                # adding head-of-line latency to co-pooled sessions whenever
-                # the metrics volume is slow. Schedule it off the hot path.
-                self._spawn_metric_task({
-                    "ts": int(time.time() * 1000),
-                    "method": pending.method,
-                    "dur_ms": round(time.monotonic() * 1000.0 - pending.t_start_ms, 3),
-                    "pool": self.pool_key.human_readable(),
-                    "pid": self.pid,
-                    "ok": "error" not in msg,
-                    "stub": pending.stub_uuid,
-                })
-            if pending.stub_uuid == "__init__":
-                await self._on_upstream_initialize(msg)
-                return
-            if pending.stub_uuid == _APPS_STUB_SENTINEL:
-                # Gateway-originated resources/read reply for an MCP Apps
-                # ui:// fetch — hand it to the parked fetch coroutine, never a
-                # stub. (Already popped above so it is removed exactly once.)
-                fut = pending.apps_future
-                if fut is not None and not fut.done():
-                    fut.set_result(msg)
-                return
-            # MCP Apps interception: a tools/call result carrying a ui://
-            # resource is parked (the response is held off the stub) while an
-            # out-of-band resources/read fetches the app payload. When it
-            # returns True the (marked) response is delivered asynchronously by
-            # a background task, so DO NOT deliver here.
-            if await self._maybe_intercept_ui_result(pending, msg):
-                self.touch()
-                return
-            rewritten = dict(msg)
-            rewritten["id"] = pending.original_id
-            await self._deliver_to_stub(pending.stub_uuid, rewritten)
-            self.touch()
-            return
-        if method is not None and msg_id is None:
-            # Attribute request-scoped notifications (progress, or a log tied
-            # to an in-flight call) to their owning stub so they are not leaked
-            # to co-pooled tenants sharing this backend.
-            owner = self._notification_owner(msg)
-            if owner is not None:
-                await self._deliver_to_stub(owner, msg)
-            elif method in _GLOBAL_BROADCAST_NOTIFICATIONS:
-                # Genuinely backend-wide state (identical for every tenant,
-                # e.g. tools/list_changed) — safe to fan out to all stubs.
-                await self._broadcast(msg)
-            else:
-                # Unattributable request-scoped notification (progress/logging
-                # without a unique routing token, or a token that collided
-                # across tenants). Broadcasting it would disclose one tenant's
-                # request-scoped content to co-tenants — a leak the non-pooled
-                # baseline never had — so drop it (deny-by-default) rather than
-                # guess an owner.
-                logger.debug(
-                    "backend pid=%s dropping unattributable request-scoped "
-                    "notification %r (not broadcast to avoid cross-tenant leak)",
-                    self.pid, method,
-                )
-            return
-        # Server-to-client request (has method AND id) — route ONLY when we can
-        # attribute it unambiguously:
-        # 1. _meta.relatedRequestId -> owning stub (MCP-spec aligned)
-        # 2. Single attached stub -> trivial case
-        # Otherwise (multiple stubs, no relatedRequestId) we recycle the backend
-        # rather than guess, to avoid a cross-tenant leak.
-        if method is not None and msg_id is not None:
-            target_stub: Optional[str] = None
-            # Priority 1: _meta.relatedRequestId lookup
-            params = msg.get("params")
-            if isinstance(params, dict):
-                meta = params.get("_meta")
-                if isinstance(meta, dict):
-                    related_id = meta.get("relatedRequestId")
-                    if related_id is not None:
-                        pending = self._pending_requests.get(str(related_id))
-                        if pending is not None:
-                            target_stub = pending.stub_uuid
-            # Priority 2: single stub attached
-            if target_stub is None:
-                async with self._inbox_lock:
-                    stubs = list(self._stub_inboxes.keys())
-                if len(stubs) == 1:
-                    target_stub = stubs[0]
-            # Priority 2 (single stub) is the only safe fallback: with multiple
-            # stubs and no relatedRequestId we cannot attribute a server->client
-            # request to a tenant without risking a cross-tenant leak
-            # (delivering B's sampling/elicitation to A, or broadcasting a
-            # request every tenant would answer). Refuse to keep pooling: recycle
-            # the backend so its stubs fall back to an unambiguous per-session
-            # exec. (Well-behaved servers set relatedRequestId -> Priority 1.)
-            if target_stub is not None:
-                await self._deliver_to_stub(target_stub, msg)
-            else:
-                async with self._inbox_lock:
-                    nstubs = len(self._stub_inboxes)
-                reason = (
-                    "server-initiated request without relatedRequestId while "
-                    f"{nstubs} stubs share this backend; cannot route without a "
-                    "cross-tenant leak — recycling"
-                )
-                logger.warning("backend pid=%s %s", self.pid, reason)
-                self._dead_reason = self._dead_reason or reason
-                await self._broadcast_backend_gone(reason)
-            return
-        logger.debug("backend pid=%s emitted malformed JSON-RPC: %r", self.pid, msg)
-
-    async def _fail_init(self, reason: str) -> None:
-        """Transition init to the terminal ``"failed"`` state and flush every
-        queued waiter with an explicit JSON-RPC error.
-
-        Called from :meth:`_on_upstream_initialize` when the backend's reply
-        is a JSON-RPC error or a malformed result. Without this path, stubs
-        queued in ``_init_pending`` during the in-flight window would hang
-        forever, and future stubs would keep piling into ``_init_pending``
-        because ``is_alive`` is still True.
-        """
-        self._init_state = "failed"
-        self._dead_reason = self._dead_reason or f"init failed: {reason}"
-        self._init_done_event.set()
-        logger.error("backend pid=%s %s", self.pid, self._dead_reason)
-        pending = list(self._init_pending)
-        self._init_pending.clear()
-        async with self._inbox_lock:
-            inboxes = dict(self._stub_inboxes)
-        for stub_uuid, original_id in pending:
-            inbox = inboxes.get(stub_uuid)
-            if inbox is None:
-                continue
-            err = {
-                "jsonrpc": "2.0",
-                "id": original_id,
-                "error": {"code": -32000, "message": f"backend init failed: {reason}"},
-            }
-            await self._enqueue_to_stub(
-                stub_uuid, inbox,
-                (json.dumps(err, separators=(",", ":")) + "\n").encode("utf-8"),
-            )
-
-    async def _on_upstream_initialize(self, response: dict[str, Any]) -> None:
-        """Process the backend's reply to the first stub's ``initialize``.
-
-        Caches the ``result`` so later stubs can be served locally; detects
-        the caller-identity capability; flushes every queued stub.
-
-        On error (backend returned a JSON-RPC error, or a malformed result),
-        transitions to the terminal ``"failed"`` state and flushes all
-        queued stubs with an explicit error response. Without this a stub
-        that registered during the in-flight window would hang forever
-        waiting for a cached-initialize that never arrives.
-        """
-        if "error" in response:
-            await self._fail_init(f"initialize error: {response['error']}")
-            return
-        result = response.get("result")
-        if not isinstance(result, dict):
-            await self._fail_init(
-                f"initialize response missing/malformed result: {response!r}"
-            )
-            return
-        self._init_result = result
-        self._init_state = "ready"
-        self._init_done_event.set()
-        capabilities = result.get("capabilities") or {}
-        experimental = capabilities.get("experimental") or {}
-        self.supports_caller_identity = isinstance(experimental, dict) and (
-            CALLER_CAPABILITY_KEY in experimental
-        )
-        logger.info(
-            "backend pid=%s initialized supports_caller_identity=%s",
-            self.pid, self.supports_caller_identity,
-        )
-        # Forward exactly one synthetic
-        # notifications/initialized to the backend now the handshake is
-        # complete. Stub-originated copies are always suppressed upstream, so
-        # without this a backend that gates tool processing on the
-        # notification would never receive it and would hang.
-        try:
-            await _write_json_line(
-                self.stdin, {"jsonrpc": "2.0", "method": "notifications/initialized"}
-            )
-        except (BrokenPipeError, ConnectionResetError) as exc:  # pragma: no cover
-            self._dead_reason = f"stdin closed during initialized: {exc}"
-        pending = list(self._init_pending)
-        self._init_pending.clear()
-        for stub_uuid, original_id in pending:
-            await self._deliver_cached_initialize(stub_uuid, original_id, result)
-
-    async def _enqueue_to_stub(
-        self, stub_uuid: str, inbox: "asyncio.Queue[bytes]", data: bytes
-    ) -> bool:
-        """Non-blocking enqueue into a stub's inbox.
-
-        Returns ``True`` on success. If the inbox is full — the stub has
-        stopped draining its socket — the stub is dropped via
-        :meth:`detach_stub` and ``False`` returned. A wedged stub must never
-        apply backpressure to the shared stdout pump nor let a chatty backend
-        grow gateway RSS without bound; dropping the one slow stub protects
-        every co-pooled session.
-        """
-        try:
-            inbox.put_nowait(data)
-            return True
-        except asyncio.QueueFull:
-            logger.warning(
-                "backend pid=%s stub=%s inbox full (cap=%d); dropping slow stub",
-                self.pid, stub_uuid, _STUB_INBOX_MAXSIZE,
-            )
-            await self.detach_stub(stub_uuid)
-            return False
-
-    async def _deliver_to_stub(self, stub_uuid: str, msg: dict[str, Any]) -> None:
-        async with self._inbox_lock:
-            inbox = self._stub_inboxes.get(stub_uuid)
-        if inbox is None:
-            logger.debug(
-                "backend pid=%s response for detached stub=%s; dropping",
-                self.pid, stub_uuid,
-            )
-            return
-        await self._enqueue_to_stub(
-            stub_uuid, inbox, (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
-        )
-
-    async def _broadcast(self, msg: dict[str, Any]) -> None:
-        # FIXED: Server-to-client requests now route via the
-        # priority chain (relatedRequestId -> single-stub -> last-requester)
-        # before falling back here. Broadcast is only used for notifications
-        # and as a last-resort fallback when no stub can be identified.
-        payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
-        async with self._inbox_lock:
-            inboxes = list(self._stub_inboxes.items())
-        for stub_uuid, inbox in inboxes:
-            await self._enqueue_to_stub(stub_uuid, inbox, payload)
-
-    def _notification_owner(self, msg: dict[str, Any]) -> Optional[str]:
-        """Best-effort attribution of a server->client notification to the one
-        stub that owns the originating request, so a request-scoped
-        notification (progress, or a log tied to an in-flight call) is not
-        leaked to co-pooled tenants. Returns None for unattributable /
-        genuinely global notifications, which the caller broadcasts.
-
-        progressToken collisions across tenants are possible (clients pick
-        their own), so only a UNIQUELY-owned token routes; an ambiguous token
-        falls through to broadcast (no worse than the pre-scoping behaviour)."""
-        params = msg.get("params")
-        if not isinstance(params, dict):
-            return None
-        # progress notifications echo the request's progressToken.
-        token = params.get("progressToken")
-        if token is not None:
-            owners = {
-                p.stub_uuid
-                for p in self._pending_requests.values()
-                if p.progress_token == token and p.stub_uuid != "__init__"
-            }
-            if len(owners) == 1:
-                return next(iter(owners))
-        # logging / other notifications may carry _meta.relatedRequestId.
-        meta = params.get("_meta")
-        if isinstance(meta, dict):
-            related_id = meta.get("relatedRequestId")
-            if related_id is not None:
-                pending = self._pending_requests.get(str(related_id))
-                if pending is not None and pending.stub_uuid != "__init__":
-                    return pending.stub_uuid
-        return None
-
-    async def _maybe_intercept_ui_result(
-        self, pending: _PendingRequest, msg: dict[str, Any]
-    ) -> bool:
-        """Decide whether ``msg`` (a completed tools/call response) carries an
-        MCP Apps ui:// resource that must be fetched + spooled before delivery.
-
-        Returns ``True`` when interception was *initiated* — a background task
-        now owns delivering the (marked) response to the stub, so the caller
-        must NOT deliver it. Returns ``False`` (the common/off path) when the
-        caller should deliver the response normally right now. Never raises:
-        any classification hiccup falls back to normal delivery.
-        """
-        if not _mcp_apps_enabled():
-            return False
-        # App-originated callbacks (the app-call relay forwards a tools/call on
-        # a ``__app_call__*`` stub) must NEVER be re-intercepted: if the called
-        # tool itself declares a ui:// resource, re-spooling would replace the
-        # app's real result with an internal marker string and mint a stray
-        # spool record. The render/spool path is only for MODEL-originated tool
-        # results; app callbacks return verbatim to the requesting app.
-        if pending.stub_uuid.startswith("__app_call__"):
-            return False
-        # Passive harvest: tool declarations are the SEP-1865 PRIMARY place a
-        # server associates a tool with its ui:// resource (the real
-        # pdf-server and Excalidraw declare it ONLY here, not on results).
-        # Every tools/list response that flows through updates the map.
-        if pending.method == "tools/list":
-            result = msg.get("result")
-            if isinstance(result, dict):
-                try:
-                    declared = extract_declared_ui_uris(result)
-                except Exception:  # pragma: no cover — defensive; extract is total
-                    declared = {}
-                # REPLACE (never merge): each tools/list is the server's
-                # complete current declaration set — merging would keep a
-                # WITHDRAWN tool→ui association alive until backend restart,
-                # so later successful calls would still render the withdrawn
-                # app resource.
-                self._apps_declared_uris = declared
-            return False
-        if pending.method != "tools/call":
-            return False
-        result = msg.get("result")
-        if not isinstance(result, dict):
-            return False
-        if result.get("isError"):
-            # A FAILED tool call must never spawn an app render (nor mint a
-            # live spool capability) — checked before EITHER association form
-            # (result-side _meta.ui or the tools/list declaration) is read.
-            return False
-        try:
-            resource_uri = extract_ui_resource_uri(result)
-        except Exception:  # pragma: no cover — defensive; extract is total
-            logger.debug("mcp-apps: extract_ui_resource_uri raised", exc_info=True)
-            return False
-        if resource_uri is None:
-            # Fall back to the uri the tool DECLARED in tools/list (the
-            # SEP-1865 primary form real servers use).
-            resource_uri = self._apps_declared_uris.get(pending.tool_name)
-        if resource_uri is None:
-            return False
-        task = asyncio.create_task(
-            self._fetch_and_deliver_ui(pending, msg, resource_uri)
-        )
-        self._apps_tasks.add(task)
-        task.add_done_callback(self._apps_tasks.discard)
-        return True
-
-    async def _fetch_and_deliver_ui(
-        self, pending: _PendingRequest, msg: dict[str, Any], resource_uri: str
-    ) -> None:
-        """Out-of-band fetch of a ui:// resource, spool it, mark the tools/call
-        response, and deliver the (possibly-marked) response to the stub.
-
-        On ANY failure/timeout the ORIGINAL response is delivered unmodified
-        and a warning logged — the app render is best-effort and must never
-        wedge or drop the tool result. Runs as a background task so the shared
-        stdout pump is never blocked awaiting the resources/read round-trip.
-        """
-        response = dict(msg)
-        response["id"] = pending.original_id
-        try:
-            contents = await self._read_ui_resource(resource_uri)
-            html, csp, permissions = self._parse_ui_contents(contents)
-            result = msg.get("result")
-            structured = result.get("structuredContent") if isinstance(result, dict) else None
-            content = result.get("content") if isinstance(result, dict) else None
-            spool_id = await asyncio.to_thread(write_spool, {
-                "server": self.pool_key.server_name,
-                "tool": pending.tool_name,
-                "session_key": pending.session_key,
-                # Exact-identity binding for the app→gateway callback: the
-                # callback resolves its backend EXCLUSIVELY by this digest, so
-                # an app can only ever call back into the same pool partition
-                # (same credentials/sandbox/approval identity) that produced
-                # it — never a co-pooled tenant's backend for the same server.
-                "pool_digest": self.pool_key.stable_hash(),
-                "html": html,
-                "csp": csp,
-                "permissions": permissions,
-                "structured_content": structured,
-                # Originating tools/call inputs + full result content, so the
-                # app initializes from its REAL state (SEP-1865 tool-input /
-                # tool-result notifications) instead of empty placeholders.
-                "tool_input": pending.tool_arguments,
-                "result_content": content if isinstance(content, list) else None,
-            })
-            if isinstance(result, dict):
-                response["result"] = append_marker(result, spool_id)
-            logger.info(
-                "mcp-apps: spooled ui resource %s for tool=%s server=%s id=%s",
-                resource_uri, pending.tool_name or "?",
-                self.pool_key.server_name, spool_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — best-effort; deliver original
-            logger.warning(
-                "mcp-apps: ui fetch/spool failed for %s (tool=%s); delivering "
-                "original response unmodified: %s",
-                resource_uri, pending.tool_name or "?", exc,
-            )
-            response = dict(msg)
-            response["id"] = pending.original_id
-        await self._deliver_to_stub(pending.stub_uuid, response)
-
-    async def _read_ui_resource(self, resource_uri: str) -> list[Any]:
-        """Issue a gateway-originated ``resources/read`` for ``resource_uri`` to
-        this backend and return its ``result.contents`` list.
-
-        Parks a future under a ``_APPS_STUB_SENTINEL`` pending entry (same
-        gateway-id mechanism the initialize handshake uses) so the stdout pump
-        resolves it. Bounded by :data:`_APPS_RESOURCE_READ_TIMEOUT_SECS`.
-        """
-        fid = self._next_forward_id()
-        fut: "asyncio.Future[dict[str, Any]]" = asyncio.get_running_loop().create_future()
-        self._pending_requests[fid] = _PendingRequest(
-            stub_uuid=_APPS_STUB_SENTINEL, original_id=None, method="resources/read",
-            t_start_ms=time.monotonic() * 1000.0, apps_future=fut,
-        )
-        request = {
-            "jsonrpc": "2.0",
-            "id": fid,
-            "method": "resources/read",
-            "params": {"uri": resource_uri},
-        }
-        try:
-            await _write_json_line(self.stdin, request)
-            response = await asyncio.wait_for(fut, timeout=_APPS_RESOURCE_READ_TIMEOUT_SECS)
-        finally:
-            # Resolved path already popped it in _route_backend_line; this
-            # covers the timeout/write-failure path so no stale entry lingers.
-            self._pending_requests.pop(fid, None)
-        if "error" in response:
-            raise RuntimeError(f"resources/read error: {response['error']}")
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError(f"resources/read malformed result: {response!r}")
-        contents = result.get("contents")
-        if not isinstance(contents, list) or not contents:
-            raise RuntimeError("resources/read returned no contents")
-        return contents
-
-    def _parse_ui_contents(self, contents: list[Any]) -> tuple[str, Any, Any]:
-        """Extract ``(html, csp, permissions)`` from a resources/read
-        ``contents`` list. Requires ``contents[0].mimeType`` to equal
-        :data:`MCP_APPS_MIME_TYPE`; reads inline ``text`` or base64 ``blob``;
-        pulls ``csp``/``permissions`` from ``contents[0]._meta.ui``."""
-        first = contents[0]
-        if not isinstance(first, dict):
-            raise RuntimeError("resources/read contents[0] is not an object")
-        mime = first.get("mimeType")
-        if mime != MCP_APPS_MIME_TYPE:
-            raise RuntimeError(
-                f"unexpected mimeType {mime!r} (want {MCP_APPS_MIME_TYPE!r})"
-            )
-        text = first.get("text")
-        if isinstance(text, str):
-            html = text
-        elif isinstance(first.get("blob"), str):
-            try:
-                html = base64.b64decode(first["blob"], validate=True).decode("utf-8")
-            except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
-                raise RuntimeError(f"invalid base64 blob: {exc}") from exc
-        else:
-            raise RuntimeError("resources/read contents[0] has neither text nor blob")
-        meta = first.get("_meta")
-        ui = meta.get("ui") if isinstance(meta, dict) else None
-        if not isinstance(ui, dict):
-            ui = {}
-        return html, ui.get("csp"), ui.get("permissions")
-
-    def _spawn_metric_task(self, record: dict[str, Any]) -> None:
-        """Schedule a best-effort latency-metric emit off the stdout-pump
-        critical path. No-op when metrics are disabled (the default), so the
-        shared pump does not allocate + schedule + discard a Task per RPC
-        response for every co-pooled tenant. Tracked in ``_metric_tasks``
-        (discarded on completion) so the task isn't GC'd before it runs; a slow
-        metrics disk therefore cannot back-pressure frame routing."""
-        if _METRICS_PATH is None:
-            return
-        task = asyncio.create_task(_emit_call_metric(record))
-        self._metric_tasks.add(task)
-        task.add_done_callback(self._metric_tasks.discard)
-
-    async def _fail_oversize_request(self, raw: bytes) -> None:
-        """Try to extract the JSON-RPC id from an oversize response and fail
-        just that request, so the waiting stub is unblocked without killing
-        the entire shared backend.
-
-        Best-effort: if the id cannot be parsed (e.g. the id field is beyond
-        the buffer we captured), fall back to failing the most-recent pending
-        request — at worst one stub gets an error, but the backend stays alive
-        for all others.
-        """
-        msg_id: Any = None
-        # Attempt to parse the id from the beginning of the oversize line.
-        try:
-            # The first ~200 bytes should contain {"jsonrpc":"2.0","id":...
-            prefix = raw[:512].decode("utf-8", errors="replace")
-            partial = json.loads(prefix.split("\n", 1)[0]) if prefix.strip().endswith("}") else None
-            if isinstance(partial, dict):
-                msg_id = partial.get("id")
-        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-            pass
-        # If prefix-parse failed, try a targeted regex for "id": value.
-        if msg_id is None:
-            prefix_str = raw[:256].decode("utf-8", errors="replace")
-            m = re.search(r'"id"\s*:\s*("(?:[^"\\]|\\.)*?"|\d+|null)', prefix_str)
-            if m:
-                try:
-                    msg_id = json.loads(m.group(1))
-                except (json.JSONDecodeError, ValueError):
-                    pass
-        if msg_id is not None:
-            pending = self._pending_requests.pop(str(msg_id), None)
-            if pending is not None and pending.stub_uuid == "__init__":
-                # Oversize *initialize* response: failing one request is not
-                # enough — the handshake can never complete, so ``_init_state``
-                # is stuck "in_flight" and every queued stub (plus any
-                # prime_initialize waiter) hangs forever with no wedge the
-                # heartbeat can detect. Recycle the whole backend instead so
-                # every init waiter gets a clean BackendGone and re-establishes
-                # (_broadcast_backend_gone marks init failed + wakes the event).
-                reason = (
-                    f"oversize initialize response (>{READ_BUFFER_LIMIT_BYTES} "
-                    "bytes); recycling shared backend"
-                )
-                self._dead_reason = self._dead_reason or reason
-                await self._broadcast_backend_gone(reason)
-                return
-            if pending is not None:
-                err_response = {
-                    "jsonrpc": "2.0",
-                    "id": pending.original_id,
-                    "error": {
-                        "code": -32000,
-                        "message": (
-                            f"response exceeded size limit "
-                            f"({READ_BUFFER_LIMIT_BYTES} bytes); request dropped"
-                        ),
-                    },
-                }
-                await self._deliver_to_stub(pending.stub_uuid, err_response)
-            return
-        # Id unrecoverable (it sat past the captured prefix): do NOT fail an
-        # arbitrary pending request — that sends a spurious error to an innocent
-        # stub while the real culprit keeps hanging until the wedge timeout.
-        # Recycle the shared backend instead so every attached stub gets a clean
-        # BackendGone and re-establishes.
-        reason = (
-            f"oversize response (>{READ_BUFFER_LIMIT_BYTES} bytes) with "
-            "unrecoverable request id; recycling shared backend"
-        )
-        self._dead_reason = self._dead_reason or reason
-        await self._broadcast_backend_gone(reason)
-
-    async def _heartbeat_once(self, now: float) -> str:
-        """Classify backend liveness for one heartbeat tick and recover a
-        wedged backend in place.
-
-        Returns one of:
-
-        * ``"gone"``   -- the OS has already reaped the subprocess
-          (``process.returncode is not None``), or a liveness ping write hit
-          a broken pipe. Marked dead; every attached stub receives a
-          synthetic error via :meth:`_broadcast_backend_gone`.
-        * ``"idle"``   -- no stubs attached (``refcount == 0``). LEFT ALONE:
-          the idle-sweep owns eviction of these on its own timer. Recycling
-          idle-but-healthy backends here would re-introduce the cr-guide
-          over-reaping regression (MCPool 0.2.7).
-        * ``"wedged"`` -- a stub is attached AND BOTH: (1) an in-flight request
-          exceeds :data:`HEARTBEAT_TIMEOUT_SECS`, AND (2) no ping response has
-          arrived within :data:`PING_STALE_SECS` (backend unresponsive). OR the
-          hard ceiling :data:`HARD_WEDGE_CEILING_SECS` is exceeded regardless
-          of ping freshness. Shared backends (kirocrew-core) host long tools
-          like ``wait`` (60-1800s) and ``spawn_sub_agents``; recycling them on
-          request age alone kills healthy-but-slow backends.
-        * ``"alive"``  -- everything else. A best-effort JSON-RPC ``ping`` is
-          written under the reserved :data:`HEARTBEAT_PING_ID`; the response is
-          swallowed in :meth:`_route_backend_line`. A failed ping write
-          (broken pipe) is itself a liveness failure and downgrades to
-          ``"gone"``.
-        """
-        # 1. Process already reaped by the OS.
-        if self.process.returncode is not None:
-            if self._dead_reason is None:
-                self._dead_reason = f"process exited rc={self.process.returncode}"
-            await self._broadcast_backend_gone(self._dead_reason)
-            return "gone"
-
-        # 2. No consumers -- leave idle backends to the idle-sweep.
-        if self.refcount == 0:
-            return "idle"
-
-        # 3. Wedge detection: two-condition rule + hard ceiling.
-        oldest_age = 0.0
-        oldest_fid: Optional[str] = None
-        oldest_pending: Optional[_PendingRequest] = None
-        for fid, pending in self._pending_requests.items():
-            age = now - (pending.t_start_ms / 1000.0)
-            if age > oldest_age:
-                oldest_age = age
-                oldest_fid = fid
-                oldest_pending = pending
-
-        if self._pending_requests and oldest_age >= HEARTBEAT_TIMEOUT_SECS:
-            ping_age = now - self._last_ping_response_mono
-            ping_stale = ping_age >= PING_STALE_SECS
-
-            # Hard ceiling: recycle regardless of ping freshness (pathological)
-            if oldest_age >= HARD_WEDGE_CEILING_SECS:
-                self._dead_reason = (
-                    f"wedged: in-flight request outstanding {oldest_age:.1f}s "
-                    f">= {HARD_WEDGE_CEILING_SECS:.0f}s hard ceiling "
-                    f"(ping_age={ping_age:.1f}s)"
-                )
-                logger.warning(
-                    "backend pid=%s pool=%s %s; recycling",
-                    self.pid, self.pool_key.human_readable(), self._dead_reason,
-                )
-                await self._broadcast_backend_gone(self._dead_reason)
-                return "wedged"
-
-            # Two-condition: old request + stale ping -> wedged
-            if ping_stale:
-                self._dead_reason = (
-                    f"wedged: in-flight request outstanding {oldest_age:.1f}s "
-                    f">= {HEARTBEAT_TIMEOUT_SECS:.0f}s timeout AND "
-                    f"ping stale {ping_age:.1f}s >= {PING_STALE_SECS:.0f}s"
-                )
-                logger.warning(
-                    "backend pid=%s pool=%s %s; recycling",
-                    self.pid, self.pool_key.human_readable(), self._dead_reason,
-                )
-                await self._broadcast_backend_gone(self._dead_reason)
-                return "wedged"
-
-            # Old request + fresh pings: backend responsive but tool slow.
-            # Log once per request id, don't recycle.
-            if oldest_fid and oldest_fid not in self._warned_slow_ids:
-                self._warned_slow_ids.add(oldest_fid)
-                logger.warning(
-                    "slow in-flight request %.1fs (method=%s, stub=%s, fid=%s) "
-                    "but backend pid=%s responsive (ping_age=%.1fs); not recycling",
-                    oldest_age,
-                    oldest_pending.method if oldest_pending else "?",
-                    oldest_pending.stub_uuid if oldest_pending else "?",
-                    oldest_fid,
-                    self.pid,
-                    ping_age,
-                )
-
-        # Prune warned ids for completed requests
-        if self._warned_slow_ids:
-            self._warned_slow_ids &= set(self._pending_requests.keys())
-
-        # 4. Alive: probe with a reserved-id ping.
-        try:
-            await _write_json_line(
-                self.stdin,
-                {"jsonrpc": "2.0", "id": HEARTBEAT_PING_ID, "method": "ping"},
-            )
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self._dead_reason = f"heartbeat ping write failed: {exc}"
-            await self._broadcast_backend_gone(self._dead_reason)
-            return "gone"
-        return "alive"
-
-    async def _cancel_background_tasks(self) -> None:
-        """Cancel and await the stdout + stderr pump tasks.
-
-        The stderr pump must be awaited on shutdown; left fire-and-forget it
-        keeps running and leaks its stderr pipe fd whenever the
-        process outlives SIGKILL — across LRU-eviction churn this exhausts fds.
-        """
-        for attr in ("_stdout_task", "_stderr_task"):
-            task = getattr(self, attr)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-                setattr(self, attr, None)
-
-    async def cancel_in_flight_for_stub(self, stub_uuid: str) -> list[str]:
-        """Send MCP ``notifications/cancelled`` for every in-flight request
-        owned by ``stub_uuid``. Returns the list of cancelled forward-ids.
-
-        This is the core Scope-A fix: when a stub disconnects (session killed),
-        the backend receives explicit cancellation so it can abort long-running
-        tool work instead of running to completion with no consumer.
-        """
-        # Collect in-flight requests for this stub (before detach clears them)
-        in_flight = [
-            (fid, p) for fid, p in self._pending_requests.items()
-            if p.stub_uuid == stub_uuid
-        ]
-        cancelled_ids: list[str] = []
-        for fid, pending in in_flight:
-            if not self.is_alive:
-                break
-            cancel_notification = {
-                "jsonrpc": "2.0",
-                "method": "notifications/cancelled",
-                "params": {
-                    "requestId": fid,
-                    "reason": "Session stopped — caller disconnected",
-                },
-            }
-            try:
-                await _write_json_line(self.stdin, cancel_notification)
-                cancelled_ids.append(fid)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                # Backend already dead — no point sending more
-                break
-        if cancelled_ids:
-            logger.info(
-                "backend pid=%s: sent %d cancel notifications for stub=%s [ids: %s]",
-                self.pid, len(cancelled_ids), stub_uuid,
-                ", ".join(cancelled_ids[:5]) + ("..." if len(cancelled_ids) > 5 else ""),
-            )
-        return cancelled_ids
-
-    async def recycle_if_idle(self) -> bool:
-        """Kill this backend if refcount == 0 (Scope B fallback).
-
-        The kill is immediate; the *respawn* is lazy — the next pool
-        ``get_or_create`` for this key sees a dead entry and spawns fresh.
-        Returns True if the backend was killed. Called after cancel
-        notifications when the last stub disconnects and the backend may
-        still be executing cancelled work (race window before backend
-        processes the cancel notification).
-        """
-        if self.refcount > 0:
-            # Co-tenants still attached — quarantine instead of killing
-            self.quarantined = True
-            logger.info(
-                "backend pid=%s quarantined: has %d remaining co-tenants, "
-                "will recycle when drained",
-                self.pid, self.refcount,
-            )
-            return False
-        # No consumers left — hard kill the backend process
-        if self.is_alive:
-            pid = self.process.pid
-            # Tree-scoped kill via platform_compat, not os.killpg/os.getpgid:
-            # those names do not exist on Windows, and the old `except
-            # (ProcessLookupError, OSError)` here did NOT catch the resulting
-            # AttributeError, so this raised out of recycle_if_idle instead of
-            # degrading. Windows also ignores spawn's start_new_session=True
-            # (it is `unused_start_new_session` in CPython's Windows
-            # _execute_child), so there is no process group there to signal at
-            # all — kill_process_tree covers both (killpg / taskkill /T) and
-            # already enforces the pid <= 1, pgid <= 1 and own-process-group
-            # refusals this call site would otherwise hand-roll.
-            # The _async variant is mandatory from a coroutine: the Windows branch
-            # spawns taskkill with a 5s timeout, which would stall the daemon's
-            # loop. On POSIX it dispatches inline to the sync helper, so
-            # os.killpg/os.getpgid monkeypatching still intercepts.
-            recycled = True
-            try:
-                await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
-            except ValueError:
-                # Refused pid (non-int, or <= 1 which is a killpg broadcast).
-                recycled = False
-            except (ProcessLookupError, PermissionError, OSError):
-                # Tree already gone or not signalable — fall back to a
-                # pid-scoped kill, as this call site did before.
-                with contextlib.suppress(
-                    ProcessLookupError, PermissionError, OSError, ValueError
-                ):
-                    await platform_compat.kill_pid_async(pid, platform_compat.SIGKILL)
-            if recycled:
-                self._dead_reason = "recycled after last stub detached with in-flight work"
-                logger.info(
-                    "backend pid=%s recycled (killed): last stub detached with "
-                    "in-flight work",
-                    pid,
-                )
-                # SEL audit: SIGKILLing a pooled backend is a security-relevant
-                # action — record it in the HMAC-chained event log regardless
-                # of which path (abort frame or plain disconnect) got us here.
-                try:
-                    SecurityEventLog().log_api_access(
-                        caller="gatewayd",
-                        operation="mcp-gateway.backend-recycle-kill",
-                        outcome="killed",
-                        source="gateway",
-                        resources=f"pid={pid} server={self.pool_key.server_name}",
-                        error=self._dead_reason,
-                    )
-                except Exception:  # pragma: no cover — audit must never break recycle
-                    logger.debug("SEL audit for backend recycle kill failed", exc_info=True)
-                return True
-        return False
-
-    async def shutdown(self, timeout: float = 5.0) -> None:
-        """Close stdin, wait for the process to exit, escalate to SIGKILL
-        after ``timeout`` seconds. Idempotent and safe to call from
-        multiple call-sites concurrently (``_shutdown_lock``).
-        """
-        async with self._shutdown_lock:
-            if self.process.returncode is not None:
-                await self._cancel_background_tasks()
-                return
-            try:
-                self.stdin.close()
-            except Exception:  # pragma: no cover — stdin may already be closed
-                pass
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "backend pid=%s did not exit within %.1fs after stdin close; "
-                    "escalating to SIGKILL",
-                    self.process.pid, timeout,
-                )
-                # Kill the whole process TREE, not just the launcher PID:
-                # on POSIX spawn uses start_new_session=True, so the backend is
-                # a session/group leader with worker children, and
-                # process.kill() SIGKILLs only the launcher, reparenting its
-                # workers to init where they leak under LRU-eviction churn.
-                # Via platform_compat rather than os.killpg(os.getpgid(...)):
-                # neither name exists on Windows, and the except clause below
-                # does not catch AttributeError — so on Windows this raised out
-                # of shutdown() and the process.kill() fallback never ran,
-                # leaving the backend alive. The _async variant is required per
-                # test_kill_process_awaits_async_variant_not_sync (Windows
-                # taskkill would otherwise block this loop).
-                try:
-                    await platform_compat.kill_process_tree_async(
-                        self.process.pid, platform_compat.SIGKILL
-                    )
-                except (ProcessLookupError, PermissionError, OSError, ValueError):
-                    try:
-                        self.process.kill()
-                    except ProcessLookupError:
-                        pass
-                try:
-                    await asyncio.wait_for(self.process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "backend pid=%s survived SIGKILL (uninterruptible sleep?)",
-                        self.process.pid,
-                    )
-            await self._cancel_background_tasks()
-            if self._dead_reason is None:
-                self._dead_reason = f"shutdown rc={self.process.returncode}"
-
-
-# --- Spawn / handshake ------------------------------------------------------
+    # The stub side of a shared ``Backend``: ``kiro_crew.mcp_gateway.backend_stubs``.
+    attach_stub = _backend_stubs.attach_stub
+    detach_stub = _backend_stubs.detach_stub
+    _next_forward_id = _backend_stubs._next_forward_id
+    forward_from_stub = _backend_stubs.forward_from_stub
+    served_tool_surface = _backend_stubs.served_tool_surface
+    carry_served_tool_surface = _backend_stubs.carry_served_tool_surface
+    probe_tool_surface = _backend_stubs.probe_tool_surface
+    _enqueue_to_stub = _backend_stubs._enqueue_to_stub
+    _deliver_to_stub = _backend_stubs._deliver_to_stub
+    _broadcast = _backend_stubs._broadcast
+    _reply_locally = _backend_stubs._reply_locally
+    cancel_in_flight_for_stub = _backend_stubs.cancel_in_flight_for_stub
+    # The ``resources/subscribe`` lease broker of a shared ``Backend``: ``kiro_crew.mcp_gateway.backend_leases``.
+    evict_stub_subscriptions = _backend_leases.evict_stub_subscriptions
+    _handle_resource_subscription = _backend_leases._handle_resource_subscription
+    _on_resource_subscription_response = _backend_leases._on_resource_subscription_response
+    resource_subscription_uris = _backend_leases.resource_subscription_uris
+    replay_resource_subscriptions = _backend_leases.replay_resource_subscriptions
+    _stub_subscription_count = _backend_leases._stub_subscription_count
+    _drain_replacement_subscribes = _backend_leases._drain_replacement_subscribes
+    _release_upstream_subscriptions = _backend_leases._release_upstream_subscriptions
+    _resource_update_targets = _backend_leases._resource_update_targets
+    # The MCP ``initialize`` handshake of a ``Backend``: ``kiro_crew.mcp_gateway.backend_handshake``.
+    _handle_initialize = _backend_handshake._handle_initialize
+    _arm_init_deadline = _backend_handshake._arm_init_deadline
+    _cancel_init_deadline = _backend_handshake._cancel_init_deadline
+    _init_deadline = _backend_handshake._init_deadline
+    _deliver_cached_initialize = _backend_handshake._deliver_cached_initialize
+    prime_initialize = _backend_handshake.prime_initialize
+    _retry_after_rehandshake = _backend_handshake._retry_after_rehandshake
+    _fail_init = _backend_handshake._fail_init
+    _on_upstream_initialize = _backend_handshake._on_upstream_initialize
+    # Liveness and teardown of a ``Backend``: ``kiro_crew.mcp_gateway.backend_liveness``.
+    _broadcast_backend_gone = _backend_liveness._broadcast_backend_gone
+    _heartbeat_once = _backend_liveness._heartbeat_once
+    _cancel_background_tasks = _backend_liveness._cancel_background_tasks
+    recycle_if_idle = _backend_liveness.recycle_if_idle
+    shutdown = _backend_liveness.shutdown
+    # The stdout pump of a ``Backend``: ``kiro_crew.mcp_gateway.backend_routing``.
+    run_stdout_pump = _backend_routing.run_stdout_pump
+    _isolate_stdout_line = _backend_routing._isolate_stdout_line
+    _handle_stdout_line = _backend_routing._handle_stdout_line
+    _route_backend_line = _backend_routing._route_backend_line
+    _fail_unparseable_response = _backend_routing._fail_unparseable_response
+    _fail_claimed_request = _backend_routing._fail_claimed_request
+    _settle = _backend_routing._settle
+    _route_backend_message = _backend_routing._route_backend_message
+    _record_hazard = _backend_routing._record_hazard
+    _apply_inflight_report = _backend_routing._apply_inflight_report
+    _notification_owner = _backend_routing._notification_owner
+    _spawn_metric_task = _backend_routing._spawn_metric_task
+    _fail_oversize_request = _backend_routing._fail_oversize_request
+    # MCP Apps on a shared ``Backend``: ``kiro_crew.mcp_gateway.backend_mcp_apps``.
+    _maybe_intercept_ui_result = _backend_mcp_apps._maybe_intercept_ui_result
+    _audit_visibility_withhold = _backend_mcp_apps._audit_visibility_withhold
+    _fetch_and_deliver_ui = _backend_mcp_apps._fetch_and_deliver_ui
+    _read_ui_resource = _backend_mcp_apps._read_ui_resource
+    _parse_ui_contents = _backend_mcp_apps._parse_ui_contents
 
 
 async def spawn_backend(
@@ -1917,14 +549,31 @@ async def spawn_backend(
     args: list[str],
     env: Mapping[str, str],
     work_dir: str,
+    declared_temp_keys: tuple[str, ...] = (),
+    secret_env_keys: tuple[str, ...] = (),
+    initialize_timeout_secs: float = _DEFAULT_INITIALIZE_TIMEOUT_SECS,
 ) -> Backend:
     """Spawn a real MCP subprocess and wrap it in a :class:`Backend`.
 
-    ``env`` is passed verbatim — callers MUST NOT rely on parent process
-    env inheritance. The rewriter layer computes the effective env for
-    each :class:`PoolKey` and includes it in the hash; spawning with a
-    different env than the key claims is a correctness bug that would
-    allow cross-tenant leakage.
+    ``initialize_timeout_secs`` bounds the backend's first ``initialize``
+    window (``Backend.initialize_timeout_secs``); the daemon threads its
+    configured value here so a constructor argument, not a module setter,
+    carries it.
+
+    ``declared_temp_keys`` are the temp-key names (``TMPDIR``/``TMP``/``TEMP``,
+    any casing) the operator's agent spec DECLARES for this server -- the
+    caller knows the declared-env set and this function does not (``env``
+    also carries the daemon's ambient values, which must not suppress
+    containment; see the containment block below). ``secret_env_keys`` marks
+    values resolved from ``secret://`` URIs so a refusal can name its key and
+    cause without persisting the resolved value in the daemon log.
+
+    ``env`` is the complete effective environment; callers MUST NOT rely on
+    parent-process inheritance. The temp rule may replace its declared temp
+    keys, and this function adds the positive spawn marker. The PoolKey still
+    hashes the caller's original effective map, so a refused declaration may
+    conservatively split two equivalent managed-temp backends but can never
+    collapse specs that declared different environments into one pool.
 
     Security boundary (accepted risk, documented in
     ``docs/system-specs/modules/security.md`` under MCP Gateway): backends
@@ -1948,9 +597,18 @@ async def spawn_backend(
     Tightening this to a full mount namespace for pooled backends is tracked
     as Phase-2 hardening; broader rollout is gated on it.
     """
+    # Minted before the process exists so the spawn line carries the same keys
+    # as every later line about this backend.
+    generation_id = lifecycle_log.new_lifecycle_id()
+    attempt_id = lifecycle_log.new_lifecycle_id()
     logger.info(
-        "spawning backend pool=%s command=%s args=%s",
-        pool_key.human_readable(), command, redact(" ".join(args)),
+        "spawning backend pool=%s command=%s args=%s %s",
+        pool_key.human_readable(),
+        command,
+        redact(" ".join(args)),
+        lifecycle_log.lifecycle_fields(
+            "initialize_started", generation=generation_id, attempt=attempt_id
+        ),
     )
     # Positive-identity marker for the orphan sweep. Safe re: the pooled-backend
     # PoolKey invariant — the marker is a compile-time constant, so it is
@@ -1958,17 +616,110 @@ async def spawn_backend(
     # identity (unlike a per-session value, which would be a correctness bug).
     spawn_env = dict(env)
     spawn_env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
-    process = await asyncio.create_subprocess_exec(
-        command,
-        *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=work_dir,
-        env=spawn_env,
-        start_new_session=True,
-        limit=READ_BUFFER_LIMIT_BYTES,
-    )
+    # Tells a first-party server it may exit to be replaced (its install was
+    # pruned): this pool respawns it. Constant, so PoolKey-safe like the above.
+    spawn_env[POOLED_BACKEND_ENV] = POOLED_BACKEND_VALUE
+    # The command a respawn reuses (the daemon's target map is frozen), so the
+    # server exits only when that relaunch can still work. Derived from the
+    # key's own command, so PoolKey-safe like the marker.
+    spawn_env[POOLED_RESPAWN_COMMAND_ENV] = command
+    # Per-process temp containment. Safe re: the pooled-backend
+    # PoolKey invariant for the same reason as the marker above -- the value
+    # is derived from the key's own digest plus a token generated AFTER
+    # pool-identity resolution and is never folded into the hash, so it can
+    # neither split nor collapse pool identity. Allocation and declaration
+    # classification run off-loop because both touch the filesystem.
+    #
+    # An operator-declared temp wins only when the shared sandbox rule clears
+    # every declared key. One refusal drops the whole declaration: ``tempfile``
+    # may consult a sibling key first, so keeping a surviving key would make
+    # the result depend on spelling order. The managed temp takes over. If its
+    # allocation fails after a refusal, no temp key survives to point the child
+    # back at the refused path.
+    #
+    # Declaration is signalled by the caller, not inferred from ``spawn_env``.
+    # The resolver folds the daemon's ambient temp into ``env`` on macOS and
+    # Windows, and an env-membership test would mistake that for operator input.
+    backend_tmp: Optional[Path] = None
+    _declared_upper: set[str] = set()
+    refused: dict[str, tuple[str, str]] = {}
+    failure = ""
+    if declared_temp_keys:
+        accepted, refused, failure = await asyncio.to_thread(
+            classify_declared_temp_env,
+            spawn_env,
+            declared_temp_keys,
+        )
+        _declared_upper = set(accepted)
+        if refused:
+            logger.warning(
+                "MCP backend [%s]: ignoring spec-declared %s — %s; spawning with the "
+                "managed temp instead",
+                pool_key.server_name,
+                format_declared_temp_refusals(
+                    refused,
+                    hidden_keys=secret_env_keys,
+                    redactor=redact,
+                ),
+                "; ".join(
+                    declared_temp_refusal_reasons(
+                        refused,
+                        failure,
+                        redactor=redact,
+                    )
+                ),
+            )
+            spawn_env = {
+                key: value
+                for key, value in spawn_env.items()
+                if key.upper() not in CANONICAL_TEMP_KEYS
+            }
+    if not _declared_upper:
+        try:
+            backend_tmp = await asyncio.to_thread(allocate_backend_tmp, pool_key.stable_hash())
+            spawn_env.update(tmp_env(backend_tmp))
+        except OSError:
+            has_inherited_temp = any(key.upper() in CANONICAL_TEMP_KEYS for key in spawn_env)
+            fallback = "inherited temp" if has_inherited_temp else "platform default"
+            logger.warning(
+                "backend-tmp: could not allocate a contained temp dir; spawning with %s",
+                fallback,
+                exc_info=True,
+            )
+    else:
+        # Keep only the declared values and re-emit their canonical spellings.
+        # Ambient siblings cannot outrank the declaration, and lowercase spec
+        # keys govern on POSIX as well as on case-insensitive Windows env maps.
+        declared_values = {
+            key.upper(): value for key, value in spawn_env.items() if key.upper() in _declared_upper
+        }
+        spawn_env = {
+            key: value for key, value in spawn_env.items() if key.upper() not in CANONICAL_TEMP_KEYS
+        }
+        spawn_env.update(declared_values)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=work_dir,
+            env=spawn_env,
+            start_new_session=True,
+            limit=READ_BUFFER_LIMIT_BYTES,
+        )
+    except BaseException:
+        # The spawn itself failed: reclaim the just-allocated dir here and
+        # now. Unowned directories are deliberately never deleted by the
+        # sweeps (an owner record can fail on a live backend), so this is
+        # the ONLY reclamation point for a dir whose process never existed.
+        if backend_tmp is not None:
+            await asyncio.to_thread(sweep_backend_tmp, backend_tmp)
+        raise
+    # Read before the first await: the child watcher cannot have reaped the
+    # process yet, so this is the backend's own identity (see Backend.start_id).
+    start_id = platform_compat.get_process_start_id(process.pid)
     if process.stdin is None or process.stdout is None:
         # asyncio.create_subprocess_exec populates these whenever PIPE was
         # requested; the guard exists for type checkers. Kill the child on
@@ -1997,129 +748,20 @@ async def spawn_backend(
         stdout=process.stdout,
         created_at=now,
         last_used_at=now,
+        initialize_timeout_secs=_effective_initialize_timeout_secs(initialize_timeout_secs),
+        backend_generation_id=generation_id,
+        attempt_id=attempt_id,
     )
     backend._last_ping_response_mono = now  # cold-start: not insta-stale
     backend._stderr_task = stderr_task
+    backend.start_id = start_id
+    if backend_tmp is not None:
+        # Liveness anchor for the daemon-boot sweep: a SIGKILL'd daemon can
+        # leave this backend running (start_new_session), and the next boot
+        # must not delete temp storage under a survivor. Off-loop, fail-open
+        # (an unowned dir falls under the sweep's grace-window rule instead).
+        await asyncio.to_thread(record_owner, backend_tmp, process.pid)
     return backend
-
-
-async def send_initialize(
-    backend: Backend,
-    *,
-    client_info: Optional[Mapping[str, Any]] = None,
-    timeout: float = _DEFAULT_INITIALIZE_TIMEOUT_SECS,
-) -> dict[str, Any]:
-    """Send the MCP ``initialize`` request and parse the response.
-
-    Side effect: sets ``backend.supports_caller_identity`` based on
-    ``capabilities.experimental.kirocrew.caller-identity`` in the response.
-    Backends that don't advertise the capability are tagged as
-    caller-identity-unaware; the routing layer falls back to per-session
-    spawn for them (no cross-tenant injection of ``_meta.kirocrew.caller``).
-
-    Raises :class:`asyncio.TimeoutError` if the backend doesn't respond
-    within ``timeout`` seconds, :class:`ValueError` on malformed responses.
-    """
-    # Invariant: this helper reads ``backend.stdout`` directly to consume the
-    # initialize reply, so it MUST run before the stdout pump owns the stream.
-    # Every caller today invokes it pre-pump; if a future caller runs it while
-    # the pump is active the two would steal frames from each other. Fail loud
-    # rather than race silently.
-    if backend._stdout_task is not None:
-        raise RuntimeError(
-            "send_initialize() must run before the stdout pump starts; "
-            "the running pump owns backend.stdout"
-        )
-    request = {
-        "jsonrpc": "2.0",
-        "id": _GATEWAY_INIT_ID,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": dict(client_info or {"name": "kirocrew-gateway", "version": "0"}),
-        },
-    }
-    await _write_json_line(backend.stdin, request)
-
-    # Backends may emit log lines to stdout before the JSON-RPC response;
-    # skip anything that isn't a well-formed JSON-RPC object addressed to
-    # our init id. Bounded by ``timeout`` so a flood of noise still fails.
-    async def _await_response() -> dict[str, Any]:
-        while True:
-            line = await backend.stdout.readuntil(b"\n")
-            try:
-                msg = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                logger.debug("backend pre-init line not JSON; dropping: %r", line[:200])
-                continue
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("id") != _GATEWAY_INIT_ID:
-                continue
-            return msg
-
-    try:
-        response = await asyncio.wait_for(_await_response(), timeout=timeout)
-    except asyncio.IncompleteReadError as exc:
-        raise ValueError(
-            f"backend closed stdout before initialize response: got {len(exc.partial)} bytes"
-        ) from exc
-
-    if "error" in response:
-        raise ValueError(f"backend returned initialize error: {response['error']}")
-    result = response.get("result")
-    if not isinstance(result, dict):
-        raise ValueError(f"backend initialize response missing/non-dict result: {response!r}")
-
-    capabilities = result.get("capabilities") or {}
-    experimental = capabilities.get("experimental") or {}
-    backend.supports_caller_identity = isinstance(experimental, dict) and (
-        CALLER_CAPABILITY_KEY in experimental
-    )
-    # Seed the init cache so a multi-stub flow can replay the result to
-    # later attachers without re-issuing the handshake. Single-stub callers
-    # (the M1 path) never observe this cache but the tests that drive the
-    # full M2 flow rely on ``_init_state == "ready"`` after initialize.
-    #
-    # NOTE: unlike the lazy _on_upstream_initialize path, this does NOT send
-    # the synthetic notifications/initialized to the backend. Correct for
-    # today's callers (production spawns take the lazy path; send_initialize
-    # callers don't gate on it), but a future caller that relies on the
-    # backend having received notifications/initialized here would hang —
-    # send it explicitly if you add such a path.
-    backend._init_result = result
-    backend._init_state = "ready"
-    logger.info(
-        "backend pid=%s initialized; supports_caller_identity=%s",
-        backend.pid, backend.supports_caller_identity,
-    )
-    return result
-
-
-# --- Helpers ----------------------------------------------------------------
-
-
-async def _write_json_line(writer: asyncio.StreamWriter, obj: Any) -> None:
-    """Serialize ``obj`` as one JSON-RPC line and drain the writer.
-
-    Backpressure matters: without ``drain()`` a slow backend can let the
-    OS pipe buffer fill and silently stall the gateway loop (Phase-0
-    item #2). Every write goes through this helper.
-    """
-    payload = json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\n"
-    lock = getattr(writer, "_mc_write_lock", None)
-    guard: Any = lock if lock is not None else contextlib.nullcontext()
-    async with guard:
-        writer.write(payload)
-        # Bounded: a backend that stopped reading its stdin must not hang the
-        # forwarding coroutine (and the heartbeat sweeper) forever. On timeout
-        # raise a pipe error so the caller recycles the wedged backend (callers
-        # treat BrokenPipeError/ConnectionResetError as BackendGone).
-        try:
-            await asyncio.wait_for(writer.drain(), timeout=_WRITE_DRAIN_TIMEOUT_SECS)
-        except asyncio.TimeoutError as exc:
-            raise BrokenPipeError("backend stdin drain timed out") from exc
 
 
 async def _pump_stderr(reader: asyncio.StreamReader, label: str) -> None:
@@ -2146,3 +788,144 @@ async def _pump_stderr(reader: asyncio.StreamReader, label: str) -> None:
             label,
             redact(line.decode("utf-8", errors="replace").rstrip()),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Compatibility facade. ``Backend``'s behaviour lives in the ``backend_*`` owner
+# modules listed below, one responsibility each: a member's body is a module-level
+# function there whose first parameter is ``self``, and the class binds it by name, so
+# every member stays an attribute of the one class and the backend's state stays on
+# the instance. The module-level names those members read live in the owners too.
+# Every name stays readable as ``kiro_crew.mcp_gateway.backend.<name>``: this module
+# answers a name it does not bind from the owner that defines it, and a write or
+# delete through this module reaches every owner binding the same object
+# (``kiro_crew._facade_mirror``), so a patch of ``kiro_crew.mcp_gateway.backend.<name>``
+# reaches every reader it reached when this was one module. Owners never import this
+# module at run time and log under its logger. ``test/test_backend_bindings.py`` pins
+# the member inventory, the binding and the reach.
+# --------------------------------------------------------------------------- #
+#: The backend's owner modules, lowest layer first: an owner imports only owners listed
+#: before it, and the first holder of a name answers a read of it.
+_BACKEND_OWNERS: tuple[str, ...] = (
+    "kiro_crew.mcp_gateway.backend_wire",
+    "kiro_crew.mcp_gateway.backend_leases",
+    "kiro_crew.mcp_gateway.backend_mcp_apps",
+    "kiro_crew.mcp_gateway.backend_handshake",
+    "kiro_crew.mcp_gateway.backend_stubs",
+    "kiro_crew.mcp_gateway.backend_liveness",
+    "kiro_crew.mcp_gateway.backend_routing",
+)
+for _owner in _BACKEND_OWNERS:
+    _importlib.import_module(_owner)
+
+
+def _surface() -> frozenset[str]:
+    """The names this module answers for: its own, and every name an owner binds that
+    is not a ``Backend`` member, which the class binds itself.
+
+    A name an owner adds is therefore part of this module too: one it defines joins the
+    ``TYPE_CHECKING`` manifest below, one it imports is imported here as well, and
+    the mirror guards (``test/test_facade_mirror_guards.py``, ``test/test_backend_bindings.py``)
+    fail until it is."""
+    members = frozenset(vars(Backend))
+    owned = frozenset(
+        name
+        for dotted in _BACKEND_OWNERS
+        for name in vars(_sys.modules[dotted])
+        if name not in members
+    )
+    return frozenset(globals()) | owned
+
+
+#: Name this module serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_MIRROR = _facade_mirror.install(
+    _sys.modules[__name__], _BACKEND_OWNERS, excluded=(), surface=_surface()
+)
+_EXPORTS.update(_MIRROR.served)
+# Installed last, so the forwarding is live for every caller but never runs while this
+# module is still binding its own names.
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(
+    name
+    for name in set(globals()) | set(_EXPORTS)
+    if not name.startswith("_") and name != "TYPE_CHECKING"
+)
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.mcp_gateway.backend_handshake import (  # noqa: F401
+        _GATEWAY_INIT_ID,
+        _LOST_SESSION_ERROR_CODE,
+        _LOST_SESSION_ERROR_MESSAGE,
+        _REHANDSHAKE_RETRY_METHODS,
+        _REHANDSHAKE_STUB_SENTINEL,
+        _WINDOWS_INITIALIZE_TIMEOUT_FLOOR_SECS,
+        _inject_inflight_capability,
+        _is_lost_session_error,
+        _parse_initialize_response,
+        _reports_inflight,
+        _without_id,
+        send_initialize,
+    )
+    from kiro_crew.mcp_gateway.backend_leases import (  # noqa: F401
+        _ORPHANED_LEASES_MAX,
+        _RELEASE_STUB_SENTINEL,
+        _RESOURCE_SUBSCRIPTIONS_MAX_PER_STUB,
+        _RESOURCE_URI_MAX_LEN,
+        _RESOURCES_SUBSCRIBE_METHOD,
+        _RESOURCES_UNSUBSCRIBE_METHOD,
+        _RESOURCES_UPDATED_NOTIFICATION,
+        _is_success_response,
+    )
+    from kiro_crew.mcp_gateway.backend_liveness import (  # noqa: F401
+        _RECYCLE_EXEMPT_METHODS,
+        HARD_WEDGE_CEILING_SECS,
+        HEARTBEAT_PING_ID,
+        HEARTBEAT_TIMEOUT_SECS,
+        PING_STALE_SECS,
+        PROGRESS_WEDGE_CEILING_SECS,
+        _is_heartbeat_id,
+        has_recyclable_in_flight,
+    )
+    from kiro_crew.mcp_gateway.backend_mcp_apps import (  # noqa: F401
+        _APPS_RESOURCE_READ_TIMEOUT_SECS,
+        _APPS_STUB_SENTINEL,
+        MCP_APPS_ENV_FALSE,
+        MCP_APPS_ENV_FLAG,
+        MCP_APPS_ENV_TRUE,
+        MCP_APPS_EXTENSION_KEY,
+        MCP_APPS_MIME_TYPE,
+        _inject_client_extensions,
+        _mcp_apps_enabled,
+        mcp_apps_env_override,
+    )
+    from kiro_crew.mcp_gateway.backend_routing import (  # noqa: F401
+        _GLOBAL_BROADCAST_NOTIFICATIONS,
+        _METRICS_PATH,
+        _emit_call_metric,
+        _write_metric_line,
+    )
+    from kiro_crew.mcp_gateway.backend_stubs import (  # noqa: F401
+        _STUB_INBOX_MAXSIZE,
+        _TOOL_SURFACE_PROBE_TIMEOUT_SECS,
+    )
+    from kiro_crew.mcp_gateway.backend_wire import (  # noqa: F401
+        _JSONRPC_SERVER_ERROR,
+        _MCP_IDENT_LOG_MAX,
+        _TOOL_ERROR_LOG_MAX,
+        _TOOL_ERROR_PRESCAN_MAX,
+        _WRITE_DRAIN_TIMEOUT_SECS,
+        INTERNAL_STUB_PREFIXES,
+        TOOL_SURFACE_STUB_PREFIX,
+        BackendGone,
+        _collapse_nonprintable,
+        _inject_caller_meta,
+        _inject_tenant_meta,
+        _log_safe_identifier,
+        _mcp_result_error_text,
+        _strip_caller_meta,
+        _tool_call_error_text,
+        _write_json_line,
+        _write_json_lines,
+    )

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import os
+import select
+import sys
+import threading
 
 import pytest
 
@@ -10,6 +15,12 @@ from kiro_crew.cloud import aws
 
 
 class TestBuildArgv:
+    @pytest.fixture(autouse=True)
+    def _bare_resolver(self, monkeypatch):
+        """Pin the shared resolver to the bare name so argv-shape assertions
+        stay deterministic across hosts (with/without an installed CLI)."""
+        monkeypatch.setattr(aws, "resolve_aws_bin", lambda: "aws")
+
     def test_bare(self):
         assert aws._build_argv(["sts", "get-caller-identity"], "", "") == [
             "aws",
@@ -25,6 +36,32 @@ class TestBuildArgv:
         argv = aws._build_argv(["s3", "ls"], "prod", "")
         assert argv == ["aws", "s3", "ls", "--profile", "prod"]
 
+    def test_argv_head_resolved_absolutely_under_minimal_path(self, monkeypatch, tmp_path):
+        """A GUI-launched gateway's minimal PATH must not yield a bare 'aws'
+        head that fails execvp: the builder routes through the deploy engine's
+        well-known-dirs resolver."""
+        import os as _os
+
+        if _os.name == "nt":
+            pytest.skip("fallback install dirs are POSIX literals; dead on Windows by design")
+        from kiro_crew import github_runner
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+        # Undo this class's bare-name pin: this test exercises the real resolver.
+        monkeypatch.setattr(aws, "resolve_aws_bin", engine.resolve_aws_bin)
+
+        argv = aws._build_argv(["sts", "get-caller-identity"], "dev", "")
+        assert argv[0] == str(fake_aws)
+        assert argv[1:] == ["sts", "get-caller-identity", "--profile", "dev"]
+
 
 class TestRunAws:
     def test_success_returns_process_output(self, monkeypatch):
@@ -35,9 +72,45 @@ class TestRunAws:
                 return "out", "err"
 
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
 
         assert aws.run_aws(["sts", "get-caller-identity"]) == (0, "out", "err")
+
+    def test_spawn_gets_widened_path_for_credential_process(self, monkeypatch, tmp_path):
+        """A GUI-launched gateway's minimal PATH must not hide ``credential_process``.
+
+        ``run_aws`` hands the child :func:`aws_spawn_env` for the resolved head, so
+        the CLI's own by-name lookups search the AWS bin dirs too.
+        """
+        from kiro_crew.deploy import engine
+
+        bin_dir = tmp_path / "aws-bin"
+        bin_dir.mkdir()
+        head = str(bin_dir / "aws")
+        monkeypatch.setattr(aws, "resolve_aws_bin", lambda: head)
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(bin_dir),))
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+        monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
+        monkeypatch.setattr(aws, "cgroup_scope_argv", lambda argv: argv)
+        seen: dict = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def communicate(self, timeout):
+                return "", ""
+
+        def fake_popen(argv, **kwargs):
+            seen["argv"] = argv
+            seen["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(aws, "popen_limited", fake_popen)
+
+        assert aws.run_aws(["sts", "get-caller-identity"]) == (0, "", "")
+        assert seen["argv"][0] == head
+        assert seen["env"] is not None
+        assert seen["env"]["PATH"].split(os.pathsep) == ["/usr/bin", "/bin", str(bin_dir)]
 
     def test_aws_cli_missing_returns_127_not_traceback(self, monkeypatch):
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
@@ -45,7 +118,7 @@ class TestRunAws:
         def raise_fnf(*a, **k):
             raise FileNotFoundError("aws not found")
 
-        monkeypatch.setattr(aws.subprocess, "Popen", raise_fnf)
+        monkeypatch.setattr(aws, "popen_limited", raise_fnf)
         rc, out, err = aws.run_aws(["sts", "get-caller-identity"])
         assert rc == 127
         assert "aws CLI not found" in err
@@ -84,7 +157,7 @@ class TestRunAws:
 
         proc = FakeProc()
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: proc)
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: proc)
 
         with pytest.raises(KeyboardInterrupt):
             aws.run_aws(["cloudformation", "deploy"])
@@ -188,7 +261,7 @@ class TestChokepointHumanActionGuard:
             def communicate(self, timeout):
                 return "out", ""
 
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
         for readonly in (
             ["sts", "get-caller-identity"],
             ["ec2", "describe-instances"],
@@ -201,9 +274,7 @@ class TestChokepointHumanActionGuard:
 
     def test_mutations_and_token_mint_refused_under_agent_session(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "sess-1")
-        monkeypatch.setattr(
-            aws.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn aws")
-        )
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: pytest.fail("must not spawn aws"))
         for sensitive in (
             ["cloudformation", "delete-stack", "--stack-name", "kirocrew-x"],
             ["cloudformation", "deploy"],
@@ -220,9 +291,7 @@ class TestChokepointHumanActionGuard:
         # An EXACT allowlist (not a get-*/list-* prefix) must deny secret-bearing
         # reads even though they start with get-/list-.
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "sess-1")
-        monkeypatch.setattr(
-            aws.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn aws")
-        )
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: pytest.fail("must not spawn aws"))
         for secret_read in (
             ["secretsmanager", "get-secret-value", "--secret-id", "x"],
             ["ssm", "get-parameter", "--name", "x", "--with-decryption"],
@@ -243,7 +312,136 @@ class TestChokepointHumanActionGuard:
             def communicate(self, timeout):
                 return "", ""
 
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
         # A human terminal (no session key) can run a mutation.
         rc, _o, _e = aws.run_aws(["cloudformation", "delete-stack", "--stack-name", "x"])
         assert rc == 0
+
+
+# --------------------------------------------------------------------------- #
+# A timed-out ``aws`` call must return promptly even while a process the CLI
+# started still holds the piped stdout/stderr: ``proc.kill()`` stops only the
+# CLI, so the drain after it is bounded. The reproducer runs the real
+# ``run_aws`` and the real ``popen_limited`` on real children; only the argv
+# builder, the sandbox wrappers, the chokepoint guard and the env builder are
+# stubbed, and none of those is part of the wait. The stand-in CLI and its
+# helper block reading a pipe the test holds, so they live until the test
+# closes it: no sleep decides how long anything runs.
+# --------------------------------------------------------------------------- #
+_JOIN_BOUND_SECS = 8
+
+
+def _stand_in_cli(hold_fd, ready_fd=None):
+    """Argv for a python stand-in CLI that blocks until ``hold_fd`` reaches end of file.
+
+    With ``ready_fd`` it first forks a helper that inherits the piped stdout and
+    stderr, the shape of a process the CLI started that outlives a killed CLI. The
+    helper writes one byte to ``ready_fd`` and then blocks on ``hold_fd`` too, holding
+    the pipes until the test closes the other end of ``hold_fd``.
+    """
+    src = "import os\n"
+    if ready_fd is not None:
+        src += (
+            "if os.fork() == 0:\n"
+            "    os.write({ready}, b'r')\n"
+            "    os.read({hold}, 1)\n"
+            "    os._exit(0)\n"
+        )
+    src += "os.read({hold}, 1)\n"
+    return [sys.executable, "-c", src.format(hold=hold_fd, ready=ready_fd)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX reproducer: the stand-in forks")
+class TestATimedOutCallReturnsWhileAHelperHoldsThePipes:
+    @pytest.fixture(autouse=True)
+    def _children_run_in_tmp_path(self, tmp_path, _floor_monkeypatch):
+        """Every real child these tests start runs in ``tmp_path``, never in the checkout."""
+        real = aws.popen_limited
+        _floor_monkeypatch.setattr(aws, "popen_limited", functools.partial(real, cwd=tmp_path))
+
+    def _run_in_thread(self, monkeypatch, args, *, timeout, pass_fds=()):
+        monkeypatch.setattr(aws, "assert_chokepoint_allowed", lambda a: None)
+        monkeypatch.setattr(aws, "_build_argv", lambda a, p, r: list(a))
+        monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
+        monkeypatch.setattr(aws, "cgroup_scope_argv", lambda argv: argv)
+        monkeypatch.setattr(aws, "aws_spawn_env", lambda head: dict(os.environ))
+        if pass_fds:
+            spawn = aws.popen_limited
+            monkeypatch.setattr(aws, "popen_limited", functools.partial(spawn, pass_fds=pass_fds))
+        captured: dict = {}
+        procs: list = []
+
+        def _call():
+            captured["value"] = aws.run_aws(args, timeout=timeout, proc_sink=procs.append)
+
+        thread = threading.Thread(target=_call, daemon=True)
+        thread.start()
+        thread.join(_JOIN_BOUND_SECS)
+        return thread, captured, procs
+
+    def test_a_timed_out_call_returns_while_a_helper_holds_the_pipes(self, monkeypatch):
+        # The call times out at 2 s and drains for at most 1 s, well inside the join
+        # bound, while the helper holds the pipes until `finally` closes `hold_w`.
+        monkeypatch.setattr(aws, "_POST_KILL_DRAIN_SECS", 1, raising=False)
+        hold_r, hold_w = os.pipe()
+        ready_r, ready_w = os.pipe()
+        thread = None
+        try:
+            args = _stand_in_cli(hold_r, ready_w)
+            thread, captured, procs = self._run_in_thread(
+                monkeypatch, args, timeout=2, pass_fds=(hold_r, ready_w)
+            )
+            up, _, _ = select.select([ready_r], [], [], _JOIN_BOUND_SECS)
+            assert up and os.read(ready_r, 1) == b"r", "the helper never started"
+            assert not thread.is_alive(), (
+                "run_aws stayed blocked past its 2s timeout and its drain bound: "
+                "a helper still held the pipes"
+            )
+            rc, out, err = captured["value"]
+            assert (rc, out) == (124, "")
+            assert "timed out after 2s" in err
+            assert procs[0].stdout.closed and procs[0].stderr.closed, "our read ends stayed open"
+        finally:
+            os.close(hold_w)  # end of file: the helper exits, and on main the call returns
+            if thread is not None:
+                thread.join(_JOIN_BOUND_SECS)
+            for fd in (hold_r, ready_r, ready_w):
+                os.close(fd)
+
+    def test_timed_out_call_with_no_helper_returns_124(self, monkeypatch):
+        hold_r, hold_w = os.pipe()
+        thread = None
+        try:
+            args = _stand_in_cli(hold_r)
+            thread, captured, _procs = self._run_in_thread(
+                monkeypatch, args, timeout=1, pass_fds=(hold_r,)
+            )
+            assert not thread.is_alive()
+            rc, _out, err = captured["value"]
+            assert rc == 124
+            assert "timed out after 1s" in err
+        finally:
+            os.close(hold_w)
+            if thread is not None:
+                thread.join(_JOIN_BOUND_SECS)
+            os.close(hold_r)
+
+    def test_call_that_finishes_in_time_is_unchanged(self, monkeypatch):
+        args = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('ok'); sys.stderr.write('e')",
+        ]
+        thread, captured, _procs = self._run_in_thread(monkeypatch, args, timeout=30)
+        thread.join(_JOIN_BOUND_SECS)
+        assert not thread.is_alive()
+        assert captured["value"] == (0, "ok", "e")
+
+    def test_the_cli_runs_in_tmp_path_not_in_the_checkout(self, tmp_path, monkeypatch):
+        args = [sys.executable, "-c", "import os, sys; sys.stdout.write(os.getcwd())"]
+        thread, captured, _procs = self._run_in_thread(monkeypatch, args, timeout=30)
+        assert not thread.is_alive()
+        rc, out, _err = captured["value"]
+        assert rc == 0
+        ran_in = os.path.realpath(out)
+        assert ran_in == os.path.realpath(tmp_path), f"the CLI ran in {out}, not in {tmp_path}"

@@ -19,9 +19,13 @@ import { api } from '../api/client'
 import MarkdownRenderer from './MarkdownRenderer'
 import type { PullRequestComment, PullRequestSource } from '../types'
 import { platformShortcut } from '../utils/platform'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
+import ErrorNotice from './ErrorNotice'
+import { sourceProviderCapabilities, sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { timeAgo } from '../utils/timeAgo'
 
 import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
 /** One review conversation: the comment that opened it plus its replies. */
 export interface CommentThread {
   /** Provider thread id — absent for standalone comments and review summaries. */
@@ -142,13 +146,16 @@ function ThreadComment(
  *  submit would throw away what the user typed the moment the provider refused,
  *  and leave the error with nowhere to appear. */
 function ReplyBox({
-  onSubmit, pending, error, label = 'Reply',
+  onSubmit, pending, error, label = 'Reply', submitPaused = false,
 }: {
   onSubmit: (body: string) => Promise<unknown>
   pending: boolean
   error: string | null
   label?: string
+  /** The draft stays editable, but nothing is sent while this is true. */
+  submitPaused?: boolean
 }) {
+  const ime = useImeGuard()
   const [open, setOpen] = useState(false)
   const [text, setText] = useState('')
   const trimmed = text.trim()
@@ -167,7 +174,7 @@ function ReplyBox({
   }
 
   const send = async () => {
-    if (!trimmed || pending) return
+    if (!trimmed || pending || submitPaused) return
     try {
       await onSubmit(trimmed)
     } catch {
@@ -183,12 +190,12 @@ function ReplyBox({
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
+        {...ime.bindComposition<HTMLTextAreaElement>()}
         // Enter inserts a newline (comments are markdown and often multi-line);
         // Cmd/Ctrl+Enter sends, matching the rest of the dashboard's composers.
         onKeyDown={(e) => {
           if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault()
-            void send()
+            if (ime.claimEnter(e)) void send()
           }
           if (e.key === 'Escape') setOpen(false)
         }}
@@ -199,16 +206,19 @@ function ReplyBox({
           // Both modifiers send (see the keydown handler), so name the one the
           // reader actually has rather than hardcoding the mac chord.
           { keys: platformShortcut('Cmd+Enter') })}
-        className="w-full resize-y rounded-lg border border-border bg-card px-2.5 py-2 text-[13px] text-text placeholder:text-muted outline-none focus:border-accent"
+        className="w-full resize-y rounded-lg border border-border bg-card px-2.5 py-2 text-[13px] text-text placeholder:text-muted outline-hidden focus-visible:border-accent"
       />
       <div className="flex items-center gap-2">
         <button
           type="button"
           onClick={() => { void send() }}
-          disabled={!trimmed || pending}
+          disabled={!trimmed || pending || submitPaused}
+          // While paused, Send shows the same spinner as a send in flight and
+          // reports busy, so the disabled button reads as waiting.
+          aria-busy={submitPaused || undefined}
           className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent-subtle px-2.5 py-1 text-[12.5px] font-medium text-accent disabled:opacity-50 cursor-pointer disabled:cursor-default"
         >
-          {pending && (
+          {(pending || submitPaused) && (
             <Loader2 size={12} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
           )}
           {label}
@@ -220,15 +230,27 @@ function ReplyBox({
         >
           {i18nT('components.commentThreads.cancel')}
         </button>
-        {error && <span className="text-[12px] text-danger">{error}</span>}
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[12px]">
+            {/* No hand-off: the reply/comment textarea draft above is unsaved. */}
+            <ErrorNotice variant="inline" testId="comment-reply-error" message={error} />
+          </span>
+        )}
       </div>
     </div>
   )
 }
 
 export default function CommentThreads(
-  { src, onAddToChat }:
-  { src: PullRequestSource; onAddToChat?: (c: PullRequestComment) => void },
+  { src, onAddToChat, writesPaused = false }:
+  {
+    src: PullRequestSource
+    onAddToChat?: (c: PullRequestComment) => void
+    /** True while `src` is a stand-in for a payload still loading: every write
+     *  here targets `src.url`, so replies, comments and resolve wait for the
+     *  real payload. Open drafts stay mounted with their text. */
+    writesPaused?: boolean
+  },
 ) {
   const qc = useQueryClient()
   const threads = useMemo(() => groupThreads(src.comments), [src.comments])
@@ -269,7 +291,14 @@ export default function CommentThreads(
 
   const resolvedCount = threads.filter((t) => t.resolved).length
   const visible = showResolved ? threads : threads.filter((t) => !t.resolved)
-  const writable = src.provider === 'github'
+  // Which write affordances this provider's gateway plugin can actually serve.
+  // Previously a single `src.provider === 'github'` boolean, which made every
+  // non-GitHub provider read-only by construction — including one a downstream
+  // edition registers. Both built-in providers serve both; a registered provider
+  // that serves neither gets the read-only notice below.
+  const capabilities = sourceProviderCapabilities(src.provider)
+  const canResolve = capabilities.resolveThreads
+  const canComment = capabilities.comment
 
   return (
     <div className="flex flex-col gap-3">
@@ -324,20 +353,23 @@ export default function CommentThreads(
                 </span>
               )}
               {t.resolved && (
-                <span className="inline-flex items-center gap-1 text-[10.5px] px-1.5 py-0.5 rounded-full bg-ok-subtle text-ok">
+                <span className="inline-flex items-center gap-1 text-[10.5px] px-1.5 py-0.5 rounded-full bg-ok-subtle text-ok-text">
                   <Check size={10} aria-hidden="true" /> {i18nT('components.commentThreads.resolved')}
                 </span>
               )}
               {/* Resolve is only offered on real threads: standalone comments and
-                  review summaries have nothing to resolve. */}
-              {writable && t.threadId && (
+                  review summaries have nothing to resolve. A GitLab plain comment
+                  carries a discussion id (it can be replied to) but is published
+                  with `resolvable: false`, so that flag hides the control too. */}
+              {canResolve && t.threadId && t.root.resolvable !== false && (
                 <button
                   type="button"
                   onClick={() => setResolved.mutate({
                     threadId: t.threadId, resolved: !t.resolved,
                   })}
-                  disabled={setResolved.isPending
-                    && setResolved.variables?.threadId === t.threadId}
+                  disabled={writesPaused || (setResolved.isPending
+                    && setResolved.variables?.threadId === t.threadId)}
+                  aria-busy={writesPaused || undefined}
                   className="ml-auto inline-flex items-center gap-1 rounded-md bg-transparent px-1.5 py-0.5 text-[11.5px] text-muted hover:text-accent disabled:opacity-50 cursor-pointer disabled:cursor-default"
                 >
                   {t.resolved
@@ -350,12 +382,21 @@ export default function CommentThreads(
                   reads as "the click did nothing" rather than "the provider said
                   no". Scoped to the thread that failed, not every rendered one. */}
               {setResolved.isError
-                && setResolved.variables?.threadId === t.threadId && (
-                <span className="text-[11.5px] text-danger">
-                  {(setResolved.error as Error | null)?.message
-                    || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
-                </span>
-              )}
+                && setResolved.variables?.threadId === t.threadId && (() => {
+                  const resolveErr = pullRequestErrorDetails(setResolved.error)
+                  return (
+                    <span className="inline-flex items-center gap-1 text-[11.5px]">
+                      {/* No hand-off: this thread's ReplyBox may hold an unsaved reply draft
+                          (its open/text state is local to ReplyBox, invisible from here). */}
+                      <ErrorNotice
+                        variant="inline"
+                        testId="comment-thread-resolve-error"
+                        message={resolveErr.message
+                          || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
+                      />
+                    </span>
+                  )
+                })()}
             </div>
 
             <div className="flex flex-col gap-2.5 px-2.5 py-2">
@@ -363,13 +404,17 @@ export default function CommentThreads(
               {t.replies.map((r) => (
                 <ThreadComment key={r.id} c={r} reply onAddToChat={onAddToChat} />
               ))}
-              {writable && t.threadId && (
+              {canResolve && t.threadId && (
                 <ReplyBox
                   onSubmit={(body) => reply.mutateAsync({ threadId: t.threadId, body })}
+                  submitPaused={writesPaused}
                   pending={reply.isPending
                     && reply.variables?.threadId === t.threadId}
-                  error={reply.variables?.threadId === t.threadId
-                    ? (reply.error as Error | null)?.message ?? null
+                  // `|| null` collapses an empty derived message to null on
+                  // purpose — ReplyBox renders errors with a falsy guard, so
+                  // '' and null are the same "nothing to show".
+                  error={reply.isError && reply.variables?.threadId === t.threadId
+                    ? pullRequestErrorDetails(reply.error).message || null
                     : null}
                 />
               )}
@@ -379,17 +424,20 @@ export default function CommentThreads(
       </ul>
 
       {/* A comment that answers nobody's line still needs somewhere to go. */}
-      {writable && (
+      {canComment && (
         <div className="border-t border-border pt-2.5">
           <ReplyBox
-            label={i18nT('components.commentThreads.comment_on_this_pull_request')}
+            label={sourceProviderMeta(src.provider).pullRequestWording
+              ? i18nT('components.commentThreads.comment_on_this_pull_request')
+              : i18nT('components.commentThreads.comment_on_this_merge_request')}
             onSubmit={(body) => comment.mutateAsync(body)}
+            submitPaused={writesPaused}
             pending={comment.isPending}
-            error={(comment.error as Error | null)?.message ?? null}
+            error={comment.isError ? pullRequestErrorDetails(comment.error).message || null : null}
           />
         </div>
       )}
-      {!writable && (
+      {!canResolve && !canComment && (
         <div className="text-[12px] text-muted italic">
           {i18nT('components.commentThreads.replying_is_github_only_for_now_open_the_merge_r')}
         </div>

@@ -14,7 +14,9 @@
 const http = require("http");
 const { app, ipcMain } = require("electron");
 const Store = require("electron-store");
-const { parseMochiEnabled, enabledOrTrust, hostDisabledMeansTeardown } = require("./instanceGate");
+const { seedRenamedStore } = require("../store-rename");
+const { sessionCookieHeader } = require("../mochi-session-token");
+const { parseMochiEnabled, remoteEnabledState, hostDisabledMeansTeardown } = require("./instanceGate");
 const {
   SELF_INSTANCE,
   MACHINE_STORE_DEFAULTS,
@@ -35,43 +37,114 @@ const {
  * and removing the app stays "delete this folder and the two calls in main.js",
  * exactly as this module's header promises.
  */
-const machineStore = new Store({ name: "mochi-machine", defaults: MACHINE_STORE_DEFAULTS });
+const MACHINE_STORE_NAME = "mochi-machine";
+const pendingGlogs = [];
+let glog = (line) => pendingGlogs.push(line);
+
+// Carry Mochi's per-machine state across the npm `name` rename, exactly as main.js
+// does for the shell's config.json — the rename repoints userData, so this file is
+// orphaned by the same mechanism. Order is load-bearing: the seed only ever runs
+// while the destination does not exist, and `new Store(...)` below creates it.
+//
+// The allowlist is the namespace segments of MACHINE_STORE_DEFAULTS' dotted keys,
+// not the dotted spellings themselves: electron-store resolves dots via
+// dot-notation, so every user-written value in the raw file lives nested under the
+// top-level "mochi" object. Deriving the segments here keeps machineStore.js the
+// single owner of which keys exist.
+seedRenamedStore(app.getPath("userData"), {
+  storeFileName: `${MACHINE_STORE_NAME}.json`,
+  keys: [...new Set(Object.keys(MACHINE_STORE_DEFAULTS).map((k) => k.split(".")[0]))],
+  log: (m) => glog(`mochi store migration: ${m}`),
+});
+
+const machineStore = new Store({ name: MACHINE_STORE_NAME, defaults: MACHINE_STORE_DEFAULTS });
 
 // Injected by initMochi(); placeholders keep every function definable at load.
 let BACKEND_URL = "";
-let fetchLocalToken = async () => "";
-let glog = () => {};
+let fetchGatewayAuth = async () => ({ value: "" });
 
 /**
  * Open Mochi's pet overlay when the builtin is enabled.
  *
  * Mochi ships defaultEnabled:false, so this is a no-op for anyone who has not
  * turned it on in the App Store. Enabled state lives in the gateway (it is an
- * app, not a shell setting), so the shell has to ask — using the same local
- * token path the dashboard window uses.
+ * app, not a shell setting), so the shell has to ask — using the same gateway
+ * credential paths the dashboard window uses (see initMochi/fetchGatewayAuth).
  *
  * Everything is best-effort: any failure (no token, gateway slow, app absent)
  * just means no pet this launch. The dashboard must never be held up by it.
  */
-// Logged once per distinct outcome so a 5s poll cannot spam the log, while a
-// state change (or a newly-broken gateway) still shows up.
-let lastMochiProbe = "";
+// Logged once per outcome per minute so alternating 403/disabled polls cannot
+// defeat deduplication. A real enabled-state change is still logged promptly.
+const MOCHI_PROBE_LOG_REPEAT_MS = 60_000;
+const recentMochiProbes = new Map();
+let lastMochiProbeState = "";
 function probeLog(outcome) {
-  if (outcome === lastMochiProbe) return;
-  lastMochiProbe = outcome;
-  console.log("Mochi pet probe:", outcome);
+  const now = Date.now();
+  for (const [message, loggedAt] of recentMochiProbes) {
+    if (now - loggedAt >= MOCHI_PROBE_LOG_REPEAT_MS) recentMochiProbes.delete(message);
+  }
+  const knownState = outcome === "mochi installed but disabled" ||
+    outcome === "mochi enabled — opening pet" || outcome.startsWith("mochi not among ");
+  const stateChanged = knownState && outcome !== lastMochiProbeState;
+  if (knownState) lastMochiProbeState = outcome;
+  if (!stateChanged && recentMochiProbes.has(outcome)) return;
+  recentMochiProbes.set(outcome, now);
+  glog("Mochi pet probe: " + outcome);
 }
 
-// Cached because the reconcile loop runs every few seconds and
-// /api/token/local MINTS A NEW SESSION TOKEN on every call — polling it would
-// issue hundreds of tokens an hour and grow the revoked-nonce table for no
-// reason. Cleared on any 401/403 so a genuinely expired token is re-minted.
-let cachedGatewayToken = "";
+// Cached because the reconcile loop runs every few seconds and a locally- or
+// SSH-minted credential comes from an endpoint that MINTS A NEW SESSION TOKEN
+// on every call — polling it would issue hundreds of tokens an hour and grow
+// the revoked-nonce table for no reason. Cleared on any 401/403 so a
+// genuinely expired credential is re-resolved. Holds `{ value, viaCookie }`:
+// `value` is the credential fetchGatewayAuth() found (empty when it found
+// none), and `viaCookie` says HOW it must be delivered — see
+// withGatewayAuth().
+let cachedGatewayAuth = { value: "" };
 
 async function gatewayToken() {
-  if (cachedGatewayToken) return cachedGatewayToken;
-  cachedGatewayToken = (await fetchLocalToken()) || "";
-  return cachedGatewayToken;
+  if (cachedGatewayAuth.value) return cachedGatewayAuth;
+  cachedGatewayAuth = (await fetchGatewayAuth()) || { value: "" };
+  return cachedGatewayAuth;
+}
+
+/**
+ * Attach gatewayToken()'s answer to a LOCAL-gateway request the way its auth
+ * middleware expects it delivered.
+ *
+ * A local-secret or SSH-fetched credential is a freshly minted LINK token
+ * (local-token.js / remote-token.js): the gateway checks its 5-minute `exp`
+ * claim when it arrives as `?token=`, which is fine because gatewayToken()
+ * re-resolves on every cache miss (roughly every 5 minutes in steady state).
+ * A BORROWED session credential (mochi-session-token.js) is the opposite: it
+ * is the value already sitting in the main window's `mc_token_<port>`
+ * cookie, whose `exp` claim froze at the moment that window's session was
+ * ORIGINALLY exchanged — almost always minutes in the past by the time
+ * Mochi reads it. Sent as `?token=` it would validate for a few minutes and
+ * then 401 forever, reproducing this exact bug on a delay. Sent as a
+ * `Cookie` header it is checked against `session_exp` instead (hours, not
+ * minutes) — the same field the browser itself relies on.
+ *
+ * The request is addressed at the URL it was built from. Nothing here re-derives
+ * a destination: the gateway holds every loopback family the configured name
+ * resolves to, and the credential was only minted at all because that coverage
+ * was verified first (`listenerSecretsFor`), so the name the URL already carries
+ * can reach no one else.
+ */
+function withGatewayAuth(url, auth) {
+  if (!auth || !auth.value) return { url, headers: {} };
+  if (auth.viaCookie) {
+    // The RAW port, matching mochi-session-token.js: this name has to be the one
+    // the GATEWAY chose, and on a scheme-default port that is its own listen
+    // port, which this process cannot know behind a tunnel. A borrowed
+    // credential only ever exists for a URL that stated its port, so resolving a
+    // default here could only ever name another gateway's cookie.
+    const cookie = sessionCookieHeader(url, auth.value);
+    return { url, headers: cookie ? { Cookie: cookie } : {} };
+  }
+  const sep = url.includes("?") ? "&" : "?";
+  return { url: `${url}${sep}token=${encodeURIComponent(auth.value)}`, headers: {} };
 }
 
 /**
@@ -128,11 +201,15 @@ let mochiPetInstanceId = "self";
  *
  * @returns {Promise<{localPort: number, token: string}|null>} null = unusable
  */
-function connectInstance(instanceId, token, { timeoutMs = 15000 } = {}) {
+function connectInstance(instanceId, auth, { timeoutMs = 15000 } = {}) {
   return new Promise((resolve) => {
+    const { url, headers } = withGatewayAuth(
+      `${BACKEND_URL}/api/instances/${encodeURIComponent(instanceId)}/connect`,
+      auth,
+    );
     const req = http.request(
-      `${BACKEND_URL}/api/instances/${encodeURIComponent(instanceId)}/connect?token=${encodeURIComponent(token)}`,
-      { method: "POST", timeout: timeoutMs },
+      url,
+      { method: "POST", timeout: timeoutMs, headers },
       (res) => {
         let data = "";
         res.on("data", (c) => { data += c; });
@@ -185,13 +262,21 @@ function connectInstance(instanceId, token, { timeoutMs = 15000 } = {}) {
  * CACHED because the reconcile tick is 5s and this request crosses an SSH
  * tunnel. Enabled-ness only changes when a human flips it in an App Store, so a
  * minute of staleness is invisible; a round trip every 5s is not.
+ *
+ * TRI-STATE, like mochiEnabledState: "enabled" | "disabled" | "unknown". A
+ * non-answer over a tunnel that just came back up is the common case on a
+ * network reconnect, and it is neither a "no" (which would move the pet) nor a
+ * "yes" (which used to CREATE an overlay for a disabled app — see
+ * remoteEnabledState). Only definite answers are cached.
  */
 const REMOTE_ENABLED_TTL_MS = 60_000;
 const remoteEnabledCache = new Map();
 
 async function remoteMochiEnabled(instanceId, localPort, token) {
   const cached = remoteEnabledCache.get(instanceId);
-  if (cached && Date.now() - cached.at < REMOTE_ENABLED_TTL_MS) return cached.enabled;
+  if (cached && Date.now() - cached.at < REMOTE_ENABLED_TTL_MS) {
+    return remoteEnabledState(cached.enabled);
+  }
 
   const enabled = await new Promise((resolve) => {
     const req = http.request(
@@ -214,10 +299,10 @@ async function remoteMochiEnabled(instanceId, localPort, token) {
     req.end();
   });
 
-  // A non-answer is NOT cached and NOT read as disabled — see enabledOrTrust.
-  if (enabled === null) return enabledOrTrust(enabled);
+  // A non-answer is NOT cached and NOT read as disabled — or as enabled.
+  if (enabled === null) return remoteEnabledState(enabled);
   remoteEnabledCache.set(instanceId, { at: Date.now(), enabled });
-  return enabledOrTrust(enabled);
+  return remoteEnabledState(enabled);
 }
 
 /**
@@ -268,9 +353,9 @@ function remoteEnabledSnapshot() {
  * the list. Answers land in the same 60s cache the resolver uses.
  */
 async function probeAllLiveInstancesEnabled() {
-  const localToken = await gatewayToken();
-  if (!localToken) return remoteEnabledSnapshot();
-  const listed = await fetchInstances(localToken);
+  const localAuth = await gatewayToken();
+  if (!localAuth.value) return remoteEnabledSnapshot();
+  const listed = await fetchInstances(localAuth);
   if (!listed.known) return remoteEnabledSnapshot();
   pruneRemoteEnabledCache(listed.instances);
   // Skip anything we already have a fresh answer for. This is what makes the
@@ -284,7 +369,7 @@ async function probeAllLiveInstancesEnabled() {
         // Shorter connect timeout than the pet's resolve path: this one runs while
         // a user waits on a Settings pane, and a stale "connected" whose tunnel
         // actually died must not hang the whole list behind one row.
-        const conn = await connectInstance(inst.id, localToken, { timeoutMs: 6000 });
+        const conn = await connectInstance(inst.id, localAuth, { timeoutMs: 6000 });
         if (conn.known && conn.usable) {
           await remoteMochiEnabled(inst.id, conn.localPort, conn.token);
         }
@@ -315,11 +400,12 @@ async function probeAllLiveInstancesEnabled() {
  * `inactive` says "restart the gateway", and without them a user with the feature
  * off just sees "This computer" and no way forward.
  */
-function fetchInstances(token) {
+function fetchInstances(auth) {
   return new Promise((resolve) => {
+    const { url, headers } = withGatewayAuth(`${BACKEND_URL}/api/instances`, auth);
     const req = http.request(
-      `${BACKEND_URL}/api/instances?token=${encodeURIComponent(token)}`,
-      { method: "GET", timeout: 5000 },
+      url,
+      { method: "GET", timeout: 5000, headers },
       (res) => {
         // 403 is an ANSWER: instances.enabled is off, so there are genuinely no
         // remotes to point at. Every other non-200 is a NON-answer.
@@ -398,12 +484,12 @@ async function resolveMochiTarget(choice) {
     return self;
   }
 
-  const localToken = await gatewayToken();
-  if (!localToken) return { keep: true };
+  const localAuth = await gatewayToken();
+  if (!localAuth.value) return { keep: true };
 
   // List FIRST. Only an already-live instance is offered a connect, so the pet
   // never brings a tunnel up on its own.
-  const listed = await fetchInstances(localToken);
+  const listed = await fetchInstances(localAuth);
   if (!listed.known) {
     mochiInstanceLog("could not read the instance list — leaving Mochi where it is");
     return { keep: true };
@@ -417,7 +503,7 @@ async function resolveMochiTarget(choice) {
     return self;
   }
 
-  const conn = await connectInstance(choice, localToken);
+  const conn = await connectInstance(choice, localAuth);
   if (!conn.known) {
     mochiInstanceLog(`petInstance "${choice}" did not answer — leaving Mochi where it is`);
     return { keep: true };
@@ -426,7 +512,14 @@ async function resolveMochiTarget(choice) {
     mochiInstanceLog(`petInstance "${choice}" is not usable — showing this computer's Mochi`);
     return self;
   }
-  if (!(await remoteMochiEnabled(choice, conn.localPort, conn.token))) {
+  const remoteMochi = await remoteMochiEnabled(choice, conn.localPort, conn.token);
+  if (remoteMochi === "unknown") {
+    // Same discipline as `!conn.known`: a slow or garbled reply from a tunnel
+    // that just came back must neither move the pet nor invent an enabled one.
+    mochiInstanceLog(`petInstance "${choice}" did not say whether Mochi is on — leaving Mochi where it is`);
+    return { keep: true };
+  }
+  if (remoteMochi === "disabled") {
     mochiInstanceLog(`petInstance "${choice}" has Mochi turned off — showing this computer's Mochi`);
     return self;
   }
@@ -442,11 +535,26 @@ async function resolveMochiTarget(choice) {
   };
 }
 
-/** Log resolution changes only — this runs every reconcile tick. */
-let lastMochiInstanceLog = "";
+// Unknown responses do not replace the last confirmed target: a later successful
+// resolution of that same target is not another state change.
+const MOCHI_INSTANCE_LOG_REPEAT_MS = 60_000;
+const recentMochiInstanceLogs = new Map();
+let lastKnownMochiInstanceState = "";
 function mochiInstanceLog(message) {
-  if (message === lastMochiInstanceLog) return;
-  lastMochiInstanceLog = message;
+  const now = Date.now();
+  for (const [outcome, loggedAt] of recentMochiInstanceLogs) {
+    if (now - loggedAt >= MOCHI_INSTANCE_LOG_REPEAT_MS) recentMochiInstanceLogs.delete(outcome);
+  }
+  const knownState = message !== "could not read the instance list — leaving Mochi where it is" &&
+    !message.includes(" did not answer — leaving Mochi where it is");
+  const stateChanged = knownState && message !== lastKnownMochiInstanceState;
+  if (knownState) lastKnownMochiInstanceState = message;
+  // A known target that has not changed was already logged when it became
+  // current; suppress it indefinitely so a steady state cannot re-log once the
+  // repeat window lapses. The TTL re-log is for unknown outcomes only.
+  if (knownState && !stateChanged) return;
+  if (!stateChanged && recentMochiInstanceLogs.has(message)) return;
+  recentMochiInstanceLogs.set(message, now);
   glog(`mochi instance: ${message}`);
 }
 
@@ -465,22 +573,20 @@ function mochiInstanceLog(message) {
  * disabled app still tears down, because the gateway answered and said so.
  */
 async function mochiEnabledState() {
-  const token = await gatewayToken();
-  if (!token) { probeLog("no gateway token — cannot query /api/apps"); return "unknown"; }
+  const auth = await gatewayToken();
+  if (!auth.value) { probeLog("no gateway token — cannot query /api/apps"); return "unknown"; }
   return new Promise((resolve) => {
-    // `?token=` — NOT a cookie. The dashboard cookie is named
-    // `mc_token_<browser-facing-port>` (token_auth.py::_cookie_port_from_host,
-    // port-keyed so SSH-tunnelled instances don't collide), so a hand-built
-    // `mc_token=` header silently fails auth. The query param is accepted on
-    // the same line that reads the cookie, and needs no port knowledge.
+    // Delivered as `?token=` or as the `mc_token_<port>` cookie depending on
+    // where gatewayToken()'s answer came from — see withGatewayAuth().
+    const { url, headers } = withGatewayAuth(`${BACKEND_URL}/api/apps`, auth);
     const req = http.request(
-      `${BACKEND_URL}/api/apps?token=${encodeURIComponent(token)}`,
-      { method: "GET", timeout: 5000 },
+      url,
+      { method: "GET", timeout: 5000, headers },
       (res) => {
         if (res.statusCode !== 200) {
           res.resume();
-          // Drop a rejected token so the next tick mints a fresh one.
-          if (res.statusCode === 401 || res.statusCode === 403) cachedGatewayToken = "";
+          // Drop a rejected credential so the next tick re-resolves one.
+          if (res.statusCode === 401 || res.statusCode === 403) cachedGatewayAuth = { value: "" };
           probeLog(`/api/apps returned HTTP ${res.statusCode}`);
           resolve("unknown");
           return;
@@ -530,8 +636,54 @@ async function mochiEnabledState() {
  * No state is tracked because both window operations are idempotent —
  * openPetWindow returns the existing window, closePetWindow no-ops when there
  * is none — so each tick can simply assert the desired end state.
+ *
+ * The cadence is ADAPTIVE, not fixed. The common steady state for anyone who
+ * has not turned Mochi on (it ships defaultEnabled:false) is "disabled, and no
+ * remote pet is keeping it alive" — a state a tick can neither change nor be
+ * changed by until a human flips the App Store toggle. Polling that at a flat
+ * 5s issues a `/api/apps` request forever and, on a gateway that answers 403
+ * for a disabled app, logs a line every cycle. So once a tick
+ * SETTLES on that state the loop backs off — doubling the delay from the base
+ * up to a ceiling — and snaps straight back to the base cadence the moment any
+ * tick reports something else (enabled, a remote pet, or an unreadable probe).
+ * Backoff rather than a hard stop because this loop is the ONLY thing that
+ * notices a re-enable without a shell restart (see the header above): a stop
+ * would trade the log flood for a pet that never comes back until relaunch,
+ * whereas a ceiling bounds the worst-case notice of a re-enable to one ceiling
+ * interval while collapsing the steady-state cost to almost nothing.
  */
 const MOCHI_PET_RECONCILE_MS = 5000;
+// Ceiling for the disabled-state backoff. Five minutes bounds the worst-case
+// lag before a re-enable is noticed, while cutting a flat-5s idle loop's
+// request/log rate by ~60x. The base doubles (5s, 10s, 20s … capped here).
+const MOCHI_PET_RECONCILE_MAX_MS = 300_000;
+
+/**
+ * The reconcile outcome the SCHEDULER reads to pick the next delay.
+ *
+ * "idle" means this tick settled on the steady disabled state and asserting it
+ * again changes nothing until a human acts — so the loop may back off. "active"
+ * means anything else (enabled, a live remote pet, or an unreadable probe that
+ * must be retried promptly), so the loop returns to the base cadence. It is a
+ * hint about CADENCE only; it never gates the reconcile's own window work.
+ */
+const RECONCILE_IDLE = "idle";
+const RECONCILE_ACTIVE = "active";
+
+/**
+ * The next reconcile delay, given the previous delay and the last tick's
+ * outcome. Pure so the backoff policy can be tested without Electron: an
+ * RECONCILE_IDLE outcome doubles the delay up to the ceiling, anything else
+ * resets it to the base, so a disabled Mochi is not polled at the base rate
+ * forever.
+ */
+function nextReconcileDelay(prevDelay, outcome) {
+  if (outcome !== RECONCILE_IDLE) return MOCHI_PET_RECONCILE_MS;
+  const base = Number.isFinite(prevDelay) && prevDelay > 0
+    ? prevDelay
+    : MOCHI_PET_RECONCILE_MS;
+  return Math.min(base * 2, MOCHI_PET_RECONCILE_MAX_MS);
+}
 
 /**
  * Mochi's settings object, or null on ANY failure (no token, non-200,
@@ -542,16 +694,17 @@ const MOCHI_PET_RECONCILE_MS = 5000;
  * per consumer.
  */
 async function mochiSettings() {
-  const token = await gatewayToken();
-  if (!token) return null;
+  const auth = await gatewayToken();
+  if (!auth.value) return null;
   return new Promise((resolve) => {
+    const { url, headers } = withGatewayAuth(`${BACKEND_URL}/api/apps/mochi/settings`, auth);
     const req = http.request(
-      `${BACKEND_URL}/api/apps/mochi/settings?token=${encodeURIComponent(token)}`,
-      { method: "GET", timeout: 5000 },
+      url,
+      { method: "GET", timeout: 5000, headers },
       (res) => {
         if (res.statusCode !== 200) {
           res.resume();
-          if (res.statusCode === 401 || res.statusCode === 403) cachedGatewayToken = "";
+          if (res.statusCode === 401 || res.statusCode === 403) cachedGatewayAuth = { value: "" };
           resolve(null);
           return;
         }
@@ -664,6 +817,11 @@ function mochiStartSnip() {
  */
 let reconcileInFlight = null;
 
+// Set by startMochiWatcher(); a no-op until the watcher owns a timer. Lets an
+// out-of-band reconcile (a user re-enabling or switching instances) reset the
+// adaptive backoff so the pet responds promptly rather than on a slow clock.
+let resetReconcileCadence = () => {};
+
 function reconcileMochiOnce() {
   if (reconcileInFlight) return reconcileInFlight;
   reconcileInFlight = reconcileMochi().finally(() => {
@@ -687,11 +845,22 @@ async function reconcileMochiAfterCurrent() {
       /* the in-flight run's own failure is not this caller's problem */
     }
   }
+  // A user just acted (re-enable seen via apply-now, or an instance switch), so
+  // drop any disabled-state backoff: the loop should be at the base cadence
+  // again, not on a slow clock inherited from when the app was off.
+  resetReconcileCadence();
   return reconcileMochiOnce();
 }
 
 async function reconcileMochi() {
-  const { openPetWindow, closePetWindow } = require("./petOverlays");
+  const {
+    openPetWindow,
+    closePetWindow,
+    isPetWindowOpen,
+    rearmBlankedOverlays,
+    hasBlankedOverlay,
+    setPetWindowsHidden,
+  } = require("./petOverlays");
   const {
     closeAvatarWindowFromReconcile,
     setAvatarBaseUrl,
@@ -711,8 +880,11 @@ async function reconcileMochi() {
 
   const state = await mochiEnabledState();
   // Could not tell: leave every window exactly as it is. Tearing down on a
-  // failed probe is what made the pet appear to crash every few seconds.
-  if (state === "unknown") return;
+  // failed probe is what made the pet appear to crash every few seconds. A
+  // non-answer must NOT back the loop off — an expired credential clears on the
+  // next tick, so retry at the base cadence rather than drifting toward the
+  // ceiling on a transient failure.
+  if (state === "unknown") return RECONCILE_ACTIVE;
 
   // ONE-SHOT migration of the per-machine prefs out of the host's Mochi
   // settings, so an existing choice is not reset by the upgrade that moves it.
@@ -734,12 +906,21 @@ async function reconcileMochi() {
   // matters for the teardown decision is the one already showing.
   const shownInstanceId = target.keep ? mochiPetInstanceId : target.instanceId;
   // On `keep` we do not know, and not-knowing must never destroy anything — the
-  // same discipline as enabledState's "unknown". A definite resolve onto self
-  // means the remote is gone, and `hostDisabledMeansTeardown` handles self.
-  const shownStillUsable = target.keep ? true : target.instanceId !== SELF_INSTANCE;
+  // same discipline as enabledState's "unknown". It must never CREATE anything
+  // either: "keep" is only meaningful for a window that exists, so on a
+  // non-answer the pet is "still usable" exactly when one is already open. A
+  // definite resolve onto self means the remote is gone, and
+  // `hostDisabledMeansTeardown` handles self.
+  const shownStillUsable = target.keep ? isPetWindowOpen() : target.instanceId !== SELF_INSTANCE;
 
   if (state === "disabled" && hostDisabledMeansTeardown(shownInstanceId, shownStillUsable)) {
     closePetWindow();
+    // Nothing is shown now, so say so. Leaving the remote's id here would let a
+    // later non-answer read as "keep the remote pet" and open one for a host
+    // that has Mochi switched off.
+    mochiPetBaseUrl = BACKEND_URL;
+    mochiPetToken = "";
+    mochiPetInstanceId = SELF_INSTANCE;
     // Hide the panel rather than orphan an opaque always-on-top rectangle over
     // the desktop; re-enable restores it if it was visible.
     hidePanelOnDisable();
@@ -758,7 +939,11 @@ async function reconcileMochi() {
     mochiWindowsHidden = false;
     // Re-arm the first-open chat panel for the next enable.
     mochiPanelAutoOpened = false;
-    return;
+    // SETTLED: host Mochi is off and no remote pet is being kept alive, so
+    // re-asserting this teardown changes nothing until a human re-enables the
+    // app. This is the ONLY outcome that lets the loop back off — see the
+    // watcher's scheduler.
+    return RECONCILE_IDLE;
   }
 
   // Past here the pet is alive: either the host's Mochi is on, or it is off and
@@ -808,7 +993,28 @@ async function reconcileMochi() {
   // (pet right-click > Avatars, or the dashboard Appearance card). The avatar
   // window is now the Avatars gallery, opened on demand rather than at startup.
   closeAvatarWindowFromReconcile();
+  setPetWindowsHidden(mochiWindowsHidden);
   openPetWindow(mochiPetBaseUrl, mochiPetToken);
+  // An overlay stuck on a gateway error page (expired cookie or a transient 5xx)
+  // has hidden itself; re-arm it with a token that works for the CURRENT target.
+  // For a remote instance that is its own query token. For self, keep the
+  // credential's delivery mode: a borrowed browser session is a Cookie header,
+  // while a newly minted local credential is a query token. Reuse the cached
+  // credential, never mint here: the reconcile probes already clear
+  // cachedGatewayAuth on a genuine 401/403, so gatewayToken() re-resolves only
+  // when the old one was truly rejected. Resolving every tick while a non-auth
+  // 4xx/5xx keeps an overlay blanked would churn session nonces and evict
+  // pending auth links.
+  if (hasBlankedOverlay()) {
+    let rearmToken = mochiPetToken;
+    let rearmViaCookie = false;
+    if (mochiPetInstanceId === SELF_INSTANCE) {
+      const auth = await gatewayToken();
+      rearmToken = auth.value;
+      rearmViaCookie = auth.viaCookie;
+    }
+    rearmBlankedOverlays(mochiPetBaseUrl, rearmToken, rearmViaCookie);
+  }
   // Fully enabled again: bring the panel back if disable had hidden it.
   restorePanelOnEnable(mochiPetBaseUrl, mochiPetToken);
   // FIRST OPEN: on the first enabled tick of a session (fresh enable, or the pet
@@ -831,6 +1037,10 @@ async function reconcileMochi() {
   // already match, so the 5s loop does not unregister+re-register every tick —
   // which would briefly drop the key.
   applyMochiShortcuts(shortcutsOf(machineStore));
+  // Reached only when a pet is alive (host Mochi on, or a live remote pet while
+  // the host is off). Both are states a later tick must still reconcile, so the
+  // loop stays at the base cadence.
+  return RECONCILE_ACTIVE;
 }
 
 // ── Mochi global-shortcut handlers ─────────────────────────────────────────
@@ -1011,6 +1221,7 @@ function startMochiWatcher() {
     const fs = require("fs");
     const path = require("path");
     const { shell } = require("electron");
+    const { openPathHardened } = require("../open-path");
     const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]);
     try {
       // realpath BEFORE the extension test: a `.png` symlink to a key file must
@@ -1019,7 +1230,7 @@ function startMochiWatcher() {
       if (!IMAGE_EXTS.has(path.extname(real).toLowerCase())) return false;
       if (!fs.statSync(real).isFile()) return false;
       // Non-empty return value means the OS refused to open it.
-      const err = await shell.openPath(real);
+      const err = await openPathHardened(shell, real);
       return err === "";
     } catch (err) {
       glog(`Mochi open-image refused: ${err && err.message}`);
@@ -1148,9 +1359,9 @@ function startMochiWatcher() {
    */
   ipcMain.handle("mochi-instances:list", async () => {
     try {
-      const token = await gatewayToken();
-      if (!token) return { known: false, state: "error", instances: [] };
-      const listed = await fetchInstances(token);
+      const auth = await gatewayToken();
+      if (!auth.value) return { known: false, state: "error", instances: [] };
+      const listed = await fetchInstances(auth);
       return {
         known: !!listed.known,
         state: listed.state || (listed.known ? "ready" : "error"),
@@ -1165,26 +1376,71 @@ function startMochiWatcher() {
   // Through the shared serializer, NOT reconcileMochi directly: a tick can make
   // requests through the SSH tunnel when petInstance names a remote, and those are
   // slower than the 5s interval on a bad link. See reconcileMochiOnce.
-  const tick = () => {
-    reconcileMochiOnce().catch((err) => {
-      // Never let a transient gateway hiccup kill the watcher.
-      console.warn("Mochi pet reconcile failed:", err?.message || err);
-    });
+  //
+  // ADAPTIVE CADENCE. A self-rescheduling timeout replaces a flat setInterval so
+  // the delay can grow while nothing can change. `reconcileMochiOnce()` resolves
+  // to RECONCILE_IDLE only when a tick settled on the steady disabled state
+  // (host off, no remote pet); every other outcome — enabled, a live remote pet,
+  // or an unreadable probe — resolves to RECONCILE_ACTIVE. On idle the delay
+  // doubles up to the ceiling; on active it snaps back to the base, so a
+  // re-enable is picked up promptly and, at worst, one ceiling interval late.
+  // A rejection is treated as "active": a thrown tick is a transient failure,
+  // not a reason to slow down noticing recovery.
+  let reconcileDelay = MOCHI_PET_RECONCILE_MS;
+  let timer = null;
+  const scheduleNextReconcile = () => {
+    timer = setTimeout(runReconcileTick, reconcileDelay);
+    // Never let this keep the process alive on its own; the app owns the loop's
+    // lifetime and clears it on before-quit.
+    if (timer && typeof timer.unref === "function") timer.unref();
   };
-  tick();
-  const timer = setInterval(tick, MOCHI_PET_RECONCILE_MS);
-  app.on("before-quit", () => clearInterval(timer));
+  function runReconcileTick() {
+    reconcileMochiOnce()
+      .then((outcome) => {
+        reconcileDelay = nextReconcileDelay(reconcileDelay, outcome);
+      })
+      .catch((err) => {
+        // Never let a transient gateway hiccup kill the watcher, and never let
+        // it slow the loop down: a failure is retried at the base cadence.
+        console.warn("Mochi pet reconcile failed:", err?.message || err);
+        reconcileDelay = MOCHI_PET_RECONCILE_MS;
+      })
+      .finally(scheduleNextReconcile);
+  }
+
+  // A user action that re-runs reconcile out of band (App Store re-enable seen
+  // via apply-now, or an instance switch) must also drop the loop back to the
+  // base cadence, so the pet responds at once rather than on a backed-off clock.
+  resetReconcileCadence = () => {
+    reconcileDelay = MOCHI_PET_RECONCILE_MS;
+    if (timer) {
+      clearTimeout(timer);
+      scheduleNextReconcile();
+    }
+  };
+
+  runReconcileTick();
+  app.on("before-quit", () => { if (timer) clearTimeout(timer); });
 }
 
 /**
- * Start the pet watcher. `backendUrl`/`fetchLocalToken`/`glog` are the shell's
- * own: the local gateway origin, the local-token fetcher (the same path the
- * dashboard window uses), and the gateway-launch logger.
+ * Start the pet watcher. `backendUrl`/`fetchGatewayAuth`/`glog` are the
+ * shell's own: the local gateway origin, a resolver that tries every gateway
+ * credential path the shell knows (local secret, SSH remote, then the main
+ * window's own already-established session — see main.js's
+ * fetchMochiGatewayAuth and mochi-session-token.js) and answers
+ * `{ value, viaCookie }`, and the gateway-launch logger.
  */
 function initMochi(deps) {
   BACKEND_URL = deps.backendUrl;
-  fetchLocalToken = deps.fetchLocalToken;
+  fetchGatewayAuth = deps.fetchGatewayAuth;
   glog = deps.glog;
+  for (const line of pendingGlogs.splice(0)) glog(line);
+  try {
+    require("./panelWindow").setMainWindowGetter(deps.getMainWindow);
+  } catch {
+    /* module shape changed */
+  }
   startMochiWatcher();
 }
 

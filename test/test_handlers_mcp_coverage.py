@@ -3,10 +3,14 @@
 Covers the request/response surface of ``mcp.py`` that the existing suites
 (``test_mcp_apply``, ``test_mcp_sync_agent``, ``test_mcp_probe_treadmill``,
 ``test_mcp_gateway_control_plane``) leave untouched: the enable/disable
-toggles (server, per-tool, all), removal, the per-agent active list, the
-probe endpoints, and the MCP-gateway metrics / server-enumeration /
-set-poolable endpoints — with their validation matrix, corrupt-config and
-write-failure branches, and every documented status code.
+toggles (server, per-tool, all), removal, server detail, the per-agent active
+list, the MCP-gateway metrics / status / enable endpoints, and the
+``config.local.json`` overlay both gateway writers resolve through — with
+their validation matrix, corrupt-config and write-failure branches, and every
+documented status code. The probe and measurement endpoints are in
+``test_handlers_mcp_coverage_probe.py``; the server-enumeration endpoint, the
+set-stub validation and write matrix, the stub-eligibility rule and the
+cleanup-sweep file lock are in ``test_handlers_mcp_coverage_gateway_servers.py``.
 
 Every filesystem seam is redirected into ``tmp_path``; no network, no real
 MCP server process, no capability-manager subprocess.
@@ -14,103 +18,25 @@ MCP server process, no capability-manager subprocess.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiohttp import web
+from handlers_mcp_coverage_helpers import agents_dir_fixture  # noqa: F401
+from handlers_mcp_coverage_helpers import sandbox_fixture  # noqa: F401
+from handlers_mcp_coverage_helpers import (
+    _effective_stubs,
+    _payload,
+    _read_global,
+    _request,
+    _write_global,
+)
 
+from conftest import host_abs
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.mcp_discovery import McpServerInfo
-
-# ── harness ─────────────────────────────────────────────────────────────
-
-
-def _request(
-    body: Any = None,
-    *,
-    state: Any = None,
-    query: dict[str, str] | None = None,
-    match_info: dict[str, str] | None = None,
-    method: str = "POST",
-) -> web.Request:
-    """Minimal aiohttp request double, matching the suite's existing style."""
-    req = MagicMock(spec=web.Request)
-    if isinstance(body, Exception):
-        req.json = AsyncMock(side_effect=body)
-    else:
-        req.json = AsyncMock(return_value=body)
-    req.app = {"state": state if state is not None else _State()}
-    req.query = query or {}
-    req.match_info = match_info or {}
-    req.method = method
-    req.get = lambda key, default=None: default
-    return req
-
-
-class _State:
-    """Stand-in for DashboardState's background-task registry."""
-
-    def __init__(self) -> None:
-        self._background_tasks: set[asyncio.Task] = set()
-
-
-def _payload(resp: web.Response) -> Any:
-    body = resp.body
-    assert isinstance(body, (bytes, bytearray))
-    return json.loads(body)
-
-
-@pytest.fixture
-def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """Point every mcp.py filesystem + audit seam at ``tmp_path``.
-
-    The agent-config sync (``kirocrew.json`` read-modify-write) belongs to
-    ``handlers.agents`` and has its own suite — record the calls instead of
-    re-testing it here.
-    """
-    global_json = tmp_path / "kiro" / "settings" / "mcp.json"
-    global_json.parent.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", global_json)
-    monkeypatch.setattr(mcp_mod, "_MCP_LOCK_PATH", global_json.with_suffix(".lock"))
-    monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "crew" / "mcp.json")
-    monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", list)
-    sel = MagicMock()
-    monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
-
-    synced: list[tuple[str, bool, bool]] = []
-    batched: list[tuple[list[str], bool]] = []
-    monkeypatch.setattr(
-        mcp_mod,
-        "_sync_mcp_to_agent",
-        lambda name, enabled, remove=False: synced.append((name, enabled, remove)),
-    )
-    monkeypatch.setattr(
-        mcp_mod,
-        "_sync_mcp_to_agent_batch",
-        lambda names, enabled: batched.append((list(names), enabled)),
-    )
-    return SimpleNamespace(
-        global_json=global_json,
-        synced=synced,
-        batched=batched,
-        sel=sel,
-    )
-
-
-def _write_global(sandbox: SimpleNamespace, servers: dict[str, Any]) -> None:
-    sandbox.global_json.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
-
-
-def _read_global(sandbox: SimpleNamespace) -> dict[str, Any]:
-    data = json.loads(sandbox.global_json.read_text(encoding="utf-8"))
-    servers = data.get("mcpServers", {})
-    assert isinstance(servers, dict)
-    return servers
 
 
 def _known(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
@@ -174,6 +100,43 @@ class TestToggleServer:
         assert resp.status == 200
         assert "disabled" not in _read_global(sandbox)["srv"]
         assert sandbox.synced == [("srv", True, False)]
+
+    @pytest.mark.asyncio
+    async def test_toggle_mutes_the_raw_slash_named_entry_the_row_stands_for(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The table asks by the canonical alias; the file holds the raw key.
+        The flag lands on the raw entry -- the one the rebuild mounts -- and no
+        stub is written beside it. Red under ``name not in servers``: a
+        ``{"disabled": true}`` stub under ``playwright-mcp`` showed the row
+        Disabled while ``npm:@playwright/mcp`` kept mounting untouched."""
+        _write_global(sandbox, {"npm:@playwright/mcp": {"command": "npx"}})
+        resp = await mcp_mod.api_mcp_toggle(
+            _request({"name": "playwright-mcp", "enabled": False})
+        )
+        assert resp.status == 200
+        servers = _read_global(sandbox)
+        assert set(servers) == {"npm:@playwright/mcp"}
+        assert servers["npm:@playwright/mcp"]["disabled"] is True
+        # And back on, through the same resolution.
+        resp = await mcp_mod.api_mcp_toggle(_request({"name": "playwright-mcp", "enabled": True}))
+        assert resp.status == 200
+        assert "disabled" not in _read_global(sandbox)["npm:@playwright/mcp"]
+
+    @pytest.mark.asyncio
+    async def test_toggle_refuses_an_ambiguous_alias_without_writing_a_stub(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """Two raw keys alias to the row's name and neither is exact: the flag
+        has no one entry to land on, and a stub under the alias would show the
+        row Disabled while both raw entries kept mounting. 409, file untouched."""
+        _write_global(sandbox, {"team/foo": {"command": "a"}, "other:team/foo": {"command": "b"}})
+        before = sandbox.global_json.read_bytes()
+        resp = await mcp_mod.api_mcp_toggle(_request({"name": "team-foo", "enabled": False}))
+        assert resp.status == 409
+        assert "alias of 2 entries" in _payload(resp)["error"]
+        assert _payload(resp)["code"] == "mcp_server_name_ambiguous"
+        assert sandbox.global_json.read_bytes() == before
 
     @pytest.mark.asyncio
     async def test_server_known_elsewhere_gets_a_stub_entry(
@@ -498,6 +461,25 @@ class TestRemove:
         mgr.uninstall_mcp.assert_awaited_once_with("srv")
 
     @pytest.mark.asyncio
+    async def test_a_commented_global_config_is_refused_before_the_uninstall(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The removal would rewrite the file as plain JSON, so it is refused
+        before the capability manager uninstalls anything."""
+        from kiro_crew.dashboard.handlers import _shared
+
+        mgr = MagicMock()
+        mgr.available.return_value = True
+        mgr.uninstall_mcp = AsyncMock()
+        monkeypatch.setattr(_shared, "_capability_manager", lambda: mgr)
+        text = '{\n  "mcpServers": {\n    "srv": {"command": "x"},\n    // parked\n  }\n}\n'
+        sandbox.global_json.write_text(text, encoding="utf-8")
+        with pytest.raises(mcp_mod.McpConfigHasComments):
+            await mcp_mod.api_mcp_remove(_request({"name": "srv"}))
+        mgr.uninstall_mcp.assert_not_awaited()
+        assert sandbox.global_json.read_text(encoding="utf-8") == text
+
+    @pytest.mark.asyncio
     async def test_corrupt_global_config_is_tolerated(
         self, sandbox: SimpleNamespace, no_capability_manager: MagicMock
     ) -> None:
@@ -519,6 +501,70 @@ class TestServerDetail:
         )
         assert resp.status == 400
         assert "server name is required" in _payload(resp)["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name",
+        ["../../evil", "..", "a/../b", "a" * 129, "-leading-dash"],
+        ids=["traversal", "bare-dotdot", "embedded-dotdot", "overlong", "bad-leading-char"],
+    )
+    async def test_put_rejects_a_name_the_rest_of_the_tree_would_refuse(
+        self, sandbox: SimpleNamespace, name: str
+    ) -> None:
+        """PUT is the writer, so it must not plant a key nothing else can address.
+
+        ``_is_valid_mcp_name`` is the predicate the validation-dependent readers
+        in this tree enforce (several call sites in ``mcp.py`` itself, plus
+        ``mcp_custom.py``, ``mcp_discover.py`` and ``connections.py``). A name
+        carrying ``..`` or exceeding ``_MAX_MCP_NAME_LEN`` written through this
+        route is invisible to those, so the entry cannot be managed through them.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request({"command": "node"}, match_info={"name": name}, method="PUT")
+        )
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_server_name"
+        # The refusal must land before the write, not after it.
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_still_removes_a_malformed_junk_key(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """DELETE stays permissive on purpose, so a junk key remains clearable.
+
+        This mirrors the documented grant/revoke asymmetry in ``security.py``:
+        the writer validates, the remover does not, because guarding a remover
+        would strand exactly the entries the writer guard prevents. ``DELETE``
+        and ``api_mcp_remove`` are both such removers. Guarding this handler's
+        DELETE half is the specific regression this test forbids.
+        """
+        _write_global(sandbox, {"../../evil": {"command": "x"}})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(None, match_info={"name": "../../evil"}, method="DELETE")
+        )
+        assert resp.status == 200
+        assert _payload(resp)["removed"] is True
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_put_accepts_the_names_the_validator_allows(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The guard must not narrow the accepted set beyond the shared validator.
+
+        ``_VALID_MCP_NAME_RE`` deliberately admits ``@``, ``/``, ``.``, ``:`` and
+        ``_`` so scoped package ids (``@scope/pkg``) keep working.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(
+                {"command": "node"}, match_info={"name": "@scope/pkg.name_v2:1"}, method="PUT"
+            )
+        )
+        assert resp.status == 200
+        assert "@scope/pkg.name_v2:1" in _read_global(sandbox)
 
     @pytest.mark.asyncio
     async def test_delete_absent_is_404(self, sandbox: SimpleNamespace) -> None:
@@ -559,6 +605,18 @@ class TestServerDetail:
         assert _payload(resp)["error"] == "invalid JSON"
 
     @pytest.mark.asyncio
+    async def test_put_refuses_a_commented_global_config(self, sandbox: SimpleNamespace) -> None:
+        """A PUT would rewrite the file as plain JSON and drop its comments."""
+        text = '{\n  "mcpServers": {\n    // "parked": {"command": "p"}\n  }\n}\n'
+        sandbox.global_json.write_text(text, encoding="utf-8")
+        with pytest.raises(mcp_mod.McpConfigHasComments) as excinfo:
+            await mcp_mod.api_mcp_server_detail(
+                _request({"command": "node"}, match_info={"name": "srv"}, method="PUT")
+            )
+        assert json.loads(excinfo.value.text)["code"] == mcp_mod.MCP_CONFIG_HAS_COMMENTS
+        assert sandbox.global_json.read_text(encoding="utf-8") == text
+
+    @pytest.mark.asyncio
     async def test_put_without_command_is_400(self, sandbox: SimpleNamespace) -> None:
         resp = await mcp_mod.api_mcp_server_detail(
             _request({"args": ["x"]}, match_info={"name": "srv"}, method="PUT")
@@ -583,19 +641,35 @@ class TestServerDetail:
         }
         assert sandbox.synced == [("srv", True, False)]
 
+    @pytest.mark.asyncio
+    async def test_put_expands_a_declared_env_path(
+        self, sandbox: SimpleNamespace, monkeypatch
+    ) -> None:
+        """The global file is consumed by the ACP runtime (per-key env), so a
+        registered PATH fragment must be emitted complete. See env.emit_env."""
+        import os
+
+        # Spelled for the host (conftest.host_abs): declared entries pass through
+        # the ``os.path.isabs`` filter in env._spec_path_entries, and from Python
+        # 3.13 a bare ``/opt/shims`` is not absolute under ntpath (no drive).
+        shims, usr_bin = host_abs("opt", "shims"), host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", usr_bin)
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(
+                {"command": "node", "env": {"PATH": shims, "K": "v"}},
+                match_info={"name": "srv"},
+                method="PUT",
+            )
+        )
+        assert resp.status == 200
+        written = _read_global(sandbox)["srv"]["env"]
+        entries = written["PATH"].split(os.pathsep)
+        assert entries[0] == shims, "caller-authored entries stay first"
+        assert usr_bin in entries, "inherited PATH must survive the override"
+        assert written["K"] == "v"
+
 
 # ── GET /api/mcp/active ─────────────────────────────────────────────────
-
-
-@pytest.fixture
-def agents_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect ``kiro_agents_dir_path()`` at a tmp agents directory."""
-    import kiro_crew.agent as agent_mod
-
-    d = tmp_path / "agents"
-    d.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", d)
-    return d
 
 
 @pytest.fixture
@@ -686,6 +760,39 @@ class TestActive:
         assert rows[0]["name"].startswith("kirocrew-")
 
     @pytest.mark.asyncio
+    async def test_default_agent_reads_the_store_and_the_row_flag_not_only_the_shared_file(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registry install awaiting consent is ``disabled: true`` in the Kiro
+        Crew store and absent from the shared file; a server switched off in a
+        provider global is in neither map. Both are off for the sessions, so
+        both answer ``enabled: false`` here. Red under the shared-file-only read,
+        which answered ``true`` for each."""
+        import kiro_crew.mcp_discovery as disc
+
+        _write_global(sandbox, {"on": {"command": "x"}})
+        store = mcp_mod._kirocrew_mcp_json()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps({"mcpServers": {"pending": {"command": "y", "disabled": True}}}),
+            encoding="utf-8",
+        )
+        # ``pending`` carries no row flag here, so only the store read can flip
+        # it; ``cc-off`` is in neither map, so only the row flag can.
+        rows = [
+            McpServerInfo(name="on", command="/bin/true"),
+            McpServerInfo(name="pending", command="/bin/true"),
+            McpServerInfo(name="cc-off", command="/bin/true", disabled=True),
+        ]
+        monkeypatch.setattr(disc, "list_servers", lambda *a, **k: list(rows))
+        resp = await mcp_mod.api_mcp_active(_request(query={}))
+        assert resp.status == 200
+        by_name = {r["name"]: r["enabled"] for r in _payload(resp)}
+        assert by_name["on"] is True
+        assert by_name["pending"] is False
+        assert by_name["cc-off"] is False
+
+    @pytest.mark.asyncio
     async def test_agent_alias_resolves_to_the_global_scope(
         self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -714,117 +821,6 @@ class TestActive:
         assert resp.status == 200
         # With no readable disabled-state, every configured row reads enabled.
         assert {r["name"]: r["enabled"] for r in _payload(resp)}["on"] is True
-
-
-# ── /api/mcp/probe (POST live, GET cached) ──────────────────────────────
-
-
-def _probed(name: str, **extra: Any) -> MagicMock:
-    srv = MagicMock()
-    srv.name = name
-    srv.to_dict.return_value = {"name": name, "status": "ok", **extra}
-    return srv
-
-
-class TestProbe:
-    @pytest.mark.asyncio
-    async def test_live_probe_overlays_enabled_and_disabled_tools(
-        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import kiro_crew.mcp_discovery as disc
-
-        _write_global(
-            sandbox,
-            {
-                "off": {"disabled": True},
-                "on": {"command": "x", "disabledTools": ["ReadFile"]},
-            },
-        )
-        monkeypatch.setattr(
-            disc, "probe_all", AsyncMock(return_value=[_probed("off"), _probed("on")])
-        )
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_ts", 0.0)
-
-        resp = await mcp_mod.api_mcp_probe(_request({}))
-        assert resp.status == 200
-        rows = {r["name"]: r for r in _payload(resp)}
-        assert rows["off"]["enabled"] is False
-        assert rows["on"]["enabled"] is True
-        assert rows["on"]["disabledTools"] == ["ReadFile"]
-        assert "disabledTools" not in rows["off"]
-        # The live result becomes the handler cache.
-        assert [r["name"] for r in mcp_mod._mcp_probe_cache] == ["off", "on"]
-        assert mcp_mod._mcp_probe_ts > 0.0
-
-    @pytest.mark.asyncio
-    async def test_live_probe_tolerates_a_missing_global_config(
-        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import kiro_crew.mcp_discovery as disc
-
-        sandbox.global_json.unlink(missing_ok=True)
-        monkeypatch.setattr(disc, "probe_all", AsyncMock(return_value=[_probed("on")]))
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
-        resp = await mcp_mod.api_mcp_probe(_request({}))
-        assert _payload(resp)[0]["enabled"] is True
-
-    @pytest.mark.asyncio
-    async def test_cached_probe_returns_the_warm_cache_without_reprobing(
-        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import time
-
-        cache = [{"name": "on", "status": "ok"}]
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", list(cache))
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_ts", time.time())
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_in_progress", False)
-        bg = AsyncMock()
-        monkeypatch.setattr(mcp_mod, "_bg_mcp_probe", bg)
-
-        state = _State()
-        resp = await mcp_mod.api_mcp_probe_cached(_request(state=state))
-        assert resp.status == 200
-        assert _payload(resp) == cache
-        assert not state._background_tasks
-        bg.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_cached_probe_arms_a_background_reprobe_when_stale(
-        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_ts", 0.0)  # never probed
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_in_progress", False)
-        bg = AsyncMock()
-        monkeypatch.setattr(mcp_mod, "_bg_mcp_probe", bg)
-
-        state = _State()
-        resp = await mcp_mod.api_mcp_probe_cached(_request(state=state))
-        assert resp.status == 200
-        assert _payload(resp) == []
-        assert mcp_mod._mcp_probe_in_progress is True
-        assert len(state._background_tasks) == 1
-        await asyncio.gather(*state._background_tasks)
-        bg.assert_awaited_once()
-        # The done-callback deregisters the task from the state registry.
-        assert not state._background_tasks
-
-    @pytest.mark.asyncio
-    async def test_cached_probe_does_not_stack_reprobes(
-        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An in-flight probe suppresses a second one even on a cold cache."""
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_ts", 0.0)
-        monkeypatch.setattr(mcp_mod, "_mcp_probe_in_progress", True)
-        bg = AsyncMock()
-        monkeypatch.setattr(mcp_mod, "_bg_mcp_probe", bg)
-
-        state = _State()
-        await mcp_mod.api_mcp_probe_cached(_request(state=state))
-        assert not state._background_tasks
-        bg.assert_not_awaited()
 
 
 # ── GET /api/mcp-gateway/metrics ────────────────────────────────────────
@@ -882,6 +878,320 @@ class TestGatewayStatusPing:
 
 
 # ── POST /api/mcp-gateway/enable — error branches ───────────────────────
+
+
+class TestSharingToggleFreezesTheLegacyAlias:
+    """The sharing toggle must not change WHICH servers are stubbed.
+
+    ``_resolve_stub_servers`` is conditional on ``enabled``, so on a config still
+    riding the deprecated ``poolable_servers`` the resolved set moves when
+    ``enabled`` moves. Writing only ``enabled`` would let the global sharing
+    switch silently rewrite the per-server stub set in both directions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enabling_sharing_does_not_stub_the_alias_entries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ON from ``enabled:false`` must keep the EMPTY set the page showed.
+
+        The page truthfully reports "0 stubbed" for this config, because a
+        gateway that was off ran no stub. One click on *sharing* must not stub
+        every alias entry and share it — that is the unrequested topology change
+        this design exists to make opt-in.
+        """
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcp_gateway": {"enabled": False, "poolable_servers": ["x-mcp"]}}),
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            _mcp_gateway_apply=AsyncMock(return_value={"running": True, "ping_ok": True})
+        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": True}, state=state))
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert saved["enabled"] is True
+        assert saved["stub_servers"] == []
+
+    @pytest.mark.asyncio
+    async def test_disabling_sharing_keeps_the_servers_stubbed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OFF from ``enabled:true`` must leave the stub set intact.
+
+        Otherwise the alias stops firing, the set empties, and "stubbed but
+        private" — the whole middle state this PR adds — becomes unreachable for
+        exactly the migrated operator. Turning sharing off narrows sharing only.
+        """
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcp_gateway": {"enabled": True, "poolable_servers": ["x-mcp"]}}),
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            _mcp_gateway_apply=AsyncMock(return_value={"running": True, "ping_ok": True})
+        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": False}, state=state))
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert saved["enabled"] is False
+        assert saved["stub_servers"] == ["x-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_empty_set_is_never_repopulated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Key presence, not truthiness: an operator who cleared ``stub_servers``
+        chose to stub nothing, and a stale ``poolable_servers`` must not revive
+        the servers they just cleared."""
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "mcp_gateway": {
+                        "enabled": True,
+                        "stub_servers": [],
+                        "poolable_servers": ["x-mcp"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            _mcp_gateway_apply=AsyncMock(return_value={"running": True, "ping_ok": True})
+        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": False}, state=state))
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert saved["stub_servers"] == []
+
+
+class TestFreezeStubServersOrdering:
+    def test_freeze_resolves_against_the_pre_write_enabled_value(self) -> None:
+        """Ordering guard: the helper must run BEFORE ``enabled`` is reassigned.
+
+        Freezing afterwards would resolve against the NEW value — the exact
+        inversion the two toggle-direction tests above exist to prevent — so this
+        pins the helper's own contract independently of its call sites.
+        """
+        section = {"enabled": True, "poolable_servers": ["x-mcp"]}
+        mcp_mod._freeze_stub_servers(section)
+        assert section["stub_servers"] == ["x-mcp"]
+
+        # After the freeze, `enabled` does not speak for the stub set at all.
+        section["enabled"] = False
+        mcp_mod._freeze_stub_servers(section)
+        assert section["stub_servers"] == ["x-mcp"]
+
+    def test_freeze_is_idempotent_and_sorted(self) -> None:
+        section: dict = {"enabled": True, "poolable_servers": ["b-mcp", "a-mcp", "b-mcp"]}
+        mcp_mod._freeze_stub_servers(section)
+        first = section["stub_servers"]
+        assert first == ["a-mcp", "b-mcp"]
+        mcp_mod._freeze_stub_servers(section)
+        assert section["stub_servers"] == first
+
+
+class TestLocalOverlayOwnsTheStubKeys:
+    """``config.local.json`` is deep-merged OVER ``config.json`` and is
+    user-owned, so the base file is NOT the effective config.
+
+    A read-modify-write that resolves from the base section alone gets the stub
+    set wrong, and a base write is inert for any key the overlay defines. Both
+    directions silently contradict what the operator sees.
+    """
+
+    @pytest.mark.asyncio
+    async def test_toggling_sharing_keeps_an_overlay_owned_allowlist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Legacy allowlist lives in the OVERLAY; the toggle's own key does not.
+
+        Effective set before the click is ``[x-mcp]`` (resolver falls back to
+        ``poolable_servers``). Freezing from the base section alone would write
+        ``stub_servers: []``, and because key PRESENCE wins in the resolver that
+        empty base value then beats the overlay's allowlist — silently unstubbing
+        a server the operator never touched.
+
+        ``enabled`` deliberately lives in the BASE here: that is the key this
+        endpoint writes, so the write can actually land. (An overlay that owns
+        ``enabled`` is the refusal case covered by the next test.)
+        """
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(json.dumps({"mcp_gateway": {"enabled": True}}), encoding="utf-8")
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"poolable_servers": ["x-mcp"]}}),
+            encoding="utf-8",
+        )
+
+        state = SimpleNamespace(
+            _mcp_gateway_apply=AsyncMock(return_value={"running": True, "ping_ok": True})
+        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": False}, state=state))
+        assert resp.status == 200
+
+        saved = json.loads(base.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert saved.get("stub_servers") == ["x-mcp"], (
+            "the overlay's allowlist was discarded: freezing must resolve from the "
+            "MERGED effective section, not from config.json alone"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_overlay_would_shadow_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the overlay itself defines the key we are about to write, a base
+        write cannot take effect — the overlay wins the deep merge. Reporting
+        success would be the same lie as a 200 with ``applied: false``."""
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(json.dumps({"mcp_gateway": {"enabled": False}}), encoding="utf-8")
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"enabled": False}}), encoding="utf-8"
+        )
+
+        state = SimpleNamespace(_mcp_gateway_apply=AsyncMock())
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": True}, state=state))
+        assert resp.status == 409, "an inert write must be refused, not reported as applied"
+        assert "config.local.json" in _payload(resp)["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_per_server_setter_also_freezes_from_the_merged_view(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same invariant on the other writer: stubbing one server must not drop
+        an allowlist that lives in the overlay."""
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(json.dumps({"mcp_gateway": {"enabled": True}}), encoding="utf-8")
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"poolable_servers": ["x-mcp"]}}), encoding="utf-8"
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "y-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+        saved = json.loads(base.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert _effective_stubs(saved) == ["x-mcp", "y-mcp"]
+        # The overlay's migrated roster is frozen into the base, and the click is a
+        # decision on top of it -- the allowlist is preserved either way, which is
+        # what this test is about.
+        assert saved["stub_servers"] == ["x-mcp"]
+        assert saved["stub_overrides"] == {"y-mcp": True}
+
+    @pytest.mark.asyncio
+    async def test_the_per_server_setter_refuses_a_shadowed_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Overlay owns ``stub_servers`` -> the row toggle cannot land either."""
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(json.dumps({"mcp_gateway": {}}), encoding="utf-8")
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["x-mcp"]}}), encoding="utf-8"
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "y-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "overlay_owns_stub_servers"
+
+    @pytest.mark.asyncio
+    async def test_an_overlay_owning_the_override_map_also_refuses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard must cover the key the toggle actually writes.
+
+        The decision lands in ``stub_overrides``, and the overlay wins the deep
+        merge per-key. Checking only ``stub_servers`` would let the click write base
+        ``config.json`` and answer 200 while the overlay kept the server on its own
+        value -- the silent never-takes-effect failure the guard exists to prevent,
+        reintroduced by relocating the write.
+        """
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp"]}}), encoding="utf-8"
+        )
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"stub_overrides": {"a-mcp": False}}}),
+            encoding="utf-8",
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 409, (
+            "the toggle wrote a value the gateway would not read -- the overlay "
+            "shadows stub_overrides, so this had to be refused"
+        )
+        body = _payload(resp)
+        assert body["code"] == "overlay_owns_stub_servers"
+        assert "stub_overrides" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_overlay_is_treated_as_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loader logs and ignores an unparseable overlay, so this path must
+        agree with it. Letting the error escape would turn a broken user file into
+        a 500 on a settings click."""
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(
+            json.dumps({"mcp_gateway": {"enabled": True, "poolable_servers": ["x-mcp"]}}),
+            encoding="utf-8",
+        )
+        config_local_path().write_text("{ not json", encoding="utf-8")
+
+        state = SimpleNamespace(
+            _mcp_gateway_apply=AsyncMock(return_value={"running": True, "ping_ok": True})
+        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": False}, state=state))
+        assert resp.status == 200
+        saved = json.loads(base.read_text(encoding="utf-8"))["mcp_gateway"]
+        # Base's own legacy allowlist still migrates; the corrupt overlay is ignored.
+        assert saved["stub_servers"] == ["x-mcp"]
 
 
 class TestGatewayEnableErrors:
@@ -946,784 +1256,11 @@ class TestGatewayEnableErrors:
             _request({"enabled": True}, state=state)
         )
         assert resp.status == 500
-        assert "broker died" in _payload(resp)["error"]
-        outcomes = [c.kwargs.get("outcome") for c in sel.log_api_access.call_args_list]
-        assert "error" in outcomes
-
-
-# ── GET /api/mcp-gateway/servers ────────────────────────────────────────
-
-
-@pytest.fixture
-def poolable_allowlist(monkeypatch: pytest.MonkeyPatch):
-    """Pin ``KiroCrewConfig.load().mcp_gateway.poolable_servers``."""
-    import kiro_crew.config.loader as loader
-
-    def _set(names: list[str]) -> None:
-        cfg = SimpleNamespace(mcp_gateway=SimpleNamespace(poolable_servers=list(names)))
-        monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(lambda: cfg))
-
-    return _set
-
-
-class TestGatewayServers:
-    @pytest.mark.asyncio
-    async def test_missing_agents_dir_yields_no_rows(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poolable_allowlist
-    ) -> None:
-        import kiro_crew.agent as agent_mod
-
-        poolable_allowlist([])
-        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path / "absent")
-        resp = await mcp_mod.api_mcp_gateway_servers(_request())
-        assert resp.status == 200
-        assert _payload(resp) == {"servers": []}
-
-    @pytest.mark.asyncio
-    async def test_dedupes_across_agents_and_computes_effective_poolability(
-        self, agents_dir: Path, poolable_allowlist
-    ) -> None:
-        poolable_allowlist(["allowed-mcp"])
-        (agents_dir / "a.json").write_text(
-            json.dumps(
-                {
-                    "name": "alpha",
-                    "mcpServers": {
-                        "allowed-mcp": {"command": "run"},
-                        "opted-in": {"command": "run", "poolable": True},
-                        "plain": {"command": "run"},
-                        "remote": {"url": "https://example.invalid/sse"},
-                        "junk": "not-a-mapping",
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        (agents_dir / "b.json").write_text(
-            json.dumps({"name": "beta", "mcpServers": {"allowed-mcp": {"command": "run"}}}),
-            encoding="utf-8",
-        )
-        resp = await mcp_mod.api_mcp_gateway_servers(_request())
-        rows = {r["name"]: r for r in _payload(resp)["servers"]}
-
-        assert "junk" not in rows  # non-mapping entries are ignored
-        assert rows["allowed-mcp"]["agents"] == ["alpha", "beta"]  # deduped + sorted
-        assert rows["allowed-mcp"]["poolable"] is True
-        assert rows["allowed-mcp"]["in_allowlist"] is True
-        # Entry-level opt-in is sufficient without the allowlist.
-        assert rows["opted-in"]["poolable"] is True
-        assert rows["opted-in"]["in_allowlist"] is False
-        assert rows["opted-in"]["entry_poolable"] is True
-        # Neither allowlisted nor opted in.
-        assert rows["plain"]["poolable"] is False
-        # HTTP/SSE transports are shared by nature, never pooled.
-        assert rows["remote"]["transport"] == "http"
-        assert rows["remote"]["poolable"] is False
-        assert list(rows) == sorted(rows)  # response is name-sorted
-
-    @pytest.mark.asyncio
-    async def test_denylisted_server_can_never_be_pooled(
-        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch, poolable_allowlist
-    ) -> None:
-        from kiro_crew.mcp_gateway import rewriter
-
-        monkeypatch.setattr(rewriter, "UNPOOLABLE_SERVERS", frozenset({"never-mcp"}))
-        poolable_allowlist(["never-mcp"])
-        (agents_dir / "a.json").write_text(
-            json.dumps(
-                {
-                    "name": "alpha",
-                    "mcpServers": {"never-mcp": {"command": "run", "poolable": True}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        rows = {
-            r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
-        }
-        assert rows["never-mcp"]["denylisted"] is True
-        assert rows["never-mcp"]["poolable"] is False
-
-    @pytest.mark.asyncio
-    async def test_unreadable_and_non_object_agent_files_are_skipped(
-        self, agents_dir: Path, poolable_allowlist
-    ) -> None:
-        poolable_allowlist([])
-        (agents_dir / "broken.json").write_text("{oops", encoding="utf-8")
-        (agents_dir / "list.json").write_text("[1, 2]", encoding="utf-8")
-        (agents_dir / "nomcp.json").write_text(
-            json.dumps({"name": "x", "mcpServers": "wrong-type"}), encoding="utf-8"
-        )
-        (agents_dir / "ok.json").write_text(
-            json.dumps({"mcpServers": {"good": {"command": "run"}}}), encoding="utf-8"
-        )
-        rows = _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
-        assert [r["name"] for r in rows] == ["good"]
-        # No "name" key in ok.json → the file stem is used as the agent label.
-        assert rows[0]["agents"] == ["ok"]
-
-
-# ── POST /api/mcp-gateway/servers/poolable ──────────────────────────────
-
-
-class TestGatewaySetPoolable:
-    @pytest.mark.asyncio
-    async def test_invalid_json_is_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request(ValueError("boom"), state=SimpleNamespace())
-        )
-        assert resp.status == 400
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "body,expected",
-        [
-            ({"poolable": True}, "name is required"),
-            ({"name": "../evil", "poolable": True}, "invalid server name"),
-            ({"name": "ok-mcp", "poolable": "yes"}, "poolable must be a boolean"),
-            ({"name": "ok-mcp"}, "poolable must be a boolean"),
-        ],
-    )
-    async def test_validation_matrix_is_400(
-        self, monkeypatch: pytest.MonkeyPatch, body: dict, expected: str
-    ) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request(body, state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert expected in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_corrupt_config_json_is_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{ nope", encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "ok-mcp", "poolable": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 500
-        assert "corrupt" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_non_object_section_is_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"mcp_gateway": []}), encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "ok-mcp", "poolable": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 500
-        assert "not an object" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_persists_allowlist_without_an_apply_callback(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """With the gateway unwired the allowlist is persisted, applied=False."""
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "ok-mcp", "poolable": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
+        # The raw exception text stays server-side (in the SEL log below); the
+        # verbatim-rendered client body gets a generic message + machine code.
         body = _payload(resp)
-        assert body == {
-            "ok": True,
-            "name": "ok-mcp",
-            "poolable": True,
-            "applied": False,
-        }
-        saved = json.loads(config_path().read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["poolable_servers"] == ["ok-mcp"]
-
-    @pytest.mark.asyncio
-    async def test_removal_dedupes_and_drops_non_string_entries(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {"mcp_gateway": {"poolable_servers": ["b-mcp", "a-mcp", "a-mcp", 7]}}
-            ),
-            encoding="utf-8",
-        )
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "a-mcp", "poolable": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["poolable_servers"] == ["b-mcp"]
-
-    @pytest.mark.asyncio
-    async def test_apply_result_is_merged_into_the_response(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        apply_cb = AsyncMock(return_value={"applied": True, "sessions_relinked": 2})
-        state = SimpleNamespace(_mcp_gateway_apply_poolable=apply_cb)
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "ok-mcp", "poolable": True}, state=state)
-        )
-        assert resp.status == 200
-        assert _payload(resp)["sessions_relinked"] == 2
-        apply_cb.assert_awaited_once_with()
-
-    @pytest.mark.asyncio
-    async def test_apply_failure_is_500_and_audited(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.config.loader import config_path
-
-        sel = MagicMock()
-        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
-        state = SimpleNamespace(
-            _mcp_gateway_apply_poolable=AsyncMock(side_effect=RuntimeError("relink"))
-        )
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "ok-mcp", "poolable": True}, state=state)
-        )
-        assert resp.status == 500
-        assert "relink" in _payload(resp)["error"]
-        # The config write happens BEFORE apply, so it survives the failure.
-        saved = json.loads(config_path().read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["poolable_servers"] == ["ok-mcp"]
+        assert "broker died" not in body["error"]
+        assert body["error"] == "apply failed"
+        assert body["code"] == "mcp_apply_failed"
         outcomes = [c.kwargs.get("outcome") for c in sel.log_api_access.call_args_list]
         assert "error" in outcomes
-
-
-# ── the batch ("toggle all") form of the same endpoint ──────────────────
-
-
-class TestGatewaySetPoolableBatch:
-    """``{"names": [...]}`` writes the allowlist once for the whole set."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "body,expected",
-        [
-            ({"names": "a-mcp", "poolable": True}, "names must be a list of strings"),
-            (
-                {"names": ["a-mcp", 7], "poolable": True},
-                "names must be a list of strings",
-            ),
-            ({"names": [], "poolable": True}, "names is required"),
-            ({"names": ["  "], "poolable": True}, "names is required"),
-            ({"names": ["../evil"], "poolable": True}, "invalid server name"),
-            ({"names": ["a-mcp"]}, "poolable must be a boolean"),
-        ],
-    )
-    async def test_validation_matrix_is_400(
-        self, monkeypatch: pytest.MonkeyPatch, body: dict, expected: str
-    ) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request(body, state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert expected in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_oversized_batch_is_400(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        names = [f"srv{i}-mcp" for i in range(mcp_mod._MAX_POOLABLE_BATCH + 1)]
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"names": names, "poolable": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert "at most" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_non_object_body_is_400(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request(["a-mcp"], state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert "object" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_adds_every_name_in_one_write(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"mcp_gateway": {"poolable_servers": ["kept-mcp"]}}),
-            encoding="utf-8",
-        )
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request(
-                {"names": ["b-mcp", "a-mcp", "a-mcp"], "poolable": True},
-                state=SimpleNamespace(),
-            )
-        )
-        assert resp.status == 200
-        # The batch form answers with `names`, never a single `name`.
-        assert _payload(resp) == {
-            "ok": True,
-            "names": ["b-mcp", "a-mcp", "a-mcp"],
-            "poolable": True,
-            "applied": False,
-        }
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["poolable_servers"] == [
-            "a-mcp",
-            "b-mcp",
-            "kept-mcp",
-        ]
-
-    @pytest.mark.asyncio
-    async def test_removes_every_name_and_leaves_the_rest(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {"mcp_gateway": {"poolable_servers": ["a-mcp", "b-mcp", "kept-mcp", 7]}}
-            ),
-            encoding="utf-8",
-        )
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request(
-                # A name that is not in the allowlist must not fail the batch.
-                {"names": ["a-mcp", "b-mcp", "absent-mcp"], "poolable": False},
-                state=SimpleNamespace(),
-            )
-        )
-        assert resp.status == 200
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["poolable_servers"] == ["kept-mcp"]
-
-    @pytest.mark.asyncio
-    async def test_re_applies_the_pool_once_for_the_whole_batch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """N names must not mean N re-links — that is the point of the form."""
-        sel = MagicMock()
-        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
-        apply_cb = AsyncMock(return_value={"applied": True, "sessions_relinked": 3})
-        state = SimpleNamespace(_mcp_gateway_apply_poolable=apply_cb)
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"names": ["a-mcp", "b-mcp"], "poolable": True}, state=state)
-        )
-        assert resp.status == 200
-        assert _payload(resp)["sessions_relinked"] == 3
-        apply_cb.assert_awaited_once_with()
-        # The audit names every server the request touched, not just the first.
-        audited = [c.kwargs.get("resources") for c in sel.log_api_access.call_args_list]
-        assert any("names=a-mcp,b-mcp" in (r or "") for r in audited)
-
-    @pytest.mark.asyncio
-    async def test_single_name_form_still_answers_with_name(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """`names` absent keeps the pre-existing single-server contract."""
-        sel = MagicMock()
-        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
-        resp = await mcp_mod.api_mcp_gateway_set_poolable(
-            _request({"name": "ok-mcp", "poolable": True}, state=SimpleNamespace())
-        )
-        assert _payload(resp) == {
-            "ok": True,
-            "name": "ok-mcp",
-            "poolable": True,
-            "applied": False,
-        }
-        audited = [c.kwargs.get("resources") for c in sel.log_api_access.call_args_list]
-        assert any("name=ok-mcp" in (r or "") for r in audited)
-
-
-# ── the synchronous cleanup-sweep file lock ─────────────────────────────
-
-
-class TestSyncFileLock:
-    def test_creates_the_lock_sidecar_and_releases_it(
-        self, sandbox: SimpleNamespace
-    ) -> None:
-        """The sweep's lock must be re-entrant across sequential acquires."""
-        lock_path = mcp_mod._MCP_LOCK_PATH
-        assert not lock_path.exists()
-        with mcp_mod._get_mcp_lock_sync():
-            assert lock_path.exists()
-        # Released: a second acquire in the same process must not block.
-        with mcp_mod._get_mcp_lock_sync():
-            assert lock_path.exists()
-
-    @pytest.mark.asyncio
-    async def test_async_lock_shares_the_same_sidecar(
-        self, sandbox: SimpleNamespace
-    ) -> None:
-        async with mcp_mod._get_mcp_lock():
-            assert mcp_mod._MCP_LOCK_PATH.exists()
-        with mcp_mod._get_mcp_lock_sync():
-            pass
-
-
-# ── POST /api/mcp-gateway/apps-enable ───────────────────────────────────
-
-
-class TestGatewayAppsEnable:
-    @pytest.mark.asyncio
-    async def test_invalid_json_is_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request(ValueError("boom"), state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert _payload(resp)["error"] == "invalid JSON"
-
-    @pytest.mark.asyncio
-    async def test_non_object_body_is_400_not_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A JSON array parses fine but has no ``.get``.
-
-        Without a type check the handler raises AttributeError and the client
-        sees a 500 for what is a malformed request.
-        """
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request([{"enabled": True}], state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert "JSON object" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_non_boolean_is_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A truthy STRING must be refused, not coerced.
-
-        ``bool("false")`` is True, so accepting a string here would let a
-        malformed client turn rendering ON while asking for it off.
-        """
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": "false"}, state=SimpleNamespace())
-        )
-        assert resp.status == 400
-        assert "boolean" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_corrupt_config_json_is_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{ nope", encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 500
-        assert "corrupt" in _payload(resp)["error"]
-
-    @pytest.mark.asyncio
-    async def test_write_failure_is_a_coded_500_and_never_reports_success(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A failed write must not be reported as a landed opt-out.
-
-        Asserts the whole contract, not just the status: non-2xx, a machine-
-        readable code, and an ``error`` SEL outcome rather than ``success`` —
-        otherwise a user believes server-authored UI is suppressed while it is
-        still rendering.
-        """
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        audit = MagicMock()
-        monkeypatch.setattr(mcp_mod, "sel", lambda: audit)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"mcp_gateway": {"enabled": True}}), encoding="utf-8")
-
-        def _boom(*_a: object, **_k: object) -> None:
-            raise OSError(28, "No space left on device")
-
-        # Patched on the HANDLER module, not on config.loader: the name is bound
-        # at module scope here, so patching the source module would not reach the
-        # reference this code actually calls.
-        monkeypatch.setattr(mcp_mod, "write_config_atomically", _boom)
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 500
-        assert _payload(resp)["code"] == "config_write_failed"
-        outcomes = [c.kwargs.get("outcome") for c in audit.log_api_access.call_args_list]
-        assert "error" in outcomes
-        assert "success" not in outcomes
-
-    @pytest.mark.asyncio
-    async def test_non_object_config_is_coded_500_not_attributeerror(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A top-level array is valid JSON but has no ``setdefault``."""
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("[]", encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 500
-        assert _payload(resp)["code"] == "config_corrupt"
-
-    @pytest.mark.asyncio
-    async def test_uses_the_mode_preserving_config_writer(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """config.json can hold inline credentials.
-
-        tmp+rename creates a NEW inode, so a writer defaulting to 0644 would
-        leave a freshly created config world-readable and later credential-bearing
-        saves would preserve that mode. Asserts the call site, because the mode
-        itself is not observable on every platform.
-        """
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
-        seen: list[object] = []
-        monkeypatch.setattr(
-            mcp_mod, "write_config_atomically", lambda p, d, **k: seen.append(p)
-        )
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
-        assert seen == [path]
-
-    @pytest.mark.asyncio
-    async def test_invalid_utf8_config_is_coded_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """UnicodeDecodeError is a ValueError, not an OSError or JSONDecodeError.
-
-        A tuple naming only those two lets invalid bytes escape as an uncoded 500.
-        """
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        monkeypatch.setattr(mcp_mod, "_apps_enabled_overlay_owned", lambda: False)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b'{"mcp_gateway": {"enabled": \xff\xfe}}')
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 500
-        assert _payload(resp)["code"] == "config_corrupt"
-
-    @pytest.mark.asyncio
-    async def test_overlay_owned_key_is_refused_not_silently_accepted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """config.local.json deep-merges OVER the base file this endpoint writes.
-
-        Accepting the write would return 200 for a change the gateway never
-        reads — the exact false-success this switch must not produce. Also
-        asserts the base file is left untouched and the refusal is audited.
-        """
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        audit = MagicMock()
-        monkeypatch.setattr(mcp_mod, "sel", lambda: audit)
-        monkeypatch.setattr(mcp_mod, "_apps_enabled_overlay_owned", lambda: True)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"mcp_gateway": {"enabled": True}}), encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 409
-        assert _payload(resp)["code"] == "apps_enabled_overlay_owned"
-        assert "apps_enabled" not in _json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
-        outcomes = [c.kwargs.get("outcome") for c in audit.log_api_access.call_args_list]
-        assert outcomes == ["denied"]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("raw", ["0", "false", "off"])
-    async def test_enabling_against_env_off_is_refused(
-        self, monkeypatch: pytest.MonkeyPatch, raw: str
-    ) -> None:
-        """Only the INERT direction is refused.
-
-        ``KIROCREW_MCP_APPS`` off is an absolute kill switch, so asking to enable
-        here cannot take effect and a 200 would be a lie. Parametrised over the
-        recognised off-tokens so the handler cannot drift from the gate.
-        """
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        audit = MagicMock()
-        monkeypatch.setattr(mcp_mod, "sel", lambda: audit)
-        monkeypatch.setattr(mcp_mod, "_apps_enabled_overlay_owned", lambda: False)
-        monkeypatch.setenv("KIROCREW_MCP_APPS", raw)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"mcp_gateway": {"enabled": True}}), encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": True}, state=SimpleNamespace())
-        )
-        assert resp.status == 409
-        assert _payload(resp)["code"] == "apps_enabled_env_override"
-        assert "apps_enabled" not in _json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
-        assert [c.kwargs.get("outcome") for c in audit.log_api_access.call_args_list] == ["denied"]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("raw", ["1", "true", "YES", "0", "off"])
-    async def test_disabling_is_always_effective_whatever_the_env_says(
-        self, monkeypatch: pytest.MonkeyPatch, raw: str
-    ) -> None:
-        """Opting OUT must never be refused.
-
-        The gate is tightest-wins, so an explicit ``apps_enabled=false`` takes
-        effect regardless of the env flag. Refusing here would block the one
-        action a user most needs to be able to take.
-        """
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        monkeypatch.setattr(mcp_mod, "_apps_enabled_overlay_owned", lambda: False)
-        monkeypatch.setenv("KIROCREW_MCP_APPS", raw)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"mcp_gateway": {"enabled": True}}), encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
-        section = _json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
-        assert section["apps_enabled"] is False
-
-    @pytest.mark.asyncio
-    async def test_unrecognised_env_value_does_not_block_the_write(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Only RECOGNISED tokens pin the flag.
-
-        An unparseable value leaves the gate falling through to config, so the
-        write is effective and must not be refused.
-        """
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        monkeypatch.setattr(mcp_mod, "_apps_enabled_overlay_owned", lambda: False)
-        monkeypatch.setenv("KIROCREW_MCP_APPS", "maybe")
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"mcp_gateway": {}}), encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
-        section = _json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
-        assert section["apps_enabled"] is False
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("overlay_section", [None, "on", [], 3])
-    async def test_non_object_overlay_section_is_treated_as_owning_the_key(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path, overlay_section: object
-    ) -> None:
-        """A non-object ``mcp_gateway`` overlay masks the base opt-out.
-
-        ``_deep_merge`` REPLACES rather than merges a non-dict value, so the base
-        section is wiped wholesale; validation then strips the invalid value and
-        the dataclass defaults restore ``apps_enabled=True``. The key never
-        appears in the overlay, so a membership-only check misses it entirely and
-        the endpoint would report a landed opt-out that the gateway never reads.
-        """
-        import json as _json
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        overlay = tmp_path / "config.local.json"
-        overlay.write_text(_json.dumps({"mcp_gateway": overlay_section}), encoding="utf-8")
-        monkeypatch.setattr(mcp_mod, "config_local_path", lambda: overlay)
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 409
-        assert _payload(resp)["code"] == "apps_enabled_overlay_owned"
-
-    @pytest.mark.asyncio
-    async def test_overlay_without_the_section_does_not_block(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ) -> None:
-        """An overlay that says nothing about mcp_gateway leaves the write effective."""
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        overlay = tmp_path / "config.local.json"
-        overlay.write_text(_json.dumps({"dashboard": {"theme": "dark"}}), encoding="utf-8")
-        monkeypatch.setattr(mcp_mod, "config_local_path", lambda: overlay)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"mcp_gateway": {}}), encoding="utf-8")
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
-        assert _json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]["apps_enabled"] is False
-
-    @pytest.mark.asyncio
-    async def test_persists_flag_and_leaves_pooling_untouched(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The render switch must not disturb the pooling opt-in beside it."""
-        import json as _json
-
-        from kiro_crew.config.loader import config_path
-
-        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            _json.dumps({"mcp_gateway": {"enabled": True, "poolable_servers": ["a"]}}),
-            encoding="utf-8",
-        )
-        resp = await mcp_mod.api_mcp_gateway_apps_enable(
-            _request({"enabled": False}, state=SimpleNamespace())
-        )
-        assert resp.status == 200
-        assert _payload(resp) == {"ok": True, "enabled": False}
-        section = _json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
-        assert section["apps_enabled"] is False
-        assert section["enabled"] is True
-        assert section["poolable_servers"] == ["a"]

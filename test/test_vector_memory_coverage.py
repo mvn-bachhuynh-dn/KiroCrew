@@ -1,14 +1,19 @@
 """Coverage-focused tests for the less-travelled paths of ``vector_memory``.
 
-The store's happy paths are already covered by ``test_vector_memory.py``. This
-module targets the branches that only fire on legacy/degraded input: the legacy
-markdown migration, the export/import round trip, episodic promotion, the
-keyword fallback, the embedding backfill sweeps, and the many "value on disk is
-not what the writer promised" recovery paths.
+The store's happy paths are already covered by ``test_vector_memory.py`` and the
+topic files its docstring names. This module targets the branches that only fire
+on legacy/degraded input: the legacy markdown migration, the export/import round
+trip, episodic promotion, the keyword fallback, the embedding backfill sweeps,
+and the many "value on disk is not what the writer promised" recovery paths.
 
 Everything runs against a fresh SQLite file under ``tmp_path`` with a
 deterministic in-process embedder — no network, no model download, no FAISS
 requirement.
+
+The module's "Additional coverage" section -- further vector-space lifecycle,
+lesson-dedup and ranking cases -- is in ``test_vector_memory_coverage_vector_space.py``;
+the store and embedder builders both modules use are in
+``vector_memory_coverage_helpers.py``.
 """
 
 from __future__ import annotations
@@ -20,48 +25,18 @@ from pathlib import Path
 from typing import Callable
 
 import pytest
+from vector_memory_coverage_helpers import (
+    _DIM,
+    _episodic_texts,
+    _fixed_embed,
+    _lesson_texts,
+    _raw_semantic_embedding,
+    _recorder,
+    _store,
+)
 
 from kiro_crew import vector_memory as vm
 from kiro_crew.vector_memory import VectorMemoryStore
-
-_DIM = 8
-
-
-def _store(tmp_path: Path, *, episodic_max: int = 10_000) -> VectorMemoryStore:
-    store = VectorMemoryStore(
-        db_path=tmp_path / "mem.db", embedding_dim=_DIM, episodic_max=episodic_max
-    )
-    store.init()
-    return store
-
-
-def _fixed_embed(value: float = 0.5, dim: int = _DIM) -> Callable[[str], list[float] | None]:
-    """A deterministic embedder: every text maps to the same unit-able vector."""
-    return lambda _text: [value] * dim
-
-
-def _recorder(sink: list[tuple[int, int]]) -> Callable[[int, int], None]:
-    """A ``progress(done, total)`` callback that records every report."""
-
-    def _record(done: int, total: int) -> None:
-        sink.append((done, total))
-
-    return _record
-
-
-def _raw_semantic_embedding(store: VectorMemoryStore, key: str) -> bytes | None:
-    row = store.db.execute(
-        "SELECT embedding FROM semantic_memory WHERE key = ?", (key,)
-    ).fetchone()
-    return None if row is None else row["embedding"]
-
-
-def _episodic_texts(store: VectorMemoryStore, *, deleted: bool = False) -> list[str]:
-    rows = store.db.execute(
-        "SELECT text FROM episodic_memories WHERE is_deleted = ? ORDER BY created_at",
-        (1 if deleted else 0,),
-    ).fetchall()
-    return [r["text"] for r in rows]
 
 
 class TestMigrateV2:
@@ -371,8 +346,7 @@ class TestDeleteLesson:
         assert store.write_lesson("Always pin the release tag before publishing a wheel")
         assert store.write_lesson("Never bind a diagnostic server to a public interface")
         assert store.delete_lesson("RELEASE TAG") is True
-        remaining = [json.loads(e["value_json"]) for e in store.get_lessons()]
-        assert remaining == ["Never bind a diagnostic server to a public interface"]
+        assert _lesson_texts(store) == ["Never bind a diagnostic server to a public interface"]
 
     def test_no_match_reports_false(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -473,6 +447,25 @@ class TestBackfillSweeps:
         blob = _raw_semantic_embedding(store, key)
         assert blob is not None and len(blob) == _DIM * 4
 
+    def test_backfill_embeds_the_bare_rule_matching_the_write_path(self, tmp_path: Path) -> None:
+        """write_lesson embeds only the rule, so a backfilled mapping row must
+        embed the same input -- embedding rule+clause would put its vector in a
+        different space than the query vectors it is compared against."""
+        store = _store(tmp_path)
+        assert store.write_lesson("Pin the port", "tool", "Do not autopick")
+        key = store.get_lessons()[0]["key"]
+        assert _raw_semantic_embedding(store, key) is None
+
+        embedded_inputs: list[str] = []
+
+        def _capture(text: str) -> list[float]:
+            embedded_inputs.append(text)
+            return [0.5] * _DIM
+
+        store.embed_fn = _capture
+        assert store._backfill_lesson_embeddings() == 1
+        assert embedded_inputs == ["Pin the port"]
+
     def test_lessons_with_unparseable_values_are_skipped(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         assert store.write_lesson("Always squash a review branch down to one commit")
@@ -511,7 +504,7 @@ class TestLessonDedup:
         assert store.write_lesson(
             "Always pin the release tag before publishing a wheel to the CDN"
         )
-        assert store.write_lesson("pin the release tag") is False
+        assert store.write_lesson("pin the release tag").wrote is False
         assert len(store.get_lessons()) == 1
 
     def test_a_longer_rule_replaces_the_lesson_it_contains(self, tmp_path: Path) -> None:
@@ -520,8 +513,7 @@ class TestLessonDedup:
         assert store.write_lesson(
             "Always pin the release tag before publishing a wheel to the CDN"
         )
-        remaining = [json.loads(e["value_json"]) for e in store.get_lessons()]
-        assert remaining == ["Always pin the release tag before publishing a wheel to the CDN"]
+        assert _lesson_texts(store) == ["Always pin the release tag before publishing a wheel to the CDN"]
 
     def test_an_unpackable_stored_vector_does_not_break_the_dedup_scan(
         self, tmp_path: Path
@@ -606,6 +598,78 @@ class TestKeywordFallback:
         )
         hits = store.search_episodic(query_text="deployment", limit=5, tag_filter=["ops"])
         assert [h["text"] for h in hits] == ["A fragment about the nightly deployment pipeline"]
+
+
+class TestCosineSimDimensionGuard:
+    """`_cosine_sim` must not silently truncate a
+    dimension-mismatched pair via `zip` instead of rejecting it, so a row
+    embedded at a different dimensionality (e.g. a leftover from a previous
+    embedding-model generation) returned a plausible-looking partial-overlap
+    score instead of 0.0."""
+
+    def test_mismatched_length_scores_zero(self) -> None:
+        a = [1.0, 0.0, 0.0, 0.0]
+        b = [1.0, 0.0, 0.0]  # one dimension short
+        assert VectorMemoryStore._cosine_sim(a, b) == 0.0
+
+    def test_matching_length_is_unaffected(self) -> None:
+        a = [1.0, 0.0, 0.0, 0.0]
+        b = [1.0, 0.0, 0.0, 0.0]
+        assert VectorMemoryStore._cosine_sim(a, b) == pytest.approx(1.0)
+
+    def test_zero_vector_still_scores_zero_not_a_zerodivisionerror(self) -> None:
+        assert VectorMemoryStore._cosine_sim([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+
+class TestStoredSimilarityScorer:
+    """The scorer built by `_stored_similarity_scorer`
+    backs the two threshold callers (semantic dedup, contradiction detection)
+    as well as the two ranking callers, so it must (1) reject a mismatched
+    dimension the same way `_cosine_sim` now does, (2) return the raw
+    (possibly negative) cosine value rather than clamping at 0.0 -- a
+    threshold caller comparing against a band that may include non-positive
+    bounds needs the true value, and (3) agree with `_cosine_sim` to float64
+    precision, not the ~1e-7 the numpy path's old float32 accumulation gave.
+    """
+
+    def _row(self, vec: list) -> dict:
+        import struct
+
+        return {"embedding": struct.pack(f"{len(vec)}f", *vec)}
+
+    @pytest.mark.parametrize("has_numpy", [True, False])
+    def test_mismatched_dimension_row_scores_zero(self, monkeypatch, has_numpy) -> None:
+        monkeypatch.setattr(vm, "_HAS_NUMPY", has_numpy and vm._HAS_NUMPY)
+        query = [1.0, 0.0, 0.0]
+        scorer = VectorMemoryStore._stored_similarity_scorer(query)
+        assert scorer(self._row([1.0, 0.0])) == 0.0  # one short
+        assert scorer(self._row([1.0, 0.0, 0.0, 0.0])) == 0.0  # one long
+
+    @pytest.mark.parametrize("has_numpy", [True, False])
+    def test_negative_cosine_is_returned_uncapped(self, monkeypatch, has_numpy) -> None:
+        monkeypatch.setattr(vm, "_HAS_NUMPY", has_numpy and vm._HAS_NUMPY)
+        query = [1.0, 0.0]
+        scorer = VectorMemoryStore._stored_similarity_scorer(query)
+        # Exactly opposite direction -> cosine == -1.0, not clamped to 0.0.
+        assert scorer(self._row([-1.0, 0.0])) == pytest.approx(-1.0)
+
+    @pytest.mark.parametrize("has_numpy", [True, False])
+    def test_agrees_with_cosine_sim_on_a_normal_pair(self, monkeypatch, has_numpy) -> None:
+        monkeypatch.setattr(vm, "_HAS_NUMPY", has_numpy and vm._HAS_NUMPY)
+        query = [0.37, -1.2, 0.05, 2.1, 0.0, -0.9]
+        row = [1.1, 0.3, -0.4, 0.02, 0.6, -1.5]
+        scorer = VectorMemoryStore._stored_similarity_scorer(query)
+        got = scorer(self._row(row))
+        want = VectorMemoryStore._cosine_sim(query, row)
+        # float32-stored row (as every scorer input is) vs the float64-list
+        # _cosine_sim compares against: agreement is bounded by the storage
+        # round-trip precision, not by the scorer's own arithmetic anymore.
+        assert got == pytest.approx(want, abs=1e-6)
+
+    def test_no_query_embedding_returns_a_constant_zero_scorer(self) -> None:
+        scorer = VectorMemoryStore._stored_similarity_scorer(None)
+        assert scorer(self._row([1.0, 0.0])) == 0.0
+        assert scorer({}) == 0.0
 
 
 class TestEpisodicPromotion:
@@ -905,557 +969,3 @@ class TestObservability:
         )
         assert preview["lessons_count"] == 1
         assert "vim" in preview["semantic_preview"]
-
-
-# ── Additional coverage: vector-space lifecycle, lesson dedup, ranking ──
-
-
-def _unit(index: int) -> list[float]:
-    """A basis vector of width ``_DIM``, orthogonal to every other basis vector."""
-    vec = [0.0] * _DIM
-    vec[index % _DIM] = 1.0
-    return vec
-
-
-class _TableEmbedder:
-    """Exact-text lookup embedder, so a test can pin two texts at a chosen cosine.
-
-    Falls back to a deterministic, process-independent vector for any text not in
-    the table (``hash()`` is salted per process and would make tests order- and
-    run-dependent).
-    """
-
-    def __init__(self, table: dict[str, list[float]] | None = None) -> None:
-        self.table = dict(table or {})
-        self.calls: list[str] = []
-
-    def __call__(self, text: str) -> list[float] | None:
-        self.calls.append(text)
-        if text in self.table:
-            return list(self.table[text])
-        vec = [0.0] * _DIM
-        for word in text.lower().split():
-            vec[sum(ord(ch) for ch in word) % _DIM] += 1.0
-        if not any(vec):
-            vec[0] = 1.0
-        return vec
-
-
-def _raw_episodic_embedding(store: VectorMemoryStore, mem_id: str) -> bytes | None:
-    row = store.db.execute(
-        "SELECT embedding FROM episodic_memories WHERE id = ?", (mem_id,)
-    ).fetchone()
-    return None if row is None else row["embedding"]
-
-
-def _lesson_key(rule: str) -> str:
-    import hashlib
-
-    return f"lesson.{hashlib.md5(rule.encode(), usedforsecurity=False).hexdigest()[:12]}"
-
-
-class TestFaissAbsentDegradation:
-    """FAISS is an optional accelerator, so every entry point must no-op without it."""
-
-    def test_build_save_and_load_are_noops(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(vm, "_HAS_FAISS", False)
-        store = _store(tmp_path)
-        assert store.build_faiss_index() == 0
-        store.save_faiss_index()
-        assert not (tmp_path / "memory.faiss").exists()
-        assert store.load_faiss_index() is False
-
-    def test_stats_report_an_empty_index(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_episodic("A fragment stored without any vector at all")
-        stats = store.memory_stats()
-        assert stats["episodic_active"] == 1
-        assert stats["faiss_index_size"] == 0
-        assert stats["embedded_count"] == 0
-
-
-class TestSqliteVectorSearchRanking:
-    """The stdlib cosine scan is the ranking path on a stock (FAISS-less) install."""
-
-    _EXACT = "Notes on the deployment pipeline rollout"
-    _HALF = "Notes on the kitchen renovation schedule"
-    _ORTHOGONAL = "Musings on the tidal patterns offshore"
-
-    def _seed(self, store: VectorMemoryStore) -> None:
-        vectors = {
-            self._EXACT: _unit(0),
-            self._HALF: [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            self._ORTHOGONAL: _unit(1),
-        }
-        for text, vec in vectors.items():
-            assert store.write_episodic(text, embedding=vec)
-
-    def test_results_are_ordered_by_similarity(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        self._seed(store)
-        hits = store.search_episodic(query_embedding=_unit(0), limit=5, mmr=False)
-        assert [h["text"] for h in hits] == [self._EXACT, self._HALF, self._ORTHOGONAL]
-        # Ordering rather than exact floats: strictly decreasing raw cosine.
-        assert hits[0]["cosine_sim"] > hits[1]["cosine_sim"] > hits[2]["cosine_sim"]
-
-    def test_limit_truncates_the_ranked_set(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        self._seed(store)
-        assert len(store.search_episodic(query_embedding=_unit(0), limit=1, mmr=False)) == 1
-
-    def test_mmr_rerank_preserves_membership(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        self._seed(store)
-        hits = store.search_episodic(query_embedding=_unit(0), limit=5, mmr=True)
-        assert {h["text"] for h in hits} == {self._EXACT, self._HALF, self._ORTHOGONAL}
-
-    def test_relevance_gate_drops_weak_short_matches(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        self._seed(store)
-        kept = [
-            h["text"]
-            for h in store.search_episodic(
-                query_embedding=_unit(0), limit=5, mmr=False, relevance_filter=True
-            )
-        ]
-        assert kept == [self._EXACT]
-
-    def test_relevance_gate_relaxes_for_long_text(self, tmp_path: Path) -> None:
-        """The same cosine that fails the short-text gate passes the long-text one."""
-        store = _store(tmp_path)
-        long_text = "Long form retrospective paragraph about the rollout. " * 8
-        assert len(long_text) > vm._EPISODIC_LONG_TEXT_CHARS
-        assert store.write_episodic(
-            long_text, embedding=[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-        )
-        hits = store.search_episodic(
-            query_embedding=_unit(0), limit=5, mmr=False, relevance_filter=True
-        )
-        assert [h["text"].strip() for h in hits] == [long_text.strip()]
-
-    def test_a_zero_norm_query_does_not_divide(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        self._seed(store)
-        hits = store.search_episodic(query_embedding=[0.0] * _DIM, limit=5, mmr=False)
-        assert len(hits) == 3
-        assert all(h["cosine_sim"] == 0.0 for h in hits)
-
-    def test_a_hit_records_its_access_timestamp(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        self._seed(store)
-        hit = store.search_episodic(query_embedding=_unit(0), limit=1, mmr=False)[0]
-        row = store.db.execute(
-            "SELECT last_accessed_at FROM episodic_memories WHERE id = ?", (hit["id"],)
-        ).fetchone()
-        assert row["last_accessed_at"] is not None
-
-    def test_a_second_search_is_debounced_not_rewritten(self, tmp_path: Path) -> None:
-        """Proven by DB state, with no wall-clock dependency: the row is untouched."""
-        store = _store(tmp_path)
-        self._seed(store)
-        hit = store.search_episodic(query_embedding=_unit(0), limit=1, mmr=False)[0]
-        store.db.execute(
-            "UPDATE episodic_memories SET last_accessed_at = 'SENTINEL' WHERE id = ?",
-            (hit["id"],),
-        )
-        store.db.commit()
-        store.search_episodic(query_embedding=_unit(0), limit=1, mmr=False)
-        row = store.db.execute(
-            "SELECT last_accessed_at FROM episodic_memories WHERE id = ?", (hit["id"],)
-        ).fetchone()
-        assert row["last_accessed_at"] == "SENTINEL"
-
-
-class TestEpisodicCapEnforcement:
-    def test_the_cap_tombstones_the_least_important_entry(self, tmp_path: Path) -> None:
-        store = _store(tmp_path, episodic_max=2)
-        assert store.write_episodic("The least important fragment of the three", importance=0.1)
-        assert store.write_episodic("The middling fragment of the three here", importance=0.5)
-        assert store.write_episodic("The most important fragment of the three", importance=0.9)
-        active = _episodic_texts(store)
-        assert "The least important fragment of the three" not in active
-        assert len(active) == 2
-
-    def test_preserve_existing_refuses_rather_than_evicting(self, tmp_path: Path) -> None:
-        store = _store(tmp_path, episodic_max=1)
-        assert store.write_episodic("The only fragment that fits under the cap")
-        assert not store.write_episodic(
-            "A second fragment the cap must refuse", preserve_existing=True
-        )
-        assert _episodic_texts(store) == ["The only fragment that fits under the cap"]
-
-
-class TestLessonDedupPaths:
-    def test_a_substring_of_an_existing_lesson_is_dropped(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("Always pin dependency versions in the manifest")
-        assert not store.write_lesson("pin dependency versions")
-        assert len(store.get_lessons()) == 1
-
-    def test_a_superstring_replaces_the_existing_lesson(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("pin dependency versions")
-        assert store.write_lesson("Always pin dependency versions in the manifest")
-        lessons = store.get_lessons()
-        assert len(lessons) == 1
-        assert "manifest" in json.loads(lessons[0]["value_json"])
-
-    def test_topic_overlap_replaces_the_older_lesson(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("Rebase feature branches before pushing them")
-        assert store.write_lesson("Rebase branches before pushing, never merge upward")
-        lessons = store.get_lessons()
-        assert len(lessons) == 1
-        assert "never merge upward" in json.loads(lessons[0]["value_json"])
-
-    def test_a_negative_example_is_appended_to_the_value(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("Quote shell arguments", negative="bare interpolation")
-        assert "NOT: bare interpolation" in json.loads(store.get_lessons()[0]["value_json"])
-
-    def test_a_non_user_source_lowers_the_confidence(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("Quote every shell argument you interpolate", source="migration")
-        assert store.get_lessons()[0]["confidence"] == 0.9
-
-    def test_semantic_dedup_keeps_the_longer_rule(self, tmp_path: Path) -> None:
-        """Distinct wording, identical vectors: only the cosine path can dedup these."""
-        short_rule = "Zebra crossings need beacons"
-        long_rule = "Submarine hatches demand orange lanterns for visibility"
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder({short_rule: _unit(0), long_rule: _unit(0)})
-        assert store.write_lesson(short_rule)
-        assert store.write_lesson(long_rule)
-        assert [json.loads(e["value_json"]) for e in store.get_lessons()] == [long_rule]
-
-    def test_semantic_dedup_rejects_the_shorter_rule(self, tmp_path: Path) -> None:
-        long_rule = "Submarine hatches demand orange lanterns for visibility"
-        short_rule = "Zebra crossings need beacons"
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder({short_rule: _unit(0), long_rule: _unit(0)})
-        assert store.write_lesson(long_rule)
-        assert not store.write_lesson(short_rule)
-        assert [json.loads(e["value_json"]) for e in store.get_lessons()] == [long_rule]
-
-    def test_the_rule_vector_is_persisted(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder()
-        assert store.write_lesson("Quote every shell argument you interpolate")
-        blob = _raw_semantic_embedding(store, store.get_lessons()[0]["key"])
-        assert blob is not None and len(blob) == _DIM * 4
-
-    def test_an_unpackable_stored_vector_does_not_stop_the_write(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("Quote every shell argument you interpolate")
-        store.db.execute(
-            "UPDATE semantic_memory SET embedding = ? WHERE key = ?",
-            (b"\x00\x01\x02\x03\x04", store.get_lessons()[0]["key"]),
-        )
-        store.db.commit()
-        store.embed_fn = _TableEmbedder()
-        assert store.write_lesson("Rotate the signing credentials every ninety days")
-        assert len(store.get_lessons()) == 2
-
-    def test_lazy_vector_backfill_is_capped_per_call(self, tmp_path: Path) -> None:
-        """Legacy NULL-vector lessons are repaired inline, but only a few per write."""
-        legacy = [
-            "Alpha zeppelins hover",
-            "Beta walruses migrate",
-            "Gamma turbines whistle",
-            "Delta glaciers retreat",
-            "Epsilon orchids bloom",
-            "Zeta harbours silt",
-            "Eta volcanoes rumble",
-        ]
-        new_rule = "Theta lighthouses blink"
-        store = _store(tmp_path)
-        for rule in legacy:
-            assert store.write_lesson(rule)
-        assert all(e["embedding"] is None for e in store.get_lessons())
-
-        table = {rule: _unit(i) for i, rule in enumerate(legacy)}
-        table[new_rule] = _unit(7)
-        store.embed_fn = _TableEmbedder(table)
-        assert store.write_lesson(new_rule)
-
-        new_key = _lesson_key(new_rule)
-        backfilled = [
-            e
-            for e in store.get_lessons()
-            if e["key"] != new_key and e["embedding"] is not None
-        ]
-        assert len(backfilled) == vm._MAX_BACKFILLS_PER_CALL
-
-    def test_a_vector_from_a_previous_space_is_left_null(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder()
-        generation = store.space_generation
-        pre_embedded = store.embed_lesson("Quote every shell argument you interpolate")
-        assert pre_embedded is not None
-        store.begin_space_change()
-        assert store.write_lesson(
-            "Quote every shell argument you interpolate",
-            rule_emb=pre_embedded,
-            rule_emb_generation=generation,
-        )
-        assert _raw_semantic_embedding(store, store.get_lessons()[0]["key"]) is None
-
-    def test_embed_lesson_without_an_embedder_returns_none(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.embed_lesson("Quote every shell argument you interpolate") is None
-
-    def test_lessons_context_is_empty_without_lessons(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.get_lessons_context() == ""
-
-
-class TestContradictionCandidateBanding:
-    def test_no_embedder_yields_no_candidates(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_lesson("Quote every shell argument you interpolate")
-        assert store.find_contradiction_candidates("Never quote a shell argument") == []
-
-    def test_only_mid_band_similarities_are_returned(self, tmp_path: Path) -> None:
-        near = "Alpha zeppelins hover above harbours"
-        mid = "Beta walruses migrate through channels"
-        far = "Gamma turbines whistle in the valley"
-        probe = "Theta lighthouses blink at dusk"
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder(
-            {
-                near: _unit(0),
-                mid: [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                far: _unit(1),
-                probe: _unit(0),
-            }
-        )
-        for rule in (near, mid, far):
-            assert store.write_lesson(rule)
-        candidates = store.find_contradiction_candidates(probe)
-        # `near` is above the high threshold, `far` below the low one.
-        assert [c["rule"] for c in candidates] == [mid]
-        assert 0.4 <= candidates[0]["similarity"] < 0.85
-
-    def test_a_caller_supplied_vector_avoids_a_second_embed(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        embedder = _TableEmbedder()
-        store.embed_fn = embedder
-        assert store.write_lesson("Quote every shell argument you interpolate")
-        embedder.calls.clear()
-        store.find_contradiction_candidates("Theta lighthouses blink", rule_emb=_unit(3))
-        assert embedder.calls == []
-
-
-@pytest.mark.skipif(not vm._HAS_NUMPY, reason="the episodic backfill sweep needs numpy")
-class TestEpisodicBackfillSweep:
-    def test_deferred_rows_are_filled_and_progress_is_reported(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder()
-        for i in range(3):
-            assert store.write_episodic(
-                f"Deferred fragment number {i} awaiting its vector", defer_embedding=True
-            )
-        seen: list[tuple[int, int]] = []
-        assert store.backfill_missing_embeddings(progress=_recorder(seen)) == 3
-        assert seen[0] == (0, 3)
-        assert seen[-1] == (3, 3)
-        assert all(
-            _raw_episodic_embedding(store, r["id"]) is not None
-            for r in store.get_episodic_list()
-        )
-
-    def test_the_sweep_is_idempotent(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder()
-        assert store.write_episodic("A deferred fragment awaiting its vector", defer_embedding=True)
-        assert store.backfill_missing_embeddings() == 1
-        assert store.backfill_missing_embeddings() == 0
-
-    def test_backfilled_vectors_become_searchable(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder({"Deferred fragment awaiting its vector": _unit(0)})
-        assert store.write_episodic("Deferred fragment awaiting its vector", defer_embedding=True)
-        assert store.search_episodic(query_embedding=_unit(0), limit=5) == []
-        assert store.backfill_missing_embeddings() == 1
-        assert len(store.search_episodic(query_embedding=_unit(0), limit=5)) == 1
-
-
-class TestEmbeddingSpaceReconciliation:
-    def test_the_first_call_stamps_without_clearing(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_episodic("A fragment that already carries a vector", embedding=_unit(0))
-        assert store.recorded_embedding_space() is None
-        assert store.reconcile_embedding_space("sig-a") == 0
-        assert store.recorded_embedding_space() == "sig-a"
-        mem_id = store.get_episodic_list()[0]["id"]
-        assert _raw_episodic_embedding(store, mem_id) is not None
-
-    def test_a_matching_signature_is_a_noop(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.reconcile_embedding_space("sig-a")
-        assert store.write_episodic("A fragment that already carries a vector", embedding=_unit(0))
-        assert store.reconcile_embedding_space("sig-a") == 0
-        mem_id = store.get_episodic_list()[0]["id"]
-        assert _raw_episodic_embedding(store, mem_id) is not None
-
-    def test_a_changed_signature_clears_episodic_and_lesson_vectors(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn = _TableEmbedder()
-        store.reconcile_embedding_space("sig-a")
-        assert store.write_episodic("A fragment that already carries a vector", embedding=_unit(0))
-        assert store.write_lesson("Quote every shell argument you interpolate")
-        assert store.reconcile_embedding_space("sig-b") == 2
-        mem_id = store.get_episodic_list()[0]["id"]
-        assert _raw_episodic_embedding(store, mem_id) is None
-        assert _raw_semantic_embedding(store, store.get_lessons()[0]["key"]) is None
-        assert store.recorded_embedding_space() == "sig-b"
-
-    def test_an_unknown_space_can_be_cleared_explicitly(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.write_episodic("A fragment that already carries a vector", embedding=_unit(0))
-        assert store.reconcile_embedding_space("sig-a", clear_when_unknown=True) == 1
-        mem_id = store.get_episodic_list()[0]["id"]
-        assert _raw_episodic_embedding(store, mem_id) is None
-
-    def test_a_surviving_stale_index_leaves_the_signature_unstamped(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Stamping while a stale index survives would make the corruption permanent."""
-        store = _store(tmp_path)
-        store.reconcile_embedding_space("sig-a")
-        assert store.write_episodic("A fragment that already carries a vector", embedding=_unit(0))
-
-        def _refuse(self: Path, missing_ok: bool = False) -> None:
-            raise OSError("read-only directory")
-
-        monkeypatch.setattr(Path, "unlink", _refuse)
-        assert store.reconcile_embedding_space("sig-b") == 1
-        assert store.recorded_embedding_space() == "sig-a"
-
-    def test_a_store_with_no_vectors_still_records_the_change(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.reconcile_embedding_space("sig-a")
-        assert store.reconcile_embedding_space("sig-b") == 0
-        assert store.recorded_embedding_space() == "sig-b"
-
-
-class TestEmbeddingWidthAndGeneration:
-    def test_non_positive_and_unchanged_widths_are_rejected(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.set_embedding_dim(0) is False
-        assert store.set_embedding_dim(-1) is False
-        assert store.set_embedding_dim(_DIM) is False
-
-    def test_a_width_change_drops_the_in_memory_index(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        assert store.set_embedding_dim(_DIM * 2) is True
-        assert store.memory_stats()["faiss_index_size"] == 0
-
-    def test_the_generation_advances_on_a_space_change(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        before = store.space_generation
-        store.begin_space_change()
-        assert store.space_generation == before + 1
-
-    def test_a_vector_produced_across_a_swap_is_discarded(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-
-        def _swap_mid_embed(_text: str) -> list[float] | None:
-            store.begin_space_change()
-            return _unit(0)
-
-        store.embed_fn = _swap_mid_embed
-        assert store.write_episodic("A fragment embedded across a live model swap")
-        mem_id = store.get_episodic_list()[0]["id"]
-        assert _raw_episodic_embedding(store, mem_id) is None
-
-
-class TestEmbedFnLazyRebind:
-    """``embed_fn_factory`` recovers from a model that was absent at gateway boot.
-
-    Driven through ``import_memory``, which calls ``_try_embed`` unconditionally.
-    """
-
-    def _import_one(self, store: VectorMemoryStore, text: str) -> None:
-        store.import_memory({"episodic": [{"text": text}]})
-
-    def test_a_working_candidate_is_bound(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        embedder = _TableEmbedder()
-        store.embed_fn_factory = lambda: embedder
-        self._import_one(store, "A fragment imported after a lazy rebind")
-        assert store.embed_fn is embedder
-        mem_id = store.get_episodic_list()[0]["id"]
-        assert _raw_episodic_embedding(store, mem_id) is not None
-
-    def test_a_factory_returning_none_leaves_it_unbound(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn_factory = lambda: None
-        self._import_one(store, "A fragment imported while the factory yields nothing")
-        assert store.embed_fn is None
-
-    def test_a_candidate_whose_probe_returns_none_is_not_bound(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.embed_fn_factory = lambda: (lambda _text: None)
-        self._import_one(store, "A fragment imported while the probe returns nothing")
-        assert store.embed_fn is None
-
-    def test_a_candidate_whose_probe_returns_empty_is_not_bound(self, tmp_path: Path) -> None:
-        """A zero-width probe response is a misconfiguration, not a success."""
-        store = _store(tmp_path)
-        store.embed_fn_factory = lambda: (lambda _text: [])
-        self._import_one(store, "A fragment imported while the probe returns empty")
-        assert store.embed_fn is None
-
-    def test_a_candidate_whose_probe_raises_is_not_bound(self, tmp_path: Path) -> None:
-        def _explode(_text: str) -> list[float] | None:
-            raise RuntimeError("inference crashed")
-
-        store = _store(tmp_path)
-        store.embed_fn_factory = lambda: _explode
-        self._import_one(store, "A fragment imported while the probe explodes")
-        assert store.embed_fn is None
-
-    def test_the_cooldown_suppresses_a_second_factory_call(self, tmp_path: Path) -> None:
-        """At most one factory call per cooldown window, so a missing model is cheap."""
-        calls: list[int] = []
-
-        def _factory() -> Callable[[str], list[float] | None] | None:
-            calls.append(1)
-            return None
-
-        store = _store(tmp_path)
-        store.embed_fn_factory = _factory
-        store.import_memory(
-            {
-                "episodic": [
-                    {"text": "The first imported fragment triggering an attempt"},
-                    {"text": "The second imported fragment inside the cooldown"},
-                ]
-            }
-        )
-        assert len(calls) == 1
-
-
-class TestStoreLifecycle:
-    def test_using_a_closed_store_raises(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.close()
-        with pytest.raises(RuntimeError, match="not initialized"):
-            store.db.execute("SELECT 1")
-
-    def test_close_is_idempotent(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.close()
-        store.close()
-
-    def test_reopening_sees_the_prior_writes(self, tmp_path: Path) -> None:
-        store = _store(tmp_path)
-        store.set_semantic("pref.editor", "neovim", 0.95, "user_explicit")
-        store.close()
-        reopened = _store(tmp_path)
-        entry = reopened.get_semantic("pref.editor")
-        assert entry is not None and json.loads(entry["value_json"]) == "neovim"
-        reopened.close()

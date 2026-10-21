@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Wrench, Shield, Save, Check, X as XIcon } from 'lucide-react';
 import { SendBtn, Badge } from '../../components/ui';
 import DetailPanel from '../../components/DetailPanel';
+import ErrorNotice from '../../components/ErrorNotice';
 import type { TaskDetail } from '../../types';
 
 import { i18nT } from '../../i18n/t'
@@ -100,8 +101,8 @@ export default function TaskDetailPanel({ task, allTasks = [], onClose, onRetry,
   return (
     <DetailPanel
       title={editable
-        ? <>{typeIcon} {i18nT('pages.aidlc.taskDetailPanel.task')} {task.index}: <input aria-label={i18nT('pages.aidlc.taskDetailPanel.task_title')} value={editTitle} disabled={saving} onChange={e => { setEditTitle(e.target.value); reportEdit(e.target.value, editDesc, editDeps) }}
-            className="bg-transparent border-b border-accent text-text text-[14px] outline-none w-[200px]" /></>
+        ? <>{typeIcon} {i18nT('pages.aidlc.taskDetailPanel.task')} {task.index}: {/* focus-cue-ok: edit-mode field whose permanent accent underline (border-b border-accent) is the cue; a ring would double-paint it inside the panel title. */}<input aria-label={i18nT('pages.aidlc.taskDetailPanel.task_title')} value={editTitle} disabled={saving} onChange={e => { setEditTitle(e.target.value); reportEdit(e.target.value, editDesc, editDeps) }}
+            className="bg-transparent border-b border-accent text-text text-[14px] outline-hidden w-[200px]" /></>
         : <>{typeIcon} {i18nT('pages.aidlc.taskDetailPanel.task')} {task.index}: {task.title}</>}
       onClose={onClose}
       initialWidth={420}
@@ -138,14 +139,13 @@ export default function TaskDetailPanel({ task, allTasks = [], onClose, onRetry,
         {/* Description */}
         {editable ? (
           <textarea aria-label={i18nT('pages.aidlc.taskDetailPanel.task_description')} value={editDesc} disabled={saving} onChange={e => { setEditDesc(e.target.value); reportEdit(editTitle, e.target.value, editDeps) }}
-            className="w-full text-[13px] leading-relaxed bg-bg-elevated border border-border rounded-md p-2 text-text outline-none resize-y min-h-[80px]" />
+            className="w-full text-[13px] leading-relaxed bg-bg-elevated border border-border rounded-md p-2 text-text outline-hidden resize-y min-h-[80px] focus-ring" />
         ) : (
           <div className="text-[13px] leading-relaxed whitespace-pre-wrap">{task.description}</div>
         )}
 
-        {task.error && (
-          <div className="p-2.5 bg-danger/10 border border-danger/20 rounded-md text-[12px] text-danger">{task.error}</div>
-        )}
+        {/* No hand-off: this panel's title, description and dependency edits, and the page's pendingEdits for other tasks, are local until Save. */}
+        <ErrorNotice message={task.error} />
         {task.result && (
           <div className="p-2.5 bg-bg-elevated border rounded-md text-[12px] text-text whitespace-pre-wrap max-h-[300px] overflow-auto" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>{task.result}</div>
         )}

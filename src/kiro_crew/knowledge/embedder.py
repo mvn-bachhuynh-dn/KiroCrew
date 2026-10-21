@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING
 
 from kiro_crew import embeddings as _embeddings
+from kiro_crew.embeddings import PRIORITY_NORMAL
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.knowledge.chunker import CHUNK_OVERLAP, CHUNK_TOKEN_SIZE
 
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "qwen3-embedding:0.6b"
 # Retained for config compatibility (knowledge.embed_timeout_secs). The
 # in-process backend has no per-request network timeout — the value is stored
-# on the embedder but no longer bounds an HTTP call.
+# on the embedder but bounds no HTTP call.
 TIMEOUT = 10  # seconds
 NEGATIVE_CACHE_TTL = 300  # seconds before re-checking failed availability
 # Safety bound (chars) on chunk content folded into an item embedding.
@@ -67,6 +68,23 @@ class InProcessEmbedder:
         except Exception:
             return DEFAULT_MODEL
 
+    @property
+    def dim(self) -> int:
+        """Output width of the vectors this embedder produces.
+
+        Read from the active backend, which sets ``dim`` at construction — so
+        this costs no model load and is cheap on any startup path. It feeds
+        :func:`embed_signature`, which is why it must come from the backend
+        rather than from a local literal: a width change at a CONSTANT model id
+        (a custom GGUF re-quantized to a different projection, a backend that
+        adopts the model's own width) has to move the signature, or same-width
+        vectors from the old space keep being served as if nothing changed.
+        """
+        try:
+            return self._get_embedder().dim
+        except Exception:
+            return _embeddings.bundled_embedding_dim()
+
     def _get_embedder(self) -> "EmbeddingBackend":
         # Module-attribute lookup (not a from-import of the function) so test
         # patches of kiro_crew.embeddings.get_shared_embedder stay effective.
@@ -81,20 +99,58 @@ class InProcessEmbedder:
         TTL so we don't probe every call; positives are re-validated after
         the TTL too (a broken backend must not report available forever).
         """
-        if self._available is not None and (time.time() - self._last_check) < NEGATIVE_CACHE_TTL:
-            return self._available
+        cached = self._fresh_cached_availability()
+        if cached is not None:
+            return cached
         embedder = self._get_embedder()
+        can_load = getattr(embedder, "can_load_on_demand", None)
         if embedder.is_ready():
+            self._available = True
+        elif callable(can_load) and can_load():
+            # Not in memory, but an embed will load it. Reported available so a
+            # search gets semantic results (its embed waits for the load once)
+            # rather than a keyword-only answer. No load is started here: status
+            # and listing pages ask this too, and must not pull in ~1 GB.
             self._available = True
         else:
             # Non-blocking probe: kicks a background load if the model file
             # just landed; returns None (→ unavailable) until the load finishes.
-            vec = embedder.embed("_availability_probe")
+            # Bulk class so it never waits for the load (only interactive
+            # embeds do).
+            vec = embedder.embed("_availability_probe", priority=_embeddings.PRIORITY_BULK)
             self._available = vec is not None
         self._last_check = time.time()
         if not self._available:
             logger.info("Embedding model not yet available — knowledge embeddings disabled")
         return bool(self._available)
+
+    def wait_ready(self, timeout: float | None = None) -> bool:
+        """Wait for the shared backend in a synchronous, one-shot flow.
+
+        Normal Knowledge requests use :meth:`is_available` and never block on
+        model loading. Benchmarks and other one-shot CLI flows may opt into a
+        bounded wait. Backends without a blocking readiness seam retain the
+        non-blocking :meth:`~kiro_crew.embeddings.EmbeddingBackend.is_ready`
+        fallback required by the public backend contract.
+        """
+        backend = self._get_embedder()
+        wait_ready = getattr(backend, "wait_ready", None)
+        ready = wait_ready(timeout=timeout) if callable(wait_ready) else backend.is_ready()
+        self._available = bool(ready)
+        self._last_check = time.time()
+        return self._available
+
+    async def model_resident_async(self) -> bool:
+        """True only when the model is in memory now. Never starts a load.
+
+        For bulk corpus work (the watcher's self-heal re-embed). Its embeds use
+        the bulk class, which never waits for a load, so a sweep started while
+        the model is only loadable would fail every row. It must not start a
+        load either: the watcher asks on every pass, so a load here would bring
+        back an idle-unloaded model within one watcher interval. The sweep runs
+        on a later pass once a search or memory write has loaded the model.
+        """
+        return self._get_embedder().is_ready()
 
     async def is_available_async(self) -> bool:
         """Loop-safe :meth:`is_available` — runs the probe off-loop.
@@ -106,17 +162,51 @@ class InProcessEmbedder:
         embed still burns CPU — keep it on the ``mc-embed`` bulkhead pool.
         """
         # Fast path: cached result within TTL needs no thread hop.
-        if self._available is not None and (time.time() - self._last_check) < NEGATIVE_CACHE_TTL:
-            return self._available
+        cached = self._fresh_cached_availability()
+        if cached is not None:
+            return cached
         return await run_in_embed_pool(self.is_available)
 
-    def embed(self, text: str) -> list[float] | None:
-        """Embed a single text. Returns float list or None on failure."""
+    def _fresh_cached_availability(self) -> bool | None:
+        """The cached verdict while it is inside the TTL, else ``None``.
+
+        A cached ``False`` is checked against the backend's non-blocking
+        ``is_ready()`` first, so a model that finishes loading inside the TTL
+        is used at once instead of after the TTL runs out.
+        """
+        if self._available is None or (time.time() - self._last_check) >= NEGATIVE_CACHE_TTL:
+            return None
+        if not self._available and self._get_embedder().is_ready():
+            self._available = True
+            self._last_check = time.time()
+        return self._available
+
+    def prefetch(self) -> None:
+        """Let the shared model start loading before this search's embed. Never blocks.
+
+        Only a hint to the backend (see ``EmbeddingBackend.prefetch``): no result
+        changes, and any error is swallowed because the embed that follows makes
+        the same attempt and reports it the usual way.
+        """
+        try:
+            self._get_embedder().prefetch()
+        except Exception:  # noqa: BLE001
+            logger.debug("embedding prefetch failed", exc_info=True)
+
+    def embed(self, text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
+        """Embed a single text. Returns float list or None on failure.
+
+        *priority* is the scheduling class (``PRIORITY_*``) forwarded to the
+        shared backend, which orders competing callers on the one in-process
+        model and sizes its thread pool per class — corpus loops pass
+        ``PRIORITY_BULK`` so they run on the reduced bulk pool and an
+        interactive embed is served ahead of them.
+        """
         if not text.strip():
             return None
         if not self.is_available():
             return None
-        vec = self._get_embedder().embed(text)
+        vec = self._get_embedder().embed(text, priority=priority)
         if vec is None:
             # The backend stopped producing vectors (reset/reload failure) —
             # invalidate the cached availability so the next call re-probes
@@ -125,9 +215,18 @@ class InProcessEmbedder:
         return vec
 
     def embed_for_item(
-        self, title: str, summary: str | None, content: str | None = None
+        self,
+        title: str,
+        summary: str | None,
+        content: str | None = None,
+        *,
+        priority: int = PRIORITY_NORMAL,
     ) -> list[float] | None:
-        """Embed title + summary + chunk content for knowledge items."""
+        """Embed title + summary + chunk content for knowledge items.
+
+        *priority* is forwarded to :meth:`embed` (see there); the default keeps
+        every existing caller on the normal interactive class.
+        """
         parts = [title]
         if summary:
             parts.append(summary)
@@ -142,7 +241,7 @@ class InProcessEmbedder:
                 )
                 content = content[: self.content_budget]
             parts.append(content)
-        return self.embed(" ".join(parts))
+        return self.embed(" ".join(parts), priority=priority)
 
 
 # Keep the old name as an alias so references to OllamaEmbedder in type
@@ -176,20 +275,18 @@ def bytes_to_floats(data: bytes) -> list[float]:
     # so one bad row is skipped instead of aborting the dedup sweep.
     try:
         parsed = json.loads(data)
-    except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+    except (TypeError, ValueError, UnicodeDecodeError):
         parsed = None
     else:
         if isinstance(parsed, list):
             try:
-                if all(
-                    isinstance(x, (int, float)) and not isinstance(x, bool) for x in parsed
-                ):
+                if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in parsed):
                     return [float(x) for x in parsed]
             except (ValueError, OverflowError):
                 pass
         return []
     # Not JSON: compact binary form (struct-packed floats). A byte length that is
-    # not a multiple of 4 is the corrupt case that used to raise struct.error.
+    # not a multiple of 4 is corrupt and would raise struct.error, so it is rejected.
     if isinstance(data, (bytes, bytearray)) and len(data) % 4 == 0:
         try:
             n = len(data) // 4
@@ -199,31 +296,59 @@ def bytes_to_floats(data: bytes) -> list[float]:
     return []
 
 
-def embed_signature(model: str, content_budget: int = _EMBED_CONTENT_BUDGET) -> str:
+def embed_signature(model: str, dim: int, content_budget: int = _EMBED_CONTENT_BUDGET) -> str:
     """Signature over the embedding inputs a re-embed can actually change.
 
-    Captures the model id and the content budget — change either and a stored
-    vector may come from a different vector space, and re-embedding the same
-    item content fixes it. Items whose stored ``embedding_sig`` differs from
-    the current one are re-embedded by the sig-gated rebuild (manual trigger
-    and watcher self-heal both use it). The literal ``inprocess`` token stands
-    where the Ollama-era ``base_url`` used to — the in-process runtime has no
-    endpoint, and keeping a distinct token forces a one-time re-embed when
-    migrating vectors produced by an external server.
+    Built ON TOP of :func:`~kiro_crew.embeddings.embedding_space_signature`
+    rather than beside it: the vector-space half of this identity is that
+    function's output verbatim, so the knowledge library and vector memory cannot
+    disagree about whether two vectors are comparable. An independently assembled
+    hash over the same fields is NOT equivalent, however carefully written — it is
+    a second definition of "same vector space", and the next input added to one
+    definition reaches only that consumer. What that costs is concrete: an input
+    the KB's half omits leaves the KB serving vectors from a space it thinks it is
+    still in, and neither the per-search dimension guard nor the sig-gated rebuild
+    can see the difference.
+
+    The call goes through the MODULE (``_embeddings.``) rather than a from-import
+    so the dependency is observable: displacing
+    ``kiro_crew.embeddings.embedding_space_signature`` moves this value too, which
+    is what pins derivation rather than mere agreement.
+
+    ``content_budget`` is folded on afterwards because it is the KB's own input
+    and no concern of memory's: change it and the same item folds a different
+    amount of chunk text, so re-embedding that item is what fixes it. Items
+    whose stored ``embedding_sig`` differs from the current one are re-embedded
+    by the sig-gated rebuild (manual trigger and watcher self-heal both use it).
+    The literal ``inprocess`` token names the runtime that produced the vector.
 
     Does NOT cover edits to ``embed_for_item``'s assembly logic (field
     set / join separator) — a value hash can't see code. Ceiling: such a change
     needs a manual ``force`` rebuild. Upgrade path: add an ast-normalized source
     hash here if that logic starts churning.
     """
-    raw = f"{model}|inprocess|{content_budget}"
+    raw = f"{_embeddings.embedding_space_signature(model, dim)}|inprocess|{content_budget}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def embedder_signature(embedder: InProcessEmbedder) -> str:
     """Current sig for an embedder. Single source of truth for callsites so the
-    set of inputs (model + budget) can't drift between them."""
-    return embed_signature(embedder.model, embedder.content_budget)
+    set of inputs (model + dim + budget) can't drift between them.
+
+    Reads ``dim`` defensively, resolving a missing attribute to the bundled width
+    — the same answer :attr:`InProcessEmbedder.dim` itself falls back to. The
+    parameter is typed as that class but the callers are duck-typed: this runs on
+    the ingest path inside ``_embed_item``, where an ``AttributeError`` is caught
+    per chunk and turns the whole job's status to ``failed``, so an embedder-shaped
+    object that embeds perfectly well would report a failed ingest and leave the
+    items unembedded. Degrading to the bundled width instead keeps the signature
+    comparable for every embedder that does declare one, and only an embedder that
+    declares no width at all is described by the default.
+    """
+    dim = getattr(embedder, "dim", None)
+    if not isinstance(dim, int) or dim <= 0:
+        dim = _embeddings.bundled_embedding_dim()
+    return embed_signature(embedder.model, dim, embedder.content_budget)
 
 
 def _positive_or(value: object, default: float) -> float:
@@ -261,7 +386,10 @@ def create_embedder_from_config(config: dict) -> InProcessEmbedder:
     # fall back to the module defaults unless the config supplies a *positive*
     # number (missing key, 0 sentinel, negative, or non-numeric all resolve to
     # the built-in default).
-    knowledge_cfg = config.get("knowledge", {}) or {}
+    knowledge_cfg = config.get("knowledge") if isinstance(config, dict) else None
+    if not isinstance(knowledge_cfg, dict):
+        # A hand-edited non-object section is a state the loader degrades too.
+        knowledge_cfg = {}
     timeout_secs = _positive_or(knowledge_cfg.get("embed_timeout_secs"), TIMEOUT)
     content_budget = int(
         _positive_or(knowledge_cfg.get("embed_content_budget"), _EMBED_CONTENT_BUDGET)

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from '../components/composerTokens'
+import { matchFileToken, matchPathToken, matchSkillToken, PATH_TOKEN_RE, replaceTokenAtCaret, splitPathToken } from '../components/composerTokens'
 
 // These matchers take the text BEFORE the caret. A returned string is the query
 // (the picker opens); null means the caret is not inside a token (picker closed).
@@ -61,6 +61,44 @@ describe('matchFileToken (caret-relative @ detection)', () => {
   })
 })
 
+describe('matchPathToken (caret-relative ./ detection)', () => {
+  it('opens on a bare ./ or ../ run and captures the whole token', () => {
+    expect(matchPathToken('./')).toBe('./')
+    expect(matchPathToken('../')).toBe('../')
+    expect(matchPathToken('read ../../src/a')).toBe('../../src/a')
+  })
+
+  it('fires mid-sentence with text after the caret excluded from `before`', () => {
+    expect(matchPathToken('open ./src/ma')).toBe('./src/ma')
+    expect(matchPathToken('line one\n./sr')).toBe('./sr')
+  })
+
+  it('needs a separator, so abbreviations and full stops never open a menu', () => {
+    expect(matchPathToken('e.g')).toBeNull()
+    expect(matchPathToken('done.')).toBeNull()
+    expect(matchPathToken('..')).toBeNull()
+    expect(matchPathToken('...')).toBeNull()
+  })
+
+  it('does NOT fire when the caret is past the token or the dot is mid-word', () => {
+    expect(matchPathToken('./src and more')).toBeNull()
+    expect(matchPathToken('a/../b')).toBeNull()
+  })
+
+  it('leaves ~/ alone — home is not a completion root', () => {
+    expect(matchPathToken('~/')).toBeNull()
+    expect(matchPathToken('~/src/a')).toBeNull()
+  })
+})
+
+describe('splitPathToken (directory prefix vs partial name)', () => {
+  it('splits at the last separator, keeping the prefix verbatim', () => {
+    expect(splitPathToken('./')).toEqual({ dir: './', partial: '' })
+    expect(splitPathToken('./src/comp')).toEqual({ dir: './src/', partial: 'comp' })
+    expect(splitPathToken('../../a/b')).toEqual({ dir: '../../a/', partial: 'b' })
+  })
+})
+
 describe('replaceTokenAtCaret (caret-relative insertion)', () => {
   it('replaces the $token at the caret and preserves text after the caret', () => {
     // "check this $cr| more" -> caret after "$cr" (index 14)
@@ -112,11 +150,65 @@ describe('caret-relative detection across newlines + detection↔insertion agree
     expect(next.value).toBe('hi $cr-review  more\nnext')
   })
 
+  it('path insertion replaces exactly the detected token, prefix and all', () => {
+    const value = 'read ./src/ma later'
+    const caret = 'read ./src/ma'.length
+    expect(matchPathToken(value.slice(0, caret))).toBe('./src/ma')
+    const next = replaceTokenAtCaret(value, caret, PATH_TOKEN_RE, './src/main.ts ')
+    expect(next.value).toBe('read ./src/main.ts  later')
+  })
+
+  it('path insertion replaces a multi-level ../ run as one span', () => {
+    const value = 'read ../../src/a'
+    const next = replaceTokenAtCaret(value, value.length, PATH_TOKEN_RE, '../../src/app.ts ')
+    expect(next.value).toBe('read ../../src/app.ts ')
+  })
+
   it('@ insertion preserves after-caret content across a newline', () => {
     const value = 'see @src/ma\nrest'
     const caret = 'see @src/ma'.length
     expect(matchFileToken(value.slice(0, caret))).toBe('src/ma')
     const next = replaceTokenAtCaret(value, caret, FILE_INSERT_RE, '@src/main.ts ')
     expect(next.value).toBe('see @src/main.ts \nrest')
+  })
+})
+
+// Issue #22348: a CJK IME emits ¥ (U+00A5), ￥ (U+FFE5) or ＄ (U+FF04) for the
+// same physical Shift+4 that types $ on a US layout. All three open the skills
+// list as aliases of $, and selecting a skill rewrites the aliased token to the
+// canonical $-prefixed marker the backend resolves.
+const SKILL_ALIAS_INSERT_RE = /(^|[\s])[$\u00A5\uFFE5\uFF04][a-z0-9/_-]*$/u
+
+describe('matchSkillToken — CJK currency-symbol aliases (issue #22348)', () => {
+  it('opens on a bare aliased sigil at a word boundary (full list)', () => {
+    expect(matchSkillToken('\u00A5')).toBe('')      // ¥
+    expect(matchSkillToken('\uFFE5')).toBe('')      // ￥
+    expect(matchSkillToken('\uFF04')).toBe('')      // ＄
+    expect(matchSkillToken('hello \u00A5')).toBe('')
+  })
+
+  it('captures the slug after an aliased sigil, same as $', () => {
+    expect(matchSkillToken('\u00A5cr')).toBe('cr')
+    expect(matchSkillToken('use \uFFE5browser-auth')).toBe('browser-auth')
+    expect(matchSkillToken('\uFF04oncall/handover')).toBe('oncall/handover')
+  })
+
+  it('keeps the existing $ behaviour unchanged', () => {
+    expect(matchSkillToken('$cr')).toBe('cr')
+    expect(matchSkillToken('$')).toBe('')
+    expect(matchSkillToken('$PATH')).toBeNull()
+    expect(matchSkillToken('foo$bar')).toBeNull()
+  })
+
+  it('does NOT fire when an aliased token is not the token at the caret', () => {
+    expect(matchSkillToken('\u00A5cr more')).toBeNull()
+    expect(matchSkillToken('\u00A5 ')).toBeNull()
+  })
+
+  it('insertion regex rewrites an aliased token to the canonical $skill', () => {
+    const value = 'use \u00A5cr'
+    const next = replaceTokenAtCaret(value, value.length, SKILL_ALIAS_INSERT_RE, '$cr-review ')
+    expect(next.value).toBe('use $cr-review ')
+    expect(next.caret).toBe('use $cr-review '.length)
   })
 })

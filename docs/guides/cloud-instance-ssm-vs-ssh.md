@@ -1,7 +1,7 @@
 # Reaching a cloud-launched instance: native SSM vs legacy SSH
 
 When the cloud launcher provisions an EC2 box for you, it also registers that box
-in the **Instances** registry so the dashboard's **Settings → Instances** page can
+in the **Instances** registry so the dashboard's **Settings → Remote Crew** page can
 manage it — open a tunnel, mint a short-lived dashboard token, keep it warm, and
 self-heal a dropped connection. This page explains **how** that managed connection
 is made, and why the launcher now uses the **native SSM transport** instead of the
@@ -12,9 +12,11 @@ older SSH-over-`ProxyCommand` workaround.
 > (grant/revoke `ssm:StartSession`, CloudTrail-audited), not a networking decision
 > gated by a key someone holds.
 
-## The two transports
+## The two EC2 connection methods
 
-The Instances registry supports two `connection_method` values. Both end at the
+The Instances registry supports three `connection_method` values overall:
+`ssh`, `ssm`, and `fargate`. An EC2 box uses the first two; `fargate` is reserved
+for ECS task targets and is outside this comparison. Both EC2 methods end at the
 same place — a loopback-bound gateway on the remote — but they get there very
 differently.
 
@@ -39,7 +41,11 @@ reg.add(
 
 Requirements on the remote: only the **SSM agent** (preinstalled on Amazon Linux)
 and an instance role that permits Session Manager. Requirements on the client:
-only the `aws` CLI + `session-manager-plugin` and `ssm:StartSession` permission.
+the `aws` CLI + `session-manager-plugin`; `ssm:StartSession` opens the tunnel,
+while managed token and remote-command operations also require
+`ssm:SendCommand` and `ssm:GetCommandInvocation`. The policy printed by
+`kirocrew cloud iam-policy` includes these permissions with the launcher-managed
+resource bounds.
 
 ### Legacy SSH over an SSM `ProxyCommand` (`connection_method="ssh"`)
 
@@ -89,11 +95,23 @@ here, and opens the dashboard — all from your laptop.
    bootstrapper does this and hands off to the wizard. Verify prerequisites with
    `kirocrew cloud doctor`. Attach the least-privilege policy printed by
    `kirocrew cloud iam-policy` to the AWS profile you'll launch with.
-2. **Launch.** Run `kirocrew cloud launch` — interactive (size picker + confirm),
+2. **Launch.** Run `kirocrew cloud launch` — interactive (size picker + a confirm
+   that names the AWS account and profile the stack will be created in),
    or non-interactive, e.g. `kirocrew cloud launch --size power --region us-west-2
    --profile dev -y`. Useful flags: `--new` (a separate box instead of resuming
    your saved one) and `--keep-on-failure` (disable CloudFormation rollback to
-   inspect a failed bootstrap).
+   inspect a failed bootstrap). To customize a **new** box: `--extra-packages
+   gh,jq` installs extra dnf packages after the stock set (a name dnf cannot
+   find is skipped with a warning in `/var/log/kirocrew-setup.log`; names are
+   letters, digits and `. _ + -`, at most 256 characters in total), and
+   `--ami ami-xxxx` launches from your own image instead of the latest Amazon
+   Linux 2023 one (it must match the size tier's architecture and be
+   AL2023-compatible, since the bootstrap still runs `dnf`). The launcher does
+   not inspect the image first: an image of the wrong architecture fails the
+   stack at instance creation (EC2 reports the architecture mismatch, and
+   `launch` prints it as the root cause), while an image without `dnf` or
+   `cfn-signal` fails or times out during the bootstrap. Both are fixed
+   when the instance is created: with an existing saved box, use `--new`.
 3. **Reach it — and the ports.** Launch ends by opening an SSM port-forward and
    your browser at `http://localhost:<local>/?token=…`. You never choose the
    **remote** port: the gateway always listens on loopback `:5476` on the box. The
@@ -109,7 +127,7 @@ here, and opens the dashboard — all from your laptop.
 For setting up a box you manage yourself (SSH or SSM, and the common EC2 gotchas),
 see [remote-crew-on-ec2.md](remote-crew-on-ec2.md).
 
-## What you see in Settings → Instances
+## What you see in Settings → Remote Crew
 
 A launched box appears as a managed instance whose connection line reads, e.g.:
 
@@ -128,11 +146,13 @@ SSM-aware health probe.
 `cloud destroy` deletes the AWS stack and then unregisters the instance.
 `unregister_instance` matches the box by `ssm_target` (native registration), and
 still falls back to matching `ssh_host` so a box registered the legacy way is
-cleaned up too.
+cleaned up too. It removes the box together with every crew chained through it
+(`remove_cascade`, the same helper the dashboard's delete uses), because a chained
+crew rides the box's forward and cannot connect without it.
 
 ## Related
 
 - `docs/system-specs/modules/cloud.md` — the cloud launcher module (provisioning,
   security model, bootstrappers).
-- `docs/system-specs/modules/instances.md` — the Instances registry and the two
-  transports; §9 documents the manual SSH-over-`ProxyCommand` option.
+- `docs/system-specs/modules/instances.md` — the Instances registry and all three
+  connection methods; §9 documents the manual SSH-over-`ProxyCommand` option.

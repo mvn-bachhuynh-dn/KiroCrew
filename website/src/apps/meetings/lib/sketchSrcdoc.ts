@@ -85,7 +85,10 @@
 //     Replacing `'unsafe-inline'` with a build-time hash of that literal would
 //     retire even that, and is the natural follow-up.
 
-import { MERMAID_RUNTIME_PATH } from '../../../lib/vendorPaths'
+import { MERMAID_RUNTIME_PATH as MERMAID_RUNTIME_PATH_ROOT } from '../../../lib/vendorPaths'
+import { withBase } from '../../../lib/basePath'
+/** The runtime's served path under this build's base (the bare path in the stock build). */
+const MERMAID_RUNTIME_PATH = withBase(MERMAID_RUNTIME_PATH_ROOT)
 
 /**
  * CSP for the sketch frame. `scriptOrigin` is the dashboard's own origin
@@ -168,7 +171,8 @@ const BASE_CSS =
  *   injects a temp `<div id="dmermaid-*">` into `document.body` that render()
  *   only cleans up on SUCCESS, so failing blocks accumulate orphaned 512px error
  *   SVGs (see src/test/MarkdownRenderer.mermaid.test.tsx — this is a real
- *   regression, kept in sync with MarkdownRenderer's `initMermaid`). Being
+ *   regression, kept in sync with `initMermaid` in
+ *   src/components/markdown/MermaidBlock.tsx). Being
  *   explicit is the only way to guarantee that setting is applied.
  * - `suppressErrors: true` on `run()` because `run()` rethrows the first error
  *   otherwise, so one malformed diagram would abort every later one. Combined
@@ -458,9 +462,13 @@ export function buildSketchSrcdoc(html: string, scriptOrigin: string): string {
   // createElement from a fixed path — so it is not something the scrub below
   // could remove even in principle, and it is the only `<script src>` in the
   // document.
-  const mermaidScript = doc.createElement('script')
-  mermaidScript.setAttribute('src', scriptOrigin + MERMAID_RUNTIME_PATH)
-  head.appendChild(mermaidScript)
+  // NOTE: uses a placeholder <meta> instead of a live <script> to avoid
+  // happy-dom's eager script loading (ECONNREFUSED in CI). See widgetSrcdoc.ts
+  // for the full rationale — same pattern.
+  const mermaidPlaceholder = doc.createElement('meta')
+  mermaidPlaceholder.setAttribute('name', 'x-script-placeholder')
+  mermaidPlaceholder.setAttribute('data-src', scriptOrigin + MERMAID_RUNTIME_PATH)
+  head.appendChild(mermaidPlaceholder)
 
   // Model HTML, adopted as typed DOM nodes — see the doc comment above.
   const range = doc.createRange()
@@ -494,5 +502,21 @@ export function buildSketchSrcdoc(html: string, scriptOrigin: string): string {
 
   // The one remaining template literal holds the static DOCTYPE plus the
   // SERIALIZED DOM tree, whose model content was already adopted as nodes.
-  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  // Post-serialization: replace the SINGLE trusted placeholder with the real
+  // <script> tag. No `g` flag — only the one placeholder we inserted into
+  // <head> is replaced. Model-authored content in <body> cannot produce a
+  // matching placeholder because: (1) scrubModelDocument strips all <meta>
+  // from model fragments (FORBIDDEN list), and (2) attribute serialization
+  // HTML-escapes quotes regardless. Non-global replace is defense-in-depth.
+  const serialized = `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  return serialized.replace(
+    /<meta name="x-script-placeholder" data-src="([^"]*)">/,
+    // crossorigin="anonymous": this srcdoc is a null-origin sandboxed iframe (a
+    // NON-secure context) and on the default deployment `src` is a loopback
+    // address, so Chrome's Private Network Access posture blocks the load
+    // unless it goes through CORS carrying the gateway's /vendor approval —
+    // the same mechanism as the widget Tailwind runtime (see widgetSrcdoc.ts).
+    // No onerror half here: this frame has no loading overlay to dismiss.
+    (_match, src) => `<script src="${src}" crossorigin="anonymous"></script>`,
+  )
 }

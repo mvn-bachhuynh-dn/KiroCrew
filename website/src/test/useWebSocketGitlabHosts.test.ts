@@ -15,7 +15,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { createElement } from 'react'
 import { Provider } from 'react-redux'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, QueryObserver } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
 import { useWebSocket } from '../hooks/useWebSocket'
 
@@ -122,5 +122,76 @@ describe('useWebSocket GitLab allowlist invalidation', () => {
     act(() => { ws2.simulateMessage({ type: 'slots', data: [], gitlabHostsGeneration: 3 }) })
 
     expect(configInvalidations()).toBe(2)
+  })
+
+  // The governance ceiling rides the same frame with the same contract: the
+  // config endpoint derives `social_share_enabled` from the ceiling, and a
+  // centrally pushed policy swaps the ceiling mid-session, so the cached answer
+  // must be dropped the moment the frame reports a new generation.
+  it('invalidates on a governance-ceiling generation change within a connection', () => {
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+
+    act(() => { ws.simulateMessage({ type: 'slots', data: [], governanceGeneration: 1 }) })
+    expect(configInvalidations()).toBe(1)
+    act(() => { ws.simulateMessage({ type: 'slots', data: [], governanceGeneration: 1 }) })
+    expect(configInvalidations()).toBe(1)
+    // The fleet pushed a new ceiling: refetch, so a withdrawn Share entry disappears.
+    act(() => { ws.simulateMessage({ type: 'slots', data: [], governanceGeneration: 2 }) })
+    expect(configInvalidations()).toBe(2)
+  })
+
+  it('treats the first governance generation of a reconnect as unknown', () => {
+    vi.useFakeTimers()
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws1 = WS_INSTANCES[0]
+    act(() => { ws1.simulateOpen() })
+    act(() => { ws1.simulateMessage({ type: 'slots', data: [], governanceGeneration: 1 }) })
+    expect(configInvalidations()).toBe(1)
+
+    // Gateway restarts with a new policy file: the counter restarts too, so an
+    // equal number after a reconnect must still refetch.
+    act(() => { ws1.onclose?.(new CloseEvent('close')) })
+    act(() => { vi.advanceTimersByTime(2000) })
+    const ws2 = WS_INSTANCES[1]
+    act(() => { ws2.simulateOpen() })
+    act(() => { ws2.simulateMessage({ type: 'slots', data: [], governanceGeneration: 1 }) })
+
+    expect(configInvalidations()).toBe(2)
+  })
+
+  // Both generation arms, and the folder seed plus its generation, can ask for
+  // the same key on one frame. Each invalidate cancels the refetch the previous
+  // one started and sends another GET, so the frame must invalidate each key once.
+  it('invalidates each key once when several arms of one frame ask for it', () => {
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+
+    act(() => {
+      ws.simulateMessage({
+        type: 'slots', data: [], folders: [],
+        foldersGeneration: 1, gitlabHostsGeneration: 3, governanceGeneration: 1,
+      })
+    })
+    expect(configInvalidations()).toBe(1)
+    expect(invalidated.filter(key => Array.isArray(key) && key[0] === 'chat-folders').length).toBe(1)
+  })
+
+  it('puts one refetch of GET /api/dashboard/config on the wire for such a frame', async () => {
+    const dashboardConfig = vi.fn().mockResolvedValue({})
+    renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => { await qc.fetchQuery({ queryKey: ['dashboardConfig'], queryFn: dashboardConfig }) })
+    // An observer keeps the query active, as the shell's readers do.
+    const unsubscribe = new QueryObserver(qc, {
+      queryKey: ['dashboardConfig'], queryFn: dashboardConfig, staleTime: Infinity,
+    }).subscribe(() => {})
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+    act(() => { ws.simulateMessage({ type: 'slots', data: [], gitlabHostsGeneration: 3, governanceGeneration: 1 }) })
+    await act(async () => { await Promise.resolve() })
+    expect(dashboardConfig).toHaveBeenCalledTimes(2)
+    unsubscribe()
   })
 })

@@ -22,7 +22,7 @@ Both stores use the same on-disk discipline as ``register_hook``:
 read-modify-write under an advisory ``flock`` on a sidecar ``.lock`` file,
 then an atomic ``os.replace`` of a 0600 temp file.
 
-SECRET AT REST — ``webhook_tokens.json`` is no longer hash-only. Bearer tokens
+SECRET AT REST — ``webhook_tokens.json`` is not hash-only. Bearer tokens
 are still stored as sha256 digests and cannot be recovered from the file, but
 each entry's ``signing_secret`` is a LIVE secret held in plaintext: an HMAC is
 symmetric, so the verifier has to be able to recompute it. That is an accepted
@@ -38,9 +38,7 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -48,6 +46,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
 from kiro_crew.config.loader import config_dir
 from kiro_crew.validation import sanitize_string
 
@@ -135,10 +134,14 @@ OUTCOME_ERROR = "error"
 OUTCOME_REJECTED_CAPACITY = "rejected_capacity"
 OUTCOME_UNAUTHORIZED = "unauthorized"
 OUTCOME_DISABLED = "disabled"
+#: The turn finished, but without an MCP server the agent spec declares (it
+#: failed, waits for authorization, or never reported). The detail names it.
+OUTCOME_DEGRADED = "degraded"
 
 VALID_OUTCOMES = frozenset(
     {
         OUTCOME_COMPLETED,
+        OUTCOME_DEGRADED,
         OUTCOME_TIMEOUT,
         OUTCOME_ERROR,
         OUTCOME_REJECTED_CAPACITY,
@@ -146,6 +149,148 @@ VALID_OUTCOMES = frozenset(
         OUTCOME_DISABLED,
     }
 )
+
+# ── Request counter outcomes ──
+#
+# ``kirocrew.webhook.requests`` counts every inbound request the endpoint
+# DECIDES, which is a wider population than the runs the ring above stores. The
+# endpoint turns several requests away before any run exists to record: the
+# kill-switch read cannot touch the store when the store is what is unreadable,
+# and the per-source auth throttle exists precisely to stop doing work -- a disk
+# write per rejected request is the opposite of what a flood needs.
+#
+# Those refusals need their own members, because folding them into a recorded
+# outcome is what makes the series lie in the case it is for: a rotated token
+# produces a few ``unauthorized`` runs, the throttle then trips, and with no
+# member of its own every later request is invisible -- the ``unauthorized`` rate
+# falls to zero while the integration is still broken, which an alert reads as
+# recovered.
+
+#: An inbound request refused by the per-source auth-failure throttle. Its own
+#: member rather than ``unauthorized``: the caller never presented a credential
+#: this build judged, so counting it as an auth failure would double-count the
+#: flood that tripped the throttle.
+METRIC_OUTCOME_THROTTLED = "throttled"
+
+#: An inbound request the endpoint could not decide because a store it must read
+#: is unreadable, or a destination could not be verified. Operator-fixable state,
+#: not a caller error, which is why it is not folded into the body members.
+METRIC_OUTCOME_UNAVAILABLE = "unavailable"
+
+#: An inbound request refused on its own content -- too large, unreadable,
+#: unparseable, or a field of the wrong type. One member for the whole class: the
+#: individual response codes are a client contract and already distinguish them,
+#: while a series per field would grow with every new field.
+METRIC_OUTCOME_REJECTED_BODY = "rejected_body"
+
+#: Refusal members, none of which is a recorded run. Disjoint from
+#: :data:`VALID_OUTCOMES` by construction, pinned by a test: a member that was
+#: both would make one request countable twice.
+METRIC_REFUSAL_OUTCOMES = frozenset(
+    {
+        METRIC_OUTCOME_THROTTLED,
+        METRIC_OUTCOME_UNAVAILABLE,
+        METRIC_OUTCOME_REJECTED_BODY,
+    }
+)
+
+#: The remainder member. Reached when a value this build does not recognise is
+#: handed to :func:`metric_outcome`, which keeps the series key bounded instead
+#: of minting one per unknown string.
+METRIC_OUTCOME_OTHER = "other"
+
+#: Every value ``outcome`` can carry on ``kirocrew.webhook.requests``: the
+#: recorded-run outcomes, the refusal outcomes, and the remainder. Pinned by a
+#: test, so widening either half without restating it in the metrics doc fails.
+METRIC_OUTCOMES = frozenset(
+    VALID_OUTCOMES | METRIC_REFUSAL_OUTCOMES | {METRIC_OUTCOME_OTHER}
+)
+
+
+def metric_outcome(outcome: object) -> str:
+    """Fold *outcome* onto :data:`METRIC_OUTCOMES`; never raises.
+
+    An attribute value must come from a closed enum, so anything this build does
+    not recognise -- including a non-string -- becomes
+    :data:`METRIC_OUTCOME_OTHER` rather than minting a series of its own.
+    """
+    if isinstance(outcome, str) and outcome in METRIC_OUTCOMES:
+        return outcome
+    return METRIC_OUTCOME_OTHER
+
+
+def count_request(outcome: str) -> None:
+    """Add 1 to ``kirocrew.webhook.requests`` for *outcome*; never raises.
+
+    THE one emitter for that series, shared by :meth:`WebhookRunStore.record`
+    and by the endpoint's pre-record refusals, so the two halves of the
+    population cannot drift apart in how they label or sanitise an outcome.
+
+    An in-memory add behind the ``telemetry.enabled`` consent gate: no disk
+    write, no network call and no log line, which is what makes it safe on a
+    refusal path whose whole purpose is to stop doing work.
+    """
+    from kiro_crew.metrics.events import WEBHOOK_REQUESTS, emit_counter
+
+    emit_counter(WEBHOOK_REQUESTS, {"outcome": metric_outcome(outcome)})
+
+
+# ── Context registrations (hooks.json) ──
+
+#: The file ``register_hook`` writes a webhook's callback context into. Shared
+#: with ``ScriptHookStore``, which keeps its own script hooks under a ``hooks``
+#: key whose value is a LIST -- which is why every reader here has to confirm the
+#: SHAPE of a value rather than trusting the file to hold only registrations.
+CONTEXT_REGISTRATIONS_FILENAME = "hooks.json"
+
+
+def context_registrations_path() -> Path:
+    """Where :data:`CONTEXT_REGISTRATIONS_FILENAME` lives in the live data home.
+
+    ``data_home`` rather than ``config_dir``: this is asked on request handlers
+    and on the metrics reader thread, and ``config_dir`` additionally ``mkdir``s
+    the home and refreshes the recovery breadcrumb on every call.
+    """
+    from kiro_crew.config.paths import data_home
+
+    return data_home() / CONTEXT_REGISTRATIONS_FILENAME
+
+
+def is_context_registration(value: object) -> bool:
+    """True when a ``hooks.json`` value is a webhook context registration.
+
+    THE single owner of that test. An id-addressed delete has to confirm the
+    shape it is removing or ``DELETE /api/webhooks/contexts/hooks`` would drop
+    every script hook the user has; the registered-hook count published as
+    ``kirocrew.inventory.webhooks.registered`` has to agree with what the
+    dashboard lists, or the gauge reports a number no surface can confirm.
+    """
+    return isinstance(value, dict) and ("context_summary" in value or "summary" in value)
+
+
+def registered_context_count(path: Path | None = None) -> tuple[int, bool]:
+    """``(count, loadable)`` for the webhook context registrations at *path*.
+
+    The pair, rather than a bare count, for the reason ``cron`` draws the same
+    distinction: an ABSENT file is a genuine 0 (a fresh install has registered
+    no hooks), while a file that is present and does not parse is a FAULT whose
+    count is unknown -- and a reader that reported 0 for both would publish a
+    number that is a lie on exactly the install worth looking at.
+
+    Never raises: an unreadable file is ``(0, False)``.
+    """
+    target = path if path is not None else context_registrations_path()
+    try:
+        raw = _read_json(target, {})
+    except WebhookStoreUnreadable:
+        return 0, False
+    if not isinstance(raw, dict):
+        # A top-level non-object is not a registration map. It parses, so it is
+        # not a fault -- ``ScriptHookStore`` is the other writer of this file --
+        # and it holds no registrations.
+        return 0, True
+    return sum(1 for value in raw.values() if is_context_registration(value)), True
+
 
 # ── Context freshness ──
 
@@ -187,8 +332,11 @@ def locked(path: Path) -> Iterator[None]:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / (path.name + ".lock")
-    with open(lock_path, "w") as lock_fd:
-        with platform_compat.flock_exclusive(lock_fd.fileno()):
+    # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
+    # loses the lock on Windows. Parent mkdir stays (the helper does
+    # not create parent dirs).
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.flock_exclusive(lock_fd):
             yield
 
 
@@ -197,43 +345,24 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
     Call inside :func:`locked` so concurrent writers cannot lose updates.
 
-    Permissions go through ``platform_compat``: ``os.fchmod`` is POSIX-only, so
-    calling it directly raises ``AttributeError`` on Windows and breaks every
-    store write there. ``restrict_to_owner`` is applied to the temp file BEFORE
-    ANY PAYLOAD BYTES ARE WRITTEN, not just before the rename — the store holds
-    signing secrets, and on Windows a bare 0600 is a no-op, so locking down
-    after the write left a window where the secrets sat in a file carrying only
-    the parent directory's inherited ACL. Locking an empty file closes that
-    window, and because the temp file is never at its final path unrestricted,
-    the published store is owner-only from the first byte. The descriptor stays
-    open across the call: on Windows ``os.open`` shares read/write/delete, so
-    ``icacls`` can still open the file for WRITE_DAC.
+    ``restrict_to_owner=True`` is the load-bearing argument here and is NOT a
+    synonym for ``mode=0o600``: this store holds signing secrets, and on
+    Windows a bare 0600 is a no-op, so the helper applies the owner-only DACL
+    to the temp file BEFORE ANY PAYLOAD BYTE IS WRITTEN. Locking down after
+    the write would leave a window where the secrets sit in a file carrying only
+    the parent directory's inherited ACL. That ordering is
+    :func:`atomic_write`'s documented contract rather than hand-rolled here,
+    which also brings the Windows ``os.replace`` sharing-violation retry.
+
+    Content is ``bytes`` rather than ``str`` on purpose: ``indent=2`` embeds
+    newlines, and text mode would translate them to CRLF on Windows.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        platform_compat.restrict_to_owner(tmp)
-        # Wrap the descriptor in a file object rather than calling os.write:
-        # os.write is a single write(2) and may write FEWER bytes than asked
-        # under disk pressure, returning the count with no error. Ignoring that
-        # count would atomically replace a valid token store or run history with
-        # truncated JSON. Python's buffered writer loops until the whole buffer
-        # is out, so the full-payload guarantee comes from the stdlib.
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1  # fdopen owns it now; the finally must not double-close
-            platform_compat.fchmod_safe(handle.fileno(), 0o600)
-            handle.write(json.dumps(payload, indent=2).encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, str(path))
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write(
+        path,
+        json.dumps(payload, indent=2).encode("utf-8"),
+        fsync=True,
+        restrict_to_owner=True,
+    )
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -248,7 +377,7 @@ def _read_json(path: Path, default: Any) -> Any:
     to inspect or restore, at the cost of erroring the surface until they do.
     """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_bytes_with_retry(path).decode("utf-8"))
     except FileNotFoundError:
         return default
     except (ValueError, OSError) as exc:
@@ -271,7 +400,7 @@ def sanitize_label(label: str) -> str:
 
 def hash_token(raw: str) -> str:
     """Return the sha256 hex digest persisted for *raw*."""
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # ── Token store ──
@@ -294,10 +423,10 @@ class WebhookTokenStore:
 
         ``_read_json`` already fails closed on bytes it cannot parse. This is the
         same hazard one level up: JSON that parses fine but whose container is
-        not a list, or whose rows are not credential rows, used to be filtered
-        away silently — and every caller that mutates the store (``mint``,
+        not a list, or whose rows are not credential rows, must not be filtered
+        away silently — every caller that mutates the store (``mint``,
         ``revoke``, ``stamp_used``) writes the loaded list straight back, so the
-        filtered-out rows were deleted on the next write. That destroys issued
+        filtered-out rows would be deleted on the next write. That destroys issued
         credentials and their signing secrets, and because the kill switch lives
         in this same file it could also drop the disabled state. Refusing keeps
         the bytes on disk for an operator to inspect, at the cost of erroring the
@@ -363,6 +492,24 @@ class WebhookTokenStore:
             write_json_atomic(self.path, data)
         return bool(enabled)
 
+    @staticmethod
+    def _public_entry(entry: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:
+        """Build the explicit, secret-free source shape used by every response."""
+        return {
+            "id": entry.get("id", ""),
+            "label": entry.get("label", ""),
+            "display_prefix": entry.get("display_prefix", ""),
+            "last4": entry.get("last4", ""),
+            "created_at": float(entry.get("created_at") or 0.0),
+            "last_used_at": entry.get("last_used_at"),
+            "legacy": legacy,
+            "require_signature": bool(entry.get("require_signature")),
+            # Rows minted before source routing remain readable and preserve
+            # their legacy caller-selected routing behavior.
+            "agent": str(entry.get("agent") or ""),
+            "enabled": entry.get("enabled", True) is not False,
+        }
+
     def public_entries(self, legacy_token: str = "") -> list[dict[str, Any]]:
         """Entries safe to hand a dashboard client (no hash, no raw secret).
 
@@ -379,32 +526,24 @@ class WebhookTokenStore:
             # legacy value has no fixed public prefix, so echoing its head
             # would leak secret material to the dashboard.
             out.append(
-                {
-                    "id": LEGACY_TOKEN_ID,
-                    "label": LEGACY_TOKEN_LABEL,
-                    "display_prefix": "hooks.webhook_token",
-                    "last4": legacy_token[-4:],
-                    "created_at": 0.0,
-                    "last_used_at": None,
-                    "legacy": True,
-                    # The config scalar has no signing secret to verify against,
-                    # so it stays bearer-only rather than breaking on upgrade.
-                    "require_signature": False,
-                }
+                self._public_entry(
+                    {
+                        "id": LEGACY_TOKEN_ID,
+                        "label": LEGACY_TOKEN_LABEL,
+                        "display_prefix": "hooks.webhook_token",
+                        "last4": legacy_token[-4:],
+                        "created_at": 0.0,
+                        "last_used_at": None,
+                        # The config scalar has no signing secret to verify
+                        # against, so it remains bearer-only on upgrade.
+                        "require_signature": False,
+                        "agent": "",
+                        "enabled": True,
+                    },
+                    legacy=True,
+                )
             )
-        for entry in self._load():
-            out.append(
-                {
-                    "id": entry.get("id", ""),
-                    "label": entry.get("label", ""),
-                    "display_prefix": entry.get("display_prefix", ""),
-                    "last4": entry.get("last4", ""),
-                    "created_at": float(entry.get("created_at") or 0.0),
-                    "last_used_at": entry.get("last_used_at"),
-                    "legacy": False,
-                    "require_signature": bool(entry.get("require_signature")),
-                }
-            )
+        out.extend(self._public_entry(entry) for entry in self._load())
         return out
 
     def entry_for(self, token_id: str) -> dict[str, Any] | None:
@@ -441,7 +580,7 @@ class WebhookTokenStore:
         write_json_atomic(self.path, data)
 
     def create(
-        self, label: str, require_signature: bool = True
+        self, label: str, require_signature: bool = True, agent: str = ""
     ) -> tuple[str, str, dict[str, Any]]:
         """Mint a token. Returns ``(raw_secret, signing_secret, public_entry)``.
 
@@ -452,6 +591,9 @@ class WebhookTokenStore:
         false — a caller that cannot compute an HMAC gets a bearer-only token.
         """
         clean_label = sanitize_label(label)
+        if not isinstance(agent, str):
+            raise WebhookError("agent must be a string")
+        clean_agent = agent.strip()
         raw = TOKEN_PREFIX + secrets.token_urlsafe(32)[:TOKEN_ENTROPY_CHARS]
         signing_secret = (
             SIGNING_SECRET_PREFIX + secrets.token_urlsafe(32)[:SIGNING_SECRET_ENTROPY_CHARS]
@@ -468,6 +610,8 @@ class WebhookTokenStore:
             "last_used_at": None,
             "require_signature": bool(require_signature),
             "signing_secret": signing_secret,
+            "agent": clean_agent,
+            "enabled": True,
         }
         path = self.path
         with locked(path):
@@ -479,11 +623,48 @@ class WebhookTokenStore:
                 entry["id"] = "wht_" + secrets.token_hex(3)
             entries.append(entry)
             self._write_tokens(entries)
-        public = {
-            k: v for k, v in entry.items() if k not in ("token_hash", "signing_secret")
-        }
-        public["legacy"] = False
+        public = self._public_entry(entry)
         return raw, signing_secret, public
+
+    def update(
+        self,
+        token_id: str,
+        *,
+        agent: str | None = None,
+        enabled: bool | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update operator-owned source fields and return its public shape.
+
+        Credentials and signing policy are intentionally absent: rotating either
+        requires minting a new source so secrets retain one-time reveal semantics.
+        """
+        if agent is not None and not isinstance(agent, str):
+            raise WebhookError("agent must be a string")
+        if enabled is not None and not isinstance(enabled, bool):
+            raise WebhookError("enabled must be a boolean")
+        clean_label = sanitize_label(label) if label is not None else None
+        clean_agent = agent.strip() if agent is not None else None
+
+        path = self.path
+        updated: dict[str, Any] | None = None
+        with locked(path):
+            entries = self._load()
+            for entry in entries:
+                if entry.get("id") != token_id:
+                    continue
+                if clean_label is not None:
+                    entry["label"] = clean_label
+                if clean_agent is not None:
+                    entry["agent"] = clean_agent
+                if enabled is not None:
+                    entry["enabled"] = enabled
+                updated = entry
+                break
+            if updated is None:
+                return None
+            self._write_tokens(entries)
+        return self._public_entry(updated)
 
     def delete(self, token_id: str) -> bool:
         """Remove the entry with *token_id*. False when unknown."""
@@ -529,9 +710,10 @@ class WebhookTokenStore:
         """
         if not candidate:
             return None
-        digest = hash_token(candidate)
+        digest = hash_token(candidate).encode("ascii")
         for entry in self._load():
-            if hmac.compare_digest(str(entry.get("token_hash", "")), digest):
+            stored_digest = str(entry.get("token_hash", "")).encode("utf-8", "surrogatepass")
+            if hmac.compare_digest(stored_digest, digest):
                 token_id = str(entry.get("id", ""))
                 if stamp_used:
                     try:
@@ -541,7 +723,10 @@ class WebhookTokenStore:
                             "webhook token last_used_at stamp failed", exc_info=True
                         )
                 return token_id
-        if legacy_token and hmac.compare_digest(candidate, legacy_token):
+        if legacy_token and hmac.compare_digest(
+            candidate.encode("utf-8", "surrogatepass"),
+            legacy_token.encode("utf-8", "surrogatepass"),
+        ):
             return LEGACY_TOKEN_ID
         return None
 
@@ -765,6 +950,16 @@ class WebhookRunStore:
             # drop completed turn output on the delivery path. The file is left
             # untouched either way, which is the point of the refusal.
             logger.warning("webhook run history write failed", exc_info=True)
+        # One call to this method is one recorded run, so counting here cannot
+        # double-count a run that is also delivered or also retried. It is NOT
+        # the whole population of the series: the endpoint turns some requests
+        # away before a run exists, and those call :func:`count_request`
+        # directly with a refusal member.
+        #
+        # Outside the try, and deliberately not conditional on the write landing:
+        # the series counts the DECISION, not the history row, and the decision
+        # was made whether or not the ring could persist it.
+        count_request(outcome)
         return record
 
 

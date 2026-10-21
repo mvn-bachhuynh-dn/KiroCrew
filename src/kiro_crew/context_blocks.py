@@ -30,6 +30,8 @@ UNCLASSIFIED_LABEL: Final = "unclassified"
 # up to the next marker's start, mirroring how the assembly concatenates them.
 # Labels are stable identifiers — the UI maps them to display names, so
 # renaming one here is a breaking change for stored rows.
+REPLY_FORMAT_LABEL: Final = "reply_format_rules"
+
 _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("critical_rules", r"\[CRITICAL RULES"),
     ("agent_instructions", r"\[AGENT SYSTEM PROMPT\]"),
@@ -39,8 +41,14 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("surface", r"\[RUNTIME\]"),
     ("workspace_identity", r"\[WORKSPACE IDENTITY\]"),
     ("docs_pointer", r"\[DOCUMENTATION\]"),
-    ("memory", r"\[Memory\b"),
+    ("memory", r"\[Memory\b(?! tools\])"),
+    ("memory_tools", r"\[Memory tools\]"),
+    ("steering", r"\[Steering resources\]"),
+    ("thread_history", r"\[THREAD CONVERSATION HISTORY"),
+    ("context_scope", r"\[CONTEXT SCOPE\]"),
+    ("recovery", r"\[(?:SESSION RESUMED|REINJECTED AFTER COMPACTION)"),
     ("semantic_memory", r"\[Semantic Memory"),
+    ("task_facts", r"\[Task facts"),
     ("skill_index", r"\[Skills:\]"),
     ("lessons", r"\[Learned corrections"),
     ("episodic_memory", r"\[Episodic Memory"),
@@ -58,14 +66,113 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("user_display", r"\[CURRENT USER\]"),
     ("user_profile", r"\[USER PROFILE\]"),
     ("ui_language", r"\[UI LANGUAGE\]"),
+    ("response_preferences", r"\[RESPONSE PREFERENCES"),
     ("channel_persona", r"\[CHANNEL\]"),
     ("incognito", r"\[INCOGNITO SESSION\]"),
     ("temporary_session", r"\[TEMPORARY SESSION\]"),
     ("cancelled_turn", r"\[PREVIOUS TURN WAS CANCELLED"),
+    ("interrupted_turn", r"\[INTERRUPTED TURN"),
+    ("change_card_results", r"\[CHANGE CARD RESULTS"),
+    (REPLY_FORMAT_LABEL, r"\[REPLY FORMAT RULES\]"),
     ("request_header", r"\[CURRENT USER REQUEST"),
 )
 
-_COMPILED: Final = tuple((label, re.compile(pat)) for label, pat in _MARKERS)
+# Every opener above is emitted by the assembly at the START of a line: each
+# block ends its own text with a newline before the next one is appended. The
+# same bracketed phrases also appear MID-LINE as prose — the agent prompt
+# (``config/prompt.md``) explains ``[RESOURCES]``, ``[Hook context:]``,
+# ``[INCOGNITO SESSION]`` and nine more to the model, in backticks — and an
+# unanchored scan took each mention for a real block start. Measured on one
+# real session: the 38,236-char agent prompt was reported as 438, and its
+# remaining 37.8K was booked to ``resource_advisory`` (12,348), ``hook_context``
+# (10,374), ``surface``, ``working_folder`` and two session modes that were
+# not even on. Anchoring to line start is what makes "the assembly emitted
+# this marker" and "the marker matched" the same statement.
+#
+# ``request_header`` is the one exception: the interactive-guidance paragraphs
+# before it end with ``)`` and no newline, so the header legitimately follows
+# them on the same line. The hyphenated form the assembly emits is scrubbed out
+# of every untrusted source before assembly; a bare ``[CURRENT USER REQUEST]``
+# is not, and can still count as a header hit here. That is a pre-existing
+# breakdown-only concern (the span the panel trusts comes from the assembly,
+# not from this scan), not a boundary-forgery one.
+#
+# The one seam whose text the assembly does not shape itself -- the caller's
+# ``request_prefix_context`` (a ``$skill`` body arrives ``.strip()``ed) -- is
+# newline-terminated by the assembly for exactly this reason.
+_LINE_START_EXEMPT: Final[frozenset[str]] = frozenset({"request_header"})
+
+_COMPILED: Final = tuple(
+    (label, re.compile(pat if label in _LINE_START_EXEMPT else r"^" + pat, re.MULTILINE))
+    for label, pat in _MARKERS
+)
+
+# Closing markers, by label. A block that has one owns only up to its OWN
+# closer; the characters between that closer and the next opening marker belong
+# to no block anybody named and are reported as ``unclassified``.
+#
+# Without this, a block's span ran all the way to the next marker it could find,
+# which silently turned "unattributed" into "MIS-attributed" — and the panel has
+# no way to tell a genuinely large block from a small one that swallowed its
+# neighbours. It is not a rare edge either: whichever blocks are conditional
+# (workspace identity and the docs pointer are skipped for a custom agent, the
+# memory family for a session sealed from the user's memory) are exactly the
+# ones whose absence lets an earlier block absorb everything downstream of it.
+# Measured on one real session: a ~470-char profile block was reported as 8,116.
+#
+# Only closers that the assembly actually emits are listed, so adding one is a
+# data change here rather than an edit to the scanner. A single-line block
+# (``[CURRENT DATE]``, ``[RUNTIME]``, …) has no closer and keeps the old
+# next-marker behaviour, which is correct for it: there is nothing in between.
+#
+# Nesting needs no special case. ``[SESSION CONTEXT`` wraps the memory family and
+# closes long after it, but the search below is bounded by the next opening
+# marker, so a wrapper whose nested blocks start first simply never finds its own
+# closer in range and ends where it always did.
+_CLOSERS: Final[dict[str, re.Pattern[str]]] = {
+    label: re.compile(pat)
+    for label, pat in (
+        ("critical_rules", r"\[END CRITICAL RULES\]"),
+        ("agent_instructions", r"\[END AGENT SYSTEM PROMPT\]"),
+        ("session_wrapper", r"\[END OF SESSION CONTEXT\]"),
+        ("workspace_identity", r"\[End of workspace identity\]"),
+        ("docs_pointer", r"\[END DOCUMENTATION\]"),
+        # Three memory blocks share this opener: the protected `[Memory —` read,
+        # the `[Memory activity index —` hints and the budgeted `[Memory activity
+        # —` block. Each closes with its own spelling, so one alternation covers
+        # them; a closer left out here lets that block absorb what follows it.
+        ("memory", r"\[End of memory(?: activity(?: index)?)?\]"),
+        ("memory_tools", r"\[End of memory tools\]"),
+        ("steering", r"\[End of steering resources\]"),
+        ("thread_history", r"\[End of thread history\]"),
+        ("recovery", r"\[END REINJECTED\]"),
+        ("semantic_memory", r"\[End of semantic memory\]"),
+        ("task_facts", r"\[End of task facts\]"),
+        ("skill_index", r"\[End of skills\]"),
+        ("lessons", r"\[End of learned corrections\]"),
+        ("episodic_memory", r"\[End of episodic memory\]"),
+        # Escaped `]` matters: `[End of skill]` is a prefix of `[End of skills]`,
+        # and an unanchored pattern would let one loaded skill claim the whole
+        # skills index that follows it.
+        ("loaded_skill", r"\[End of skill\]"),
+        ("skill_hint", r"\[End of relevant skills\]"),
+        ("channel_context", r"\[END SLACK THREAD CONTEXT\]"),
+        ("conversation_replay", r"\[END CONVERSATION HISTORY\]"),
+        # Two spellings reach this opener: `context_assembly/turn_message.py` emits
+        # `[End of hook context]` and `dashboard/chat_turn/turn_dispatch_gates.py` emits
+        # `[End hook context]`. Both are real emit sites, so one alternation covers them
+        # rather than picking whichever the assembly happened to use last.
+        ("hook_context", r"\[End (?:of )?hook context\]"),
+        ("history_prefix", r"\[End of history\]"),
+        ("theme_persona", r"\[END THEME PERSONA\]"),
+        ("user_profile", r"\[End of user profile\]"),
+        ("ui_language", r"\[End of UI language\]"),
+        ("response_preferences", r"\[END RESPONSE PREFERENCES\]"),
+        ("cancelled_turn", r"\[END PREVIOUS TURN\]"),
+        ("interrupted_turn", r"\[END INTERRUPTED TURN\]"),
+        ("change_card_results", r"\[END CHANGE CARD RESULTS\]"),
+    )
+}
 
 # The reply-format / tool-contract paragraphs the assembly appends after the
 # user's text. They open with a parenthesis at the start of a line and are the
@@ -79,8 +186,6 @@ EVERY_TURN_LABELS: Final[frozenset[str]] = frozenset(
     {"surface", "working_folder", "request_header", "reply_format_rules", "user_display"}
 )
 
-REPLY_FORMAT_LABEL: Final = "reply_format_rules"
-
 PHASE_SESSION_START: Final = "session_start"
 PHASE_PER_TURN: Final = "per_turn"
 
@@ -93,6 +198,11 @@ def attributable_user_chars(original_len: int, *, prompt_expanded: bool) -> int:
 
     * ``@prompt`` REPLACES the message with SOP/prompt content — injected
       instruction, not user typing — so none of it is the user's (return 0).
+    * A ``/plain``-style QUICK PROMPT is the same class of replacement: the token
+      the user typed is gone from the turn and what remains is generated
+      instruction, so none of it is theirs either. ``build_message`` reports an
+      empty user span for that turn, and the caller passes ``prompt_expanded``
+      for it, so this fallback agrees with the authoritative span.
     * ``$skill`` APPENDS skill bodies after the original text, so the original
       typed length still marks the user's span; the appended ``[Skill: ]``
       blocks classify by their own markers in :func:`split_blocks`.
@@ -109,6 +219,7 @@ def split_blocks(
     user_chars: int = 0,
     user_offset: int = 0,
     user_span: tuple[int, int] | None = None,
+    utf8_bytes: bool = False,
 ) -> dict[str, int]:
     """Attribute ``prompt``'s characters to the block that produced them.
 
@@ -131,11 +242,15 @@ def split_blocks(
     so the user span starts ``user_offset`` chars in rather than flush against
     the header; the prepended context keeps its own attribution.
 
-    Returns a label -> characters mapping. Zero-length blocks are omitted.
-    Every character of ``prompt`` is accounted for exactly once, so the values
+    Returns a label -> characters mapping (UTF-8 bytes with ``utf8_bytes=True``).
+    Span coordinates always remain characters; use an authoritative ``user_span``
+    for exact byte attribution. No tokenizer or provider serialization is involved.
+    Zero-length blocks are omitted. Every character of ``prompt`` is accounted for exactly once, so the values
     sum to ``len(prompt)`` — a property the tests assert, and the reason
     ``unclassified`` exists rather than a silent drop.
     """
+    if utf8_bytes and user_span is None:
+        raise ValueError("UTF-8 attribution requires an authoritative user_span")
     if not prompt:
         return {}
 
@@ -154,7 +269,13 @@ def split_blocks(
     # book its bytes as memory while the header's bytes were credited to the
     # message.
     header_at = next(
-        (m.start() for label, pat in _COMPILED if label == "request_header" for m in [pat.search(prompt)] if m),
+        (
+            m.start()
+            for label, pat in _COMPILED
+            if label == "request_header"
+            for m in [pat.search(prompt)]
+            if m
+        ),
         None,
     )
     user_start = user_end = -1
@@ -181,19 +302,24 @@ def split_blocks(
     if user_start >= 0:
         hits = [(pos, label) for pos, label in hits if not (user_start <= pos < user_end)]
 
+    # Keep marker/span coordinates in characters in both modes. Only the
+    # measured extents change; native serialization is outside this boundary.
+    def size(start: int, end: int) -> int:
+        return len(prompt[start:end].encode("utf-8")) if utf8_bytes else end - start
+
     out: dict[str, int] = {}
     if not hits:
-        # No markers at all: a bare prompt (minimal-context cron runs reach
-        # here). Attribute what the caller told us and leave the rest visible.
-        if user_chars:
-            out[USER_LABEL] = min(user_chars, len(prompt))
-        remainder = len(prompt) - out.get(USER_LABEL, 0)
+        start = user_start if user_start >= 0 else 0
+        end = user_end if user_start >= 0 else min(user_chars, len(prompt))
+        if end > start:
+            out[USER_LABEL] = size(start, end)
+        remainder = size(0, len(prompt)) - out.get(USER_LABEL, 0)
         if remainder > 0:
             out[UNCLASSIFIED_LABEL] = remainder
         return out
 
     if hits[0][0] > 0:
-        out[UNCLASSIFIED_LABEL] = hits[0][0]
+        out[UNCLASSIFIED_LABEL] = size(0, hits[0][0])
 
     # Accumulate each block's span, carving out any overlap with the user span
     # so the user's bytes are credited to USER_LABEL EXACTLY where they sit.
@@ -205,15 +331,59 @@ def split_blocks(
     # count would leave the user's bytes mis-credited to memory and strip
     # unrelated header bytes instead.
     user_taken = 0
+    if user_start >= 0 and hits[0][0] > user_start:
+        right = min(hits[0][0], user_end)
+        user_taken = size(user_start, right)
+        out[UNCLASSIFIED_LABEL] -= user_taken
     for index, (start, label) in enumerate(hits):
-        end = hits[index + 1][0] if index + 1 < len(hits) else len(prompt)
-        seg = end - start
+        next_start = hits[index + 1][0] if index + 1 < len(hits) else len(prompt)
+        # A block owns up to its own closer when it has one IN RANGE, otherwise up
+        # to the next block. Bounding the search by ``next_start`` is what keeps a
+        # wrapper (whose nested blocks open before it closes) behaving as before.
+        end = next_start
+        closer = _CLOSERS.get(label)
+        if closer is not None:
+            # The LAST match before the next opener, not the first. A block's
+            # content can quote its own closer — a custom agent prompt that
+            # documents the envelope it is injected into embeds
+            # `[END AGENT SYSTEM PROMPT]` verbatim — and first-match would end the
+            # block at that quotation, booking the rest of its real body as
+            # `unclassified`. Last-match is right by construction: nothing of the
+            # block follows its real closer, so any earlier occurrence in range is
+            # content. Bounded by `next_start`, so this still cannot reach past the
+            # next block.
+            closed = None
+            for match in closer.finditer(prompt, start, next_start):
+                closed = match
+            if closed is not None:
+                end = closed.end()
+                # The blank line a block emits right after its own closer is that
+                # block's separator, not unattributed text. Keeping it here is what
+                # makes the remainder a real gap instead of a two-character crumb
+                # of `unclassified` after every single closed block.
+                while end < next_start and prompt[end] in " \t\r\n":
+                    end += 1
+        seg = size(start, end)
         if user_start >= 0:
-            overlap = max(0, min(end, user_end) - max(start, user_start))
+            left, right = max(start, user_start), min(end, user_end)
+            overlap = size(left, right) if right > left else 0
             seg -= overlap
             user_taken += overlap
         if seg > 0:
             out[label] = out.get(label, 0) + seg
+        # The characters after this block's closer and before the next block
+        # started. Naming them ``unclassified`` is the whole point: billing them to
+        # whichever block happens to precede them would read as a confident
+        # measurement of something nobody measured.
+        if end < next_start:
+            gap = size(end, next_start)
+            if user_start >= 0:
+                left, right = max(end, user_start), min(next_start, user_end)
+                overlap = size(left, right) if right > left else 0
+                gap -= overlap
+                user_taken += overlap
+            if gap > 0:
+                out[UNCLASSIFIED_LABEL] = out.get(UNCLASSIFIED_LABEL, 0) + gap
 
     if user_taken > 0:
         out[USER_LABEL] = out.get(USER_LABEL, 0) + user_taken
@@ -230,3 +400,123 @@ def split_blocks(
                 del out[host]
 
     return {label: size for label, size in out.items() if size > 0}
+
+
+def _block_domain(label: str) -> str:
+    """Group one assembled block by what the provider is being asked to do with it.
+
+    Five domains: the user's own turn is a ``request``, the two instruction
+    blocks are a ``contract``, the three replayed-turn blocks are ``replay``,
+    and the reply-format rules are a ``following_interaction``. Everything else
+    is ``background`` — that is most of ``_MARKERS``, plus the
+    ``UNCLASSIFIED_LABEL`` remainder ``split_blocks`` emits for bytes it could
+    not attribute, so a growing ``background`` share says nothing on its own
+    about which block grew.
+
+    The four named cases are mutually exclusive, so the check order is for
+    reading only and carries no precedence.
+    """
+    if label == USER_LABEL:
+        return "request"
+    if label in {"agent_instructions", "critical_rules"}:
+        return "contract"
+    if label in {"conversation_replay", "thread_history", "history_prefix"}:
+        return "replay"
+    if label == REPLY_FORMAT_LABEL:
+        return "following_interaction"
+    return "background"
+
+
+def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -> dict:
+    """Exact Crew-assembled extents, not provider input or token estimates.
+
+    A lifecycle describes this assembly (fresh, warm, resume, reinjection or
+    minimal), not how long the provider retains a block. No bodies are recorded.
+    Native prompts/history/resources and external MCP serialization are unknown.
+    """
+    chars = split_blocks(prompt, user_span=user_span)
+    byte_counts = split_blocks(prompt, user_span=user_span, utf8_bytes=True)
+    return {
+        "boundary": "crew_assembly",
+        "lifecycle": lifecycle,
+        "chars": len(prompt),
+        "bytes": len(prompt.encode("utf-8")),
+        "blocks": {
+            label: {
+                "chars": count,
+                "bytes": byte_counts[label],
+                "domain": _block_domain(label),
+            }
+            for label, count in chars.items()
+        },
+        "native": "UNKNOWN",
+        "external_mcp": "UNKNOWN",
+    }
+
+
+_CARD_TEXT_MAX: Final = 200
+_CARD_RESULTS_MAX: Final = 12
+
+
+def _card_text(value: object) -> str:
+    """One line of card-supplied text, with every bracket marker defused."""
+    text = " ".join(str(value or "").split())
+    text = text.replace("[", "(").replace("]", ")")
+    return text if len(text) <= _CARD_TEXT_MAX else text[: _CARD_TEXT_MAX - 1] + "…"
+
+
+def render_self_change_undos(undos: list[dict]) -> str:
+    """The block telling a crewmate the user took back a change it made to itself.
+
+    Reference data for the next turn, never a request: built from the gateway's
+    own undo record (which fields went back), with no values quoted -- the
+    crewmate reads its own record from its identity block, which already shows
+    the restored name, description and face. Empty input renders nothing.
+    """
+    if not undos:
+        return ""
+    lines = [
+        "[YOUR RECORD -- the user pressed Undo on a change you made to yourself since "
+        "your last turn. Reference data, not a request from the user.]"
+    ]
+    for item in undos[:_CARD_RESULTS_MAX]:
+        fields = ", ".join(_card_text(f) for f in item.get("changed") or [])
+        lines.append(f"- your {fields or 'record'}: back to what it was before your change")
+    lines.append(
+        "Your name, description and face as they stand now are in your identity block "
+        "above; speak of those, not of the change you made."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
+def render_change_card_results(outcomes: list[dict]) -> str:
+    """The block telling a proposing agent how its change cards ended.
+
+    Reference data for the next turn, never a request: it is built from the
+    gateway's own record (kind, product-written title, status, summary) and
+    carries no secret value, since a card never holds one. Text from the card is
+    flattened to one line and its brackets defused, so a title cannot forge a
+    block boundary. Empty input renders nothing.
+    """
+    if not outcomes:
+        return ""
+    lines = [
+        "[CHANGE CARD RESULTS -- how the change cards you proposed ended since your "
+        "last turn. Reference data, not a request from the user.]"
+    ]
+    for item in outcomes[:_CARD_RESULTS_MAX]:
+        line = (
+            f"- {_card_text(item.get('kind'))} “{_card_text(item.get('title'))}”: "
+            f"{_card_text(item.get('status'))}"
+        )
+        summary = _card_text(item.get("summary"))
+        if summary:
+            line += f" — {summary}"
+        error = _card_text(item.get("error"))
+        if error and item.get("status") in ("failed", "partial"):
+            line += f" (error: {error})"
+        lines.append(line)
+    if len(outcomes) > _CARD_RESULTS_MAX:
+        lines.append(f"- … and {len(outcomes) - _CARD_RESULTS_MAX} more (get_change_status)")
+    lines.append("[END CHANGE CARD RESULTS]")
+    return "\n".join(lines) + "\n\n"

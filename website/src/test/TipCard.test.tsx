@@ -25,9 +25,9 @@ vi.mock('../api/client', () => ({
 
 vi.mock('framer-motion', () => ({
   motion: {
-    div: ({ children, ...props }: any) => <div {...props}>{children}</div>,
+    div: ({ children, ...props }: { children?: React.ReactNode } & Record<string, unknown>) => <div {...props}>{children}</div>,
   },
-  AnimatePresence: ({ children }: any) => <>{children}</>,
+  AnimatePresence: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
 }))
 
 function renderWithQuery(ui: React.ReactElement) {
@@ -50,7 +50,11 @@ describe('TipCard (single-line strip)', () => {
     const { container } = renderWithQuery(
       <TipCard tip={mockTip} onDismiss={onDismiss} />,
     )
-    const root = container.firstElementChild as HTMLElement
+    // The motion wrapper is `container.firstElementChild`; the card itself is
+    // the Glass host inside it (components/Glass.tsx), which carries the layout
+    // classes and the Lightbulb.
+    expect(container.firstElementChild).not.toBeNull()
+    const root = screen.getByTestId('tip-card')
     expect(root.className).toContain('flex')
     expect(root.className).toContain('items-start')
 
@@ -68,8 +72,9 @@ describe('TipCard (single-line strip)', () => {
     expect(body.className).toContain('overflow-y-auto')
     expect(body.className).toContain('break-words')
 
-    // Lucide lightbulb SVG present
-    const icon = root.querySelector('svg[aria-hidden="true"]')
+    // Lucide lightbulb SVG present. The Glass host also renders a 0x0
+    // aria-hidden <svg> for its refraction filter, so match the lucide class.
+    const icon = root.querySelector('svg.lucide[aria-hidden="true"]')
     expect(icon).not.toBeNull()
   })
 
@@ -114,6 +119,45 @@ describe('TipCard (single-line strip)', () => {
     }
   })
 
+  it('renders the Learn more link from doc_link when doc is empty (dismissal-identity split)', () => {
+    // A curated tip links a doc it does not own for dismissal purposes:
+    // doc="" keeps the dismissal path inert, doc_link restores the link.
+    renderWithQuery(
+      <TipCard
+        tip={{ ...mockTip, doc: '', doc_link: 'dynamic-subagent-sizing.md' }}
+        onDismiss={onDismiss}
+      />,
+    )
+    const link = screen.getByRole('link', { name: /learn more/i }) as HTMLAnchorElement
+    expect(link.href).toBe(
+      'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/dynamic-subagent-sizing.md',
+    )
+  })
+
+  it('prefers doc_link over doc and applies the same filename validation to it', () => {
+    // When both are set, the rendering-only field wins.
+    renderWithQuery(
+      <TipCard
+        tip={{ ...mockTip, doc: 'cron-and-scheduling.md', doc_link: 'skills.md' }}
+        onDismiss={onDismiss}
+      />,
+    )
+    const preferred = screen.getByRole('link', { name: /learn more/i }) as HTMLAnchorElement
+    expect(preferred.href).toBe(
+      'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/skills.md',
+    )
+  })
+
+  it('omits the Learn more link when doc_link is present but invalid (no silent doc fallback)', () => {
+    for (const doc_link of ['../secrets/keys.md', 'https://evil.example/x.md']) {
+      const { unmount } = renderWithQuery(
+        <TipCard tip={{ ...mockTip, doc: '', doc_link }} onDismiss={onDismiss} />,
+      )
+      expect(screen.queryByRole('link', { name: /learn more/i })).toBeNull()
+      unmount()
+    }
+  })
+
   it('"Turn off tips" opts out permanently (same action as the Settings toggle) and hides the card', async () => {
     const { api: mockApi } = await import('../api/client')
     renderWithQuery(
@@ -128,12 +172,12 @@ describe('TipCard (single-line strip)', () => {
     })
   })
 
-  it('renders a Settings link pointing at the Feature Tips toggle (Settings → Chat)', () => {
+  it('renders a Settings link pointing at the Feature Tips toggle (Settings → Chat → Discovery)', () => {
     renderWithQuery(
       <TipCard tip={mockTip} onDismiss={onDismiss} />,
     )
     const link = screen.getByRole('link', { name: /tip settings/i }) as HTMLAnchorElement
-    expect(link.getAttribute('href')).toBe('/settings?tab=chat')
+    expect(link.getAttribute('href')).toBe('/settings/chat/discovery')
   })
 
   it('dismiss calls tipsFeedback(id, "dismiss") and hides on success', async () => {

@@ -25,15 +25,21 @@ No subprocess is spawned by anything in this file.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
+import shutil
 import sys
+import threading
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.apps.builtins.papyrus.backend import store
+from kiro_crew.slugs import SLUG_CHARS
+from kiro_crew.testing.wait import wait_until
 
 
 @pytest.fixture()
@@ -95,8 +101,7 @@ class TestSafeChild:
         with pytest.raises(store.PathRejected):
             store.safe_child(project, "a" * 2000)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
+    @requires_symlinks
     def test_rejects_a_symlink_escaping_the_project(self, project: Path) -> None:
         """A cloned repo can ship a symlink whose target is outside the project.
 
@@ -109,14 +114,12 @@ class TestSafeChild:
         with pytest.raises(store.PathRejected):
             store.safe_child(project, "evil-link.tex")
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
     def test_rejects_a_path_through_a_symlinked_directory(self, project: Path) -> None:
         """The escape can also be a mid-path DIRECTORY link, not just a file one."""
         outside = project.parent / "outside-dir"
         outside.mkdir()
         (outside / "secret.tex").write_text("secret", encoding="utf-8")
-        os.symlink(outside, project / "linked")
+        make_dir_link(project / "linked", outside)
         with pytest.raises(store.PathRejected):
             store.safe_child(project, "linked/secret.tex")
 
@@ -156,6 +159,53 @@ class TestSafeProjectDir:
             store.safe_project_dir(store.normalize_project_name("../escape"), data_root)
 
 
+class TestProjectNameStaysAscii:
+    """The name is a directory and a ``git``/``pdflatex`` argument, so the rule
+    stays a lowercase ASCII slug. A refusal is its own type, which the routes
+    answer with the character the user typed (see ``test_papyrus_routes.py``)."""
+
+    @pytest.mark.parametrize(
+        "typed",
+        [
+            "\u8bba\u6587",  # Han
+            "\ubd84\uae30\ubcf4\uace0",  # Hangul
+            "\u041e\u0442\u0447\u0435\u0442",  # Cyrillic
+            "\u062a\u0642\u0631\u064a\u0631",  # Arabic
+            "\u8ad6\u6587\u30c9\u30e9\u30d5\u30c8",  # Japanese
+            "M\u00fcnchen",
+            "Mu\u0308nchen",  # NFD
+            "\u0130stanbul",  # lowercases to a combining dot, still refused
+        ],
+    )
+    def test_a_name_in_another_script_is_refused_and_creates_nothing(
+        self, data_root: Path, typed: str
+    ) -> None:
+        name = store.normalize_project_name(typed)
+        with pytest.raises(store.InvalidProjectName) as caught:
+            store.safe_project_dir(name, data_root)
+        # Still a PathRejected, so every existing handler keeps refusing it.
+        assert isinstance(caught.value, store.PathRejected)
+        assert str(caught.value) == "invalid project name"
+        assert not any(store.projects_dir(data_root).iterdir())
+
+    @pytest.mark.parametrize("name", ["../escape", "a\\b", "a\u202eb", "-rf", ".hidden", "x" * 65])
+    def test_path_and_option_refusals_hold(self, data_root: Path, name: str) -> None:
+        with pytest.raises(store.InvalidProjectName):
+            store.safe_project_dir(name, data_root)
+
+    def test_the_rule_itself_is_unchanged_ascii(self) -> None:
+        """The regex admits exactly the shared slug alphabet and nothing outside
+        ASCII -- this change explains the rule, it does not widen it."""
+        for code in range(0x110000):
+            if 0xD800 <= code <= 0xDFFF:
+                continue
+            char = chr(code)
+            accepted = bool(store.PROJECT_NAME_RE.match("a" + char))
+            assert accepted == (char in SLUG_CHARS), repr(char)
+        assert store.PROJECT_NAME_RE.match("x" * 64)
+        assert not store.PROJECT_NAME_RE.match("x" * 65)
+
+
 class TestMainFile:
     def test_defaults_when_no_config(self, project: Path) -> None:
         assert store.get_main_file(project) == "main.tex"
@@ -185,6 +235,13 @@ class TestMainFile:
     def test_handles_a_corrupt_config(self, project: Path) -> None:
         (project / store.PROJECT_CONFIG_FILENAME).write_text("{not valid json", encoding="utf-8")
         assert store.get_main_file(project) == "main.tex"
+        # An oversized clone-supplied config reads as absent instead of raising.
+        oversized = json.dumps({"pad": "x" * store.PROJECT_CONFIG_MAX_BYTES})
+        (project / store.PROJECT_CONFIG_FILENAME).write_text(oversized, encoding="utf-8")
+        assert store.get_main_file(project) == "main.tex"
+        # ...and is not rewritten (which would discard its keys).
+        store.set_main_file(project, "main.tex")
+        assert (project / store.PROJECT_CONFIG_FILENAME).read_text(encoding="utf-8") == oversized
 
     def test_handles_a_non_object_config(self, project: Path) -> None:
         (project / store.PROJECT_CONFIG_FILENAME).write_text('["a list"]', encoding="utf-8")
@@ -245,8 +302,7 @@ class TestListFiles:
         assert not any(f.startswith(".") for f in listed)
         assert "main.tex" in listed
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
+    @requires_symlinks
     def test_skips_symlinks_entirely(self, project: Path) -> None:
         """A tree walk that follows links is how containment leaks."""
         outside = project.parent / "outside.tex"
@@ -286,7 +342,9 @@ class TestListProjects:
         proj.mkdir(parents=True)
         (proj / "main.tex").write_text("", encoding="utf-8")
         payload = store.list_projects(data_root)[0].to_dict()
-        assert set(payload) == {"name", "modified", "has_pdf"}
+        assert set(payload) == {"name", "modified", "has_pdf", "title", "generation"}
+        assert payload["title"] == "paper"
+        assert payload["generation"]
 
 
 class TestFileIO:
@@ -588,6 +646,30 @@ class TestProjectConfigIsContained:
         store.write_project_config(project, {"main_file": "x.tex"})
         assert secret.read_text(encoding="utf-8") == original
 
+    def test_a_junctioned_config_is_refused(self, project: Path, tmp_path: Path) -> None:
+        """The two tests above skip on Windows, where os.symlink needs
+        SeCreateSymbolicLinkPrivilege -- so the one link type an unprivileged
+        Windows user CAN create had no coverage here at all.
+
+        The link points INSIDE the project on purpose: `safe_child` answers "does
+        this resolve inside the project", and an in-project link satisfies it, so
+        an out-of-project link is refused by containment whether or not the link
+        guard fires and cannot tell the two builds apart. Asserted on
+        `_config_path` rather than `read_project_config`, because reading a
+        directory fails anyway and the outcome would look right while the guard
+        was never consulted.
+
+        A junction is directory-only, so it cannot stand in for the
+        `.papyrus.json -> paper.tex` overwrite the symlink tests cover; what it
+        does is slip past a refusal this module documents as link-type-agnostic.
+        """
+        inside = project / "chapters"
+        inside.mkdir(exist_ok=True)
+        (project / store.PROJECT_CONFIG_FILENAME).unlink(missing_ok=True)
+        make_dir_link(project / store.PROJECT_CONFIG_FILENAME, inside)
+
+        assert store._config_path(project) is None
+
     @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
     def test_an_in_project_config_symlink_cannot_overwrite_the_manuscript(
         self, project: Path
@@ -717,11 +799,11 @@ class TestGitMachineryIsNotDocumentContent:
 class TestASymlinkedProjectEntryIsRefused:
     """`projects/<name>` must be a real directory under `projects_dir`, never a link.
 
-    The containment check used to accept `resolved == projects_dir` (the `resolved
-    != base_resolved` disjunct), and `projects/pwn -> .` satisfied exactly that.
-    The blast radius was total: every OTHER paper became a "child" of the fake
-    project, so `safe_child` resolved `other-paper/main.tex` as an in-project path
-    (cross-project read AND write), and `DELETE /project?name=pwn` ran `rmtree` on
+    A containment check that accepts `resolved == projects_dir` (the `resolved
+    != base_resolved` disjunct) is satisfied by `projects/pwn -> .`, and the blast
+    radius is total: every OTHER paper becomes a "child" of the fake project, so
+    `safe_child` resolves `other-paper/main.tex` as an in-project path
+    (cross-project read AND write), and `DELETE /project?name=pwn` runs `rmtree` on
     the projects ROOT — destroying every paper the user had.
     """
 
@@ -730,7 +812,7 @@ class TestASymlinkedProjectEntryIsRefused:
         pdir.mkdir(parents=True, exist_ok=True)
         (pdir / "thesis").mkdir()
         (pdir / "thesis" / "main.tex").write_text("SECRET", encoding="utf-8")
-        (pdir / "pwn").symlink_to(".", target_is_directory=True)
+        make_dir_link(pdir / "pwn", pdir)
 
         with pytest.raises(store.PathRejected):
             store.safe_project_dir("pwn", tmp_path)
@@ -740,7 +822,7 @@ class TestASymlinkedProjectEntryIsRefused:
         pdir.mkdir(parents=True, exist_ok=True)
         outside = tmp_path / "outside"
         outside.mkdir()
-        (pdir / "escape").symlink_to(outside, target_is_directory=True)
+        make_dir_link(pdir / "escape", outside)
 
         with pytest.raises(store.PathRejected):
             store.safe_project_dir("escape", tmp_path)
@@ -750,7 +832,7 @@ class TestASymlinkedProjectEntryIsRefused:
         pdir = store.projects_dir(tmp_path)
         pdir.mkdir(parents=True, exist_ok=True)
         (pdir / "real").mkdir()
-        (pdir / "alias").symlink_to(pdir / "real", target_is_directory=True)
+        make_dir_link(pdir / "alias", pdir / "real")
 
         with pytest.raises(store.PathRejected):
             store.safe_project_dir("alias", tmp_path)
@@ -772,14 +854,17 @@ class TestReparseLinkCoversJunctions:
     drift apart on which link types they cover.
     """
 
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="symlink creation needs privilege on Windows"
-    )
-    def test_a_symlink_is_a_reparse_link(self, tmp_path: Path) -> None:
+    def test_a_directory_link_is_a_reparse_link(self, tmp_path: Path) -> None:
+        """A junction on Windows, a directory symlink on POSIX.
+
+        The junction leg is the whole point of this helper, so it must be the leg
+        exercised on Windows: `make_dir_link` needs no privilege there, while a
+        directory symlink would raise WinError 1314 in an unelevated shell.
+        """
         real = tmp_path / "real"
         real.mkdir()
         link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
+        make_dir_link(link, real)
         assert store.is_reparse_link(link) is True
 
     def test_a_plain_directory_is_not(self, tmp_path: Path) -> None:
@@ -800,10 +885,11 @@ class TestReparseLinkCoversJunctions:
         real = tmp_path / "real"
         real.mkdir()
         link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
+        make_dir_link(link, real)
 
         with mock.patch.object(store, "_ISJUNCTION", None):
-            # A symlink is still caught by the `is_symlink()` leg.
+            # Without `isjunction`, a POSIX symlink is still caught by the
+            # `is_symlink()` leg and a Windows junction by the stat-field fallback.
             assert store.is_reparse_link(link) is True
             assert store.is_reparse_link(plain) is False
 
@@ -844,3 +930,235 @@ class TestReparseLinkCoversJunctions:
         with mock.patch.object(store, "is_reparse_link", return_value=True):
             with pytest.raises(store.PathRejected, match="symlink"):
                 store.safe_project_dir("looks-real", tmp_path)
+
+
+class TestTheWalkAndTheScanRefuseJunctionsToo:
+    """Both directory walks must refuse a link through ``is_reparse_link``.
+
+    ``is_reparse_link``'s own docstring states the contract: "every place this
+    module refuses a link at a name Kiro Crew owns has to refuse a junction too, or
+    the refusal is POSIX-only". ``safe_project_dir`` honours it. ``list_files`` and
+    ``list_projects`` asked ``is_symlink()``, which does NOT report a Windows
+    directory junction -- and a junction is precisely a DIRECTORY link, so it is the
+    ``is_dir()`` arm of both loops that it reaches:
+
+    * ``list_files`` skips the link, then descends the directory. A junction is not
+      skipped and IS a directory, so the walk follows it out of the project and
+      returns names from wherever it points, under project-relative paths.
+    * ``list_projects`` skips a linked entry, then treats the directory as a real
+      project. A junction under ``projects/`` is therefore enumerated as a project,
+      which is the entry ``safe_project_dir`` refuses outright at the other door.
+
+    Junctions are the link type a Windows user can create WITHOUT elevation, so
+    these are the platform's cheapest bypass. Asserted through the shared helper
+    rather than by creating a real junction, because ``os.path.isjunction`` is 3.12+
+    and always ``False`` off Windows -- the same technique the project-entry test
+    above uses.
+    """
+
+    def test_the_file_walk_does_not_descend_a_junction(self, project: Path) -> None:
+        outside = project.parent / "outside"
+        outside.mkdir()
+        (outside / "secret.tex").write_text("secret", encoding="utf-8")
+        junction = project / "linked"
+        junction.mkdir()
+        (junction / "secret.tex").write_text("secret", encoding="utf-8")
+
+        with mock.patch.object(store, "is_reparse_link", lambda p: Path(p) == junction):
+            listed = store.list_files(project)
+
+        assert "linked/secret.tex" not in listed
+        assert "main.tex" in listed
+
+    def test_the_file_walk_consults_the_shared_helper(self, project: Path) -> None:
+        """A junction is only refused if the walk ASKS the helper about it."""
+        (project / "sub").mkdir(exist_ok=True)
+        seen: list[str] = []
+
+        def _spy(p):
+            seen.append(Path(p).name)
+            return False
+
+        with mock.patch.object(store, "is_reparse_link", _spy):
+            store.list_files(project)
+
+        assert "sub" in seen
+
+    def test_a_junction_under_projects_is_not_listed_as_a_project(self, data_root: Path) -> None:
+        pdir = store.projects_dir(data_root)
+        real = pdir / "paper"
+        real.mkdir(parents=True)
+        (real / "main.tex").write_text("", encoding="utf-8")
+        junction = pdir / "pwn"
+        junction.mkdir()
+        (junction / "main.tex").write_text("", encoding="utf-8")
+
+        with mock.patch.object(store, "is_reparse_link", lambda p: Path(p) == junction):
+            names = [p.name for p in store.list_projects(data_root)]
+
+        assert names == ["paper"]
+
+    @requires_symlinks
+    def test_a_symlinked_project_entry_is_still_skipped(self, data_root: Path) -> None:
+        """Regression control: the POSIX leg the previous check already covered."""
+        pdir = store.projects_dir(data_root)
+        real = pdir / "paper"
+        real.mkdir(parents=True)
+        (real / "main.tex").write_text("", encoding="utf-8")
+        make_dir_link(pdir / "alias", real)
+
+        assert [p.name for p in store.list_projects(data_root)] == ["paper"]
+
+
+class TestPaperTitle:
+    """What the list CALLS a paper: the user's name, else the directory."""
+
+    def test_an_untrusted_title_is_cleaned(self, data_root: Path) -> None:
+        proj = store.projects_dir(data_root) / "cloned"
+        proj.mkdir(parents=True)
+        (proj / "main.tex").write_text("", encoding="utf-8")
+        cases: list[tuple[object, str]] = [
+            ("paper\u202egnp.txt", "papergnp.txt"),
+            ("first\nsecond", "first second"),
+            ("90% done", "90% done"),
+            ("\\LaTeX", "\\LaTeX"),
+            ("  Two   spaces ", "Two spaces"),
+            ({"nested": "object"}, "cloned"),
+            ("A" * 4000, "A" * 4000),  # the display cap is the route's, after redaction
+        ]
+        for configured, expected in cases:
+            store.write_project_config(proj, {"title": configured})
+            assert store.project_title(proj) == expected, configured
+
+        store.write_project_config(proj, {"title": "Kept"})
+        with pytest.raises(store.TitleRejected), store.config_lock(proj):
+            store.set_project_title_locked(proj, "\u200b")
+        assert store.read_project_config(proj)["title"] == "Kept"
+
+    @requires_symlinks
+    def test_no_config_read_follows_a_link(
+        self, data_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "config.json").write_text(json.dumps({"title": "Exfiltrated"}), encoding="utf-8")
+        proj = store.projects_dir(data_root) / "paper"
+        proj.mkdir(parents=True)
+
+        # `.papyrus.json` swapped for a link after `_config_path` checked it.
+        config = proj / store.PROJECT_CONFIG_FILENAME
+        os.symlink(outside / "config.json", config)
+        monkeypatch.setattr(store, "_config_path", lambda _project: config)
+        assert store.read_project_config(proj) == {}
+
+    def test_paper_state_survives_deletes_and_races(
+        self, data_root: Path, tmp_path: Path
+    ) -> None:
+        def paper(name: str) -> Path:
+            proj = store.projects_dir(data_root) / name
+            proj.mkdir(parents=True)
+            (proj / "main.tex").write_text("\\documentclass{article}", encoding="utf-8")
+            return proj
+
+        # A generation is stable, changes when the paper is replaced, and is shared
+        # with a spelling of the same paper behind a linked ancestor.
+        proj = paper("paper")
+        before = store.project_generation(proj)
+        assert store.project_generation(proj) == before
+        make_dir_link(tmp_path / "alias", data_root)
+        via_link = store.projects_dir(tmp_path / "alias") / "paper"
+        assert store.project_generation(via_link) == before
+        assert store.config_lock(via_link) is store.config_lock(proj)
+        store.delete_project(proj)
+        proj = paper("paper")
+        assert store.project_generation(proj) != before
+
+        # The registry is capped. A full registry first forgets entries whose
+        # folder is gone, then refuses a new paper instead of evicting a token it
+        # already handed out, so a listing never invalidates a row it returns.
+        store._GENERATIONS.clear()
+        current = store.project_generation(proj)
+        with mock.patch.object(store, "_MAX_GENERATIONS", 2):
+            other_gen = store.project_generation(other := paper("other"))
+            assert store.project_generation(third := paper("third")) == ""
+            assert store.project_generation(proj) == current
+            assert store.project_generation(other) == other_gen
+            with pytest.raises(RuntimeError):
+                store.list_projects(data_root)
+            shutil.rmtree(other)  # removed outside Papyrus
+            assert store.project_generation(third) != ""
+        store.delete_project(third)
+        # A row torn by a delete and recreate while it is built is left out.
+        real_title = store.project_title
+
+        def replaced_mid_row(project: Path) -> str:
+            title = real_title(project)
+            store.delete_project(project)
+            paper(project.name)
+            return title
+
+        with mock.patch.object(store, "project_title", replaced_mid_row):
+            assert store.list_projects(data_root) == []
+        assert [p.name for p in store.list_projects(data_root)] == ["paper"]
+
+        # A title rename and a main-file change racing between read and write both land.
+        paper("race")
+        race = store.projects_dir(data_root) / "race"
+        (race / "other.tex").write_text("", encoding="utf-8")
+        real_read = store.read_project_config
+        real_read_for_update = store._read_config_for_update
+        both_read = threading.Barrier(2, timeout=0.5)
+
+        def slow_read(project: Path) -> dict:
+            config = real_read_for_update(project)
+            try:
+                both_read.wait()
+            except threading.BrokenBarrierError:
+                pass  # serialized: the second reader never enters the window
+            return config
+
+        def rename(project: Path, title: str) -> None:
+            with store.config_lock(project):
+                store.set_project_title_locked(project, title)
+
+        with mock.patch.object(store, "_read_config_for_update", slow_read):
+            workers = [
+                threading.Thread(target=rename, args=(race, "Named")),
+                threading.Thread(target=store.set_main_file, args=(race, "other.tex")),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+        config = real_read(race)
+        assert (config.get("title"), config.get("main_file")) == ("Named", "other.tex")
+
+        # A refused write is not a saved rename, nor a saved main document.
+        with mock.patch.object(store, "write_project_config", return_value=False):
+            with pytest.raises(store.ConfigWriteRefused):
+                rename(race, "New name")
+            assert store.set_main_file(race, "main.tex") is False
+
+        # A delete waits for a write in flight, and a late write never recreates it.
+        lock = store.config_lock(race)
+        lock.acquire()
+        queued = threading.Event()
+        worker = threading.Thread(target=store.delete_project, args=(race,))
+        try:
+            with mock.patch.object(
+                store, "_config_lock", side_effect=lambda _p, held=lock: queued.set() or held
+            ):
+                worker.start()
+                wait_until(queued.is_set)
+            assert race.exists()
+        finally:
+            lock.release()
+            worker.join(timeout=5)
+        assert not race.exists()
+        assert store.write_project_config(race, {"title": "late"}) is False
+        assert not race.exists()
+
+        # A deleted paper does not keep its lock in the registry.
+        del lock
+        gc.collect()
+        assert str(race) not in store._CONFIG_LOCKS

@@ -6,13 +6,19 @@
  * their current equivalents; unknown/current ids pass through unchanged.
  */
 import { describe, it, expect } from 'vitest'
-import { resolveLegacyHighlightId } from '../hooks/useSettingHighlight'
+import { LEGACY_EXACT_HIGHLIGHT_IDS, resolveLegacyHighlightId } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 
 describe('resolveLegacyHighlightId', () => {
-  it('maps slack.* ids to channels.* (nav regroup tab collapse)', () => {
-    expect(resolveLegacyHighlightId('slack.slash-command')).toBe('channels.slash-command')
-    expect(resolveLegacyHighlightId('slack.owner-slack-member-id')).toBe('channels.owner-slack-member-id')
+  it('maps slack.* ids to the suffixed channels.* forms (tab collapse + label suffix)', () => {
+    expect(resolveLegacyHighlightId('slack.slash-command')).toBe('channels.slash-command-slack')
+    expect(resolveLegacyHighlightId('slack.owner-slack-member-id')).toBe('channels.owner-slack-member-id-slack')
+  })
+
+  it('maps pre-suffix channels.* ids (all SlackPanel rows) to the -slack forms', () => {
+    expect(resolveLegacyHighlightId('channels.slash-command')).toBe('channels.slash-command-slack')
+    // A suffixed (current) id passes through untouched.
+    expect(resolveLegacyHighlightId('channels.folder-name-teams')).toBe('channels.folder-name-teams')
   })
 
   it('maps the four positional voice AWS ids to their qualified forms', () => {
@@ -34,12 +40,39 @@ describe('resolveLegacyHighlightId', () => {
     expect(resolveLegacyHighlightId('display.zoom-level')).toBe('display.zoom-level')
   })
 
+  // The pin toggle's label moved from "prompt" to "turn" vocabulary, and the
+  // derived id moved with it.
+  it('maps the pin toggle id to its turn-vocabulary form', () => {
+    expect(resolveLegacyHighlightId('chat.pin-the-latest-prompt')).toBe('chat.pin-the-latest-turn')
+  })
+
+  // The peer-session preview card folded into "Chat on a crew"; a bookmark
+  // saved against either of its ids lands on the one switch.
+  it('maps both peer-session preview ids to the Chat on a crew card', () => {
+    expect(resolveLegacyHighlightId('developer.remote-instance-sessions')).toBe('developer.chat-on-a-crew')
+    expect(resolveLegacyHighlightId('developer.remote-crew-sessions')).toBe('developer.chat-on-a-crew')
+  })
+
+  // The two About update switches were relabelled by what each one does.
+  it('maps the update switch ids to their current labels', () => {
+    expect(resolveLegacyHighlightId('about.auto-update-on-restart')).toBe('about.install-app-updates-automatically')
+    expect(resolveLegacyHighlightId('about.update-notifications')).toBe('about.update-the-gateway-automatically')
+  })
+
+  it('rewrites no id a registry row has now', () => {
+    const ids = new Set(SETTINGS_REGISTRY.map(e => e.id))
+    expect(LEGACY_EXACT_HIGHLIGHT_IDS.filter(id => ids.has(id))).toEqual([])
+  })
+
   it('every migrated target exists in the generated registry', () => {
     const ids = new Set(SETTINGS_REGISTRY.map(e => e.id))
     for (const legacy of [
       'slack.slash-command', 'slack.owner-slack-member-id', 'slack.phase-reactions', 'slack.show-thinking',
       'voice.aws-profile', 'voice.aws-profile-2', 'voice.aws-region', 'voice.aws-region-2',
       'voice.aws-profile-polly', 'voice.aws-region-polly',
+      'chat.pin-the-latest-prompt',
+      'developer.remote-instance-sessions', 'developer.remote-crew-sessions',
+      'about.auto-update-on-restart', 'about.update-notifications',
     ]) {
       const target = resolveLegacyHighlightId(legacy)
       expect(ids.has(target), `${legacy} -> ${target} missing from registry`).toBe(true)

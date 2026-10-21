@@ -17,7 +17,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,22 +39,22 @@ except ImportError:  # pragma: no cover - standalone fallback
 _RISK_W = {"low": 0, "medium": 35, "high": 60}
 _BLAST_W = {"SMALL": 0, "MEDIUM": 25, "LARGE": 40}
 
-# LLM-authored free-text fields. These are model output and must never be
-# surfaced raw: the dashboard reads the local rows.json / focus-report.html this
-# module writes DIRECTLY (no redaction in between), so we scrub here. Per
-# untrusted-LLM-output guidance ("should not be trusted at all") + the security-controls
-# guideline (scan with redact_exfiltration_urls + redact_credentials before any
-# external surface). The artifact-archive path also redacts; this closes the
-# local-file gap. ``pipeline._redact`` is a no-op when the redaction lib is
-# unavailable (standalone), so this is safe everywhere.
-_LLM_ROW_FIELDS = ("problem", "why_it_matters", "solution_assessment", "rationale")
-
 # Nesting depth past which a value is stringified rather than walked. The record
 # is worker-written JSON, so depth is attacker-chosen; recursing without a bound
 # turns a deep payload into a RecursionError on the report path.
 _REDACT_MAX_DEPTH = 6
 
 
+# Why the helpers below exist at all: the strings a worker and the reviewing model
+# write reach three local artifacts this module produces -- focus-report.html,
+# rows.json and report.json -- with nothing between `build_report` and the file, so
+# the scrub happens here. Per untrusted-LLM-output guidance ("should not be trusted
+# at all") plus the security-controls guideline (scan with redact_exfiltration_urls
+# AND redact_credentials before any external surface). `read_report` redacts AGAIN on
+# the way out, because the reports dir is writable by that worker, and the
+# artifact-archive path redacts too. ``pipeline._redact`` is a no-op when the
+# redaction lib is unavailable (standalone), so these calls are safe to make
+# everywhere.
 def _redact_deep(value: object, skip: frozenset[str] = frozenset(),
                  _depth: int = 0) -> object:
     """Redact every string inside `value` -- keys and values, at any depth --
@@ -125,20 +124,19 @@ def _redact_deep_map(d: dict, skip: frozenset[str] = frozenset(), *,
 def _redact_finding(f: dict) -> dict:
     """Scrub every model-written string in a finding, at any depth.
 
-    Enumerating the prose fields missed `file`, which the reviewer also writes and
+    Enumerating the prose fields misses `file`, which the reviewer also writes and
     which reaches report.json and the dashboard. Redacting every string value
-    instead of a named subset closed the set of KEYS; `_redact_deep` then closed
-    the set of VALUES, so a nested dict or list can no longer carry an injected
-    secret through.
+    instead of a named subset closes the set of KEYS; `_redact_deep` closes the
+    set of VALUES, so a nested dict or list cannot carry an injected secret
+    through.
 
-    There is NO skip set. `line` used to be exempt "because it is numeric", but
-    nothing enforced that: the boundary validator accepts any scalar, so a
-    reviewer writing a credential into `line` as a string sailed past the
-    exemption and reached the dashboard unredacted. `validate_result` now requires
-    `line` to be a real number, which makes the exemption unnecessary — a number
-    is not a string, so `_redact_deep` leaves it alone anyway. An exemption whose
-    premise is not enforced is just a hole, so the premise is enforced and the
-    exemption is gone.
+    There is NO skip set. Exempting `line` "because it is numeric" needs that
+    premise enforced: a boundary validator accepting any scalar lets a reviewer
+    write a credential into `line` as a string and sail past the exemption to the
+    dashboard unredacted. `validate_result` requires `line` to be a real number,
+    which makes an exemption unnecessary — a number is not a string, so
+    `_redact_deep` leaves it alone anyway. An exemption whose premise is not
+    enforced is just a hole, so the premise is enforced and there is no exemption.
     A finding's KEY NAMES are model-written too -- the boundary validator requires
     the fields it needs but does not forbid extras, so a worker can name a field
     anything, including a credential. `redact_keys=True` scrubs this level's names;
@@ -227,18 +225,18 @@ def classify(record: dict, config: dict | None = None) -> dict:
 # and `band_override` is already constrained to them, so this is a vocabulary for
 # screening the UNTRUSTED read path, not a constraint on our own output.
 #
-# It replaces a redaction exemption. `band` used to be the one row field skipped by
-# `_redact_row`, on the argument that `bands[row["band"]]` here and
-# `BAND_DOT[row.band]` in ReportView index on its exact value. The concern was real
-# but the protection was wrong: redaction is shape-based, so red/yellow/green come
-# back byte-identical and the indexing was never at risk — while the exemption made
-# `band` the single field in the row that reached the dashboard verbatim, so a
-# planted "red <credential>" leaked where the prose beside it was scrubbed.
+# It stands in for a redaction exemption, which no row field gets. Exempting
+# `band` from `_redact_row` because `bands[row["band"]]` here and
+# `BAND_DOT[row.band]` in ReportView index on its exact value is unnecessary:
+# redaction is shape-based, so red/yellow/green come back byte-identical and the
+# indexing is never at risk — while an exemption makes `band` the single field in
+# the row that reaches the dashboard verbatim, so a planted "red <credential>"
+# leaks where the prose beside it is scrubbed.
 #
-# An earlier version of that set also exempted `change_id`, `platform`,
-# `gate_verdict`, `blast` and `design_risk` on the claim that they are "validated
-# against fixed vocabularies". That was wrong for the same reason: `validate_result`
-# enforces a vocabulary for `gate_verdict` alone. Nothing in a row is exempt now.
+# The same holds for `change_id`, `platform`, `gate_verdict`, `blast` and
+# `design_risk`: "validated against fixed vocabularies" is not true of them —
+# `validate_result` enforces a vocabulary for `gate_verdict` alone. Nothing in a
+# row is exempt.
 _VALID_BANDS = frozenset({"red", "yellow", "green"})
 
 
@@ -311,6 +309,94 @@ def build_report(records: list[dict], config: dict | None = None) -> dict:
     rows = [row for _band, row in paired]
     return {"bands": bands, "rows": rows,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def counts_without_dismissed(rec: dict, dismissed: set[str]) -> dict:
+    """The record's ``counts`` with its dismissed findings taken out.
+
+    A dismissal names a comment key (``finding:<i>``), and ``i`` indexes the
+    record's ``findings`` list -- the same mapping ``pipeline.build_pending_comments``
+    uses to mint the key. Severity is read the way the dashboard reads it: only
+    ``red`` blocks, everything else is a should-fix. Counts never go below zero,
+    so a key that points past the findings list cannot push a count negative.
+    """
+    counts = dict(rec.get("counts") or {})
+    red = int(counts.get("red", 0) or 0)
+    yellow = int(counts.get("yellow", 0) or 0)
+    findings = rec.get("findings") or []
+    for key in dismissed:
+        m = pipeline.FINDING_KEY_RE.match(str(key))
+        if not m:
+            continue
+        i = int(m.group(1))
+        if i >= len(findings) or not isinstance(findings[i], dict):
+            continue
+        if findings[i].get("severity") == "red":
+            red -= 1
+        else:
+            yellow -= 1
+    counts["red"], counts["yellow"] = max(0, red), max(0, yellow)
+    return counts
+
+
+def reband(payload: dict, dismissed: dict | None, root: Path | None = None,
+           run_id: str | None = None, config: dict | None = None) -> dict:
+    """Re-run ``classify()`` for the rows whose findings were dismissed.
+
+    A report row's band is the one ``classify()`` computed when the report was
+    built. Dismissing a finding later changes the red/yellow finding counts, which
+    is ONE of the reasons a row can be red or yellow, so the band must be
+    recomputed from the full record with the dismissed findings removed from
+    ``counts`` -- never from the count alone, or a row red for ``blast=LARGE``
+    would turn green the moment its only finding was dismissed.
+
+    ``dismissed`` is the run's ``{change_id: {key: {...}}}`` map. Rows with no
+    dismissals keep their stored band. The row's ``red`` / ``yellow`` stay the
+    report's own tallies: the dashboard subtracts dismissals from those itself,
+    so a server-side subtraction would be counted twice. A row whose result record
+    cannot be read (a report adopted without its records) also keeps its stored
+    band -- a stale band is a smaller error than a band computed from a record
+    that is not there.
+
+    The band tallies are rebuilt from the re-banded rows and the rows re-sorted,
+    so the chips, the filter and the row order agree on the same bands.
+    """
+    rows = list(payload.get("rows") or [])
+    if dismissed and isinstance(dismissed, dict):
+        for row in rows:
+            cid = str(row.get("change_id") or "")
+            per_change = dismissed.get(cid)
+            if not isinstance(per_change, dict) or not per_change:
+                continue
+            rec = results.read_result(cid, root, run_id)
+            if rec is None:
+                continue
+            adjusted = dict(rec)
+            try:
+                adjusted["counts"] = counts_without_dismissed(rec, set(per_change))
+                c = classify(adjusted, config)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                # The record and the live config.json both sit in the
+                # worker-reachable data dir and can be rewritten after the
+                # report was built (`"triage": null`, a string threshold, a
+                # shape the validator has not seen). The stored report already
+                # has a band for this row, so a recompute that cannot run keeps
+                # it: a stale band is a smaller error than a report read that
+                # fails for every row because one input is malformed.
+                continue
+            # Scrubbed like the build path scrubs the same fields: `why` carries
+            # the record's blast rating verbatim, and both the rating and the
+            # threshold it is compared to are worker-reachable, so the
+            # recomputed rationale is redacted before it reaches the row.
+            row.update(_redact_row({"band": c["band"], "why": c["why"],
+                                    "score": c["score"]}))
+    bands = {"red": 0, "yellow": 0, "green": 0}
+    for row in rows:
+        if row.get("band") in bands:
+            bands[row["band"]] += 1
+    order = {"red": 0, "yellow": 1, "green": 2}
+    rows.sort(key=lambda r: (order.get(r.get("band"), 3), -_as_count(r.get("score"))))
+    return {**payload, "bands": bands, "rows": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -498,9 +584,12 @@ def _detail_html(r: dict) -> str:
     label = (f"Design reasoning + {n} finding{'s' if n != 1 else ''}"
              if n else "Design reasoning")
     verdict = html.escape(r["gate_verdict"])
-    vc, vbg = (_SEV_COLORS["red"] if verdict == "BLOCK"
-               else _SEV_COLORS["yellow"] if verdict == "CONCERNS"
-               else _SEV_COLORS["green"])
+    if verdict == "BLOCK":
+        vc, vbg = _SEV_COLORS["red"]
+    elif verdict == "CONCERNS":
+        vc, vbg = _SEV_COLORS["yellow"]
+    else:
+        vc, vbg = _SEV_COLORS["green"]
     body = ""
     if design:
         body += (
@@ -637,7 +726,7 @@ def write_outputs(report: dict, html_body: str, root: Path | None = None,
     HTML. ``index.json`` remains the small pointer the UI polls."""
     _ensure(root, run_id)
     rd = reports_dir(root, run_id)
-    rd.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(rd)
     html_path = rd / "focus-report.html"
     _atomic_write(html_path, html_body)
     # Compact 🔴+🟡 rows for inline rendering in the dashboard (chat/export default).
@@ -648,7 +737,7 @@ def write_outputs(report: dict, html_body: str, root: Path | None = None,
     # Full report for the in-app report view (all bands + findings).
     full_path = rd / "report.json"
     _atomic_write(full_path, json.dumps(report, indent=2))
-    # Preserve a previously-set artifact slug when regenerating without one, so
+    # Preserve an already-recorded artifact slug when regenerating without one, so
     # "Open full report" keeps working across re-reviews (the driver calls
     # generate() with slug=None on every run).
     if slug is None:
@@ -771,7 +860,7 @@ def set_report_slug(slug: str, root: Path | None = None,
     idx_path = reports_dir(root, run_id) / "index.json"
     idx = json.loads(read_within_reports(idx_path, root, run_id) or "{}")
     idx["report_slug"] = slug
-    idx_path.parent.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(idx_path.parent)
     _atomic_write(idx_path, json.dumps(idx, indent=2))
     return idx
 
@@ -783,7 +872,7 @@ def reset(root: Path | None = None, run_id: str | None = None) -> None:
     clears the live display — not the record of past runs."""
     _ensure(root, run_id)
     rd = reports_dir(root, run_id)
-    rd.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(rd)
     empty = {"report_slug": None, "bands": {"red": 0, "yellow": 0, "green": 0},
              "generated_at": "", "total": 0}
     idx_path = rd / "index.json"
@@ -797,23 +886,16 @@ def _atomic_write(path: Path, text: str) -> None:
 
     The reports dir is reachable by the review worker, so any of these output
     names can be a planted symlink; `write_text` would follow it and overwrite
-    the linked file, and the `os.chmod` after it would follow it too. Staging a
+    the linked file, and the lockdown after it would follow it too. Staging a
     private temp file in the same directory and renaming over the name swaps the
     NAME without following a link, so a plant is destroyed rather than honoured.
-    Mirrors `learning.py:_atomic_write`.
+    The staging and the rename are both anchored to a DESCRIPTOR for the reports
+    dir instead of resolving its name three times -- see
+    ``store.atomic_write_locked``, which is now the single implementation this
+    and ``learning.py:_atomic_write`` share rather than two copies of one block.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        try:
-            os.write(fd, text.encode("utf-8"))
-        finally:
-            os.close(fd)  # always close the fd, even if os.write raised
-        os.chmod(tmp, 0o600)  # 0600 before it takes the real name, not after
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    store.mkdir_refusing_links(path.parent)
+    store.atomic_write_text(path, text)
 
 
 def read_within_reports(path: Path, root: Path | None = None,
@@ -822,10 +904,10 @@ def read_within_reports(path: Path, root: Path | None = None,
 
     The counterpart to `_atomic_write`, and for the same reason: the reports dir
     is reachable by the review worker, so any of these names can be a planted
-    symlink. Round 21 stopped the WRITES from following a plant, which left the
-    reads — a link at `focus-report.html` or `index.json` pointing at a
-    credential file was still followed, and its contents flowed onward into a
-    dashboard artifact or a rendered report. `hooks.safe_read_file_bytes_nolink`
+    symlink. The WRITES not following a plant is not enough on its own: an
+    unguarded read of a link at `focus-report.html` or `index.json` pointing at a
+    credential file follows it, and its contents flow onward into a dashboard
+    artifact or a rendered report. `hooks.safe_read_file_bytes_nolink`
     opens with O_NOFOLLOW and validates the inode it actually read, and pinning
     `within_root` to the reports dir also rejects a path that escapes it.
     Returns None when the file is missing, planted, or not valid UTF-8; every
@@ -848,10 +930,17 @@ def read_within_reports(path: Path, root: Path | None = None,
 
 
 def generate(root: Path | None = None, slug: str | None = None,
-             run_id: str | None = None) -> dict:
-    """Read all result records, build + render + persist the report."""
+             run_id: str | None = None, records: list[dict] | None = None) -> dict:
+    """Build + render + persist the report.
+
+    ``records`` are the records the caller already accepted. A run passes them in
+    because its results directory stays writable by every dispatched worker, so a
+    re-read there would render whatever a worker wrote after acceptance. Without
+    them (the CLI), the stored records are read.
+    """
     cfg = store.load_config(root)
-    records = results.list_results(root, run_id)
+    if records is None:
+        records = results.list_results(root, run_id)
     report = build_report(records, cfg)
     html_body = render_html(report)
     index = write_outputs(report, html_body, root, slug, run_id)

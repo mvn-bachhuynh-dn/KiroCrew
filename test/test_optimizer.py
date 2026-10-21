@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,6 +48,19 @@ class TestOptimizerSystem:
 
     def test_system_prompt_mentions_structure(self):
         assert "structure" in OPTIMIZER_SYSTEM.lower()
+
+    def test_system_prompt_keeps_file_mentions_verbatim(self):
+        # A picked "@rel" mention attaches its file; a rewrite that rewords or
+        # drops it is refused by the composer, so the model is told to keep it.
+        assert "FILE MENTIONS" in OPTIMIZER_SYSTEM
+        assert "keep every file mention verbatim" in OPTIMIZER_SYSTEM
+
+    def test_system_prompt_keeps_folder_mentions_verbatim(self):
+        # A folder chip is derived from its "@rel/" token, and the composer
+        # refuses a rewrite that changes the folder tokens, so the model is
+        # told to keep them too.
+        assert '"@src/utils/"' in OPTIMIZER_SYSTEM
+        assert "trailing slash included" in OPTIMIZER_SYSTEM
 
 
 class TestOptimizerEndpoint:
@@ -285,6 +299,133 @@ class TestOptimizerEndpoint:
         assert "B" * 2000 in captured_prompt[0]
         assert "A" * 3000 not in captured_prompt[0]
 
+    @pytest.mark.asyncio
+    async def test_context_image_refs_not_forwarded_as_inlinable_paths(self):
+        """A screenshot ref in the chat context must NOT reach the optimizer
+        session as a bare absolute path.
+
+        The context is replayed chat history, forwarded as text inside the
+        payload and then handed to ``client.stream``, which runs
+        ``build_prompt_blocks`` over it and inlines any readable absolute image
+        path as a (multi-MB) base64 image block. The optimizer only rewrites
+        text and never needs the picture, so the raw path must be scrubbed to a
+        content-free marker before it is forwarded; otherwise every optimize
+        call that follows a pasted screenshot bloats the request.
+        """
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+
+        mock_client = AsyncMock()
+        captured_prompt: list[str] = []
+
+        async def fake_stream(prompt):
+            captured_prompt.append(prompt)
+            yield MagicMock(kind=EVENT_TEXT_CHUNK, text="optimized result")
+            yield MagicMock(kind=EVENT_COMPLETE)
+
+        mock_client.stream = fake_stream
+
+        mock_sessions = MagicMock()
+        mock_sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
+        mock_sessions.release = MagicMock()
+
+        mock_state = MagicMock()
+        mock_state.sessions = mock_sessions
+
+        # Use an absolute image path of the host's own grammar: strip_image_refs
+        # matches Windows-shaped paths on nt and POSIX-shaped paths elsewhere, so
+        # a hard-coded "/tmp/..." would never be recognized on a Windows runner.
+        screenshot = (
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\Screenshot_2026.png"
+            if os.name == "nt"
+            else "/tmp/Screenshot_2026.png"
+        )
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "prompt": "make this clearer and more actionable",
+                "context": f"here is the error I saw\n{screenshot}\nplease help",
+            }
+        )
+        request.app = _ready_app(mock_state)
+
+        await handle_optimize(request)
+
+        # The bare absolute image path must not survive into the forwarded
+        # prompt — if it did, build_prompt_blocks would inline it as base64.
+        assert screenshot not in captured_prompt[0]
+        # The surrounding prose is still forwarded so the model keeps the context.
+        assert "here is the error I saw" in captured_prompt[0]
+        assert "please help" in captured_prompt[0]
+
+    @pytest.mark.asyncio
+    async def test_dedicated_session_conversation_is_discarded_after_each_call(self):
+        """The "_optimizer" session must not accumulate history across calls.
+
+        A persistent key RESUMES the same conversation on the next optimize, so
+        without discarding it the transcript (and any image blocks that rode in
+        it) grows unbounded until requests fail as malformed. The handler
+        discards the conversation with replay suppressed after every call, so
+        each optimize cold-starts fresh.
+        """
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+
+        mock_client = AsyncMock()
+
+        async def fake_stream(prompt):
+            del prompt
+            yield MagicMock(kind=EVENT_TEXT_CHUNK, text="optimized result")
+            yield MagicMock(kind=EVENT_COMPLETE)
+
+        mock_client.stream = fake_stream
+
+        mock_sessions = MagicMock()
+        mock_sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
+        mock_sessions.release = MagicMock()
+        mock_sessions.discard_conversation = AsyncMock(return_value=True)
+
+        mock_state = MagicMock()
+        mock_state.sessions = mock_sessions
+
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "prompt": "make this clearer and more actionable",
+                "context": "",
+            }
+        )
+        request.app = _ready_app(mock_state)
+
+        await handle_optimize(request)
+
+        mock_sessions.discard_conversation.assert_awaited_once()
+        args, kwargs = mock_sessions.discard_conversation.await_args
+        assert args[0] == "_optimizer"
+        assert kwargs.get("replay") is False
+
+    @pytest.mark.asyncio
+    async def test_dedicated_session_discarded_even_when_llm_fails(self):
+        """The conversation discard runs on the error path too, so a failed
+        optimize does not leave stale history behind for the next call.
+        """
+        mock_sessions = MagicMock()
+        mock_sessions.get_or_create = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
+        mock_sessions.release = MagicMock()
+        mock_sessions.discard_conversation = AsyncMock(return_value=True)
+
+        mock_state = MagicMock()
+        mock_state.sessions = mock_sessions
+
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"prompt": "refactor the thing", "context": ""})
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        mock_sessions.discard_conversation.assert_awaited_once()
+        _args, kwargs = mock_sessions.discard_conversation.await_args
+        assert kwargs.get("replay") is False
+
 
 def _paste_mock_state(captured_prompt, reply_text):
     """Build a mocked DashboardState whose optimizer session streams reply_text
@@ -307,6 +448,16 @@ def _paste_mock_state(captured_prompt, reply_text):
     return mock_state
 
 
+def _invisible_id(id_: str) -> str:
+    """Mirror pasteTokens.ts encodeIdInvisible: each ASCII char as 7 bits
+    MSB-first over U+200b (0) / U+200c (1), fenced by two U+2063 separators.
+    Lets a backend test build the exact zero-width id run the frontend emits."""
+    bits = "".join(
+        ("\u200c" if (ord(ch) >> b) & 1 else "\u200b") for ch in id_ for b in range(6, -1, -1)
+    )
+    return f"\u2063{bits}\u2063"
+
+
 class TestPasteSeqs:
     """Placeholder-seq extraction from draft/rewrite text."""
 
@@ -322,6 +473,27 @@ class TestPasteSeqs:
         from kiro_crew.dashboard.handlers.optimizer import _paste_seqs
 
         assert _paste_seqs("no pastes here") == set()
+
+    def test_extracts_seq_from_id_bearing_tokens(self):
+        # The frontend (pasteTokens.ts formatToken) carries the block's stable
+        # id right after "#N" as an ENTIRELY zero-width run — U+200b/U+200c bits
+        # fenced by two U+2063 INVISIBLE SEPARATORs — so a recalled token pairs
+        # to its own block. The run is invisible and must not stop the backend
+        # from scoping paste content by seq. New-form and legacy tokens mix here.
+        from kiro_crew.dashboard.handlers.optimizer import _paste_seqs
+
+        new_form = f"look at [ Paste #1{_invisible_id('mg4kx2a7ab')} · 40 lines ]"
+        legacy = "and [ Paste #2 · 3 lines ]"
+        assert _paste_seqs(f"{new_form} {legacy}") == {"1", "2"}
+
+    def test_token_counts_match_the_exact_id_bearing_string(self):
+        # The multiset guard keys on the FULL token string, which includes the
+        # invisible id run; it must count the id-bearing token the frontend
+        # substitutes back, or an unchanged draft would read as a dropped token.
+        from kiro_crew.dashboard.handlers.optimizer import _paste_token_counts
+
+        token = f"[ Paste #1{_invisible_id('mg4kx2a7ab')} · 5 lines ]"
+        assert _paste_token_counts(f"see {token} and {token}") == {token: 2}
 
 
 class TestBuildPastedContentBlock:
@@ -453,6 +625,87 @@ class TestOptimizerPasteHandling:
         assert data["optimized"] == "whats wrong here [ Paste #1 · 5 lines ]"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model_id_run",
+        ["", "\u2063\u200b\u200c\u2063", "\u2063\u200b\u200b\u200b\u2063"],
+        ids=["dropped", "garbled", "wrong-bits"],
+    )
+    async def test_visible_token_without_its_id_keeps_the_rewrite(self, model_id_run):
+        # The model returns the paste token it was shown, minus (or with
+        # a mangled copy of) the invisible stable-id run. The rewrite must be
+        # kept, and the token handed back must be the draft's own exact string so
+        # the frontend can still pair it to its paste block.
+        captured: list = []
+        token = f"[ Paste #1{_invisible_id('mg4kx2a7ab')} · 2 lines ]"
+        mock_state = _paste_mock_state(
+            captured, f"Diagnose the error in [ Paste #1{model_id_run} · 2 lines ] and fix it."
+        )
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "prompt": f"whats wrong here {token}",
+                "context": "",
+                "pastes": [{"seq": 1, "content": "Traceback: boom"}],
+            }
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is True
+        assert data["optimized"] == f"Diagnose the error in {token} and fix it."
+
+    @pytest.mark.asyncio
+    async def test_id_restore_still_rejects_a_duplicated_token(self):
+        # Putting the id back never adds a token: a rewrite that repeats the
+        # visible placeholder is still caught by the multiset guard.
+        captured: list = []
+        token = f"[ Paste #1{_invisible_id('mg4kx2a7ab')} · 2 lines ]"
+        mock_state = _paste_mock_state(
+            captured, "Compare [ Paste #1 · 2 lines ] with [ Paste #1 · 2 lines ]."
+        )
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "prompt": f"whats wrong here {token}",
+                "context": "",
+                "pastes": [{"seq": 1, "content": "Traceback: boom"}],
+            }
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        assert data["optimized"] == f"whats wrong here {token}"
+
+    @pytest.mark.asyncio
+    async def test_look_alike_tokens_with_different_ids_need_their_exact_ids(self):
+        # Two draft tokens with the same visible text but different ids cannot be
+        # told apart by sight, so they are not restored: a rewrite that drops
+        # their ids is rejected rather than risk pairing a token to the wrong block.
+        captured: list = []
+        a = f"[ Paste #1{_invisible_id('aaaaaaaaaa')} · 2 lines ]"
+        b = f"[ Paste #1{_invisible_id('bbbbbbbbbb')} · 2 lines ]"
+        mock_state = _paste_mock_state(
+            captured, "Compare [ Paste #1 · 2 lines ] with [ Paste #1 · 2 lines ] closely."
+        )
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "prompt": f"diff {a} vs {b}",
+                "context": "",
+                "pastes": [{"seq": 1, "content": "x\ny"}],
+            }
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        assert data["optimized"] == f"diff {a} vs {b}"
+
+    @pytest.mark.asyncio
     async def test_injection_in_paste_content_returns_original(self):
         captured: list = []
         mock_state = _paste_mock_state(captured, "should never be reached")
@@ -473,3 +726,379 @@ class TestOptimizerPasteHandling:
         assert data["changed"] is False
         # Screened before the model ran — the session was never streamed.
         assert captured == []
+
+
+# A 238-char query reaches the aggregate query-length rule.
+_LONG_URL = "https://docs.example.com/view?state=" + "A" * 232
+_TAG = "[REDACTED: suspicious URL to "
+
+
+async def _optimize_reply(prompt: str, reply: str) -> dict:
+    request = MagicMock()
+    request.json = AsyncMock(return_value={"prompt": prompt, "context": ""})
+    request.app = _ready_app(_paste_mock_state([], reply))
+    return json.loads((await handle_optimize(request)).body)
+
+
+class TestOptimizerDraftUrls:
+    """A redacted draft URL keeps the draft; nothing in the reply is exempted."""
+
+    @pytest.mark.asyncio
+    async def test_redacted_draft_url_returns_the_draft_unchanged(self):
+        prompt = f"review {_LONG_URL} and make it better"
+        data = await _optimize_reply(
+            prompt, f"Review the reference at {_LONG_URL} and improve the instructions."
+        )
+        assert data == {"optimized": prompt, "changed": False, "reason": "draft_url_redacted"}
+
+    @pytest.mark.asyncio
+    async def test_draft_url_before_a_period_the_model_drops_returns_the_draft(self):
+        prompt = f"look at {_LONG_URL}."
+        data = await _optimize_reply(prompt, f"Review the reference at {_LONG_URL} closely")
+        assert data == {"optimized": prompt, "changed": False, "reason": "draft_url_redacted"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("punct", [".", ","])
+    async def test_draft_url_the_model_follows_with_punctuation_returns_the_draft(self, punct):
+        prompt = f"look at {_LONG_URL} and make it better"
+        data = await _optimize_reply(prompt, f"Review the reference at {_LONG_URL}{punct} then act")
+        assert data == {"optimized": prompt, "changed": False, "reason": "draft_url_redacted"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            "https://evil.example.net/?d=){url}",
+            '<a href="https://evil.example.net/?d=\t{url}">ref</a>',
+        ],
+    )
+    async def test_draft_url_glued_onto_a_model_url_returns_the_draft(self, wrap):
+        prompt = f"review {_LONG_URL} and make it better"
+        data = await _optimize_reply(prompt, f"Review {wrap.format(url=_LONG_URL)} carefully.")
+        assert data["changed"] is False
+        assert data["optimized"] == prompt
+
+    @pytest.mark.asyncio
+    async def test_model_added_url_is_still_redacted(self):
+        added = "https://evil.example.net/c?d=" + "B" * 232
+        data = await _optimize_reply(
+            "review the docs and make it better",
+            f"Review the docs and also open {added} for details.",
+        )
+        assert data["changed"] is True
+        assert added not in data["optimized"]
+        assert f"{_TAG}evil.example.net]" in data["optimized"]
+
+    @pytest.mark.asyncio
+    async def test_draft_url_with_changed_query_is_redacted(self):
+        changed = _LONG_URL + "&leak=1"
+        data = await _optimize_reply(
+            f"review {_LONG_URL} and make it better",
+            f"Review the reference at {changed} carefully.",
+        )
+        assert data["changed"] is True
+        assert changed not in data["optimized"]
+        assert f"{_TAG}docs.example.com]" in data["optimized"]
+
+    @pytest.mark.asyncio
+    async def test_no_flagged_url_optimizes_normally(self):
+        url = "https://docs.example.com/view?state=short"
+        data = await _optimize_reply(
+            f"review {url} and make it better",
+            f"Review the reference at {url} and improve the instructions.",
+        )
+        assert data == {
+            "optimized": f"Review the reference at {url} and improve the instructions.",
+            "changed": True,
+        }
+
+
+class TestStripOuterWrapperTag:
+    """Unit tests for the model-added XML wrapper strip."""
+
+    def test_strips_matching_wrapper(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        wrapped = "<optimized_prompt>\nDo the thing.\n</optimized_prompt>"
+        assert _strip_outer_wrapper_tag(wrapped, "refactor the auth module") == "Do the thing."
+
+    def test_tag_name_is_the_models_choice(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        assert (
+            _strip_outer_wrapper_tag("<answer>Do the thing.</answer>", "refactor the auth module")
+            == "Do the thing."
+        )
+
+    def test_inner_angle_brackets_survive_unwrap(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        wrapped = "<optimized_prompt>\nRead <a link> and verify it is clear.\n</optimized_prompt>"
+        assert (
+            _strip_outer_wrapper_tag(wrapped, "refactor the auth module")
+            == "Read <a link> and verify it is clear."
+        )
+
+    def test_text_with_angle_brackets_untouched(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        text = "Read the requirements in <a link> and verify they are clear."
+        assert _strip_outer_wrapper_tag(text, "refactor the auth module") == text
+
+    def test_leading_non_identifier_tag_untouched(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        # A draft that BEGINS with an angle-bracket run that is not a bare
+        # identifier tag (space or digit) must not be misread as a wrapper.
+        for text in (
+            "<a link> holds the requirements; read it first.",
+            "<3 retries> then stop trying <3 retries>",
+        ):
+            assert _strip_outer_wrapper_tag(text, "refactor the auth module") == text
+
+    def test_mismatched_closing_name_untouched(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        text = "<answer>Do the thing.</reply>"
+        assert _strip_outer_wrapper_tag(text, "refactor the auth module") == text
+
+    def test_case_mismatched_pair_untouched(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        text = "<Answer>Do the thing.</answer>"
+        assert _strip_outer_wrapper_tag(text, "refactor the auth module") == text
+
+    def test_unbalanced_pair_untouched(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        for text in (
+            "<answer>Do the thing.",
+            "<answer>Do the thing.</answer> and more",
+            "Do the thing.</answer>",
+        ):
+            assert _strip_outer_wrapper_tag(text, "refactor the auth module") == text
+
+    def test_strips_exactly_one_layer(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        # A rewrite that is genuinely a single XML element loses only the
+        # model-added outer wrapper, never its own structure.
+        wrapped = "<outer><inner>Do the thing.</inner></outer>"
+        assert (
+            _strip_outer_wrapper_tag(wrapped, "refactor the auth module")
+            == "<inner>Do the thing.</inner>"
+        )
+
+    def test_empty_wrapper_yields_empty(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        assert _strip_outer_wrapper_tag("<answer></answer>", "refactor the auth module") == ""
+
+    def test_tag_already_in_draft_never_stripped(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        # The draft carries its own XML-style structure; a reply enclosed in
+        # that same tag is the user's content, not a model-added wrapper.
+        reply = "<task>Refactor the auth module cleanly.</task>"
+        assert _strip_outer_wrapper_tag(reply, "<task>refactor the auth module</task>") == reply
+
+    def test_draft_tag_guard_is_case_insensitive(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        reply = "<task>Refactor the auth module cleanly.</task>"
+        assert _strip_outer_wrapper_tag(reply, "<Task>refactor the auth module</Task>") == reply
+
+    def test_attributed_draft_tag_never_stripped(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        # The draft spells its tag with attributes; a bare wrapper of the same
+        # name in the reply is still the draft's own structure, not packaging.
+        reply = "<task>Refactor the auth module cleanly.</task>"
+        draft = '<task priority="high">refactor the auth module</task>'
+        assert _strip_outer_wrapper_tag(reply, draft) == reply
+
+    def test_self_closing_draft_tag_never_stripped(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        reply = "<task>Refactor the auth module cleanly.</task>"
+        assert _strip_outer_wrapper_tag(reply, "expand <task/> into steps") == reply
+
+    def test_shared_prefix_tag_in_draft_still_stripped(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        # <taskforce> is a different tag than <task>: the guard must not fire
+        # on a name prefix, or every wrapper sharing a prefix with draft text
+        # would survive as pollution.
+        reply = "<task>Refactor the auth module cleanly.</task>"
+        draft = "brief the <taskforce> on the auth refactor"
+        assert _strip_outer_wrapper_tag(reply, draft) == "Refactor the auth module cleanly."
+
+    def test_surrounding_whitespace_tolerated(self):
+        from kiro_crew.dashboard.handlers.optimizer import _strip_outer_wrapper_tag
+
+        assert (
+            _strip_outer_wrapper_tag(
+                "\n<answer>Do the thing.</answer>\n", "refactor the auth module"
+            )
+            == "Do the thing."
+        )
+
+
+class TestOptimizerWrapperHandling:
+    """End-to-end wrapper stripping through handle_optimize."""
+
+    @pytest.mark.asyncio
+    async def test_wrapped_rewrite_is_unwrapped(self):
+        captured: list = []
+        mock_state = _paste_mock_state(
+            captured,
+            "<optimized_prompt>\nRefactor the auth module: extract token validation "
+            "into a separate service.\n</optimized_prompt>",
+        )
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={"prompt": "refactor the auth module to be cleaner", "context": ""}
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is True
+        assert data["optimized"] == (
+            "Refactor the auth module: extract token validation into a separate service."
+        )
+
+    @pytest.mark.asyncio
+    async def test_wrapped_original_leaves_draft_alone(self):
+        # Rule 2 regression: the model returns the ORIGINAL draft inside a
+        # wrapper. The wrapper must not defeat the leave-it-alone path — the
+        # draft comes back untouched with changed: false, never overwritten by
+        # a tagged copy of itself.
+        prompt = "Refactor the auth module: extract token validation into a separate service."
+        captured: list = []
+        mock_state = _paste_mock_state(
+            captured, f"<optimized_prompt>\n{prompt}\n</optimized_prompt>"
+        )
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"prompt": prompt, "context": ""})
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        assert data["optimized"] == prompt
+
+    @pytest.mark.asyncio
+    async def test_wrapped_unchanged_sentinel_still_recognized(self):
+        captured: list = []
+        mock_state = _paste_mock_state(captured, "<answer>UNCHANGED</answer>")
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={"prompt": "refactor the auth module to be cleaner", "context": ""}
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        assert data["optimized"] == "refactor the auth module to be cleaner"
+
+    @pytest.mark.asyncio
+    async def test_rewrite_with_angle_brackets_untouched(self):
+        captured: list = []
+        reply = "Read the requirements in <a link> and verify they are clear before implementing."
+        mock_state = _paste_mock_state(captured, reply)
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={"prompt": "check the requirements doc", "context": ""}
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is True
+        assert data["optimized"] == reply
+
+    @pytest.mark.asyncio
+    async def test_wrapped_empty_reply_returns_original(self):
+        captured: list = []
+        mock_state = _paste_mock_state(captured, "<optimized_prompt></optimized_prompt>")
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={"prompt": "refactor the auth module to be cleaner", "context": ""}
+        )
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        assert data["optimized"] == "refactor the auth module to be cleaner"
+
+    @pytest.mark.asyncio
+    async def test_xml_draft_echoed_back_stays_unchanged(self):
+        # The draft itself is a single XML element and the model echoes it
+        # verbatim per the leave-it-alone rule. The user's tags are their own
+        # content: the reply must not be unwrapped, must compare equal, and the
+        # draft must come back byte-identical with changed: false.
+        prompt = "<task>Refactor the auth module: extract token validation.</task>"
+        captured: list = []
+        mock_state = _paste_mock_state(captured, prompt)
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"prompt": prompt, "context": ""})
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is False
+        assert data["optimized"] == prompt
+
+    @pytest.mark.asyncio
+    async def test_xml_draft_rewrite_keeps_user_tags(self):
+        # The model rewrites the inner text but preserves the draft's own
+        # tags. Those tags are user content, so they survive into the result.
+        prompt = "<task>refactor the auth module</task>"
+        reply = "<task>Refactor the auth module, preserving existing behavior.</task>"
+        captured: list = []
+        mock_state = _paste_mock_state(captured, reply)
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"prompt": prompt, "context": ""})
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is True
+        assert data["optimized"] == reply
+
+    @pytest.mark.asyncio
+    async def test_attributed_xml_draft_keeps_outer_tag(self):
+        # The draft's tag carries attributes; the model replies with a bare
+        # wrapper of the same name. The reply is preserving the draft's
+        # structure, so the outer tag must survive into the result.
+        prompt = '<task priority="high">refactor the auth module</task>'
+        reply = "<task>Refactor the auth module, preserving existing behavior.</task>"
+        captured: list = []
+        mock_state = _paste_mock_state(captured, reply)
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"prompt": prompt, "context": ""})
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is True
+        assert data["optimized"] == reply
+
+    @pytest.mark.asyncio
+    async def test_quoted_and_wrapped_reply_fully_normalized(self):
+        # Both format-imitation shapes at once: quotes around a wrapper.
+        captured: list = []
+        mock_state = _paste_mock_state(
+            captured, '"<optimized_prompt>Refactor the auth module cleanly.</optimized_prompt>"'
+        )
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"prompt": "refactor the auth module", "context": ""})
+        request.app = _ready_app(mock_state)
+
+        resp = await handle_optimize(request)
+        data = json.loads(resp.body)
+        assert data["changed"] is True
+        assert data["optimized"] == "Refactor the auth module cleanly."

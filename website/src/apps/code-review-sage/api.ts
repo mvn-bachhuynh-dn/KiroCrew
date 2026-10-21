@@ -5,12 +5,15 @@
 // dashboard session cookie — no tokens are added here.
 import type {
   AddRepoResponse,
+  ChatState,
   ConsolidateResponse,
+  FollowupStart,
   LearningsResponse,
   NamespacesResponse,
   PinnedRepo,
   RecentReposResponse,
   RepoPrsResponse,
+  ReviewQueueResponse,
   Run,
   RunReport,
   RunsResponse,
@@ -23,20 +26,45 @@ const API = '/api/apps/code-review-sage'
 
 interface ApiError {
   error?: string
+  code?: string
+  char?: string
 }
 
-async function parseErrorBody(r: Response): Promise<string> {
+/** A failed request, carrying the backend's machine-readable `code`.
+ *
+ *  The prose in `message` is English produced in Python and is advisory only —
+ *  rendering it inside a localized page is what the error-code contract exists to
+ *  stop. Callers that show copy to the user switch on `code` and supply their own
+ *  translated string; `message` is for logs and for codes nobody has mapped yet. */
+export class SageApiError extends Error {
+  code: string
+  /** For `invalid_namespace_name`: the refused character, or '' when none was named. */
+  char: string
+
+  constructor(message: string, code: string, char = '') {
+    super(message)
+    this.name = 'SageApiError'
+    this.code = code
+    this.char = char
+  }
+}
+
+async function parseErrorBody(r: Response): Promise<SageApiError> {
   try {
     const body = (await r.json()) as ApiError
-    return body.error || `HTTP ${r.status}`
+    return new SageApiError(
+      body.error || `HTTP ${r.status}`,
+      body.code || '',
+      typeof body.char === 'string' ? body.char : '',
+    )
   } catch {
-    return `HTTP ${r.status}`
+    return new SageApiError(`HTTP ${r.status}`, '')
   }
 }
 
 async function getJSON<T>(path: string): Promise<T> {
   const r = await fetch(`${API}${path}`, { credentials: 'same-origin' })
-  if (!r.ok) throw new Error(await parseErrorBody(r))
+  if (!r.ok) throw await parseErrorBody(r)
   return r.json() as Promise<T>
 }
 
@@ -47,11 +75,24 @@ async function sendJSON<T>(path: string, method: string, body?: unknown): Promis
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
-  if (!r.ok) throw new Error(await parseErrorBody(r))
+  if (!r.ok) throw await parseErrorBody(r)
   return r.json() as Promise<T>
 }
 
 export const sageApi = {
+  // --- Follow-up sessions ---
+  /** Stored history for one reviewed change, plus whether a follow-up session
+   *  would restore the reviewer's own context. */
+  chatState: (runId: string, changeId: string): Promise<ChatState> =>
+    getJSON(`/chat?run_id=${encodeURIComponent(runId)}`
+      + `&change_id=${encodeURIComponent(changeId)}`),
+
+  /** Arm the resume and get what the chat slot needs. Rejects with a
+   *  `SageApiError` whose `code` is `followup_not_recorded` /
+   *  `followup_transcript_gone` / `chat_run_deleted` / ... */
+  followupStart: (runId: string, changeId: string): Promise<FollowupStart> =>
+    sendJSON('/followup', 'POST', { run_id: runId, change_id: changeId }),
+
   // --- Runs (threads) ---
   runs: (): Promise<RunsResponse> => getJSON('/runs'),
 
@@ -98,6 +139,16 @@ export const sageApi = {
       })),
     }),
 
+  /** Dismiss one finding with a reason, or undo that with `reason: null`. A
+   *  dismissed finding stays in the report but is never posted. */
+  dismissFinding: (
+    runId: string, changeId: string, key: string, reason: string | null,
+  ): Promise<{ ok: boolean; dismissed: boolean }> =>
+    sendJSON(`/runs/${encodeURIComponent(runId)}/dismiss`, 'POST',
+      reason === null
+        ? { change_id: changeId, key, dismissed: false }
+        : { change_id: changeId, key, reason }),
+
   /** Publish this run's report as a shareable artifact (retry / share path). */
   archiveRun: (runId: string): Promise<{ ok: boolean; report_slug: string }> =>
     sendJSON(`/runs/${encodeURIComponent(runId)}/archive`, 'POST'),
@@ -137,6 +188,9 @@ export const sageApi = {
 
   repoPrs: (repo: string): Promise<RepoPrsResponse> =>
     getJSON(`/repo-prs?repo=${encodeURIComponent(repo)}`),
+
+  /** Open PRs across GitHub that request the gh user's review. */
+  reviewQueue: (): Promise<ReviewQueueResponse> => getJSON('/review-queue'),
 
   // --- Settings + learning ---
   settings: (): Promise<SettingsResponse> => getJSON('/settings'),

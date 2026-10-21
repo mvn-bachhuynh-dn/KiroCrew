@@ -24,21 +24,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -63,8 +63,10 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatFolder, ChatSlot } from '../types'
 
-function renderSidebar(slots: any[], folders: any[]) {
+function renderSidebar(slots: ChatSlot[], folders: ChatFolder[]) {
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -72,8 +74,8 @@ function renderSidebar(slots: any[], folders: any[]) {
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, workflowRuns: {} } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, workflowRuns: {} } as unknown as RootState['chat'],
   })
   // staleTime keeps the seeded folder list authoritative: the blanket api mock
   // resolves every call to [], so an on-mount refetch would wipe the folders
@@ -186,7 +188,7 @@ describe('chat sidebar — flat view respects the folder filter', () => {
     // bottom and simply overflows into the menu's own scroll. Anything placed
     // below it would drift out of easy reach. jsdom cannot measure layout, so
     // assert the two contracts that produce the behavior: the menu itself is the
-    // single scroll container, and every folder row follows the Sort by heading.
+    // single scroll container, and every folder row follows the Sort sessions by heading.
     const folders = Array.from({ length: 30 }, (_, i) => ({ id: `f${i}`, name: `folder-${i}`, collapsed: false, order: i }))
     const { getByLabelText, findByTestId } = renderSidebar([looseChat], folders)
     fireEvent.keyDown(getByLabelText('Sort and filter sessions'), { key: 'Enter' })
@@ -198,9 +200,9 @@ describe('chat sidebar — flat view respects the folder filter', () => {
     expect(menu.querySelectorAll('.overflow-y-auto').length).toBe(0)
     const rows = [...menu.querySelectorAll('[data-testid^="folder-filter-f"]')]
     expect(rows.length).toBe(30)
-    const sortLabel = [...menu.children].find(el => el.textContent?.trim() === 'Sort by')!
+    const sortLabel = [...menu.children].find(el => el.textContent?.trim() === 'Sort sessions by')!
     expect(sortLabel).toBeTruthy()
-    // DOCUMENT_POSITION_FOLLOWING (4): the first folder row comes after Sort by.
+    // DOCUMENT_POSITION_FOLLOWING (4): the first folder row comes after Sort sessions by.
     expect(sortLabel.compareDocumentPosition(rows[0]) & 4).toBeTruthy()
   })
 

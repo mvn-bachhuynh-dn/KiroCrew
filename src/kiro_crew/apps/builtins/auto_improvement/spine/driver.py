@@ -29,28 +29,37 @@ stub profile (mirrors ``autoloop.py --dry-run``).
 from __future__ import annotations
 
 import argparse
+import importlib as _importlib
 import logging
 import os
-import subprocess
+import subprocess  # noqa: F401
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from kiro_crew import _facade_mirror
+from kiro_crew.platform.context import redact_log_via_context, redact_via_context  # noqa: F401
+from kiro_crew.subprocess_utf8 import UTF8_TEXT  # noqa: F401
+
+from . import driver_commit as _driver_commit
+from . import driver_publish as _driver_publish
 from . import ledger as L
-from . import pr_description as D
+from . import pr_description as D  # noqa: F401
 from . import preflight as PF
 from .archive import Archive
 from .contracts import TRACK_BUG, TRACK_PERF, BugGateResult, Proposal, TargetProfile
+from .driver_git import _git
 from .gate import Gate
-from .git_safety import GIT_SAFE_CONFIG, require_pinned
+from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned  # noqa: F401
 from .keeper import KEPT, Keeper
 from .measurer import Measurer
 from .pr_pipeline import CrPipeline
 from .preflight import PreflightResult
 from .proposer import Proposer
-from .push_policy import normalize_branch
+from .push_policy import normalize_branch  # noqa: F401
 
 
 @dataclass
@@ -101,32 +110,6 @@ class Stats:
 class PushEnabledError(RuntimeError):
     """Raised at boot if the clone's push is NOT disabled (do-not-leak invariant,
     08_safety §1.3). The driver refuses to start."""
-
-
-#: Trusted git config injected on EVERY host-side git invocation over an agent-writable tree.
-#: The agent runs inside a sandbox, but these git commands run on the HOST as the gateway user
-#: against the same worktree/clone the agent edits — so a repository instruction that has the
-#: auto-approved shell write a hook and point `core.hooksPath` at it would get that hook
-#: EXECUTED host-side, outside the sandbox, on the next add/commit/checkout. `core.hooksPath` to
-#: os.devnull disables every hook; `core.fsmonitor=false` disables the fsmonitor daemon, a second
-#: repo-controlled exec vector (a repo can set it to an arbitrary program git then spawns). These
-#: are `-c` overrides on OUR argv, which take precedence over anything in the repo's own config,
-#: and they are placed BEFORE the subcommand so git applies them. Raised by the GPT review.
-_GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
-
-
-def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    require_pinned(cwd)
-    # ``errors="replace"``: callers run `diff`/`show`, which print file CONTENT, and a repo
-    # legitimately holds non-UTF-8 bytes. A strict decode raises inside
-    # ``subprocess.communicate``, so the failure cannot be read off ``returncode`` — the
-    # direct-push path would abort on any tree containing a PNG. See ``pr_watchers._git``.
-    return subprocess.run(
-        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG, *args],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
 
 
 class Driver:
@@ -275,8 +258,77 @@ class Driver:
             guardrail_tolerances=self.guardrail_tolerances,
             logger=self.log,
             direct_commit=self.direct_commit,
+            retire_if_unsafe=self._retire_if_unsafe,
         )
         self._stop = False
+        self._repository_retired = False
+        #: Set when a provisional rollback FAILED. HEAD then still carries a commit that
+        #: was refused and never published, and the next winner commits ON TOP of it: that
+        #: winner's scan reads only its own revision (`<rev>~1..<rev>`) while its push sends the
+        #: whole ancestry, so the refused content is published by a scanner that never saw it.
+        #: Nothing local can repair that -- the rollback is what was supposed to -- so this
+        #: latches and publishing refuses from here on. This flag covers ONE PROCESS; the clone
+        #: is also QUARANTINED on disk (`_quarantine_unrolled_clone`), because the refused commit
+        #: outlives the run and the clone is reused. Raised by the GPT review of this branch.
+        self._rollback_failed = False
+        # Terminal latch for a probe whose sandbox launcher crashed: set (then
+        # re-raised) by `_retire_if_unsafe`. Some intermediate layers catch
+        # broadly to keep a run alive (per-candidate error containment), so
+        # `run()` re-raises this before returning stats — otherwise a run
+        # aborted by a safety-probe failure would be recorded as STATUS_DONE.
+        # Raised by the GPT review of this branch.
+        self._probe_failure: Exception | None = None
+
+    def _retire_if_unsafe(self, stage: str) -> bool:
+        """Stop and atomically retire the clone if post-agent validation fails."""
+        from ..backend.clone_setup import (
+            IsolationProbeError,
+            _repository_is_isolated,
+            _retire_unsafe_clone,
+        )
+
+        try:
+            isolated = _repository_is_isolated(self.clone)
+        except IsolationProbeError as exc:
+            # The probe could not RUN — its sandbox launcher died before git
+            # executed, which says nothing about the clone. Do NOT retire:
+            # retiring renames away a clone whose remotes were never read,
+            # destroying good state over an unrelated sandbox failure.
+            # The tight signature match in `_launcher_failure_detail` is
+            # what keeps this branch unreachable for ambiguous or
+            # repository-influenced errors — those return False below and
+            # retire. Re-raise after recording: swallowing here would let
+            # `driver.run()` return normally, so the supervisor would record
+            # STATUS_DONE for a run aborted by a safety-probe failure; the
+            # run-loop's catch-all records STATUS_ERROR with this message
+            # instead.
+            self._stop = True
+            self._probe_failure = exc
+            self.log.error("isolation probe could not run after %s: %s", stage, exc)
+            self._progress(stage="isolation_probe_failed", error=str(exc))
+            raise
+        if isolated:
+            return False
+        retained = _retire_unsafe_clone(self.clone)
+        self._repository_retired = True
+        self._stop = True
+        if retained is None:
+            self.log.error(
+                "repository safety changed after %s; run stopped and clone left unsafe in place",
+                stage,
+            )
+        else:
+            self.log.error(
+                "repository safety changed after %s; run stopped and clone retained at %s",
+                stage,
+                retained,
+            )
+        self._progress(
+            stage="repository_unsafe",
+            error="repository safety changed after agent-controlled execution",
+            retained_clone=str(retained or ""),
+        )
+        return True
 
     # ── boot-time safety preconditions (M0 exit criterion) ──────────────
 
@@ -292,7 +344,18 @@ class Driver:
         case this needs to additionally allow is a clone whose push is somehow live AND a
         valid direct-commit authorization; a protected/blank branch is refused by
         :func:`.push_policy.authorize_direct_push` regardless. We fail CLOSED: any
-        ambiguity → the original refusal stands."""
+        ambiguity → the original refusal stands. Both probes below propagate
+        ``clone_setup.IsolationProbeError`` when their sandbox launcher crashed
+        before git executed — a stricter refusal (the run still does not start),
+        never a relaxation, surfacing the sandbox failure instead of a
+        misleading isolation verdict."""
+        from ..backend.clone_setup import _repository_is_safe
+
+        if not _repository_is_safe(self.clone):
+            raise PushEnabledError(
+                f"SAFETY: repository metadata for clone {self.clone} failed validation — "
+                "refusing to start"
+            )
         if self.profile.isolation.push_disabled():
             return
         if self.direct_commit:
@@ -345,8 +408,8 @@ class Driver:
         self.log.info("preflight: proving the ruler before Phase 2 (03_metric §0/§11)…")
         boot = self.boot_callable if self._explicit_boot else self._resolve_measurement_boot()
         # Duck-wire a stop_check onto the ruler so a clean-stop request can interrupt
-        # the ~30-boot calibration loop between reps (previously a Stop click had to
-        # wait out the entire preflight — the "stuck in phase2_perf" symptom). The
+        # the ~30-boot calibration loop between reps (without it a Stop click waits out
+        # the entire preflight — the "stuck in phase2_perf" symptom). The
         # ruler treats it as optional; partial samples surface as CalibrationError.
         try:
             self.profile.ruler.stop_check = lambda: self._stop  # type: ignore[attr-defined]
@@ -424,6 +487,65 @@ class Driver:
         except Exception:  # noqa: BLE001
             self.log.debug("on_progress sink failed", exc_info=True)
 
+    def _fan_out_checked(self, *, fresh_candidates: list, base_sha: str, cycle: int) -> list | None:
+        """Run proposer agents, then validate before re-raising any post-agent error."""
+        proposals: list = []
+        error: Exception | None = None
+        try:
+            proposals = self.proposer.fan_out(
+                profile=self.profile,
+                candidates=fresh_candidates,
+                base_sha=base_sha,
+                cycle=cycle,
+                stop_check=lambda: self._stop,
+            )
+        except Exception as exc:  # noqa: BLE001 - validate before interpreting
+            error = exc
+        if self._retire_if_unsafe("proposal"):
+            return None
+        if error is not None:
+            raise error
+        return proposals
+
+    def _work_one_proposal_checked(
+        self,
+        prop: Proposal,
+        *,
+        base_sha: str,
+        cycle: int,
+        proposals: list,
+        perf_survivors: list,
+        bug_winners: list,
+        gated_sha: dict,
+    ) -> bool:
+        """Run one candidate and validate before fallible error bookkeeping."""
+        error: Exception | None = None
+        try:
+            self._work_one_proposal(
+                prop,
+                base_sha=base_sha,
+                cycle=cycle,
+                proposals=proposals,
+                perf_survivors=perf_survivors,
+                bug_winners=bug_winners,
+                gated_sha=gated_sha,
+            )
+        except Exception as exc:  # noqa: BLE001 - one candidate must not kill the run
+            error = exc
+        if self._retire_if_unsafe("candidate gate/measure"):
+            return False
+        if error is not None:
+            self.log.error(
+                "cycle %d: candidate %s errored: %s: %s",
+                cycle,
+                prop.cand_id,
+                type(error).__name__,
+                error,
+            )
+            self.stats.errors += 1
+            self._record(prop, L.STATUS_ERROR, f"{type(error).__name__}: {error}")
+        return True
+
     def run_cycle(self, cycle: int) -> int:
         """Run one Profile→Propose→Gate→Measure→Keep pass. Returns the number of
         FRESH (not-yet-seen) candidates this cycle (drives quiescence)."""
@@ -445,7 +567,7 @@ class Driver:
             )
             # The cycle index rotates agent-discovery's focus ordering WITHIN each value tier
             # so a per-cycle read budget samples a different slice of the FULL changed-file
-            # surface each cycle (operator directive 2026-06-18: do not limit the search space
+            # surface each cycle (operator directive: do not limit the search space
             # — rotate coverage across all files instead of capping to the same top-N).
             self.profile._discovery_rotate = cycle  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 — skip-list is a cost optimization, never fatal
@@ -461,6 +583,8 @@ class Driver:
             known_loci=known,
             agent_runner=self._agent_runner,
         )
+        if self._retire_if_unsafe("discovery"):
+            return 0
         self.stats.discovered += len(disc.candidates)
         fresh_candidates = []
         for cand in disc.candidates:
@@ -496,13 +620,13 @@ class Driver:
         # Phase B — propose (fan-out wide + deep; each in its own worktree).
         # The stop_check lets a clean-stop request abort the fan-out mid-loop, so we
         # don't keep spawning expensive agent subprocesses after the user clicked Stop.
-        proposals = self.proposer.fan_out(
-            profile=self.profile,
-            candidates=fresh_candidates,
+        proposals = self._fan_out_checked(
+            fresh_candidates=fresh_candidates,
             base_sha=base_sha,
             cycle=cycle,
-            stop_check=lambda: self._stop,
         )
+        if proposals is None:
+            return 0
         self._progress(
             cycle=cycle,
             stage="gate",
@@ -522,28 +646,16 @@ class Driver:
             for prop in proposals:
                 if self._stop:
                     break
-                try:
-                    self._work_one_proposal(
-                        prop,
-                        base_sha=base_sha,
-                        cycle=cycle,
-                        proposals=proposals,
-                        perf_survivors=perf_survivors,
-                        bug_winners=bug_winners,
-                        gated_sha=gated_sha,
-                    )
-                except Exception as e:  # noqa: BLE001 — one bad candidate must NEVER
-                    # kill the whole run (the original autoloop recorded status=error and
-                    # continued; without this a gate/measure exception aborts the run).
-                    self.log.error(
-                        "cycle %d: candidate %s errored: %s: %s",
-                        cycle,
-                        prop.cand_id,
-                        type(e).__name__,
-                        e,
-                    )
-                    self.stats.errors += 1
-                    self._record(prop, L.STATUS_ERROR, f"{type(e).__name__}: {e}")
+                if not self._work_one_proposal_checked(
+                    prop,
+                    base_sha=base_sha,
+                    cycle=cycle,
+                    proposals=proposals,
+                    perf_survivors=perf_survivors,
+                    bug_winners=bug_winners,
+                    gated_sha=gated_sha,
+                ):
+                    return 0
 
             # Phase E — perf keep / revert (one decision; archive all perf survivors).
             self._progress(cycle=cycle, stage="keep")
@@ -587,8 +699,11 @@ class Driver:
                 self._apply_bug_winner(cycle, prop, bug_res)
             return kept_count
         finally:
-            for prop in proposals:
-                self.proposer.teardown(prop)
+            if not self._repository_retired:
+                for prop in proposals:
+                    self.proposer.teardown(prop)
+            else:
+                self.log.warning("proposal teardown skipped because repository safety failed")
 
     def _work_one_proposal(
         self,
@@ -695,93 +810,17 @@ class Driver:
     #: Attempts for a direct push: the first try, then one rebase-and-retry.
     _PUSH_ATTEMPTS = 2
 
-    def _reverify_head(self) -> bool:
-        """Re-run the profile's build gate on the clone's CURRENT tree. Fail-closed.
-
-        Called only after a rebase rewrote HEAD. The gate result we hold was measured
-        against the PRE-rebase base, so it says nothing about the replayed tree: a rebase
-        can apply cleanly and still produce a combination that was never built or tested
-        (our patch plus whatever landed on the branch meanwhile). Publishing on the
-        strength of the stale result would break the app's core promise — that nothing
-        reaches a shared branch unless a measurement on THAT tree passed.
-
-        Any error re-verifying is a refusal, not a pass: an unverifiable tree is exactly
-        the case this gate exists for.
-        """
-        try:
-            res = self.profile.build_gate.build_and_test(
-                worktree=self.clone, src=self.clone / "src"
-            )
-        except Exception as exc:  # noqa: BLE001 — an unverifiable tree must not publish
-            self.log.error("direct-push: could not re-verify the rebased tree: %s", exc)
-            return False
-        if not getattr(res, "passed", False):
-            self.log.warning(
-                "direct-push: rebased tree FAILED re-verification (%s) — not pushing",
-                getattr(res, "detail", "") or "no detail",
-            )
-            return False
-        return True
-
-    def _push_with_rebase(self, fetch_url: str, dest: str, target: str):
-        """Push HEAD to ``dest``, rebasing ONCE onto the remote if it moved meanwhile.
-
-        A run takes tens of minutes, so the branch can legitimately advance between the
-        clone's fetch and the winner's push — and a bare push then dies
-        ``! [rejected] ... (fetch first)``, stranding a fully verified fix. Measured on
-        this app's own dogfood: 3 of 6 gate survivors were lost this way, every one of
-        them work that had already passed RED x2 -> GREEN -> STAYGREEN.
-
-        The retry is deliberately narrow and safe:
-          * only on a NON-FAST-FORWARD rejection — any other failure (auth, no such
-            ref, protected branch) is returned untouched, because retrying those just
-            hides the real error;
-          * ``git rebase`` REPLAYS our single verified commit on top of the new remote
-            tip. A conflict aborts the rebase and returns the original failure rather
-            than pushing a half-merged tree;
-          * the REPLAYED tree is RE-VERIFIED through the profile's build gate before it
-            is pushed (:meth:`_reverify_head`). A clean rebase is a statement about
-            TEXT, not about behaviour: our verified patch combined with whatever landed
-            on the branch meanwhile is a tree nothing has ever built or tested. Without
-            this the retry published an unverified commit — the one thing the whole
-            measurement-first pipeline exists to prevent. Raised by the GPT review of
-            this branch;
-          * never ``--force``. If the second push is also rejected, we stop — a losing
-            race is a signal, not something to overwrite.
-
-        The caller must read the pushed sha from the clone AFTER this returns, not from
-        its own pre-push snapshot: a rebase rewrites HEAD, so the pre-rebase sha names a
-        commit that does not exist on the remote.
-        """
-        require_pinned(self.clone)
-        push = subprocess.run(
-            ["git", "-C", str(self.clone), *_GIT_SAFE_CONFIG, "push", fetch_url, f"HEAD:refs/heads/{dest}"],
-            capture_output=True,
-            text=True,
-        )
-        for _ in range(self._PUSH_ATTEMPTS - 1):
-            if push.returncode == 0:
-                return push
-            blob = f"{push.stdout or ''}\n{push.stderr or ''}"
-            if "non-fast-forward" not in blob and "fetch first" not in blob:
-                return push  # a different failure — do not mask it with a retry
-            self.log.info("direct-push: %s moved under us; rebasing and retrying", dest)
-            if _git(["fetch", fetch_url, dest], self.clone).returncode != 0:
-                return push
-            reb = _git(["rebase", "FETCH_HEAD"], self.clone)
-            if reb.returncode != 0:
-                _git(["rebase", "--abort"], self.clone)
-                self.log.warning("direct-push: rebase onto %s conflicted — not pushing", dest)
-                return push
-            if not self._reverify_head():
-                return push  # rebased tree is unverified — return the original rejection
-            require_pinned(self.clone)
-            push = subprocess.run(
-                ["git", "-C", str(self.clone), *_GIT_SAFE_CONFIG, "push", fetch_url, f"HEAD:refs/heads/{dest}"],
-                capture_output=True,
-                text=True,
-            )
-        return push
+    # Publish a verified winner to its authorized branch (F10): ``spine/driver_publish.py``.
+    #: The object the last push sent, recorded by ``_push_with_rebase`` for ``_direct_push``.
+    _pushed_object: str
+    _reverify_head = _driver_publish._reverify_head
+    _revision_scans_clean = _driver_publish._revision_scans_clean
+    _restore_branch = _driver_publish._restore_branch
+    _push_with_rebase = _driver_publish._push_with_rebase
+    _prepush_review_clean = _driver_publish._prepush_review_clean
+    _build_test_pre_push_clean = _driver_publish._build_test_pre_push_clean
+    _head_is_the_committed_sha = _driver_publish._head_is_the_committed_sha
+    _direct_push = _driver_publish._direct_push
 
     def _metric_direction(self) -> str:
         """The improving direction of the profile's PRIMARY metric.
@@ -822,6 +861,8 @@ class Driver:
         }
 
     def _apply_verdict(self, cycle, base_sha, verdict, archived, fresh_count, gated_sha) -> int:
+        if self._publishing_is_halted():
+            return 0
         # Archive ALL survivors (the whole population is evolutionary memory). The kept
         # winner's diff_ref is reused as the CR's ``diff-ref`` (06_*.md §3.1/§3.2).
         winner_diff_ref = ""
@@ -918,6 +959,9 @@ class Driver:
             diff_ref=winner_diff_ref,
             base_anchor=f"{self.branch} @ {base_sha[:12]}",
         )
+        if outcome.repository_retired:
+            self.stats.kept -= 1
+            return fresh_count
         if outcome.filed or outcome.committed_ready:
             # AMEND the provisional commit with the §2.4 attributable message, derived from
             # the SAME measured numbers as the CR (§3.2 end). The pipeline's INDEPENDENT
@@ -936,9 +980,10 @@ class Driver:
                 # F10 direct-commit: push the verified commit to the authorized branch and
                 # record ``committed`` with the real sha (only on a successful push — a
                 # refused/failed push already recorded ``error`` and nothing left the sandbox).
-                if self._direct_push(
+                pushed = self._direct_push(
                     fp=outcome.fp, kind="perf", target=winner.candidate.target, sha=committed
-                ):
+                )
+                if pushed is True:
                     # `pushed_sha`, not `committed`: a rebase-and-retry inside the push
                     # rewrites HEAD, and recording the pre-rebase sha would point the
                     # ledger at a commit that is not in the remote's history.
@@ -961,7 +1006,7 @@ class Driver:
                         self.branch,
                         landed,
                     )
-                else:
+                elif pushed is False:
                     # ROLL BACK the refused commit. Leaving it at HEAD is a credential LEAK,
                     # not just untidy bookkeeping: the direct-push scan range is
                     # `HEAD~1..HEAD` (one commit), so the NEXT winner's scan does not see this
@@ -971,13 +1016,17 @@ class Driver:
                     # Raised by the GPT review of this branch.
                     self._reset_provisional(pre_sha)
                     self.stats.kept -= 1  # push refused/failed → not a realized outcome
+                else:
+                    # The clone was atomically retired; any Git rollback would trust
+                    # metadata that just failed validation.
+                    self.stats.kept -= 1
                 return fresh_count
             self.stats.filed += 1
             self.log.info(
                 "cycle %d: FILED %s cr=%s commit=%s", cycle, winner.cand_id, outcome.cr, committed
             )
             # Announce the filed CR so the app can start a watcher session that keeps it
-            # mergable + drives it to passing-all-checks (tasks #21/#24). Opaque to the
+            # mergeable + drives it to passing-all-checks (tasks #21/#24). Opaque to the
             # spine — the backend's on_progress sink decides what to do with it.
             self._progress(
                 cr_filed={
@@ -1026,476 +1075,18 @@ class Driver:
             self.log.info("cycle %d: %s NOT filed (%s)", cycle, winner.cand_id, outcome.status)
         return fresh_count
 
-    @staticmethod
-    def _redact_commit_message(msg: str) -> str:
-        """Strip credentials / exfiltration URLs from a commit message before it becomes
-        PERMANENT git metadata. The message is built from agent-authored content (proposal
-        signature/description), which is untrusted (CLAUDE.md) — and metadata-leak
-        guidance is explicit that git commit messages "stay forever in
-        the repository", so a leaked secret there is unwipeable. Applies to BOTH the CR-path
-        local commit and the F10 direct-push commit. Best-effort: if the redaction helpers
-        are unavailable, the message passes through (the commit still happens)."""
-        try:
-            # Kiro Crew's core redactor: one call, string return, both the
-            # credential and exfiltration-URL passes. (The port originally
-            # referenced a vendored module that does not exist here, so this
-            # silently no-op'd on every commit — a real leak risk, now fixed.)
-            from kiro_crew.security import redact
-
-            msg = redact(msg)
-        except Exception:  # noqa: BLE001 — a commit message is permanent, pushed git history
-            # FAIL CLOSED (same as backend/commit.py): a message that cannot be scanned must
-            # not be committed verbatim, since it becomes unwipeable once pushed. Fall back
-            # to a fixed, prose-free subject. Raised by the GPT review of this branch.
-            logging.getLogger("auto_improvement.driver").warning(
-                "commit-message redaction failed; using a fixed subject"
-            )
-            return "auto-improvement: apply verified change"
-        return msg
-
-    def _prepush_review_clean(self, *, target: str, base_ref: str) -> tuple[bool, str]:
-        """F10 + F6: run a REAL automated reviewer review on the just-committed fix
-        diff BEFORE the direct push, and return ``(clean, note)``.
-
-        A direct-pushed commit gets NO human review — so the automated reviewer must clear
-        it first (the user's pre-push-gate decision; the F6 roadmap item). We run the SAME
-        automated reviewer the post-CR watcher uses, but as a one-shot REVIEW-only verdict on
-        ``base_ref...HEAD`` in the clone, via this driver's agent runner. The agent emits a
-        final ``REVIEW: clean`` / ``REVIEW: <N> open`` / ``REVIEW: unavailable`` line.
-
-        AUTHORIZATION (operator directive 2026-06-15): the push is allowed when the fix has
-        a clean POSITIVE signal — a clean review verdict OR (when the review is INCONCLUSIVE)
-        a clean full build/test (``_build_test_pre_push_clean``). CONCRETE review open
-        findings still BLOCK (a green build does not excuse a real review finding).
-        FAIL-CLOSED: if the gate is required (``self.prepush_review``) and NEITHER signal
-        is provably clean — open findings, OR (review inconclusive AND build/test red),
-        no agent runner, or any error — we return ``(False, …)`` so the push is BLOCKED. An
-        auto-pushed, un-reviewed, unproven commit is what the gate exists to prevent. When
-        the gate is OFF (default), returns ``(True, "gate disabled")`` without running."""
-        if not getattr(self, "prepush_review", False):
-            return True, "pre-push review gate disabled"
-        runner = self._agent_runner
-        if runner is None:
-            return False, "pre-push review REQUIRED but no agent runner — blocking push"
-        try:
-            # Self-contained review instruction. The upstream version shelled out to a
-            # host-specific reviewer skill discovered on disk; that coupling is gone, so
-            # the diff itself is the whole input and the reviewer is the session agent.
-            prompt = (
-                "You are the PRE-PUSH review gate for an autonomous bug-fix loop. A fix was\n"
-                "just committed locally and is about to be PUSHED to a shared feature branch\n"
-                "with NO human review, so you are the only review it will get.\n\n"
-                f"Review the diff of `{base_ref}...HEAD` in this repository. Read the changed\n"
-                "files for real context — do not review the diff hunks in isolation.\n\n"
-                "Look for defects that would matter in review: incorrect logic, unhandled\n"
-                "errors, resource leaks, race conditions, security issues, and behaviour\n"
-                "changes the commit does not mention. Ignore style preferences.\n\n"
-                "Do NOT push. Do NOT open a pull request. Review only — you may fix a trivial\n"
-                "finding in the clone and re-review, but the last line MUST be the verdict.\n\n"
-                "End your reply with EXACTLY one line: `REVIEW: clean` if there are no open\n"
-                "findings on the added or changed lines, else `REVIEW: <N> open`. If you could\n"
-                "not actually review the diff, say `REVIEW: unavailable` rather than guessing —\n"
-                "an unfounded `clean` is the one answer that defeats this gate."
-            )
-            res = runner.run(
-                prompt,
-                cwd=str(self.clone),
-                allowed_tools=["Bash", "Read", "Edit", "Grep", "Glob"],
-                max_turns=30,
-                timeout_s=420,
-            )
-            out = (getattr(res, "text", "") or "").strip()
-            # Parse the LAST REVIEW verdict line (the review may print intermediate ones).
-            verdict = ""
-            for ln in out.splitlines():
-                s = ln.strip()
-                if s.upper().startswith("REVIEW:"):
-                    verdict = s
-            low = verdict.lower()
-            if "clean" in low:
-                return True, "prepush_review clean"
-            # the review found CONCRETE open findings → a real defect signal → BLOCK (a clean
-            # build does NOT excuse open review findings; this path stays fail-closed).
-            if "open" in low:
-                return False, f"prepush_review found open findings: {verdict[:120]}"
-            # the review was INCONCLUSIVE (unavailable / no parseable verdict). Per the operator
-            # decision, an inconclusive review must NOT permanently block a fix that is
-            # otherwise provably safe — fall back to a clean POSITIVE build/test signal
-            # (a fresh full `bb release` / pytest suite green on the committed fix). The push
-            # is authorized iff the review is clean OR the build/test is clean; it stays
-            # fail-closed only when BOTH are inconclusive (06_*.md F6/F10; operator directive
-            # 2026-06-15: "clean prepush_review + bb release or other clean autotest should allow
-            # push to the remote").
-            reason = (
-                "prepush_review unavailable"
-                if "unavailable" in low
-                else "prepush_review produced no clear verdict"
-            )
-            build_ok, build_note = self._build_test_pre_push_clean(target=target)
-            if build_ok:
-                return True, f"{reason}; authorized by clean build/test ({build_note})"
-            return (
-                False,
-                f"{reason} AND build/test not clean ({build_note}) — blocking push (fail-closed)",
-            )
-        except Exception as e:  # noqa: BLE001 — a gate error must BLOCK, never silently pass
-            return False, f"prepush_review gate error ({type(e).__name__}) — blocking push"
-
-    def _build_test_pre_push_clean(self, *, target: str) -> tuple[bool, str]:
-        """Fallback pre-push signal: is the committed fix's tree a clean full build/test?
-
-        Returns ``(clean, note)``. Runs the profile's full-suite gate (``bug_runner
-        .run_suite`` — the profile-supplied build/test command, the SAME check STAYGREEN
-        uses) against the clone's working tree (HEAD = the just-committed fix). A green
-        suite is an independent, deterministic positive signal that the fix did not break
-        the build — the operator-approved alternative to a clean review verdict when the
-        autonomous review is inconclusive. Fail-closed: any missing primitive /
-        error / red suite returns ``(False, …)`` so the push is still blocked unless the
-        suite is PROVABLY green. (The concrete build command is the profile's concern, not
-        the spine's — kept target-agnostic here.)"""
-        runner = getattr(self.profile, "bug_runner", None)
-        run_suite = getattr(runner, "run_suite", None)
-        if not callable(run_suite):
-            return False, "no build/test gate available"
-        src = self.clone / "src"
-        if not src.exists():
-            src = self.clone
-        try:
-            green, failing = run_suite(src=src)
-        except Exception as e:  # noqa: BLE001 — a gate error blocks, never silently passes
-            return False, f"build/test gate error ({type(e).__name__})"
-        if green:
-            return True, "full suite green"
-        return False, f"{len(failing)} failing test(s): {', '.join(failing[:3])}"
-
-    def _direct_push(self, *, fp: str, kind: str, target: str, sha: str) -> bool:
-        """F10: push the just-committed verified change to the operator-authorized branch.
-
-        Returns True iff the push succeeded. Re-checks authorization at push time (never
-        assumes the start-time check still holds): a protected/blank branch is refused by
-        :func:`.push_policy.authorize_direct_push` — the spine-side, non-overridable gate.
-        The push target is the bare branch name (``origin/x`` → ``x``), pushed to ``origin``
-        explicitly via the clone's FETCH url (the push *remote* stays ``DISABLED_NO_PUSH``;
-        we push to the real fetch url for this ONE ref so the global push-disable holds for
-        everything else). A failed/ refused push is logged and recorded as ``error`` — the
-        verified commit stays local (recoverable), nothing escapes the sandbox silently.
-
-        Before pushing, the pre-push review gate (:meth:`_prepush_review_clean`) must pass
-        when enabled — an auto-pushed commit gets no human review, so the automated reviewer
-        is its gate (F6/F10; fail-closed)."""
-        from .push_policy import (
-            authorize_direct_push,
-            describe_scan,
-            normalize_branch,
-            scan_content_for_secrets,
-        )
-
-        ok, reason = authorize_direct_push(direct_commit=self.direct_commit, branch=self.branch)
-        if not ok:
-            self.log.warning("direct-push refused for %s: %s", target, reason)
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note=f"direct-push refused: {reason}"[:200],
-                )
-            )
-            return False
-        # PRE-PUSH REVIEW GATE (fail-closed): a direct-pushed commit gets no human review,
-        # so the automated reviewer must clear it before it lands on the shared branch.
-        clean, note = self._prepush_review_clean(target=target, base_ref=self.branch)
-        if not clean:
-            self.log.warning("direct-push BLOCKED by review gate for %s: %s", target, note)
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note=f"pre-push review gate blocked: {note}"[:200],
-                )
-            )
-            return False
-        if not sha or sha == "-":
-            self.log.error("direct-push: no commit sha for %s — skipping push", target)
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note="direct-push: winner diff did not apply",
-                )
-            )
-            return False
-        dest = normalize_branch(self.branch)
-        # Resolve the real remote URL the clone FETCHES from (push remote is disabled). We
-        # push HEAD (the verified commit we just made on self.branch) to the authorized ref.
-        # Prefer the url the PROFILE was given (carried in config), because the clone's
-        # own remote urls are both neutralized so agent-run Bash inside it cannot find a
-        # push target. Falling back to the clone keeps older configs working: it yields
-        # the DISABLED sentinel, which the check below refuses — fail closed, never a
-        # silent unguarded push.
-        fetch_url = str(getattr(getattr(self.profile, "pr_recipe", None), "fetch_url", "") or "")
-        if not fetch_url:
-            fetch_url = _git(["remote", "get-url", "origin"], self.clone).stdout.strip()
-        if not fetch_url or "DISABLED" in fetch_url.upper():
-            self.log.error("direct-push: no usable fetch url for %s — refusing", target)
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note="direct-push: no usable remote url",
-                )
-            )
-            return False
-
-        # Scan the CONTENT before it leaves the host. `_redact_commit_message` covers the
-        # message; this covers the commit itself, which is equally unwipeable once pushed
-        # and is agent-authored. Detect-and-refuse: the commit stays local and the ledger
-        # records why, rather than publishing a silently-rewritten patch.
-        # Scan the RANGE THAT WILL BE PUSHED, which is the verified commit itself: HEAD and
-        # its parent. The earlier `{dest}..HEAD` form was silently EMPTY — `dest` is the
-        # local branch this commit sits on the tip of, so `git diff <branch>..HEAD` diffs a
-        # ref against itself and returns nothing, which `scan_content_for_secrets` reads as
-        # "clean" and the fail-closed credential gate is SKIPPED. Measured against a real
-        # repo: a commit adding an AWS key produced a 0-byte `<branch>..HEAD` diff and a
-        # 144-byte `HEAD~1..HEAD` diff carrying the key. (This regressed when the checkout
-        # was moved to the local branch; before that `dest` was the stale `origin/<branch>`
-        # tracking ref, which happened to differ.) Raised by the GPT review of this branch.
-        #
-        # `HEAD~1..HEAD` for a normal commit; `--root` shows a root commit that has no
-        # parent. The git call's EXIT STATUS is load-bearing, not just its stdout: `_git`
-        # does not raise, and a failed diff exits non-zero with EMPTY stdout — which the
-        # scanner would read as "nothing to scan". Both sibling call sites refuse on a
-        # non-zero status; this one must too.
-        has_parent = (
-            _git(["rev-parse", "--verify", "--quiet", "HEAD~1"], self.clone).returncode == 0
-        )
-        proc = (
-            _git(["diff", "HEAD~1..HEAD"], self.clone)
-            if has_parent
-            else _git(["show", "--format=", "--root", "HEAD"], self.clone)
-        )
-        if proc.returncode != 0:
-            self.log.error(
-                "direct-push REFUSED for %s: could not read the pushable diff (git exit %s)",
-                target,
-                proc.returncode,
-            )
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note="direct-push refused: could not read the pushable diff",
-                )
-            )
-            return False
-        clean, scan_code = scan_content_for_secrets(proc.stdout or "")
-        if not clean:
-            # `describe_scan` maps a fixed code to a fixed literal, so nothing derived
-            # from the scanned content reaches this log line or the ledger row below.
-            scan_note = describe_scan(scan_code)
-            self.log.error("direct-push REFUSED for %s: %s", target, scan_note)
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note=f"direct-push refused: {scan_note}",
-                )
-            )
-            return False
-
-        push = self._push_with_rebase(fetch_url, dest, target)
-        # Read the sha back from the clone: a rebase inside `_push_with_rebase` rewrites
-        # HEAD, so the caller's pre-push snapshot would name a commit that is NOT on the
-        # remote. `self.pushed_sha` is what the ledger records. Fall back to the snapshot
-        # only when rev-parse fails, so a reporting hiccup cannot blank a real sha.
-        head_after = _git(["rev-parse", "HEAD"], self.clone)
-        self.pushed_sha = (head_after.stdout or "").strip() or sha
-        if push.returncode != 0:
-            self.log.error("direct-push FAILED for %s: %s", target, (push.stderr or "")[:300])
-            self.ledger.record(
-                L.LedgerEntry(
-                    fp=fp,
-                    kind=kind,
-                    target=target,
-                    status=L.STATUS_ERROR,
-                    note=f"direct-push failed: {(push.stderr or '')[:150]}",
-                )
-            )
-            return False
-        self.log.info("direct-push OK: %s → origin/%s (%s)", target, dest, self.pushed_sha)
-        return True
-
-    def _discard_staged(self, why: str) -> None:
-        """Throw away the applied-but-not-committed diff so nothing inherits it.
-
-        A provisional commit that FAILS (a rejecting hook, gpg/signing trouble) leaves the
-        candidate's diff sitting in the index, and the next candidate's ``git commit`` —
-        which stages with ``add -A`` — silently absorbs it. Measured on a real repo with a
-        rejecting ``pre-commit`` hook: candidate B's commit contained candidate A's
-        REJECTED, never-verified diff in ``m.py`` alongside B's own file. Publishing an
-        unmeasured change is the one thing this pipeline must not do. Raised by the GPT
-        review of this branch.
-
-        ``reset --hard`` alone is not enough: files the patch CREATED were staged by
-        ``add -A``, and a reset leaves them untracked on disk where the next ``add -A``
-        picks them straight back up. So the added paths are collected first (from the
-        index, before the reset) and removed individually — a targeted cleanup rather
-        than a blanket ``git clean``, which would also delete unrelated build output.
-        """
-        added = _git(["diff", "--cached", "--name-only", "--diff-filter=A"], self.clone)
-        paths = [p for p in (added.stdout or "").splitlines() if p.strip()]
-        reset = _git(["reset", "--hard", "HEAD"], self.clone)
-        if reset.returncode != 0:
-            # Nothing else is safe to do here, but the operator must see it: the next
-            # candidate may inherit this tree.
-            self.log.error(
-                "could not discard the staged diff after %s: %s",
-                why,
-                (reset.stderr or "")[:200],
-            )
-        for rel in paths:
-            try:
-                (self.clone / rel).unlink(missing_ok=True)
-            except OSError as exc:  # a directory or a permission problem — log, continue
-                self.log.warning("could not remove %s left by %s: %s", rel, why, exc)
-
-    def _stage_winner(self, winner: Proposal) -> bool:
-        """Apply the winner's diff to the working branch and stage it. Returns False when
-        the diff does not apply (the caller records an error and does not draft).
-
-        SPLIT OUT of :meth:`_commit_winner` so the winner is in the shared clone's tree
-        BEFORE the PR pipeline drafts. ``pr_recipe._push_fix_branch`` pushes the clone's
-        ``HEAD``, so drafting first meant pushing a branch that did not contain the fix —
-        or contained a PREVIOUS cycle's commit. Raised by review of this branch; traced
-        through: the queue copy carries ``winner.diff`` (correct), ``gated_commit_sha``
-        feeds the reproduce MEASUREMENT rather than the draft, and ``gate_res.commit_sha``
-        is the throwaway WORKTREE's head — none of them put the fix in the shared clone.
-
-        Committing earlier instead would have been wrong: the commit MESSAGE needs
-        ``outcome.reproduce``, which only the pipeline produces, and reordering that way
-        would silently degrade every kept-commit message to echoing VERIFY (06_*.md
-        §3.1/§3.2). Apply-then-draft-then-commit keeps both properties.
-        """
-        _git(["checkout", normalize_branch(self.branch)], self.clone)
-        if not winner.diff.strip():
-            return True
-        ap = subprocess.run(
-            ["git", "-C", str(self.clone), "apply"],
-            input=winner.diff,
-            capture_output=True,
-            text=True,
-        )
-        if ap.returncode != 0:
-            self.log.error("winner diff did not apply: %s", ap.stderr[:200])
-            return False
-        _git(["add", "-A"], self.clone)
-        return True
-
-    def _commit_winner_provisional(self, winner: Proposal) -> bool:
-        """Apply the winner and commit it with a PLACEHOLDER message. False if it will not
-        apply.
-
-        A real commit, not just a staged index: ``git push HEAD:refs/heads/<b>`` sends the
-        commit HEAD points at, so a staged-but-uncommitted fix is invisible to the draft.
-        The final message needs the pipeline's reproduce measurement, so it is amended by
-        :meth:`_finalize_winner_commit` once that exists, and rolled back by
-        :meth:`_reset_provisional` when nothing is filed.
-        """
-        if not self._stage_winner(winner):
-            return False
-        if not winner.diff.strip():
-            return True
-        # CHECK the commit return code. `_git` does not raise, so a failed commit (a
-        # rejecting hook, gpg failure, or an empty index) would otherwise leave HEAD on the
-        # PREVIOUS commit while this returns True — the pipeline then drafts/pushes a commit
-        # that does not contain the fix (or a prior cycle's). Fail closed instead. Raised by
-        # the GPT review of this branch.
-        commit = _git(
-            # FIXED message — never `winner.cand_id`. `cand_id` embeds the model-chosen
-            # `candidate.target`, and `_short` only restricts to alnum/`_`/`-`, which is
-            # exactly the character class of an AWS key id or a `ghp_` token. Measured:
-            # `src/m.py::AKIAIOSFODNN7EXAMPLE` produced
-            # `c1_wide_m_py_AKIAIOSFODNN7EXAMPLE_d469bc5b`. This message is what the
-            # DRAFT PUSH publishes — the redacted amend happens AFTER the push (871 ->
-            # 887 -> 903) — so an unscanned cand_id lands in GitHub history, which cannot
-            # be edited without rewriting it. The cand_id is still in the run archive and
-            # the ledger, where it belongs. Raised by the GPT review of this branch.
-            ["commit", "-q", "-m", "wip(auto-improvement): staging a verified candidate"],
-            self.clone,
-        )
-        if commit.returncode != 0:
-            self.log.error(
-                "provisional commit failed for %s: %s",
-                winner.cand_id,
-                (commit.stderr or "")[:200],
-            )
-            self._discard_staged(f"a failed provisional commit for {winner.cand_id}")
-            return False
-        return True
-
-    def _reset_provisional(self, pre_sha: str) -> None:
-        """Roll the branch back to ``pre_sha`` after a provisional commit that was not
-        filed, so a fluke, duplicate or error never advances HEAD (06_*.md §1.1)."""
-        if not pre_sha:
-            return
-        head = _git(["rev-parse", "HEAD"], self.clone).stdout.strip()
-        if head == pre_sha:
-            return  # nothing was committed (empty diff)
-        res = _git(["reset", "--hard", pre_sha], self.clone)
-        if res.returncode != 0:
-            self.log.error(
-                "could not roll back the provisional commit to %s: %s",
-                pre_sha[:10],
-                (res.stderr or "").strip()[:160],
-            )
-
-    def _finalize_winner_commit(
-        self, winner: Proposal, *, verify, reproduce=None, cycle: int, diff_ref: str
-    ) -> str:
-        """Apply the winner's diff to the working branch (local commit only), with the
-        §2.4 attributable commit message (stage breakdown + guardrails + reproduce + RH
-        guards + diff-ref). Every kept commit is independently reviewable (06_*.md §3.1).
-
-        ``reproduce`` is the pipeline's SECOND independent A/B :class:`Measurement` (the one
-        the CR description used); the commit message renders its REAL delta on the
-        ``reproduce:`` line so commit and CR never disagree (06_*.md §3.1/§3.2). It falls
-        back to ``verify`` only if the pipeline did not carry a reproduce measurement (it
-        always does on a filed perf win) — never silently re-using VERIFY when the real
-        numbers are available."""
-        if not winner.diff.strip():
-            return _git(["rev-parse", "--short", "HEAD"], self.clone).stdout.strip()
-        if True:
-            # Use the INDEPENDENT reproduce measurement (carried back from the pipeline) for
-            # the ``reproduce:`` line so the kept-commit message states the real second-A/B
-            # delta the CR cited, not an echo of VERIFY (06_*.md §3.1/§3.2; CrOutcome.reproduce).
-            msg = D.perf_commit_message(
-                proposal=winner,
-                verify=verify,
-                reproduce=reproduce if reproduce is not None else verify,
-                cycle=cycle,
-                primary_name=self.profile.ruler.primary_name,
-                unit=self.profile.ruler.unit,
-                diff_ref=diff_ref,
-                guardrail_tolerances=self.guardrail_tolerances,
-            )
-            # AMEND: the provisional commit already carries the winner's tree (that is what
-            # the draft pushed); only its message is replaced.
-            _git(
-                ["commit", "-q", "--amend", "-m", self._redact_commit_message(msg)],
-                self.clone,
-            )
-        return _git(["rev-parse", "--short", "HEAD"], self.clone).stdout.strip()
+    # Commit a kept winner, amend it or roll it back: ``spine/driver_commit.py``.
+    _publishing_is_halted = _driver_commit._publishing_is_halted
+    _redact_commit_message = staticmethod(_driver_commit._redact_commit_message)
+    _discard_staged = _driver_commit._discard_staged
+    _stage_winner = _driver_commit._stage_winner
+    _commit_winner_provisional = _driver_commit._commit_winner_provisional
+    _reset_provisional = _driver_commit._reset_provisional
+    _quarantine_unrolled_clone = _driver_commit._quarantine_unrolled_clone
+    _finalize_winner_commit = _driver_commit._finalize_winner_commit
+    _stage_bug_winner = _driver_commit._stage_bug_winner
+    _commit_bug_winner_provisional = _driver_commit._commit_bug_winner_provisional
+    _finalize_bug_winner_commit = _driver_commit._finalize_bug_winner_commit
 
     # ── bug-track keep/draft (M4; 05_improvement_loop_bugfix.md §4) ───────────
 
@@ -1507,6 +1098,8 @@ class Driver:
         This is the bug-track analogue of :meth:`_apply_verdict`'s keep path, but the
         CR trigger is the boolean RED/GREEN gate (the doubled-RED flake check is the
         reproduction analogue, §4.1) — there is no second A/B and no noise band."""
+        if self._publishing_is_halted():
+            return
         diff_ref = self.archive.save_candidate(
             cand_id=winner.cand_id,
             diff=winner.diff,
@@ -1574,9 +1167,10 @@ class Driver:
             if outcome.committed_ready:
                 # F10 direct-commit (bug track): push the verified RED→GREEN fix to the
                 # authorized branch; record ``committed`` only on a successful push.
-                if self._direct_push(
+                pushed = self._direct_push(
                     fp=outcome.fp, kind="bug", target=winner.candidate.target, sha=committed
-                ):
+                )
+                if pushed is True:
                     # See the perf track: record the sha that LANDED, not the pre-rebase one.
                     landed = self.pushed_sha or committed
                     self.ledger.record(
@@ -1598,7 +1192,7 @@ class Driver:
                         self.branch,
                         landed,
                     )
-                else:
+                elif pushed is False:
                     # Same rollback as the perf twin, and for the same reason: a refused
                     # commit left at HEAD is invisible to the NEXT winner's `HEAD~1..HEAD`
                     # scan but still published by its push. This branch had no `else` at
@@ -1659,96 +1253,20 @@ class Driver:
                 "cycle %d: bug fix %s NOT filed (%s)", cycle, winner.cand_id, outcome.status
             )
 
-    def _stage_bug_winner(self, winner: Proposal) -> bool:
-        """Apply + stage the bug fix on the working branch. False when it will not apply.
-
-        Split out for the same reason as :meth:`_stage_winner`: the recipe pushes the shared
-        clone's HEAD, so the fix has to be in this tree BEFORE the pipeline drafts.
-        """
-        _git(["checkout", normalize_branch(self.branch)], self.clone)
-        if not winner.diff.strip():
-            return True
-
-        # Apply with --3way: the diff was authored in a throwaway WORKTREE forked off a
-        # base sha that may have drifted from the clone's branch HEAD (a prior candidate
-        # landed, a clone-sync moved HEAD, or the agent touched an artifact like uv.lock
-        # that already exists here). A plain ``git apply`` fails outright on any context
-        # mismatch or "already exists in working directory" — the observed committed=0
-        # cause (2026-06-17: "bug fix diff did not apply: error: uv.lock: already exists").
-        # --3way falls back to a blob-level 3-way merge, which reconciles drift and
-        # absorbs an already-present file instead of aborting. We retry plain-apply first
-        # (cheapest, no index churn) and only fall back to 3-way so behavior is unchanged
-        # when the base matches.
-        def _apply(extra: list[str]):
-            return subprocess.run(
-                ["git", "-C", str(self.clone), "apply", *extra],
-                input=winner.diff,
-                capture_output=True,
-                text=True,
-            )
-
-        ap = _apply([])
-        if ap.returncode != 0:
-            self.log.info(
-                "bug fix plain-apply failed (%s) — retrying with --3way",
-                (ap.stderr or "").strip()[:120],
-            )
-            ap = _apply(["--3way"])
-        if ap.returncode != 0:
-            self.log.error("bug fix diff did not apply (even --3way): %s", ap.stderr[:200])
-            return False
-        _git(["add", "-A"], self.clone)
-        return True
-
-    def _commit_bug_winner_provisional(self, winner: Proposal) -> bool:
-        """Apply + commit the bug fix with a placeholder message. See
-        :meth:`_commit_winner_provisional` for why a commit rather than a staged index."""
-        if not self._stage_bug_winner(winner):
-            return False
-        if not winner.diff.strip():
-            return True
-        # Same as the perf twin: a failed commit must not report success, or the draft/push
-        # publishes a HEAD that lacks the fix. Raised by the GPT review of this branch.
-        commit = _git(
-            # FIXED message — never `winner.cand_id`. `cand_id` embeds the model-chosen
-            # `candidate.target`, and `_short` only restricts to alnum/`_`/`-`, which is
-            # exactly the character class of an AWS key id or a `ghp_` token. Measured:
-            # `src/m.py::AKIAIOSFODNN7EXAMPLE` produced
-            # `c1_wide_m_py_AKIAIOSFODNN7EXAMPLE_d469bc5b`. This message is what the
-            # DRAFT PUSH publishes — the redacted amend happens AFTER the push (871 ->
-            # 887 -> 903) — so an unscanned cand_id lands in GitHub history, which cannot
-            # be edited without rewriting it. The cand_id is still in the run archive and
-            # the ledger, where it belongs. Raised by the GPT review of this branch.
-            ["commit", "-q", "-m", "wip(auto-improvement): staging a verified candidate"],
-            self.clone,
-        )
-        if commit.returncode != 0:
-            self.log.error(
-                "provisional bug commit failed for %s: %s",
-                winner.cand_id,
-                (commit.stderr or "")[:200],
-            )
-            self._discard_staged(f"a failed provisional bug commit for {winner.cand_id}")
-            return False
-        return True
-
-    def _finalize_bug_winner_commit(
-        self, winner: Proposal, *, bug_res: BugGateResult, cycle: int, diff_ref: str
-    ) -> str:
-        """Apply the bug fix to the working branch (local commit only). The commit
-        message states the defect + the RED→GREEN correctness narrative (not a perf
-        metric — 05_*.md §4.2 / 06_*.md §3.1 contrast the bug narrative with the perf A/B)."""
-        if winner.diff.strip():
-            # AMEND the provisional commit: its tree is what the draft pushed; only the
-            # message is replaced (staging + --3way happened in _stage_bug_winner).
-            msg = D.bug_commit_message(
-                proposal=winner, bug_res=bug_res, cycle=cycle, diff_ref=diff_ref
-            )
-            _git(
-                ["commit", "-q", "--amend", "-m", self._redact_commit_message(msg)],
-                self.clone,
-            )
-        return _git(["rev-parse", "--short", "HEAD"], self.clone).stdout.strip()
+    def _preflight_checked(self) -> PreflightResult | None:
+        """Run perf preflight, then attest/retire before any later host Git."""
+        result: PreflightResult | None = None
+        error: Exception | None = None
+        try:
+            result = self.preflight()
+        except Exception as exc:  # noqa: BLE001 - attest before interpreting
+            error = exc
+        if self._retire_if_unsafe("perf preflight"):
+            return None
+        if error is not None:
+            raise error
+        assert result is not None
+        return result
 
     # ── the durable loop ────────────────────────────────────────────────
 
@@ -1777,7 +1295,9 @@ class Driver:
             )
             run_preflight = False
         if run_preflight:
-            res = self.preflight()  # raises (HALT/BLOCK) if the ruler is not proven
+            res = self._preflight_checked()
+            if res is None:
+                return self.stats
             # Surface the MEASURED calibration results (the band, the baseline rep
             # count, the canary's observed delta, the per-guardrail baseline medians)
             # to the progress sink so the UI's measurement battery can show real
@@ -1879,6 +1399,12 @@ class Driver:
                 self.stats.filed,
                 self.stats.errors,
             )
+        if self._probe_failure is not None:
+            # A safety probe that could not run aborted this run; per-candidate
+            # error containment may have swallowed the in-flight raise, so
+            # re-raise here where the supervisor's catch-all records
+            # STATUS_ERROR instead of reading the early stop as DONE.
+            raise self._probe_failure
         return self.stats
 
     def request_stop(self) -> None:
@@ -1991,6 +1517,60 @@ def _run_dry(args, caps: BudgetCaps, log: logging.Logger) -> int:
     print(f"  ledger:  {data / 'state' / 'ledger.jsonl'}")
     print(f"  pr_queue:{data / 'pr_queue'}")
     return 0
+
+
+# ── the owner family ─────────────────────────────────────────────────────
+#
+# This module is the facade of the spine driver and the path every caller imports. ``Driver``
+# keeps its whole interface here: the members whose bodies live in an owner are bound on the
+# class by name, so a patch of ``Driver.<member>``, or of one instance's member, reaches every
+# caller. New work goes to the owner of its responsibility:
+#
+#   ``driver_git`` -- the host-side ``_git`` chokepoint and the object reads built on it
+#   ``driver_publish`` -- the F10 direct push, its gates and its one rebase-and-retry
+#   ``driver_commit`` -- the winner's provisional commit: stage, commit, amend, roll back
+#
+# A name this module binds is read here, and a git helper that moved to ``driver_git`` is
+# served from it. A write or delete through this module -- ``monkeypatch.setattr``,
+# ``mock.patch`` -- reaches every owner that binds the same object (``kiro_crew._facade_mirror``),
+# so a patch of ``driver._git`` or ``driver.subprocess`` reaches the moved code as it did when
+# this was one module. The imports at the top stay bound even where this module's own code
+# does not read them (``# noqa: F401``): they are its surface, which callers read and tests
+# patch. Owners never import this module at run time. ``test/test_driver_owner_bindings.py``
+# pins the bindings, the mirror and that direction.
+#: The owner modules, lowest layer first: the first holder of a name answers its reads.
+#: Named from this module's own package, so the family also loads under the app loader's name.
+_OWNERS = (
+    f"{__package__}.driver_git",
+    f"{__package__}.driver_publish",
+    f"{__package__}.driver_commit",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name this module serves but does not bind -> the owner that answers a read of it. Its
+#: surface is what it bound before the split: its own names and the git helpers it defined.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(
+    _facade_mirror.install(
+        sys.modules[__name__],
+        _OWNERS,
+        excluded=(),
+        surface=frozenset(globals()) | frozenset(vars(sys.modules[_OWNERS[0]])),
+    ).served
+)
+sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.apps.builtins.auto_improvement.spine.driver_git import (  # noqa: F401
+        _ATTRIBUTION_FORMAT,
+        _GIT_SAFE_CONFIG,
+        _commit_attribution,
+        _commit_tree,
+        _committer_identity,
+        _expected_replay_tree,
+        _fetched_tip_oid,
+        _full_head_id,
+    )
 
 
 if __name__ == "__main__":

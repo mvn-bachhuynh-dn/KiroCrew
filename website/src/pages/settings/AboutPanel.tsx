@@ -1,37 +1,36 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import { useReducedMotion } from '../../hooks/useReducedMotion'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Trans } from 'react-i18next'
-import { RefreshCw, Scale, CheckCircle2, AlertCircle, Bug, GitBranch, GitCommitHorizontal, ExternalLink, ArrowUp, History, Package, X, Download, Copy } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { RefreshCw, Scale, CheckCircle2, AlertCircle, Bug, GitBranch, GitCommitHorizontal, ExternalLink, ArrowUp, History, Download, Copy } from 'lucide-react'
+import { SettingsLink } from '../../components/SettingsLink'
 import { Progress } from '@/components/ui/progress'
-import { Card, CardTitle, Btn, Toggle } from '../../components/ui'
+import { Card, CardTitle, Btn } from '../../components/ui'
+import { SettingsToggle } from '../../components/settings'
 import { useBranding } from '../../hooks/useBranding'
 import { useAppSelector } from '../../store'
 import { codeBrowserBranchUrl, codeBrowserCommitUrl } from '../../lib/codeBrowser'
-import MarkdownRenderer from '../../components/MarkdownRenderer'
 import SegmentedControl from '../../components/SegmentedControl'
 import ReportProblemCard from './ReportProblemCard'
-import { api, ApiError } from '../../api/client'
-import { copyToClipboard } from '../../utils/clipboard'
+import { ARM_POLL_FAILURE_THRESHOLD, AGENT_REQUEST_POLL_MS, AgentUpdateRequestCard, copyCommand } from './AboutPanelUpdateFlow'
+import { AboutPanelGatewayUpdates, AboutPanelUpdateConfirm, useAboutPanelGatewayUpdate } from './AboutPanelGatewayUpdate'
+import { api } from '../../api/client'
+import { gatewayAutoUpdateCopy, useGatewayAutoUpdateEffect, useUpdateSwitchesShown } from '../../utils/updateSwitches'
+import { useGatewayAutoUpdate, type SwitchState } from '../../hooks/useGatewayAutoUpdate'
+import { useAppAutoDownload } from '../../hooks/useAppAutoDownload'
+import { storeAnsweredUpdateInfo, updateInfoQuery } from '../../api/updateInfoQuery'
+import { failedWithNoData } from '../../api/queryState'
+import ErrorNotice from '../../components/ErrorNotice'
+import { CopyCommand } from '../../components/agentHarness/CopyCommand'
 
 import { i18nT } from '../../i18n/t'
-import { fmtDateTimeNumeric } from '../../i18n/format'
-type UpdateState = {
-  state: 'checking' | 'found' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
-  version?: string
-  notes?: string
-  pubDate?: string
-  channel?: string
-  message?: string
-  /** Which stage failed. Absent on builds older than the phase-aware emit. */
-  phase?: 'check' | 'download' | 'install'
-  /** Stable failure class; the user-facing copy is chosen from this, not from `message`. */
-  code?: string
-  httpStatus?: number
-  /** Download progress, 0-100. Absent until the first progress event arrives. */
-  percent?: number
-  bytesPerSecond?: number
-}
+import { fmtDateTimeNumeric, fmtList } from '../../i18n/format'
+import { feedbackTracker } from '../../feedbackTracker'
+import type { UpdateState } from '../../hooks/useUpdateSubscription'
+import { gatewayStopCommand } from '../../hooks/useUpdateSubscription'
+import { foldStableStamp, sameBuildVersion } from '../../utils/displayVersion'
+import { bytesAreTheStableRelease as followedLanePublishesRunningBytes } from '../../utils/laneMembership'
 
 /** Human-readable transfer rate for the progress label. */
 function formatRate(bps: number): string {
@@ -39,46 +38,6 @@ function formatRate(bps: number): string {
   const mb = bps / (1024 * 1024)
   return mb >= 1 ? `${mb.toFixed(1)} MB/s` : `${Math.round(bps / 1024)} KB/s`
 }
-
-/**
- * Why the GATEWAY update check produced no verdict.
- *
- * Distinct from `updateErrorText` below, which speaks for the Electron updater's
- * download/install lifecycle. These codes come from `/api/update/check` and mean
- * "the comparison did not happen" — never "you are up to date".
- *
- * An unrecognised code deliberately falls back to the generic reason instead of
- * being dropped: a newer gateway paired with an older bundle must still say the
- * check failed rather than silently render the success line.
- */
-const GATEWAY_CHECK_ERROR_KEYS: Record<string, string> = {
-  feed_unreachable: 'pages.settings.aboutPanel.update_check_error_feed_unreachable',
-  feed_malformed: 'pages.settings.aboutPanel.update_check_error_feed_malformed',
-  git_fetch_failed: 'pages.settings.aboutPanel.update_check_error_git_fetch_failed',
-  git_read_failed: 'pages.settings.aboutPanel.update_check_error_git_read_failed',
-  version_unparseable: 'pages.settings.aboutPanel.update_check_error_version_unparseable',
-  // Not failures: this gateway is not the update surface for the install it is
-  // running inside. A desktop bundle embeds this same backend, so it reaches this
-  // code and must defer to the Electron updater; a container is replaced by
-  // pulling a new image.
-  managed_by_app: 'pages.settings.aboutPanel.update_check_managed_by_app',
-  managed_by_image: 'pages.settings.aboutPanel.update_check_managed_by_image',
-}
-
-function gwCheckErrorText(code: string): string {
-  const key = GATEWAY_CHECK_ERROR_KEYS[code]
-  return i18nT(key || 'pages.settings.aboutPanel.update_check_error_unknown')
-}
-
-/**
- * Codes that mean "not my job", not "it broke".
- *
- * They still travel in the `error` field — it is the one channel that says why
- * there is no verdict — but rendering them under "Couldn't check for updates"
- * would be a lie: nothing failed, the update simply arrives through a different
- * surface. So they get a neutral line instead of the danger one.
- */
-const GATEWAY_CHECK_INFO_CODES = new Set(['managed_by_app', 'managed_by_image'])
 
 /**
  * User-facing copy for a failure class. `message` from the updater is raw
@@ -103,9 +62,12 @@ const UPDATE_ERROR_KEYS = {
   serverStatus: 'pages.settings.aboutPanel.update_error_server_status',
   server: 'pages.settings.aboutPanel.update_error_server',
   noRelease: 'pages.settings.aboutPanel.update_error_no_release',
+  stageInvalidated: 'pages.settings.aboutPanel.update_error_stage_invalidated',
   integrity: 'pages.settings.aboutPanel.update_error_integrity',
   misconfigured: 'pages.settings.aboutPanel.update_error_misconfigured',
   unknown: 'pages.settings.aboutPanel.update_error_unknown',
+  installUnknown: 'pages.settings.aboutPanel.update_error_install_unknown',
+  gatewayStillRunning: 'pages.settings.aboutPanel.update_error_gateway_still_running',
 } as const
 
 function updateErrorText(st: UpdateState | null | undefined): string {
@@ -122,42 +84,32 @@ function updateErrorText(st: UpdateState | null | undefined): string {
         : i18nT(UPDATE_ERROR_KEYS.server)
     }
     case 'no-release': return i18nT(UPDATE_ERROR_KEYS.noRelease)
+    case 'stage-invalidated': return i18nT(UPDATE_ERROR_KEYS.stageInvalidated)
     case 'integrity': return i18nT(UPDATE_ERROR_KEYS.integrity)
     case 'misconfigured': return i18nT(UPDATE_ERROR_KEYS.misconfigured)
+    // The command itself renders beside this text (gatewayStopCommand), so the
+    // sentence points at it; without a command the install generic applies.
+    case 'gateway-still-running':
+      return gatewayStopCommand(st)
+        ? i18nT(UPDATE_ERROR_KEYS.gatewayStillRunning)
+        : i18nT(UPDATE_ERROR_KEYS.installUnknown)
     // Unclassified failure. The localized generic WINS over st.message: the raw
     // value is electron-updater's exception text, written for a developer reading
     // logs ("ShipIt could not replace the application bundle") and always English.
     // The detail still reaches the log via the main process; only fall
     // back to it if the catalog key is somehow missing, since a raw string beats
     // an empty error line.
-    default: return i18nT(UPDATE_ERROR_KEYS.unknown) || st?.message || ''
+    //
+    // The INSTALL phase gets its own generic: the shared one advises "try
+    // checking for updates again", which sits directly beside the card's Retry
+    // button — two conflicting next steps for the same failure. The install
+    // copy names what failed and leaves the next step to the card's controls.
+    default: return i18nT(st?.phase === 'install' ? UPDATE_ERROR_KEYS.installUnknown : UPDATE_ERROR_KEYS.unknown) || st?.message || ''
   }
 }
 
-type UpdateInfo = {
-  version?: string
-  channel?: string
-  stampedChannel?: string | null
-  channelSwitchable?: boolean
-  channelPreference?: string
-  platform?: string
-  /** Manual-reinstall permalink from the main process; absent when no lane. */
-  downloadUrl?: string | null
-  packaged?: boolean
-  disabled?: string
-}
-
-type UpdateAPI = {
-  onState: (cb: (payload: UpdateState) => void) => (() => void)
-  check: () => Promise<unknown>
-  download: () => Promise<unknown>
-  install: () => Promise<unknown>
-  getInfo: () => Promise<UpdateInfo>
-  setChannel?: (channel: string) => Promise<{ ok: boolean; error?: string }>
-}
-
 function getUpdateApi(): UpdateAPI | undefined {
-  return (window as unknown as { updateAPI?: UpdateAPI }).updateAPI
+  return window.updateAPI
 }
 
 // Subtle accent tint for the version pill + build chips (works with any theme's
@@ -174,14 +126,13 @@ const HERO_BG: React.CSSProperties = {
 }
 
 /**
- * Where the prerelease note sends a bug report.
- *
- * Same endpoint as `prompts/featureRequest.ts` FEATURE_REQUEST_URL, deliberately
- * NOT imported from it: that constant is named for (and used by) the guided
- * feature-request flow, and a rename or a redirect to an in-app form there must
- * not silently retarget this link.
+ * Where the prerelease note sends a bug report: the feedback tracker's blank
+ * new-issue page (`feedbackTracker().issueUrl`). Read through the seam, not
+ * from the guided flow's own constants: an edition retargets every feedback
+ * surface in one call, and the guided flow's prompt can change shape without
+ * touching this link.
  */
-const REPORT_ISSUE_URL = 'https://github.com/kirodotdev/KiroCrew/issues/new'
+const reportIssueUrl = (): string => feedbackTracker().issueUrl
 
 /**
  * Last-resort prerelease test for an info payload with NO channel fields.
@@ -211,34 +162,180 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   )
 }
 
+export {
+  AGENT_REQUEST_POLL_MS,
+  AgentUpdateRequestCard,
+  InAppUpdateFlow,
+  RestartGatewayButton,
+  resolveUnarmedPhase,
+} from './AboutPanelUpdateFlow'
+
+/**
+ * A switch row's notices: the saved value could not be read (the switch then
+ * shows its default), a read failed while the switch shows a value known
+ * otherwise (the last value read, or a save's answer), or the write failed or
+ * was refused. askAgent on: the switch shows the value still
+ * in effect, so nothing is lost by leaving.
+ */
+function SwitchNotices({ state, unreadable, testIdPrefix, onHandoff }: {
+  state: SwitchState
+  /** Omitted where another notice on the page already reports the read. */
+  unreadable?: string
+  testIdPrefix: string
+  onHandoff?: () => void
+}) {
+  return (
+    <>
+      {unreadable && state.readFailed && (
+        <ErrorNotice variant="inline" message={unreadable} askAgent onHandoff={onHandoff}
+          testId={`${testIdPrefix}-read-error`} />
+      )}
+      {state.refreshFailed && (
+        <ErrorNotice variant="inline" message={state.refreshFailed}
+          askAgent onHandoff={onHandoff} testId={`${testIdPrefix}-refresh-error`} />
+      )}
+      {state.saveError && (
+        <ErrorNotice variant="inline" message={state.saveError} askAgent onHandoff={onHandoff}
+          testId={`${testIdPrefix}-save-error`} />
+      )}
+    </>
+  )
+}
+
+/**
+ * The desktop app updater's auto-download opt-out, which is ON by default.
+ * Shared with the What's-new modal; where each surface draws it is
+ * `utils/updateSwitches`. Held at the shell's default, on, until the
+ * updater's getInfo() answers.
+ */
+export function AppAutoDownloadSwitch({ unreadable, anchor = true, onHandoff }: {
+  /** The read-failure copy; omitted where the page already reports it. */
+  unreadable?: string
+  /** `false` for a copy outside Settings, so deep links land on About's row. */
+  anchor?: boolean
+  onHandoff?: () => void
+}) {
+  const app = useAppAutoDownload()
+  return (
+    <div className="pt-1 border-t border-border">
+      <SettingsToggle
+        label={i18nT('pages.settings.aboutPanel.install_app_updates_automatically')}
+        description={i18nT('pages.settings.aboutPanel.install_app_updates_automatically_hint')}
+        checked={app.checked}
+        disabled={app.held}
+        onChange={app.set}
+        anchor={anchor}
+      />
+      <SwitchNotices state={app} testIdPrefix="auto-download" onHandoff={onHandoff} unreadable={unreadable} />
+    </div>
+  )
+}
+
+/**
+ * The gateway's `auto_update` switch, shared with the What's-new modal. One
+ * row in every state: what changes with the gateway's `update_auto_effect` is
+ * whether the switch can be flipped and the note under it
+ * (`gatewayAutoUpdateCopy`), so a verdict that arrives while the row is on
+ * screen never swaps it for another element. Held at the schema default, on,
+ * until the saved value has been read. Where config.local.json sets the key,
+ * a note says so (the Privacy tab's pin note); the switch stays usable, since
+ * a click is how a removed override is noticed.
+ */
+export function GatewayAutoUpdateSwitch({ anchor = true, readOnMount = false, onHandoff }: {
+  /** `false` for a copy outside Settings, so deep links land on About's row. */
+  anchor?: boolean
+  /** Re-read the saved value on every mount, not only once it is 30 s old. */
+  readOnMount?: boolean
+  onHandoff?: () => void
+}) {
+  const canApply = useAppSelector(s => s.dashboard.status?.update_can_apply) === true
+  const copy = gatewayAutoUpdateCopy(useGatewayAutoUpdateEffect(), { canApply })
+  const gw = useGatewayAutoUpdate({ readOnMount })
+  const reduceMotion = useReducedMotion()
+  const noteId = useId()
+  const pinNoteId = useId()
+  // A refusal already says the same thing, through its notice.
+  const showPinNote = gw.overlayPinned && !gw.saveError
+  const describedBy = [copy.hint ? noteId : '', showPinNote ? pinNoteId : ''].filter(Boolean).join(' ') || undefined
+  return (
+    <div className="pt-2.5 border-t border-border">
+      <SettingsToggle
+        label={i18nT('pages.settings.aboutPanel.automatic_updates')}
+        description={i18nT('pages.settings.aboutPanel.gateway_auto_update_description')}
+        checked={gw.checked}
+        disabled={copy.disabled || gw.held}
+        onChange={gw.set}
+        configKey="auto_update"
+        describedBy={describedBy}
+        anchor={anchor}
+      />
+      <AnimatePresence initial={false}>
+        {copy.hint && (
+          <motion.p
+            key="note"
+            id={noteId}
+            className="text-[12px] text-muted overflow-hidden"
+            initial={reduceMotion ? false : { opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={reduceMotion ? undefined : { opacity: 0, height: 0 }}
+            data-testid="auto-update-note"
+          >
+            {copy.hint}
+          </motion.p>
+        )}
+      </AnimatePresence>
+      {showPinNote && (
+        <p id={pinNoteId} className="text-[12px] text-muted mt-1" data-testid="auto-update-pin-note">
+          {i18nT('pages.settings.privacyPanel.recordMetricsOverlayPinned')}
+        </p>
+      )}
+      <SwitchNotices state={gw} testIdPrefix="auto-update" onHandoff={onHandoff}
+        unreadable={i18nT('pages.settings.aboutPanel.auto_update_setting_unavailable')} />
+    </div>
+  )
+}
+
 export function AboutPanel() {
   const { botName, avatar } = useBranding()
   const gatewayVersion = useAppSelector(s => s.dashboard.status?.version) || ''
   const buildBranch = useAppSelector(s => s.dashboard.status?.branch) || ''
   const buildCommit = useAppSelector(s => s.dashboard.status?.commit) || ''
-  const updateAvailable = useAppSelector(s => s.dashboard.status?.update_available) || false
+  // `=== true` because the verdict is nullable: null means a check that never
+  // ran or one that failed, and neither may light an update affordance.
+  const updateAvailable = useAppSelector(s => s.dashboard.status?.update_available) === true
   // Undefined on a gateway that predates the field; `!== false` below is what
   // keeps that case behaving as before.
-  const statusSelfUpdatable = useAppSelector(s => s.dashboard.status?.update_self_updatable)
+  const statusSelfUpdatable = useAppSelector(s => s.dashboard.status?.update_can_apply)
   // The background check's own verdict + command, so the 12-hourly check that
   // lights the nav badge lands the user on something actionable instead of an
   // Update button that 409s.
-  const statusChecked = useAppSelector(s => s.dashboard.status?.update_checked) || false
+  const statusChecked = useAppSelector(
+    s => s.dashboard.status?.update_check_status
+  ) === 'succeeded'
   const statusCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
+  // The background check's commit distance, from the status push. What lets
+  // the hero badge tell a diverged checkout from a current one on first
+  // visit, before any manual check has populated the local counts.
+  const statusAhead = useAppSelector(s => s.dashboard.status?.update_commits_ahead) || 0
+  const statusBehind = useAppSelector(s => s.dashboard.status?.update_commits_behind) || 0
+  const lastCheckedAt = useAppSelector(s => s.dashboard.status?.update_last_checked_at) ?? null
+  const checkIntervalSecs = useAppSelector(s => s.dashboard.status?.update_check_interval_secs) ?? 43200
   const queryClient = useQueryClient()
   const desktopApi = getUpdateApi()
   const isDesktop = !!desktopApi
 
   // Desktop (Electron) app info (version, channel, platform)
-  const { data: info } = useQuery({
-    queryKey: ['update-info'],
-    queryFn: () => desktopApi!.getInfo(),
-    enabled: isDesktop,
-    staleTime: Infinity, // static per session
-  })
+  const infoQuery = useQuery({ ...updateInfoQuery, enabled: isDesktop })
+  const info = infoQuery.data
+  // A shell with no getInfo() answers `null`: as much a failed read here as a
+  // rejection, since the version, channel and auto-download rows all need it.
+  // The last settled read, so the notice holds through a retry.
+  const infoError = failedWithNoData(infoQuery) || (isDesktop && info === null)
+  // A re-read rejected over cached info: the rows shown are the last ones read.
+  const infoRefreshFailed = info !== undefined && infoQuery.isError
 
   // Desktop update lifecycle state, read from the shared cache that
-  // useUpdateSubscription (mounted in App.tsx) populates.
+  // useUpdateSubscription (mounted in shell/appShell.tsx) populates.
   const { data: updateState } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
@@ -253,28 +350,155 @@ export function AboutPanel() {
   })
   // Explicit consent actions (macOS Software Update semantics): downloading
   // and installing each happen only when the user clicks.
-  const downloadMutation = useMutation({ mutationFn: () => desktopApi!.download() })
+  const downloadMutation = useMutation({ mutationFn: () => desktopApi!.download!() })
   const installMutation = useMutation({ mutationFn: () => desktopApi!.install() })
   // Install is a ONE-WAY door, so the control must never become actionable
   // again. Note isSuccess, not just isPending: `update:install` resolves as soon
   // as the install is DISPATCHED, and on macOS the platform installer then works
   // for several more seconds before the app quits. Keying `disabled` on
   // isPending alone lets the button re-arm during that window, so the user sees
-  // a clickable "Restart & Update" followed by an unexplained quit -- which reads
+  // a clickable install-and-restart action followed by an unexplained quit -- which reads
   // as a crash.
   const installDispatched = installMutation.isPending || installMutation.isSuccess
+  // An agent's pending request for THIS packaged install. Polled while on
+  // desktop; the poll is also how the card leaves — a decline, an expiry, or
+  // the install itself (which quits the app under this tab) all end it.
+  const agentRequest = useQuery({
+    queryKey: ['update-arm-status'],
+    queryFn: () => api.armStatus(),
+    enabled: isDesktop,
+    refetchInterval: AGENT_REQUEST_POLL_MS.value,
+  })
+  const pendingAgentRequest = agentRequest.data?.armed === true && agentRequest.data.managed_by === 'electron'
+    ? agentRequest.data
+    : null
+  // React Query keeps the last successful data through errors, so a failing
+  // poll leaves the card mounted with its error line rather than blanking it.
+  // The human's click on the request card: the SAME download→install path the
+  // ordinary card uses. With a stage already present, install; otherwise
+  // download and let the `downloaded` state's Install button (or the
+  // deferred-on-quit install) finish it — exactly as a manual click would.
+  const [agentInstallArmed, setAgentInstallArmed] = useState(false)
+  // Before dispatching the install, retire the request by the id the card
+  // showed. The install quits the app; on relaunch into the new version, a
+  // request left on disk would put the card straight back up asking for a
+  // version that is already running. Best-effort and NOT awaited: the human
+  // said yes, and a slow gateway must not stand between that and the install.
+  const retireAgentRequest = () => {
+    const id = pendingAgentRequest?.request_id
+    if (id) void api.dismissUpdateArm(id).catch(() => {})
+  }
+  const installFromAgentRequest = () => {
+    setAgentInstallArmed(true)
+    if (updateState?.state === 'downloaded') {
+      retireAgentRequest()
+      installMutation.mutate()
+    } else {
+      downloadMutation.mutate()
+    }
+  }
+  const agentDownloadLanded = agentInstallArmed && updateState?.state === 'downloaded'
+  useEffect(() => {
+    // The download the request card started has landed: finish it. One shot —
+    // `agentInstallArmed` is cleared so a later, unrelated download does not
+    // ride this click.
+    if (!agentDownloadLanded || installDispatched) return
+    setAgentInstallArmed(false)
+    retireAgentRequest()
+    installMutation.mutate()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentDownloadLanded, installDispatched])
+  // A download the card started that then FAILED — the updater's own
+  // download-phase error, or the IPC rejecting — must release the click, or
+  // both request actions stay disabled with no way forward.
+  const agentDownloadFailed = agentInstallArmed
+    && (downloadMutation.isError || (updateState?.state === 'error' && updateState.phase === 'download'))
+  useEffect(() => {
+    if (agentDownloadFailed) setAgentInstallArmed(false)
+  }, [agentDownloadFailed])
+  // Failures the request card must SHOW (errors-use-error-notice): a poll that
+  // keeps failing means an approval could land unseen; a refused download means
+  // the click did nothing. The poll uses the same consecutive-failure threshold
+  // InAppUpdateFlow uses for the same reason — one blip is left to the next
+  // interval.
+  const agentRequestPanelError = agentRequest.failureCount >= ARM_POLL_FAILURE_THRESHOLD
+    ? i18nT('pages.settings.aboutPanel.arm_status_poll_failing')
+    : agentDownloadFailed
+      ? `${i18nT('pages.settings.aboutPanel.download_failed')}: ${updateState?.state === 'error' ? updateErrorText(updateState) : i18nT(UPDATE_ERROR_KEYS.unknown)}`
+      : ''
+  // While a request is live, its card owns the one Install control. Rendering
+  // the ordinary card's "Download & Install" beneath it shows two buttons for
+  // one update and the reader cannot tell whether they differ. The ordinary
+  // card keeps everything else — progress, notes, the failure row, the manual
+  // fallback — because those are what the request card's click drives.
+  const ctaOwnedByRequest = !!pendingAgentRequest
   // Channel switcher (stable ⇄ insider opt-in). Switching persists the
   // preference and triggers a check; the other channel's build then arrives
   // as the normal consent card above -- never an automatic install. Nightly
   // builds report channelSwitchable=false (separate pinned install).
   const channelMutation = useMutation({
     mutationFn: (next: string) => desktopApi!.setChannel!(next),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['update-info'] }),
+    onSuccess: answer => storeAnsweredUpdateInfo(queryClient, answer),
   })
+  // A refused switch arrives either as a rejection or as a RESOLVED
+  // `{ ok: false, error }` — the bridge's contract — so both count as failed.
+  // The shell's reason, when it gave one, is the only actionable detail.
+  const desktopChannelFailed = channelMutation.isError
+    || (channelMutation.data !== undefined && !channelMutation.data.ok)
+  const desktopChannelReason = channelMutation.data && !channelMutation.data.ok
+    ? (channelMutation.data.error || '')
+    : ''
 
-  const version = info?.version || gatewayVersion || '—'
+  // The version chip's DISPLAY text. For a gateway install the fold is the
+  // backend's (`version_display`, raw `version` fallback for a gateway that
+  // predates the field); for a desktop build it is computed locally, because
+  // the Electron-reported version never crosses the gateway. Every functional
+  // reader (`versionLooksPrerelease`, the updater compare gate, the SPA's
+  // reload-on-upgrade comparison) keeps its raw source.
+  const gatewayVersionDisplay = useAppSelector(s => s.dashboard.status?.version_display) || ''
+  // The desktop lane pair, live-first. `info` is a one-shot `getInfo()` read from
+  // mount, while every later check pushes its own answer on the lifecycle payload,
+  // so preferring the push is what keeps the chip and the prerelease ask correct
+  // after a check that ran while this panel was open. A replayed payload is the
+  // same `getInfo()` seed, so it is no worse than the fallback. `undefined` on
+  // either side means unknown and must never read as "ahead".
+  const laneVersion = updateState?.laneVersion || info?.laneVersion || ''
+  const runningAheadOfLane = updateState?.laneVersion !== undefined && updateState.laneVersion !== ''
+    ? updateState.runningAheadOfLane
+    : info?.runningAheadOfLane
+  const versionDisplay = info?.version
+    ? foldStableStamp(info.version, info.channel, runningAheadOfLane)
+    : (gatewayVersionDisplay || gatewayVersion || '—')
+  // Two version lanes. `versionDisplay` is the DESKTOP SHELL's stamp whenever
+  // `getInfo()` answered and the gateway's only as a fallback, while the branch
+  // and commit chips are always the gateway's (`status.branch` / `status.commit`,
+  // stamped from the checkout the backend runs from). A shell that spawned its
+  // own gateway keeps both lanes equal, so folding them into one row is
+  // harmless there. A shell attached to a gateway it did not spawn (dev-fleet,
+  // launchd, an SSH tunnel to a source checkout) is where the fold lies: the row
+  // reads `v0.6.0-insider.6 · main · 2ed1f603d`, a build that never existed.
+  // When the two disagree, label both and hang the chips off the gateway line,
+  // since that is what they stamp. "Agree" is EITHER of two tests, because one
+  // build is stamped in two spellings (`release_channel.py`: the shell carries
+  // SemVer `0.6.0-insider.4`, the wheel it launched carries PEP 440 `0.6.0rc4`):
+  // the raw strings name the same build (`sameBuildVersion`, so a self-spawned
+  // insider install is one lane), or the DISPLAY strings match (a promoted
+  // stable build folds its prerelease stamp on both sides — foldStableStamp
+  // here, `_display_version` on the backend — while its raw stamps differ).
+  const gatewayLaneVersion = gatewayVersionDisplay || gatewayVersion
+  const versionLanesDiffer = !!info?.version && !!gatewayLaneVersion
+    && versionDisplay !== gatewayLaneVersion
+    && !sameBuildVersion(info.version, gatewayVersion || gatewayLaneVersion)
   const channel = info?.channel
   const updatesDisabled = info?.disabled
+  // An externally-managed install (a distro/enterprise package) has no channel
+  // its owner reads and no self-update lane, so both the switcher and the
+  // channel row disappear rather than describing a control that changes nothing.
+  const isExternallyManaged = updatesDisabled === 'externally-managed'
+  // A marker with updateCommand routes to the managed lane: the external
+  // package manager handles discovery and apply, but the managed-by notice
+  // and the copyable command still apply alongside the regular update controls.
+  const isManagedLane = !isExternallyManaged && !updatesDisabled && !!info?.updateCommand
   const checking = checkMutation.isPending || updateState?.state === 'checking'
 
   // "What's the difference?" disclosure next to the channel switcher. Collapsed
@@ -307,10 +531,36 @@ export function AboutPanel() {
   // when present keeps the desktop answer authoritative (it knows which FEED
   // the build tracks, not just how its version reads).
   const gatewayChannel = useAppSelector(s => s.dashboard.status?.release_channel)
-  const isPrerelease = info?.stampedChannel === undefined
-    ? (!!info?.packaged && versionLooksPrerelease(info?.version))
-      || (!isDesktop && !!gatewayChannel && gatewayChannel !== 'stable')
-    : !!info.stampedChannel && info.stampedChannel !== 'stable'
+  // The channel this INSTALL follows, as opposed to the lane the running bytes
+  // were built on (`release_channel` above). Empty on a layout with no channel
+  // at all — a git checkout, a desktop bundle, a container — which is exactly
+  // when the switcher must not be offered, because the backend refuses it.
+  const statusUpdateChannel = useAppSelector(s => s.dashboard.status?.update_channel) || ''
+  // Who manages updates on this gateway: 'command' = a policy-pinned provider
+  // owns them, so self-managed installer copy would instruct the user to run
+  // the exact mechanism the policy excluded.
+  const gwManagedByCommand = useAppSelector(s => s.dashboard.status?.update_managed_by) === 'command'
+  // In-app arm+approve applies only where the backend probed the managed-venv
+  // shape; managed_by alone also covers bare source installs whose arm would 409.
+  const gwCanArm = useAppSelector(s => s.dashboard.status?.update_can_arm) === true
+  // The background check's candidate version, so the Arm button can name its
+  // target before the user ever presses the manual Check button (gwTarget is
+  // only populated by an explicit check in this tab).
+  const gwStatusLatest = useAppSelector(s => s.dashboard.status?.update_latest_version) || ''
+  // DISPLAY-ONLY fold of the candidate above, so the channel-move note can name
+  // the release the followed lane actually publishes (`0.4.1`) instead of its
+  // promoted candidate's raw stamp (`0.4.1rc1`).
+  const gwStatusLatestDisplay = useAppSelector(s => s.dashboard.status?.update_latest_version_display) || ''
+  // Is the running build ahead of everything the followed channel publishes?
+  // The backend derives this from the FEED (see `_channel_move_pending`), which
+  // is the only honest source: the previous SPA-side rule compared
+  // `update_channel` against the version-derived `release_channel`, and since a
+  // promoted stable release keeps its candidate's `rc` stamp, that comparison
+  // reported "mid-switch" permanently for every promoted-stable install.
+  const gwChannelMovePending = useAppSelector(s => s.dashboard.status?.update_channel_move_pending) === true
+  // Running prerelease bytes? See `isPrerelease` below — computed after the
+  // gateway check state it consults, and rendered from JSX, so the ordering is
+  // free.
 
   // Desktop status line under the Check button (simple states only — the
   // found/downloading/downloaded lifecycle renders as the update card below).
@@ -322,7 +572,25 @@ export function AboutPanel() {
   } else if (updateState?.state === 'error' && updateState.phase !== 'download' && updateState.phase !== 'install') {
     // Download failures are NOT rendered here: they render inside the update
     // card so the found version stays on screen and can be retried.
-    status = <span className="text-danger flex items-center gap-1.5"><AlertCircle size={13} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates')}: {updateErrorText(updateState)}</span>
+    // askAgent on: a status line; the Check button above is the retry.
+    status = (
+      <ErrorNotice
+        variant="inline"
+        message={`${i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates')}: ${updateErrorText(updateState)}`}
+        askAgent
+      />
+    )
+  } else if (checkMutation.isError) {
+    // The IPC call itself rejected, so no updater push will ever describe this
+    // failure — without this branch the click simply does nothing visible.
+    status = (
+      <ErrorNotice
+        variant="inline"
+        message={`${i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates')}: ${i18nT(UPDATE_ERROR_KEYS.unknown)}`}
+        askAgent
+        testId="check-request-failed"
+      />
+    )
   }
 
   // Update card: shown whenever an update is found / downloading / ready.
@@ -337,9 +605,13 @@ export function AboutPanel() {
   const cardFailedPhase = updateState?.phase === 'download' || updateState?.phase === 'install'
   const cardFailed = cardState === 'error' && cardFailedPhase
   const cardInstallFailed = cardState === 'error' && updateState?.phase === 'install'
+  // An install refused because the gateway kept running: the error text ends
+  // by pointing at the command that stops it, rendered right under it.
+  const refusedStopCommand = cardInstallFailed ? gatewayStopCommand(updateState) : null
   const showUpdateCard = !checking && (cardState === 'found' || cardState === 'available' || cardState === 'downloading' || cardState === 'downloaded' || cardFailed)
   const cardBusy = cardState === 'available' || cardState === 'downloading'
   const cardReady = cardState === 'downloaded'
+  const showsWindowsInstaller = updateState?.installHandoff === 'windows-installer'
   // Determinate only once a progress event has arrived; before that the label
   // stays indeterminate, since `percent` is optional in the emit.
   const cardPercent = cardState === 'downloading' && typeof updateState?.percent === 'number'
@@ -366,11 +638,11 @@ export function AboutPanel() {
           </span>
         </div>
         <div className="shrink-0">
-          {cardReady ? (
+          {ctaOwnedByRequest ? null : cardReady ? (
             <Btn primary onClick={() => installMutation.mutate()} disabled={installDispatched}>
               <RefreshCw size={13} className={`lucide-inline ${installDispatched ? 'animate-spin' : ''}`} /> {installMutation.isSuccess
                 ? i18nT('pages.settings.aboutPanel.restarting')
-                : i18nT('pages.settings.aboutPanel.restart_update')}
+                : i18nT('pages.settings.aboutPanel.install_update_restart_app')}
             </Btn>
           ) : (
             <Btn primary onClick={() => downloadMutation.mutate()} disabled={cardBusy || downloadMutation.isPending}>
@@ -397,20 +669,48 @@ export function AboutPanel() {
           </span>
         </>
       )}
+      {/* askAgent on: the card is the retry surface (Retry / manual link stay
+          siblings), and a download holds no user input to lose. */}
       {cardFailed && (
-        <span className="text-[12px] text-danger flex items-start gap-1.5" data-testid="update-download-error">
-          <AlertCircle size={13} className="lucide-inline shrink-0" />
-          <span>{i18nT(cardInstallFailed ? 'pages.settings.aboutPanel.install_failed' : 'pages.settings.aboutPanel.download_failed')}: {updateErrorText(updateState)}</span>
-        </span>
+        <ErrorNotice
+          variant="inline"
+          message={`${i18nT(cardInstallFailed ? 'pages.settings.aboutPanel.install_failed' : 'pages.settings.aboutPanel.download_failed')}: ${updateErrorText(updateState)}`}
+          askAgent
+          testId="update-download-error"
+        />
+      )}
+      {refusedStopCommand && (
+        <CopyCommand><code data-testid="update-gateway-stop-command">{refusedStopCommand}</code></CopyCommand>
+      )}
+      {/* The IPC call rejected before the updater ever emitted a failure state,
+          so no `cardFailed` row describes it: the button would just re-arm with
+          no message. Gated on !cardFailed so a real updater failure is never
+          reported twice. */}
+      {!cardFailed && downloadMutation.isError && (
+        <ErrorNotice
+          variant="inline"
+          message={`${i18nT('pages.settings.aboutPanel.download_failed')}: ${i18nT(UPDATE_ERROR_KEYS.unknown)}`}
+          askAgent
+          testId="update-download-request-error"
+        />
+      )}
+      {!cardFailed && installMutation.isError && (
+        <ErrorNotice
+          variant="inline"
+          message={`${i18nT('pages.settings.aboutPanel.install_failed')}: ${i18nT(UPDATE_ERROR_KEYS.installUnknown)}`}
+          askAgent
+          testId="update-install-request-error"
+        />
       )}
       {cardReady && (
         <span className="text-[12px] text-muted">
           {/* Once dispatched, the gateway goes down ON PURPOSE and the dashboard
-              disconnects for the ~1-2 min Squirrel handoff. This line is the last
-              thing the card says, so it must explain the coming silence. */}
+              disconnects during the platform installer handoff. This line is the
+              last thing the card says, so it must explain what happens next. */}
           {installDispatched
             ? i18nT('pages.settings.aboutPanel.installing_quiet_note')
             : i18nT('pages.settings.aboutPanel.downloaded_and_verified_the_app_restarts_to_fini')}
+          {showsWindowsInstaller && ` ${i18nT('components.updateModal.windows_installer_handoff')}`}
         </span>
       )}
       {showManualFallback && (
@@ -442,75 +742,93 @@ export function AboutPanel() {
     </div>
   ) : null
 
+  // Copy feedback for the desktop managed lane's update command.
+  const [managedCmdCopied, setManagedCmdCopied] = useState(false)
+  const [managedCmdCopyFailed, setManagedCmdCopyFailed] = useState(false)
+
   // --- Gateway (web dashboard) update flow ---
   // The gateway exposes /api/update/check + /api/update; used when not running
   // inside the Electron shell. "Check for updates" flips to "Update to vX" when
   // status.update_available is set; the update itself is gated behind a
   // changelog confirm because applying restarts the gateway.
-  const [gwChanges, setGwChanges] = useState('')
-  const [gwTarget, setGwTarget] = useState('')
-  const [gwFound, setGwFound] = useState(false)
-  // The honesty trio, straight from /api/update/check.
+  const gwUpdate = useAboutPanelGatewayUpdate(queryClient)
+  const {
+    gwTargetDisplay, gwFound, gwAhead, gwBehind, gwChecked, gwSelfUpdatable, gwChannel,
+    gwChannelError, gwCommand, showConfirm, setShowConfirm, restarting, gwCheck, gwApply,
+    gwChannelMutation,
+  } = gwUpdate
+  // Diverged: local commits on top of a moved upstream. `update_available` is
+  // false there BY DESIGN (the apply path is a destructive reset), so this is
+  // derived from the counts rather than from any availability flag — it is the
+  // third verdict between "update available" and "up to date". Both counts come
+  // from the SAME check response, so this can never mix two checks' answers.
+  const gwDiverged = gwAhead > 0 && gwBehind > 0
+  // The badge's diverged verdict: a manual check's counts win once one has
+  // run (they are the newer read of the same backend cache); before that, the
+  // background check's counts from the status push carry the same fact, so a
+  // fresh visit to a diverged install is told the truth without clicking
+  // anything.
+  const heroDiverged = gwChecked ? gwDiverged : statusAhead > 0 && statusBehind > 0
+  // Running prerelease bytes? The question is about the BYTES, so it keys on the
+  // build's own stamp (`stampedChannel` on desktop, the gateway's
+  // version-derived `release_channel`) — a user who just opted INTO insider is
+  // still running the stable build they have, and one who just opted back to
+  // stable is still running insider bytes. Both directions are pinned by
+  // AboutPanel.channelExplainer tests.
   //
-  // `gwChecked` is what licenses the "you're on the latest version" line. It used
-  // to be enough that the request returned 200 — but for a wheel install the
-  // backend's check never actually ran, so a check that did nothing reported an
-  // out-of-date install as up to date. A 200 is now only a transport success;
-  // `checked` is the verdict, and `gwError` names why there is none.
-  const [gwChecked, setGwChecked] = useState(false)
-  const [gwError, setGwError] = useState('')
-  // Null = not yet known from a check; the redux status flag below carries the
-  // same fact for the pre-check case.
-  const [gwSelfUpdatable, setGwSelfUpdatable] = useState<boolean | null>(null)
-  const [gwChannel, setGwChannel] = useState('')
-  const [gwCommand, setGwCommand] = useState('')
-  const [gwCommandCopied, setGwCommandCopied] = useState(false)
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [applyError, setApplyError] = useState('')
-  const [restarting, setRestarting] = useState(false)
-  const [autoUpdate, setAutoUpdate] = useState(true)
-  const { data: mcCfg } = useQuery({ queryKey: ['mc-config-autoupdate'], queryFn: () => api.kirocrewConfig() })
-  useEffect(() => {
-    const v = (mcCfg as any)?.auto_update
-    if (typeof v === 'boolean') setAutoUpdate(v)
-  }, [mcCfg])
-  const gwCheck = useMutation({
-    mutationFn: () => api.checkUpdate(),
-    onSuccess: (d: any) => {
-      setGwChanges(d?.changes || '')
-      // `remote_version` is the field the gateway actually emits; `version` is
-      // read as a fallback only because it is what some older payloads carried.
-      const target = d?.remote_version || d?.version
-      if (target) setGwTarget(String(target))
-      // Derive availability from the check response itself, not only the redux
-      // status flag (which refreshes on a slower WS status push). Otherwise a
-      // check that finds an update could still show "You're on the latest
-      // version" until the flag catches up.
-      setGwFound(!!d?.available)
-      setGwChecked(!!d?.checked)
-      setGwError(typeof d?.error === 'string' ? d.error : '')
-      setGwChannel(typeof d?.channel === 'string' ? d.channel : '')
-      setGwCommand(typeof d?.update_command === 'string' ? d.update_command : '')
-      setGwCommandCopied(false)
-      if (typeof d?.self_updatable === 'boolean') setGwSelfUpdatable(d.self_updatable)
-      if (typeof d?.auto_update === 'boolean') setAutoUpdate(d.auto_update)
-    },
-  })
-  const gwApply = useMutation({
-    mutationFn: () => api.applyUpdate(),
-    onSuccess: () => setRestarting(true),
-    onError: (e: unknown) => {
-      // A real server rejection (e.g. 409 dirty tree, 400) arrives as ApiError
-      // with a status code — surface it. A bare network failure means the POST's
-      // connection was reset by the gateway restart the update itself triggers;
-      // that is the expected success path, not a failure.
-      if (e instanceof ApiError) setApplyError(e.message || i18nT('pages.settings.aboutPanel.update_failed'))
-      else setRestarting(true)
-    },
-  })
+  // The one case a stamp cannot answer is a PROMOTED stable release: promotion
+  // re-points the soaked candidate's bytes without re-stamping them, so its
+  // version reads `insider` while it IS the stable release, and the entire
+  // stable population was shown "thanks for testing an early build". That case
+  // is exempted by the feed's own answer — the followed lane is stable AND it
+  // publishes exactly these bytes (not-ahead, from a comparison that actually
+  // COMPLETED). UNKNOWN (no check yet) deliberately keeps the stamp's verdict:
+  // an unproven exemption would hide the ask from a genuine prerelease user,
+  // while showing a bug-report invitation one check early costs nothing.
+  const stampedLane = isDesktop ? info?.stampedChannel : gatewayChannel
+  // One rule, shared with the header chip (utils/laneMembership) so the two
+  // cannot drift on what licenses the exemption. `laneAnswered` comes from the
+  // SAME source as the verdict in both branches: the desktop's tri-state pair,
+  // and — on the gateway — `statusChecked` alone. NOT `gwChecked ||`:
+  // `gwChecked` is a local useState set by a manual check in this tab, while
+  // `update_channel_move_pending` only ever arrives on the status frame, so
+  // pairing them exempted a genuine prerelease install here while the header
+  // still flagged it.
+  const bytesAreTheStableRelease = followedLanePublishesRunningBytes(isDesktop
+    ? {
+      followedChannel: info?.channel,
+      laneAnswered: runningAheadOfLane === true || runningAheadOfLane === false,
+      runningAheadOfLane: runningAheadOfLane === true,
+    }
+    : {
+      followedChannel: statusUpdateChannel,
+      laneAnswered: statusChecked,
+      runningAheadOfLane: gwChannelMovePending,
+    })
+  const isPrerelease = stampedLane === undefined
+    ? !!info?.packaged && versionLooksPrerelease(info?.version)
+    : !!stampedLane && stampedLane !== 'stable' && !bytesAreTheStableRelease
   // Update is available if either the redux status flag or the latest check
-  // response says so.
-  const showUpdate = updateAvailable || gwFound
+  // response says so — EXCEPT when the latest check said diverged. The redux
+  // flag refreshes on the slower WS status push, so for up to one push interval
+  // it can still carry `true` from a check that ran before the checkout gained
+  // local commits; letting it win would offer an Update button whose backend
+  // path is a bare `git pull` — a silent merge into the user's branch. A fresh
+  // diverged verdict therefore outranks the stale flag (fail-safe: withholding
+  // the button is recoverable, a surprise merge is not). `gwFound` needs no
+  // such guard: it is set from the same response as the counts, and a diverged
+  // check reports `update_available: false`.
+  const showUpdate = (updateAvailable && !gwDiverged) || gwFound
+  // Shared by the check-result line and the confirm modal, so the two surfaces
+  // cannot drift while describing the same verdict.
+  const gwDivergedText = gwDiverged
+    ? i18nT('pages.settings.aboutPanel.checkout_diverged_from_upstream', {
+        distance: fmtList([
+          i18nT('pages.settings.aboutPanel.commits_ahead', { count: gwAhead }),
+          i18nT('pages.settings.aboutPanel.commits_behind', { count: gwBehind }),
+        ]),
+      })
+    : ''
   // Can this install apply the update itself? A fresh check wins; before one has
   // run, the redux status flag carries the same fact from the gateway's own boot
   // check. Defaulting to TRUE when neither is known preserves the historical
@@ -527,7 +845,48 @@ export function AboutPanel() {
   // suppressed unconditionally, because it POSTs to an endpoint that answers 409
   // for this layout. A missing command degrades to an explanation, never to a
   // button that cannot work.
-  const showManualUpdate = showUpdate && !gwSelfUpdate
+  // A manual check's / switch's answer wins; otherwise the background check's,
+  // shipped in status. Empty means this layout has no channel to switch.
+  const effectiveGwChannel = gwChannel || statusUpdateChannel
+  const showGwChannelSwitcher = !isDesktop && !!effectiveGwChannel
+  // Nightly is not an OFFERABLE destination on any surface. Its builds are
+  // untested `main` HEAD, so following that lane is a deliberate install
+  // (`cli.sh --channel nightly`), never a one-click flip from a control that
+  // sits next to Stable and reads like a third equal option.
+  //
+  // The segment is rendered only when this install is ALREADY on nightly —
+  // either the lane it follows or the lane the running bytes came from — which
+  // keeps the control truthful for a nightly user (a two-segment control with
+  // neither segment selected shows no indicator at all) and leaves them a
+  // one-click exit back to Stable. Reading BOTH channels matters for the window
+  // after that click: the followed lane is stable while the running build is
+  // still nightly, and dropping the segment there would strand an accidental
+  // click with no way back. There is no path IN: a stable/insider install never
+  // renders it. This matches the desktop switcher, which has only ever offered
+  // stable ⇄ insider.
+  const gwNightlyLane = effectiveGwChannel === 'nightly' || gatewayChannel === 'nightly'
+  // Moving lanes needs the installer command whether or not the target lane's
+  // version is numerically NEWER. Switching from nightly back to stable is a
+  // downgrade, and the command is still the only thing that performs it — so
+  // gating the command on `available` alone left the switcher's own note ("run the
+  // command below") pointing at nothing in exactly that case.
+  //
+  // The predicate is the BACKEND's, computed from the followed lane's feed (see
+  // `_channel_move_pending`). It replaces a local comparison of the followed
+  // channel against `release_channel`, which is derived from the version string:
+  // because promotion re-points the soaked candidate's bytes without re-stamping
+  // them, a promoted stable release reports `release_channel: insider`, so that
+  // comparison was permanently true for every promoted-stable install and this
+  // whole branch — installer command included — rendered forever.
+  const channelMovePending = !isDesktop && gwChannelMovePending
+  const showManualUpdate = (showUpdate || channelMovePending) && !gwSelfUpdate
+  const effectiveGwCanArm = typeof gwCheck.data?.can_arm === 'boolean'
+    ? gwCheck.data.can_arm
+    : gwCanArm
+  const updateSwitches = useUpdateSwitchesShown()
+  // The app switch says itself when a re-read fails; with no switch drawn,
+  // the card's notice must say it instead.
+  const showInfoError = infoError || (infoRefreshFailed && !updateSwitches.app)
 
   // Escape closes the confirm dialog (unless an apply/restart is in flight).
   useEffect(() => {
@@ -537,13 +896,32 @@ export function AboutPanel() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [showConfirm, gwApply.isPending, restarting])
+  }, [showConfirm, gwApply.isPending, restarting, setShowConfirm])
+
+  // Gateway-stamped build chips. Hoisted because they render in one of two
+  // places: beside the license chip when the lanes agree, or on the gateway's
+  // own version line when they do not (see `versionLanesDiffer`).
+  const branchChip = buildBranch && (
+    <a href={codeBrowserBranchUrl(buildBranch)} target="_blank" rel="noopener noreferrer"
+       title={i18nT('pages.settings.aboutPanel.browse_this_branch_on_github')}
+       className="inline-flex items-center gap-1.5 text-[12px] font-mono text-accent border rounded-lg px-2.5 py-1 no-underline hover:underline" style={ACCENT_TINT}>
+      <GitBranch size={12} className="shrink-0" /> <span className="truncate max-w-[220px]">{buildBranch}</span> <ExternalLink size={10} className="opacity-60 shrink-0" />
+    </a>
+  )
+  const commitChip = buildCommit && (
+    <a href={codeBrowserCommitUrl(buildCommit)} target="_blank" rel="noopener noreferrer"
+       title={i18nT('pages.settings.aboutPanel.view_this_commit_on_github')}
+       className="inline-flex items-center gap-1.5 text-[12px] font-mono text-accent border rounded-lg px-2.5 py-1 no-underline hover:underline" style={ACCENT_TINT}>
+      <GitCommitHorizontal size={12} className="shrink-0" /> {buildCommit} <ExternalLink size={10} className="opacity-60 shrink-0" />
+    </a>
+  )
 
   return (
     <>
       <Card style={HERO_BG}>
         {/* Identity hero */}
         <div className="flex items-center gap-4">
+          {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- `onError` is the image's own load-failure hook (hide a broken avatar so the row keeps its layout), not a user interaction; the img is decorative (`alt=""`) and there is nothing here for a keyboard to reach */}
           <img
             src={avatar}
             alt=""
@@ -554,11 +932,45 @@ export function AboutPanel() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2.5 flex-wrap">
               <span className="text-[19px] font-extrabold tracking-tight text-text-strong">{botName || 'Kiro Crew'}</span>
-              <span className="text-[12px] font-mono font-semibold text-accent rounded-full px-2.5 py-0.5 border" style={ACCENT_TINT}>{i18nT('pages.settings.aboutPanel.v')}{version}</span>
-              {!isDesktop && (updateAvailable
+              <span className="text-[12px] font-mono font-semibold text-accent rounded-full px-2.5 py-0.5 border" style={ACCENT_TINT}
+                    title={versionLanesDiffer ? i18nT('pages.settings.aboutPanel.app_lane_title') : undefined}
+                    data-testid="about-version">
+                {versionLanesDiffer && (
+                  <span className="font-sans font-medium text-muted mr-1" data-testid="about-version-lane">{i18nT('pages.settings.aboutPanel.app_lane_label')}</span>
+                )}
+                {i18nT('pages.settings.aboutPanel.v')}{versionDisplay}</span>
+              {!isDesktop && (heroDiverged
+                // Diverged outranks BOTH other verdicts: `update_available` is
+                // false here BY DESIGN (the no-auto-apply property), and a
+                // stale `true` from a check that predates the local commits
+                // must not paint "Update available" beside the divergence
+                // warning below — the exact half-truth the neutral branch's
+                // comment forbids. A manual check's counts win once one has
+                // run; the status push's counts cover the first visit.
+                ? <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold rounded-full px-2 py-0.5"
+                    style={{ color: 'var(--warn)', background: 'color-mix(in oklab, var(--warn) 14%, transparent)' }}
+                    data-testid="hero-diverged">
+                    <GitBranch size={11} className="lucide-inline" aria-hidden /> {i18nT('pages.settings.aboutPanel.diverged')}</span>
+                : updateAvailable
                 ? <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold rounded-full px-2 py-0.5"
                     style={{ color: 'var(--warn)', background: 'color-mix(in oklab, var(--warn) 14%, transparent)' }}>
                     <ArrowUp size={11} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.update_available')}</span>
+                // The followed lane has never published these bytes, so this
+                // install is not on it yet. Outranks "Up to date", which is what
+                // the panel used to say here: the feed comparison DOES come back
+                // "nothing newer" (the running build is ahead), so a green pill
+                // was technically about the version and a lie about the state —
+                // it sat directly above a command telling the user to move.
+                : gwChannelMovePending
+                // Deliberately NOT the `ArrowUp` of "Update available": this state
+                // is the one that does NOT progress on its own — only re-running
+                // the installer moves the install — and an upward arrow beside
+                // "not on stable" reads as an upgrade already under way. Same
+                // warn pill (it IS an attention state), non-directional icon.
+                ? <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold rounded-full px-2 py-0.5"
+                    style={{ color: 'var(--warn)', background: 'color-mix(in oklab, var(--warn) 14%, transparent)' }}
+                    data-testid="hero-channel-move-pending">
+                    <AlertCircle size={11} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.not_on_channel_yet', { channel: effectiveGwChannel })}</span>
                 : (gwChecked || statusChecked)
                   ? <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold rounded-full px-2 py-0.5"
                       style={{ color: 'var(--ok)', background: 'color-mix(in oklab, var(--ok) 14%, transparent)' }}
@@ -574,34 +986,49 @@ export function AboutPanel() {
               )}
             </div>
             <div className="text-[12.5px] text-muted mt-1">{i18nT('pages.settings.aboutPanel.autonomous_agent_management_runs_locally_open_so')}</div>
+            {/* The gateway's own line, only when it is not the build the shell
+                badge above names. The branch and commit chips live here in that
+                case — they are gateway stamps, so beside the shell badge they
+                described a build that never existed. */}
+            {versionLanesDiffer && (
+              <div className="mt-2 flex items-center gap-2 flex-wrap" data-testid="about-gateway-lane">
+                <span className="text-[12px] font-mono font-semibold text-accent rounded-full px-2.5 py-0.5 border" style={ACCENT_TINT}
+                      title={i18nT('pages.settings.aboutPanel.gateway_lane_title')}
+                      data-testid="about-gateway-version">
+                  <span className="font-sans font-medium text-muted mr-1">{i18nT('pages.settings.aboutPanel.gateway_lane_label')}</span>
+                  {i18nT('pages.settings.aboutPanel.v')}{gatewayLaneVersion}</span>
+                {branchChip}
+                {commitChip}
+              </div>
+            )}
+            {/* getInfo() rejected: the version chip above fell back to the
+                gateway's figure and the channel row is missing, with nothing
+                to say why. askAgent on: a read failure on a status card. */}
+            {showInfoError && (
+              <ErrorNotice
+                variant="inline"
+                className="mt-1"
+                message={i18nT('pages.settings.aboutPanel.update_info_unavailable')}
+                askAgent
+                testId="update-info-error"
+              />
+            )}
           </div>
         </div>
 
         {/* Build + license chips */}
         <div className="mt-4 flex flex-wrap gap-2">
-          {buildBranch && (
-            <a href={codeBrowserBranchUrl(buildBranch)} target="_blank" rel="noopener noreferrer"
-               title={i18nT('pages.settings.aboutPanel.browse_this_branch_on_github')}
-               className="inline-flex items-center gap-1.5 text-[12px] font-mono text-accent border rounded-lg px-2.5 py-1 no-underline hover:underline" style={ACCENT_TINT}>
-              <GitBranch size={12} className="shrink-0" /> <span className="truncate max-w-[220px]">{buildBranch}</span> <ExternalLink size={10} className="opacity-60 shrink-0" />
-            </a>
-          )}
-          {buildCommit && (
-            <a href={codeBrowserCommitUrl(buildCommit)} target="_blank" rel="noopener noreferrer"
-               title={i18nT('pages.settings.aboutPanel.view_this_commit_on_github')}
-               className="inline-flex items-center gap-1.5 text-[12px] font-mono text-accent border rounded-lg px-2.5 py-1 no-underline hover:underline" style={ACCENT_TINT}>
-              <GitCommitHorizontal size={12} className="shrink-0" /> {buildCommit} <ExternalLink size={10} className="opacity-60 shrink-0" />
-            </a>
-          )}
+          {!versionLanesDiffer && branchChip}
+          {!versionLanesDiffer && commitChip}
           <span className="inline-flex items-center gap-1.5 text-[12px] text-muted border border-border rounded-lg px-2.5 py-1 bg-bg"
                 title={i18nT('pages.settings.aboutPanel.open_source_under_the_apache_2_0_license')}>
             <Scale size={12} className="shrink-0" /> {i18nT('pages.settings.aboutPanel.apache_2_0')}
           </span>
         </div>
 
-        {isDesktop && channel && (
+        {isDesktop && channel && !isExternallyManaged && (
           info?.channelSwitchable && desktopApi?.setChannel ? (
-            <div className="flex flex-col" data-testid="channel-switcher">
+            <div className="flex flex-col" data-testid="channel-switcher" data-setting-label={i18nT('pages.settings.aboutPanel.update_channel')}>
               <div className="flex items-center justify-between py-1.5 text-sm gap-3">
                 <div className="flex flex-col items-start min-w-0">
                   <span className="text-muted">{i18nT('pages.settings.aboutPanel.update_channel')}</span>
@@ -657,10 +1084,158 @@ export function AboutPanel() {
                   </span>
                 </div>
               )}
+              {/* Mirrors the gateway switcher's error line: a refused switch used
+                  to leave the control silently sitting on the old lane. The
+                  bridge reports a refusal either as a rejection or as
+                  `{ ok: false, error }`, so both are read. askAgent on: the
+                  preference is persisted by the shell, nothing here is a draft. */}
+              {desktopChannelFailed && (
+                <ErrorNotice
+                  title={desktopChannelReason ? i18nT('pages.settings.aboutPanel.channel_switch_failed') : undefined}
+                  message={desktopChannelReason || i18nT('pages.settings.aboutPanel.channel_switch_failed')}
+                  askAgent
+                  testId="channel-error"
+                />
+              )}
             </div>
           ) : (
             <Row label={i18nT('pages.settings.aboutPanel.update_channel')}>{channel}</Row>
           )
+        )}
+        {showGwChannelSwitcher && (
+          // Gateway (CLI / wheel / cloud source) channel switcher: the same two
+          // lanes the desktop offers, stable ⇄ insider. Nightly is a deliberate
+          // pinned install rather than a destination this control hands out, so
+          // its segment appears only for an install already on that lane (see
+          // `gwNightlyLane`) — as an exit, never an entrance.
+          //
+          // Switching persists the preference and re-checks; it never installs.
+          // The new lane's build then arrives through the normal Update surface
+          // below, so a channel change is never an unconsented version jump.
+          <div className="flex flex-col" data-testid="gateway-channel-switcher" data-setting-label={i18nT('pages.settings.aboutPanel.update_channel')}>
+            <div className="flex items-center justify-between py-1.5 text-sm gap-3">
+              <div className="flex flex-col items-start min-w-0">
+                <span className="text-muted">{i18nT('pages.settings.aboutPanel.update_channel')}</span>
+                <button
+                  type="button"
+                  aria-expanded={showChannelHelp}
+                  data-testid="gateway-channel-help-toggle"
+                  className="text-[11.5px] text-accent underline decoration-dotted underline-offset-2 hover:decoration-solid cursor-pointer bg-transparent border-none p-0 text-left"
+                  onClick={() => setShowChannelHelp(v => !v)}
+                >
+                  {showChannelHelp
+                    ? i18nT('pages.settings.aboutPanel.channel_help_hide')
+                    // The prompt names exactly the lanes the control shows: the
+                    // three-lane wording on a two-lane control advertises a
+                    // channel the user cannot pick here.
+                    : gwNightlyLane
+                      ? i18nT('pages.settings.aboutPanel.channel_help_show_all')
+                      : i18nT('pages.settings.aboutPanel.channel_help_show')}
+                </button>
+              </div>
+              <div className="shrink-0 flex items-center gap-2">
+                {gwChannelMutation.isPending && <RefreshCw size={13} className="lucide-inline animate-spin text-muted" />}
+                <SegmentedControl
+                  segments={[
+                    { key: 'stable', label: i18nT('pages.settings.aboutPanel.stable') },
+                    { key: 'insider', label: i18nT('pages.settings.aboutPanel.insider') },
+                    ...(gwNightlyLane
+                      ? [{ key: 'nightly', label: i18nT('pages.settings.aboutPanel.nightly') }]
+                      : []),
+                  ]}
+                  value={effectiveGwChannel}
+                  onChange={next => {
+                    if (next !== effectiveGwChannel && !gwChannelMutation.isPending) gwChannelMutation.mutate(next)
+                  }}
+                  layoutId="gateway-update-channel"
+                  collapse={false}
+                />
+              </div>
+            </div>
+            {showChannelHelp && (
+              <div className="mb-1 p-2.5 bg-bg rounded-lg border border-border flex flex-col gap-1.5 text-[12px]" data-testid="gateway-channel-help">
+                <div className="flex gap-2">
+                  <span className="font-medium text-text shrink-0">{i18nT('pages.settings.aboutPanel.stable')}</span>
+                  <span className="text-muted">{i18nT('pages.settings.aboutPanel.channel_explainer_stable')}</span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-medium text-text shrink-0">{i18nT('pages.settings.aboutPanel.insider')}</span>
+                  <span className="text-muted">{i18nT('pages.settings.aboutPanel.channel_explainer_insider')}</span>
+                </div>
+                {/* Explained only where it is selectable. A definition for a lane
+                    the control does not offer reads as an invitation to look for
+                    the missing segment. */}
+                {gwNightlyLane && (
+                  <div className="flex gap-2">
+                    <span className="font-medium text-text shrink-0">{i18nT('pages.settings.aboutPanel.nightly')}</span>
+                    <span className="text-muted">{i18nT('pages.settings.aboutPanel.channel_explainer_nightly')}</span>
+                  </div>
+                )}
+                <span className="text-muted opacity-80 pt-1.5 border-t border-border">
+                  {i18nT('pages.settings.aboutPanel.channel_explainer_gateway_switch_note')}
+                </span>
+              </div>
+            )}
+            {/* askAgent on: the switch persists server-side or not at all; the
+                control still shows the lane actually followed. The 409 reason,
+                when given, is the message (and the journal key); the generic
+                line becomes a bold lead in front of it rather than a prefix
+                concatenated into it. */}
+            {gwChannelMutation.isError && (
+              <ErrorNotice
+                title={gwChannelError ? i18nT('pages.settings.aboutPanel.channel_switch_failed') : undefined}
+                message={gwChannelError || i18nT('pages.settings.aboutPanel.channel_switch_failed')}
+                askAgent
+                testId="gateway-channel-error"
+              />
+            )}
+            {/* Switching re-points the FEED; it installs nothing. The segmented
+                control highlights the new lane the moment the switch succeeds, so
+                without this line the UI reads as "you are on Nightly now" when no
+                bytes have moved. It must not hide behind the disclosure: the
+                misreading happens precisely to the user who did not open it.
+
+                Requires a command to point at: the sentence says "run the
+                command below", so with no command resolved (failed check, offline
+                host) it would dangle exactly like the `available`-gated version
+                did.
+
+                Stands down while the explainer is open, because the explainer's
+                closing line is this very sentence and the two rendered back to
+                back read as a stutter at exactly the moment the user is reading
+                carefully.
+
+                Shown only while the followed lane has never published the RUNNING
+                bytes — i.e. exactly the window where a move is outstanding. Once
+                that lane's build is installed the feed comparison stops reporting
+                it and the line retires itself.
+
+                Names the version the lane publishes when the check knows it: a
+                user switching back to Stable from a newer Insider build is
+                performing a DOWNGRADE, and "run the command below" without the
+                target version left them unable to tell what they were about to
+                install. */}
+            {!gwChannelMutation.isError
+              && !showChannelHelp
+              && !!effectiveCommand
+              && channelMovePending && (
+              <span className="text-[12px] text-muted flex items-start gap-1.5"
+                data-testid="gateway-channel-pending-note">
+                {/* Not `ArrowUp`: this sentence says the lane's release is OLDER
+                    than the running build, and an upward arrow opening it reads
+                    as an upgrade in flight — the same mis-cue the hero badge
+                    rejected. No versionless fallback: `channel_move_pending` is
+                    only ever written in the same `_set_update_info` call that
+                    sets `latest_version` (and reset to False by every other),
+                    so the display version cannot be empty in this branch. */}
+                <AlertCircle size={13} className="lucide-inline shrink-0 text-warn" />
+                <span>{i18nT('pages.settings.aboutPanel.channel_explainer_gateway_switch_note_version', {
+                  channel: effectiveGwChannel,
+                  version: gwTargetDisplay || gwStatusLatestDisplay,
+                })}</span>
+              </span>
+            )}
+          </div>
         )}
         {isPrerelease && (
           // NOT behind the disclosure: a user already running prerelease bytes
@@ -691,7 +1266,7 @@ export function AboutPanel() {
                 i18nKey="pages.settings.aboutPanel.prerelease_report_prompt"
                 components={{
                   // eslint-disable-next-line jsx-a11y/anchor-has-content, jsx-a11y/control-has-associated-label
-                  report: <a href={REPORT_ISSUE_URL} target="_blank" rel="noreferrer" className="text-accent hover:underline" />,
+                  report: <a href={reportIssueUrl()} target="_blank" rel="noreferrer" className="text-accent hover:underline" />,
                 }}
               />
             </span>
@@ -702,8 +1277,21 @@ export function AboutPanel() {
 
       <Card>
         <CardTitle><RefreshCw size={15} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.updates')}</CardTitle>
-        {isDesktop ? (
-          updatesDisabled ? (
+        {isDesktop ? (<>
+          {isExternallyManaged ? (
+            // The marker's owner (a distro/enterprise package manager) replaces
+            // the whole install, so there is no Check button and no channel —
+            // just the "updates are managed by …" fact. A marker that ALSO
+            // carries an updateCommand routes to the managed lane instead and
+            // shows the notice + copyable command above the update controls.
+            <div className="flex flex-col gap-2" data-testid="externally-managed-updates">
+              <p className="text-sm text-muted">
+                {info?.managedBy
+                  ? i18nT('pages.settings.aboutPanel.updates_managed_externally_by', { managedBy: info.managedBy })
+                  : i18nT('pages.settings.aboutPanel.updates_managed_externally')}
+              </p>
+            </div>
+          ) : updatesDisabled ? (
             <p className="text-sm text-muted">
               {updatesDisabled === 'dev'
                 ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_dev_build')
@@ -711,10 +1299,48 @@ export function AboutPanel() {
                   ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_translocated')
                   : updatesDisabled === 'volume'
                     ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_volume')
-                    : i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_platform')}
+                    : updatesDisabled === 'channel'
+                      // Distinct from the platform message because the fix is
+                      // different and it is in this same panel: the platform has
+                      // an update lane, just not on the channel this install
+                      // tracks, so switching channels above restores updates.
+                      // Falling through to the platform string would blame the
+                      // OS and hide the way back.
+                      ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_channel')
+                      : i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_platform')}
             </p>
           ) : (
             <div className="flex flex-col gap-2.5">
+              {/* Managed lane: the marker names an external owner even though
+                  the updater is armed; show the managed-by notice and the
+                  copyable command above the regular update controls. */}
+              {isManagedLane && (
+                <div className="flex flex-col gap-2" data-testid="externally-managed-updates">
+                  <p className="text-sm text-muted">
+                    {info?.managedBy
+                      ? i18nT('pages.settings.aboutPanel.updates_managed_lane_by', { managedBy: info.managedBy })
+                      : i18nT('pages.settings.aboutPanel.updates_managed_lane')}
+                  </p>
+                  <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+                    data-testid="managed-update-command">
+                    {info.updateCommand}
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Btn onClick={() => copyCommand(info.updateCommand!, setManagedCmdCopied, setManagedCmdCopyFailed)}>
+                      <Copy size={13} className="lucide-inline" /> {managedCmdCopied
+                        ? i18nT('pages.settings.aboutPanel.copied')
+                        : i18nT('pages.settings.aboutPanel.copy_command')}
+                    </Btn>
+                    {managedCmdCopyFailed && (
+                      <ErrorNotice
+                        variant="inline"
+                        message={i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually')}
+                        askAgent
+                      />
+                    )}
+                  </div>
+                </div>
+              )}
               <p className="text-sm text-muted">
                 {botName || 'Kiro Crew'} {i18nT('pages.settings.aboutPanel.checks_for_updates_automatically_you_can_also_ch')}
               </p>
@@ -724,110 +1350,82 @@ export function AboutPanel() {
                 </Btn>
               </div>
               {status && <div className="text-[13px]">{status}</div>}
+              {/* The followed lane has never published these bytes (the running
+                  build is ahead of its feed), so "up to date" above is about the
+                  version and not about the state. This is what a user sees after
+                  flipping the switcher back to Stable from a newer Insider build.
+
+                  The unsolicited auto-path stays deliberately untouched: its
+                  direction gate exists so a build running ahead of its channel is
+                  never nagged (or silently auto-downloaded) into a downgrade, and
+                  that protection covers the entire promoted-stable population. So
+                  the move is offered here as an EXPLICIT download of the lane's
+                  own release, using the same permalink the failed-install escape
+                  hatch uses. */}
+              {runningAheadOfLane === true && !!laneVersion && !!channel && !!manualUrl && (
+                <p className="text-[12px] text-muted flex items-start gap-1.5"
+                  data-testid="desktop-channel-move-pending">
+                  {/* Same reason as the gateway twin: the sentence says "older". */}
+                  <AlertCircle size={13} className="lucide-inline shrink-0 text-warn" />
+                  <span>
+                    {/* ONE catalog string carrying the anchor, rendered through
+                        `Trans` for the same reason the prerelease ask above is:
+                        a hand-rolled split on a mustache literal locks every
+                        language into English clause order, and the translator
+                        must be free to put the link where the grammar needs it. */}
+                    <Trans
+                      i18nKey="pages.settings.aboutPanel.channel_publishes_older_version"
+                      values={{ channel, version: foldStableStamp(laneVersion, channel) }}
+                      components={{
+                        // eslint-disable-next-line jsx-a11y/anchor-has-content, jsx-a11y/control-has-associated-label
+                        link: <a href={manualUrl} target="_blank" rel="noreferrer" className="text-accent hover:underline" />,
+                      }}
+                    />
+                  </span>
+                </p>
+              )}
+              {/* Above the update card on purpose: a pending request is a
+                  decision waiting for this person, and the card below is the
+                  ordinary flow that decision rides on. */}
+              {pendingAgentRequest && (
+                <AgentUpdateRequestCard
+                  request={pendingAgentRequest}
+                  foundVersion={updateState?.version}
+                  busy={agentInstallArmed || cardBusy || installDispatched}
+                  panelError={agentRequestPanelError}
+                  onInstall={installFromAgentRequest}
+                  onDeclined={() => agentRequest.refetch()}
+                />
+              )}
               {updateCard}
+              {/* The card's update-info notice already reports a failed read. */}
+              {updateSwitches.app && <AppAutoDownloadSwitch />}
             </div>
-          )
-        ) : (
-          <div className="flex flex-col gap-2.5">
-            {showUpdate ? (
-              <>
-                <p className="text-sm text-muted flex items-center gap-1.5">
-                  <ArrowUp size={13} className="lucide-inline text-accent" /> {i18nT('pages.settings.aboutPanel.a_new_version')}{gwTarget ? ` (v${gwTarget})` : ''} {i18nT('pages.settings.aboutPanel.is_available')}
-                </p>
-                {showManualUpdate ? (
-                  // This install cannot replace its own code (a `cli.sh` wheel
-                  // install, not a git checkout), so there is no Update button to
-                  // offer — pressing one would 409. Show the command that does
-                  // work instead. The channel is spelled out in it deliberately:
-                  // the installer defaults to stable and never reads the channel
-                  // file, so a bare re-run would silently move this install to a
-                  // different lane.
-                  <div className="flex flex-col gap-2" data-testid="manual-update-instructions">
-                    <p className="text-[13px] text-muted">
-                      {gwChannel
-                        ? i18nT('pages.settings.aboutPanel.this_install_updates_by_re_running_the_installer_channel', { channel: gwChannel })
-                        : i18nT('pages.settings.aboutPanel.this_install_updates_by_re_running_the_installer')}
-                    </p>
-                    {effectiveCommand && (
-                      <>
-                        <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
-                          data-testid="manual-update-command">
-                          {effectiveCommand}
-                        </div>
-                        <div>
-                          {/* copyToClipboard, not navigator.clipboard directly: the
-                              Clipboard API is unavailable on a plain-HTTP remote
-                              gateway — exactly the deployment this command targets —
-                              and flipping the label regardless would tell the user
-                              their shell paste is ready when the clipboard still
-                              holds something else. Await it, then confirm. */}
-                          <Btn onClick={async () => { await copyToClipboard(effectiveCommand); setGwCommandCopied(true) }}>
-                            <Copy size={13} className="lucide-inline" /> {gwCommandCopied
-                              ? i18nT('pages.settings.aboutPanel.copied')
-                              : i18nT('pages.settings.aboutPanel.copy_command')}
-                          </Btn>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                ) : (
-                  <div>
-                    <Btn primary onClick={() => { if (!gwChanges) gwCheck.mutate(); setApplyError(''); setRestarting(false); setShowConfirm(true) }}>
-                      {/* Whole-sentence keys, not "Update" + " to vX": the version
-                          does not follow the verb in every language. */}
-                      <ArrowUp size={13} className="lucide-inline" /> {gwTarget
-                        ? i18nT('pages.settings.aboutPanel.update_to_version', { version: gwTarget })
-                        : i18nT('pages.settings.aboutPanel.update_now')}
-                    </Btn>
-                  </div>
-                )}
-              </>
-            ) : (
-              <>
-                <p className="text-sm text-muted">
-                  {botName || 'Kiro Crew'} {i18nT('pages.settings.aboutPanel.checks_for_updates_automatically_you_can_also_ch')}
-                </p>
-                <div>
-                  <Btn onClick={() => gwCheck.mutate()} disabled={gwCheck.isPending}>
-                    <RefreshCw size={13} className={`lucide-inline ${gwCheck.isPending ? 'animate-spin' : ''}`} /> {i18nT('pages.settings.aboutPanel.check_for_updates')}
-                  </Btn>
-                </div>
-                {/* A 200 is transport success, NOT a verdict: `checked` is the
-                    verdict. Gating the success line on it is the fix for the
-                    original bug, where a wheel install's no-op check rendered
-                    "you're on the latest version" while being two releases
-                    behind. An unrecognised error code still lands here (in the
-                    error branch), never in the success branch. */}
-                {gwCheck.isSuccess && gwChecked && !gwError && !showUpdate && (
-                  <span className="text-ok text-[13px] flex items-center gap-1.5" data-testid="up-to-date"><CheckCircle2 size={13} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.you_re_on_the_latest_version')}</span>
-                )}
-                {gwCheck.isSuccess && !!gwError && GATEWAY_CHECK_INFO_CODES.has(gwError) && (
-                  <span className="text-muted text-[13px] flex items-center gap-1.5" data-testid="check-not-applicable"><Package size={13} className="lucide-inline" /> {gwCheckErrorText(gwError)}</span>
-                )}
-                {(gwCheck.isError || (gwCheck.isSuccess && !!gwError && !GATEWAY_CHECK_INFO_CODES.has(gwError))) && (
-                  <span className="text-danger text-[13px] flex items-center gap-1.5" data-testid="check-failed"><AlertCircle size={13} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates_2')}{gwError ? `: ${gwCheckErrorText(gwError)}` : ''}</span>
-                )}
-              </>
-            )}
-            {/* The auto-apply promise only holds where the gateway can replace its
-                own code. On any other layout the backend deliberately downgrades
-                auto-update to a notification (the `self_updatable` guard in
-                `gateway.py`), so leaving an enabled toggle and an "automatically
-                pull and apply" tooltip here would accept input for something that
-                cannot happen. Say what it will actually do instead. */}
-            <div className="flex items-center justify-between pt-2.5 border-t border-border"
-              title={gwSelfUpdate
-                ? i18nT('pages.settings.aboutPanel.automatically_pull_and_apply_updates_when_the_ga')
-                : i18nT('pages.settings.aboutPanel.auto_update_notify_only_on_this_install')}>
-              <span className={`text-sm ${gwSelfUpdate ? 'text-text' : 'text-muted'}`}>{gwSelfUpdate
-                ? i18nT('pages.settings.aboutPanel.auto_update_on_restart')
-                : i18nT('pages.settings.aboutPanel.notify_when_an_update_is_available')}</span>
-              <Toggle checked={autoUpdate} label={gwSelfUpdate
-                ? i18nT('pages.settings.aboutPanel.auto_update_on_restart')
-                : i18nT('pages.settings.aboutPanel.notify_when_an_update_is_available')}
-                onChange={async next => { setAutoUpdate(next); try { await api.setAutoUpdate(next) } catch { setAutoUpdate(!next) } }} />
-            </div>
-          </div>
+          )}
+          {/* Outside the app updater's branches on purpose: a gateway the app
+              does not own (a reused cli.sh service, an SSH-forwarded one)
+              installs on its own switch whatever this build's updater says. */}
+          {updateSwitches.gateway && <GatewayAutoUpdateSwitch />}
+        </>) : (
+          <AboutPanelGatewayUpdates
+            gwUpdate={gwUpdate}
+            showUpdate={showUpdate}
+            channelMovePending={channelMovePending}
+            showManualUpdate={showManualUpdate}
+            effectiveGwCanArm={effectiveGwCanArm}
+            effectiveCommand={effectiveCommand}
+            effectiveGwChannel={effectiveGwChannel}
+            gwChannelMovePending={gwChannelMovePending}
+            gwManagedByCommand={gwManagedByCommand}
+            gwStatusLatest={gwStatusLatest}
+            gwStatusLatestDisplay={gwStatusLatestDisplay}
+            gwDiverged={gwDiverged}
+            gwDivergedText={gwDivergedText}
+            lastCheckedAt={lastCheckedAt}
+            checkIntervalSecs={checkIntervalSecs}
+            botName={botName}
+            autoUpdateSwitch={<GatewayAutoUpdateSwitch />}
+          />
         )}
 
         {/* The full changelog used to be inlined here, open by default. It grows
@@ -836,49 +1434,19 @@ export function AboutPanel() {
             its own Releases panel and this is the link to it. See
             pages/settings/ReleasesPanel.tsx. */}
         <div className="mt-3 pt-3 border-t border-border">
-          <Link
-            to="?tab=releases"
+          <SettingsLink
+            tab="releases"
             className="text-[13px] text-accent hover:underline inline-flex items-center gap-1.5"
           >
             <History size={13} className="lucide-inline" aria-hidden="true" />
             {i18nT('pages.settings.aboutPanel.view_all_releases')}
-          </Link>
+          </SettingsLink>
         </div>
       </Card>
 
       {/* Web update confirm — shows the changelog, then applies (which restarts the gateway). */}
       {showConfirm && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-sm animate-rise"
-             role="dialog" aria-modal="true" aria-label={i18nT('pages.settings.aboutPanel.update')}
-             onClick={() => { if (!gwApply.isPending && !restarting) setShowConfirm(false) }}>
-          <div role="document" className="bg-card border border-border rounded-xl p-6 max-w-md w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
-            <div className="flex justify-between items-center mb-3">
-              <div className="text-sm font-bold text-text-strong flex items-center gap-1.5"><Package size={15} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.update')}{gwTarget ? ` to v${gwTarget}` : ''}</div>
-              <button aria-label={i18nT('pages.settings.aboutPanel.close')} className="text-muted hover:text-text cursor-pointer bg-transparent border-none disabled:opacity-40 disabled:cursor-default" disabled={gwApply.isPending || restarting} onClick={() => { if (!gwApply.isPending && !restarting) setShowConfirm(false) }}><X size={15} /></button>
-            </div>
-            {gwCheck.isPending ? (
-              <div className="text-[13px] text-muted flex items-center gap-1.5 mb-4"><RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.loading_changelog')}</div>
-            ) : gwChanges ? (
-              <>
-                <div className="text-[12px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('pages.settings.aboutPanel.what_s_new')}</div>
-                <div className="p-3 bg-bg rounded-lg border border-border max-h-56 overflow-y-auto mb-4 text-[13px] text-text"><MarkdownRenderer content={gwChanges} /></div>
-              </>
-            ) : (
-              <p className="text-[13px] text-muted mb-4">{i18nT('pages.settings.aboutPanel.a_newer_version_is_available')}</p>
-            )}
-            <p className="text-[12px] text-muted mb-3">{i18nT('pages.settings.aboutPanel.updating_restarts_the_gateway_active_sessions_wi')}</p>
-            {applyError && <div className="text-[13px] text-danger mb-3 flex items-center gap-1.5"><AlertCircle size={13} className="lucide-inline" /> {applyError}</div>}
-            {restarting ? (
-              <div className="text-[13px] text-accent flex items-center justify-center gap-1.5 py-2" role="status">
-                <RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.updating_gateway_restarting')}
-              </div>
-            ) : (
-              <Btn primary className="w-full justify-center" disabled={gwApply.isPending} onClick={() => gwApply.mutate()}>
-                {gwApply.isPending ? <><RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.updating')}</> : i18nT('pages.settings.aboutPanel.update_now')}
-              </Btn>
-            )}
-          </div>
-        </div>
+        <AboutPanelUpdateConfirm gwUpdate={gwUpdate} gwDiverged={gwDiverged} gwDivergedText={gwDivergedText} />
       )}
 
       <ReportProblemCard />

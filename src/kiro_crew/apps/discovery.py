@@ -6,7 +6,6 @@ Discovers builtins by scanning the filesystem: each subdirectory of
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -61,8 +60,17 @@ def _manifest_to_builtin_dict(manifest: AppManifest) -> dict[str, Any]:
     if manifest.skills:
         d["skills"] = list(manifest.skills)
 
+    # Same reason as agents/skills above: a typed field missing here is stripped from
+    # the persisted app.json, so a builtin's contributed commands would vanish from
+    # the launcher while an external app's survived.
+    contrib_d = manifest.contributes.to_dict()
+    if contrib_d:
+        d["contributes"] = contrib_d
+
     if manifest.mcpServers:
         d["mcpServers"] = manifest.mcpServers
+    if manifest.config_keys:
+        d["config_keys"] = list(manifest.config_keys)
 
     if manifest.crons:
         d["crons"] = [c.to_dict() for c in manifest.crons]
@@ -81,11 +89,11 @@ def _manifest_to_builtin_dict(manifest: AppManifest) -> dict[str, Any]:
         d["publishProvider"] = pp_d
 
     # The REMAINING declarative fields, same reasoning as the agents/skills block
-    # above (#1076): this dict is what register_builtin_apps() persists as the
+    # above: this dict is what register_builtin_apps() persists as the
     # app.json snapshot, and register_app() reads that snapshot rather than the
     # packaged manifest — so any typed field not copied here is silently dropped
-    # for every builtin. agents/skills was the instance that shipped; these are
-    # the rest of the same class, and the round-trip guard covers all of them.
+    # for every builtin. agents/skills is one instance of that class; these are
+    # the rest of it, and the round-trip guard covers all of them.
     if manifest.sops:
         d["sops"] = list(manifest.sops)
     if manifest.jobFamilies:
@@ -142,7 +150,8 @@ def discover_builtin_apps(builtins_dir: Path | None = None) -> list[dict[str, An
 
         try:
             manifest = AppManifest.from_json_file(manifest_path)
-            errors = manifest.validate(app_root=entry)
+            unchecked: list[str] = []
+            errors = manifest.validate(app_root=entry, unchecked=unchecked)
             if errors:
                 logger.warning(
                     "Skipping builtin %s: validation errors: %s",
@@ -150,9 +159,18 @@ def discover_builtin_apps(builtins_dir: Path | None = None) -> list[dict[str, An
                     "; ".join(errors),
                 )
                 continue
+            if unchecked:
+                # The path screen did not answer, which is not a verdict on the
+                # shipped manifest. The builtin stays listed (and so is not read
+                # as orphaned); registration screens each path again and retries.
+                logger.warning(
+                    "Builtin %s: paths not checked yet, keeping it listed: %s",
+                    entry.name,
+                    "; ".join(unchecked),
+                )
             apps.append(_manifest_to_builtin_dict(manifest))
             logger.debug("Discovered builtin app: %s v%s", manifest.name, manifest.version)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             logger.warning("Failed to parse builtin manifest %s: %s", manifest_path, exc)
         except Exception:
             logger.warning(

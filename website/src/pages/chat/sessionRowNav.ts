@@ -20,10 +20,12 @@ export const SESSION_ROW_SELECTOR = '[data-session-row]'
  * Every row rendered in the same scope as `row`, in DOM order, minus the ones
  * that cannot take focus.
  *
- * A collapsed folder still renders its rows — `FolderBody` hides them with
- * `inert` + `visibility: hidden` rather than unmounting, so the collapse can
- * animate to intrinsic height. Those rows are unfocusable, so leaving them in
- * would stall the rove on an invisible row instead of carrying on to the next
+ * A collapsed folder still renders its rows — `FolderBody` keeps them mounted
+ * and suppresses them with `inert` + `visibility: hidden` (and, once the
+ * collapse has finished animating, `content-visibility: hidden`) rather than
+ * unmounting, so the collapse can animate to intrinsic height and the settled
+ * state reserves no scroll height. Those rows are unfocusable, so leaving them
+ * in would stall the rove on an invisible row instead of carrying on to the next
  * visible session. `row` itself is always kept so the caller's `indexOf` holds.
  */
 export function sessionRowsInScope(row: HTMLElement): HTMLElement[] {
@@ -61,6 +63,42 @@ export function focusSiblingSessionRow(row: HTMLElement, step: number): boolean 
   const target = siblingSessionRow(row, step)
   if (!target) return false
   target.focus()
-  if (typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'nearest' })
+  if (typeof target.scrollIntoView === 'function') {
+    target.scrollIntoView({ block: 'nearest' })
+    clearPinnedHeaders(target)
+  }
   return target.ownerDocument.activeElement === target
+}
+
+/**
+ * Bring `row` out from under the pinned folder headers above it.
+ *
+ * A row inside a folder carries `scroll-margin-top` equal to the height of the
+ * pinned header stack over it (index.css, `--folder-pin-stack`). Chromium's
+ * `block: 'nearest'` treats a row that is inside the scrollport as already
+ * visible and ignores that margin, so a row the headers cover stays covered.
+ * `block: 'start'` does honour the margin, so re-align with it only when the
+ * row actually sits inside the margin band. Rows with no margin (unfiled rows,
+ * board columns) are left exactly where `nearest` put them.
+ *
+ * The band starts where the pinned headers do, not at the scroller's edge:
+ * under the floating search dock (components/ListDock) the lane pads and
+ * scroll-pads its top by the dock's height plus a rest gap, and the headers
+ * pin on the dock's bottom edge — the padding edge less that gap, which the
+ * dock publishes as `--list-dock-pin-inset` — so a row is covered while it
+ * lies within `padding - inset + margin` of the edge. With no dock both are 0
+ * and the test is the plain margin band.
+ */
+function clearPinnedHeaders(row: HTMLElement): void {
+  const view = row.ownerDocument.defaultView
+  if (!view) return
+  const margin = parseFloat(view.getComputedStyle(row).scrollMarginTop) || 0
+  if (margin <= 0) return
+  let port = row.parentElement
+  while (port && !/(auto|scroll)/.test(view.getComputedStyle(port).overflowY)) port = port.parentElement
+  if (!port) return
+  const portStyle = view.getComputedStyle(port)
+  const padding = parseFloat(portStyle.scrollPaddingTop) || 0
+  const inset = parseFloat(portStyle.getPropertyValue('--list-dock-pin-inset')) || 0
+  if (row.getBoundingClientRect().top - port.getBoundingClientRect().top < padding - inset + margin) row.scrollIntoView({ block: 'start' })
 }

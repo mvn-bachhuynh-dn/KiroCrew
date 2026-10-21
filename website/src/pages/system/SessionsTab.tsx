@@ -7,8 +7,8 @@
  * `Group by` folds rows on an ATTRIBUTE (agent, channel). Sorting, expansion,
  * grouping, and aggregation come from `@tanstack/react-table`.
  */
-import { type MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { type MutableRefObject, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
   createColumnHelper,
@@ -27,8 +27,10 @@ import {
 import { ChevronDown, ChevronRight, ChevronUp, MemoryStick, Columns3, TriangleAlert } from 'lucide-react'
 import { api } from '../../api/client'
 import { Btn, Card, ContentSkeleton, EmptyState, IconButton, SearchInput } from '../../components/ui'
+import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table'
 import InfoTip from '../../components/InfoTip'
+import { SettingRef } from '../../components/settingRef/SettingRef'
 import SegmentedControl, { type Segment } from '../../components/SegmentedControl'
 import { fmtNumber, fmtPercent } from '../../i18n/format'
 import {
@@ -41,6 +43,9 @@ import {
   fmtTurns,
   fmtUptime,
   heatLevel,
+  rowName,
+  aggregateOncePerRuntime,
+  sumOncePerRuntime,
   type SessionRow,
 } from './sessionRows'
 
@@ -113,8 +118,6 @@ export default function SessionsTab({ planeStateRef }: Props) {
     saved?.visibility ?? { share: false, channel: false },
   )
   const [pickerOpen, setPickerOpen] = useState(false)
-  const pickerRef = useRef<HTMLDivElement>(null)
-  const pickerBtnRef = useRef<HTMLButtonElement>(null)
 
   // Persist state to planeStateRef on every change so it survives plane flips.
   useEffect(() => {
@@ -122,43 +125,46 @@ export default function SessionsTab({ planeStateRef }: Props) {
     planeStateRef.current = { ...planeStateRef.current, sessions: state }
   }, [sorting, groupBy, filter, visibility, planeStateRef])
 
-  // Finding 4: Escape + outside-click to close the Columns popover
-  useEffect(() => {
-    if (!pickerOpen) return
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (pickerBtnRef.current?.contains(t)) return
-      if (pickerRef.current?.contains(t)) return
-      setPickerOpen(false)
-      pickerBtnRef.current?.focus()
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setPickerOpen(false)
-        pickerBtnRef.current?.focus()
-      }
-    }
-    document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [pickerOpen])
-
   const { data, isPending, isError, isFetching, refetch } = useQuery<Payload>({
     queryKey: ['sessionsMemory'],
     queryFn: () => api.sessionsMemory(),
     refetchInterval: 5000,
+    // Keep the last sample on screen while the next one is in flight. Without it a
+    // slow sample blanks the whole table for its duration — every five seconds, on a
+    // page whose job is to be watched — and the rows jump back as it lands. The
+    // lineage phase of this payload is now ~0, so the remaining latency is the /proc
+    // and spend passes; this makes their cost invisible instead of disruptive.
+    placeholderData: keepPreviousData,
   })
 
   const sessions = data?.sessions ?? EMPTY_SESSIONS
   const tasks = data?.tasks ?? EMPTY_TASKS
   const totals = data?.totals
-  const unattributed = data?.unattributed ?? null
   const hostMb = totals?.host_mb ?? null
   const rows = useMemo(() => buildTree(sessions, tasks), [sessions, tasks])
   const maxima = useMemo(() => columnMaxima(rows), [rows])
+  // The creator's display name for a created session's citation, keyed by the
+  // full session key `parent.key` carries and by the bare slot key a crew log
+  // cites. A creator with no live row here is named by the slot the log cited.
+  const nameOf = useMemo(() => {
+    const byKey = new Map<string, string>()
+    for (const s of sessions) {
+      byKey.set(s.key, rowName(s))
+      if (s.slot_key) byKey.set(s.slot_key, rowName(s))
+    }
+    return byKey
+  }, [sessions])
+  const creatorOf = (r: SessionRow): string | null => {
+    if (r.kind !== 'session' || r.parent == null) return null
+    // `key` names the CREATOR only on an ordinary edge. On a re-parented row it is
+    // the nearest open ancestor, and naming that one here would credit the creating
+    // to a session that did not do it -- so the citation falls back to `slot`, which
+    // is the creator either way.
+    const named = r.parent.key != null && r.parent.ancestor !== true
+      ? nameOf.get(r.parent.key)
+      : undefined
+    return named ?? nameOf.get(r.parent.slot) ?? r.parent.slot
+  }
 
   const columns = useMemo(
     () => [
@@ -202,7 +208,8 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('procs', {
           header: i18nT('pages.sessionsTab.procs'),
           enableGrouping: false,
-          aggregationFn: 'sum',
+          // Runtime-level count: added once per runtime, not once per co-tenant.
+          aggregationFn: (_id, leafRows) => aggregateOncePerRuntime('procs', leafRows),
           size: 68,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -212,7 +219,8 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('mcp', {
           header: i18nT('pages.sessionsTab.mcp_stubs'),
           enableGrouping: false,
-          aggregationFn: 'sum',
+          // Runtime-level count: added once per runtime, not once per co-tenant.
+          aggregationFn: (_id, leafRows) => aggregateOncePerRuntime('mcp', leafRows),
           size: 92,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -253,6 +261,11 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('pid', {
           header: i18nT('pages.sessionsTab.pid'),
           enableGrouping: false,
+          // A pid is an identifier, not a quantity: the default numeric roll-up
+          // added four pids into one impossible number on every group row. A
+          // group spans several runtimes, so it HAS no single pid -- the honest
+          // aggregate is none, and the cell falls through to its em-dash.
+          aggregationFn: () => null,
           size: 74,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -296,11 +309,17 @@ export default function SessionsTab({ planeStateRef }: Props) {
   })
 
   const usedMb = totals?.rss_mb ?? 0
+  const topLevelSessions = rows.filter(r => r.kind === 'session').length
   const largestMb = sessions.reduce<number | null>(
     (m, s) => (s.rss_mb != null && (m == null || s.rss_mb > m) ? s.rss_mb : m),
     null,
   )
-  const procTotal = sessions.reduce((n, s) => n + (s.procs ?? 0), 0)
+  // Each runtime's process count ONCE. `procs` is the runtime's own total,
+  // reported whole on every co-tenant row, so a plain sum over rows multiplies a
+  // shared runtime by its tenant count -- three co-tenants of one 9-process
+  // runtime read as 27. Same rule as the `procs` column's group aggregate; this
+  // footer is a second reader of the same figure and needs the same key.
+  const procTotal = sumOncePerRuntime(sessions.map(s => [s.pid, s.procs] as const)) ?? 0
 
   // Finding 7a: surface the disabled reason via InfoTip, not just title
   const groupSegments: Array<Segment<GroupBy>> = [
@@ -316,23 +335,21 @@ export default function SessionsTab({ planeStateRef }: Props) {
   ]
   const hideable = table.getAllLeafColumns().filter(c => c.getCanHide())
 
-  /** Whether to show the unattributed row: only when procs > 0. */
-  const showUnattributed = unattributed != null && unattributed.procs > 0
 
+  /** Radix returns focus to the trigger when the popover closes. */
   const closePicker = useCallback(() => {
     setPickerOpen(false)
-    pickerBtnRef.current?.focus()
   }, [])
 
   return (
-    <Card className="mb-6 overflow-hidden">
+    <Card className="mb-6">
       {/* Stale-data notice. Shown when a poll has failed but a previous payload is
           still on screen: the rows below are real, just not current, and saying so
           is what lets the user trust them without mistaking them for live. */}
       {isError && data && (
         <div
           data-testid="sessions-stale"
-          className="flex items-center gap-2 px-3.5 py-2 border-b border-border bg-warn-subtle text-[11.5px] text-warn"
+          className="flex items-center gap-2 px-3.5 py-2 border-b border-border bg-warn-subtle text-[11.5px] text-warn-text"
         >
           <TriangleAlert size={13} aria-hidden="true" className="lucide-inline shrink-0" />
           <span>{i18nT('pages.sessionsTab.could_not_refresh')}</span>
@@ -358,45 +375,45 @@ export default function SessionsTab({ planeStateRef }: Props) {
           onChange={e => setFilter(e.currentTarget.value)}
           className="w-[150px]"
         />
-        <div className="relative ml-auto">
-          <Btn
-            ref={pickerBtnRef}
-            type="button"
-            aria-expanded={pickerOpen}
-            aria-haspopup="true"
-            onClick={() => setPickerOpen(o => !o)}
-            className="text-[11.5px] gap-1.5"
+        {/* The Radix popover primitive owns what a menu surface needs to get
+            right: focus moves into the panel on open and back to the trigger on
+            close, Escape and outside-press dismiss, and the panel stays anchored
+            to its trigger across scroll and resize instead of being positioned
+            once at open time. */}
+        <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+          <PopoverTrigger asChild>
+            <Btn type="button" className="ml-auto text-[11.5px] gap-1.5">
+              <Columns3 size={13} aria-hidden="true" className="lucide-inline" />
+              {i18nT('pages.sessionsTab.columns')}
+            </Btn>
+          </PopoverTrigger>
+          <PopoverContent
+            align="end"
+            sideOffset={4}
+            aria-label={i18nT('pages.sessionsTab.columns')}
+            className="w-auto min-w-40 p-1.5"
           >
-            <Columns3 size={13} aria-hidden="true" className="lucide-inline" />
-            {i18nT('pages.sessionsTab.columns')}
-          </Btn>
-          {pickerOpen && (
-            <div
-              ref={pickerRef}
-              role="dialog"
-              aria-label={i18nT('pages.sessionsTab.columns')}
-              className="absolute right-0 z-20 mt-1 min-w-40 rounded border border-border bg-bg-elevated p-1.5 shadow-lg"
-            >
-              {hideable.map(col => (
-                <label key={col.id} className="flex items-center gap-2 px-1.5 py-1 text-[12px] cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={col.getIsVisible()}
-                    onChange={col.getToggleVisibilityHandler()}
-                  />
-                  {flexRender(col.columnDef.header, {} as never) as never}
-                </label>
-              ))}
-              <div className="mt-1 border-t border-border pt-1">
-                <Btn type="button" onClick={closePicker} className="w-full text-[11px] justify-center">
-                  {i18nT('pages.sessionsTab.done')}
-                </Btn>
-              </div>
+            {hideable.map(col => (
+              <label key={col.id} className="flex items-center gap-2 px-1.5 py-1 text-[12px] cursor-pointer">
+                {/* eslint-disable-next-line jsx-a11y/control-has-associated-label -- the wrapping <label> IS the association, and its text is the column's own header: every `header` in the column defs above is a translated string, so the name is never empty. Only `flexRender` resolving it at runtime hides it from static analysis */}
+                <input
+                  type="checkbox"
+                  checked={col.getIsVisible()}
+                  onChange={col.getToggleVisibilityHandler()}
+                />
+                {flexRender(col.columnDef.header, {} as never) as never}
+              </label>
+            ))}
+            <div className="mt-1 border-t border-border pt-1">
+              <Btn type="button" onClick={closePicker} className="w-full text-[11px] justify-center">
+                {i18nT('pages.sessionsTab.done')}
+              </Btn>
             </div>
-          )}
-        </div>
+          </PopoverContent>
+        </Popover>
       </div>
 
+      <div className="overflow-hidden rounded-b-lg">
       {isPending ? (
         // "No active sessions" is a claim about the machine, and during the first
         // fetch it is one we cannot make — a slow or failing endpoint made the page
@@ -435,7 +452,7 @@ export default function SessionsTab({ planeStateRef }: Props) {
             </Btn>
           }
         />
-      ) : table.getRowModel().rows.length === 0 && !showUnattributed ? (
+      ) : table.getRowModel().rows.length === 0 ? (
         <EmptyState
           icon={<MemoryStick className="lucide-inline" />}
           title={i18nT('pages.sessionsTab.no_active_sessions')}
@@ -485,35 +502,6 @@ export default function SessionsTab({ planeStateRef }: Props) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {/* Unattributed row — pinned above all sessions, outside sort.
-                Finding 6: use warn tint instead of danger for a documented-healthy state. */}
-            {showUnattributed && (
-              <TableRow data-testid="unattributed-row" className="text-warn">
-                {table.getHeaderGroups()[0]?.headers.map(h => {
-                  const colId = h.column.id
-                  const isName = colId === 'name'
-                  let content: string
-                  if (isName) content = ''
-                  else if (colId === 'rssMb') content = fmtMb(unattributed!.rss_mb)
-                  else if (colId === 'procs') content = fmtNumber(unattributed!.procs)
-                  else if (colId === 'uptimeS') content = fmtUptime(unattributed!.oldest_uptime_s)
-                  else content = '—'
-                  return (
-                    <TableCell
-                      key={h.id}
-                      className={isName ? 'px-3 py-1 text-left text-[12.5px] text-warn font-medium' : `px-3 py-1 ${NUM} text-warn`}
-                    >
-                      {isName ? (
-                        <span className="inline-flex items-center gap-1.5">
-                          <span>{i18nT('pages.sessionsTab.unattributed')}</span>
-                          <InfoTip text={i18nT('pages.sessionsTab.unattributed_hint')} />
-                        </span>
-                      ) : content}
-                    </TableCell>
-                  )
-                })}
-              </TableRow>
-            )}
             {table.getRowModel().rows.map(row => {
               const r = row.original
               const grouped = row.getIsGrouped()
@@ -535,10 +523,15 @@ export default function SessionsTab({ planeStateRef }: Props) {
                 >
                   {row.getVisibleCells().map(cell => {
                     const isName = cell.column.id === 'name'
+                    // heatClass() picks one of the HEAT literals above; the lint
+                    // cannot read through the call, so the values are checked at
+                    // their declaration instead.
                     const heat =
                       cell.column.id === 'rssMb'
+                        // eslint-disable-next-line shadcn/require-static-classes -- see above
                         ? heatClass(r.rssMb, maxima.rssMb)
                         : cell.column.id === 'cpuCores'
+                          // eslint-disable-next-line shadcn/require-static-classes -- see above
                           ? heatClass(r.cpuCores, maxima.cpuCores)
                           : ''
                     if (cell.getIsPlaceholder()) return <TableCell key={cell.id} className={NUM} />
@@ -547,70 +540,186 @@ export default function SessionsTab({ planeStateRef }: Props) {
                         key={cell.id}
                         className={
                           isName
-                            ? `px-3 py-1 text-left text-[12.5px] truncate ${
-                                row.depth > 0 ? 'pl-9 text-text' : 'text-text-strong font-medium'
+                            ? `relative px-3 py-1 text-left text-[12.5px] truncate ${
+                                row.depth > 0 ? 'text-text' : 'text-text-strong font-medium'
                               }`
                             : `px-3 py-1 ${NUM} ${heat}`
                         }
+                        // One step of indent per level. A session opened by a
+                        // session nests under it and that session's tasks nest
+                        // under IT, so the tree has no fixed depth and a
+                        // per-level class cannot draw it. 12px is the cell's own
+                        // `px-3`; each level adds 24px.
+                        {...(isName && row.depth > 0
+                          ? { style: { paddingLeft: `${12 + row.depth * 24}px` } }
+                          : {})}
                         {...(isName ? { title: grouped ? (groupLabel ?? '') : r.name } : {})}
                       >
+                        {/* One guide line per ancestor level, under that
+                            ancestor's expander (the chevron is 12px wide and
+                            ends where its row's text starts, so its centre is
+                            6px before that row's indent). Sorting orders each
+                            parent's children by the sorted column, so a shallow
+                            row can sit below a deeper one; with indent as the
+                            only cue that reads as deeper still. The lines say
+                            which ancestors a row has. Full cell height, so they
+                            run through the row padding and join up. */}
+                        {isName &&
+                          Array.from({ length: row.depth }, (_, level) => (
+                            <span
+                              key={level}
+                              aria-hidden="true"
+                              data-depth-guide={level}
+                              className="absolute top-0 bottom-0 border-l border-border pointer-events-none"
+                              style={{ left: `${6 + level * 24}px` }}
+                            />
+                          ))}
                         {isName ? (
-                          <>
-                            {row.getCanExpand() && (
-                              <IconButton
-                                aria-expanded={row.getIsExpanded()}
-                                aria-label={i18nT(
-                                  row.getIsExpanded()
-                                    ? 'pages.sessionsTab.collapse_tasks'
-                                    : 'pages.sessionsTab.expand_tasks',
-                                  { name: r.name },
-                                )}
-                                onClick={e => {
-                                  e.stopPropagation()
-                                  row.toggleExpanded()
-                                }}
-                                className="inline-block w-3 -ml-3 mr-0.5 p-0 align-middle text-muted hover:text-text"
-                              >
-                                {row.getIsExpanded() ? (
-                                  <ChevronDown size={12} aria-hidden="true" className="lucide-inline" />
-                                ) : (
-                                  <ChevronRight size={12} aria-hidden="true" className="lucide-inline" />
-                                )}
-                              </IconButton>
-                            )}
-                            {groupLabel != null ? (
-                              <span className="truncate">{groupLabel}</span>
-                            ) : href ? (
-                              <Btn
-                                type="button"
-                                onClick={e => {
-                                  e.stopPropagation()
-                                  navigate(href)
-                                }}
-                                // `Btn` is inline-flex, which does not shrink below
-                                // its content width, so without `min-w-0` the button
-                                // overflows the cell instead of ellipsizing. The
-                                // column now has a real declared width (columnDef
-                                // `size` + the <colgroup> above), which is what keeps
-                                // the name inside the cell the expander shares.
-                                className="border-transparent bg-transparent px-0 py-0 text-left text-inherit font-inherit hover:underline min-w-0 max-w-full"
-                              >
-                                <span className="truncate">{r.name}</span>
-                              </Btn>
-                            ) : (
-                              flexRender(cell.column.columnDef.cell, cell.getContext())
-                            )}
-                            {grouped && (
-                              <span className="ml-2 text-[10.5px] text-muted font-mono">
-                                {fmtNumber(row.subRows.length)}
+                          // Two lines. The first is a flex row so that, when the
+                          // cell is too narrow for everything, the NAME is what
+                          // shrinks and ellipsizes while the badges keep their
+                          // size. The second, only on a row that has something
+                          // to say about its lineage, gets the whole cell width
+                          // and wraps rather than truncates: a citation whose
+                          // tail is cut off names nobody, and naming the creator
+                          // is its only job.
+                          <span className="flex flex-col min-w-0">
+                            <span className="flex items-center min-w-0">
+                              {row.getCanExpand() && (
+                                <IconButton
+                                  aria-expanded={row.getIsExpanded()}
+                                  aria-label={i18nT(
+                                    row.subRows.some(sub => sub.original.kind === 'session')
+                                      ? row.getIsExpanded()
+                                        ? 'pages.sessionsTab.collapse_sessions'
+                                        : 'pages.sessionsTab.expand_sessions'
+                                      : row.getIsExpanded()
+                                        ? 'pages.sessionsTab.collapse_tasks'
+                                        : 'pages.sessionsTab.expand_tasks',
+                                    { name: r.name },
+                                  )}
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    row.toggleExpanded()
+                                  }}
+                                  className="shrink-0 w-3 -ml-3 mr-0.5 p-0 text-muted hover:text-text"
+                                >
+                                  {row.getIsExpanded() ? (
+                                    <ChevronDown size={12} aria-hidden="true" className="lucide-inline" />
+                                  ) : (
+                                    <ChevronRight size={12} aria-hidden="true" className="lucide-inline" />
+                                  )}
+                                </IconButton>
+                              )}
+                              {groupLabel != null ? (
+                                <span className="truncate min-w-0">{groupLabel}</span>
+                              ) : href ? (
+                                <Btn
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    navigate(href)
+                                  }}
+                                  // `Btn` is inline-flex, which does not shrink below
+                                  // its content width, so without `min-w-0` the button
+                                  // overflows the cell instead of ellipsizing. The
+                                  // column has a real declared width (columnDef `size`
+                                  // + the <colgroup> above), which is what keeps the
+                                  // name inside the cell the expander shares.
+                                  className="border-transparent bg-transparent px-0 py-0 text-left text-inherit hover:underline min-w-0 shrink"
+                                >
+                                  {/* The folded badge beside it can clip a long name in the
+                                      default column width; the full name rides on the clipped
+                                      span (the column is also resizable). */}
+                                  <span className="truncate" title={r.name}>{r.name}</span>
+                                </Btn>
+                              ) : (
+                                <span className="truncate min-w-0">
+                                  {/* A task's kind, said in the row: once created sessions
+                                      nest too, indent alone no longer says "task", and the
+                                      kind otherwise shows only on hover (a session's name
+                                      underlines, a task's does not). */}
+                                  {r.kind === 'task' && (
+                                    <span className="mr-1.5 text-[10px] uppercase tracking-[.06em] text-muted align-middle">
+                                      {i18nT('pages.sessionsTab.task_marker')}
+                                    </span>
+                                  )}
+                                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                </span>
+                              )}
+                              {/* A count beside a folded row too, not only a group:
+                                  the rows under it are hidden, not rolled up, and a
+                                  reader judging the parent's own figure should see
+                                  that N rows with figures of their own sit below. */}
+                              {grouped && (
+                                <span className="shrink-0 ml-2 text-[10.5px] text-muted font-mono">
+                                  {fmtNumber(row.subRows.length)}
+                                </span>
+                              )}
+                              {/* The folded count says what it is IN the text: it
+                                  counts every hidden descendant, sessions and tasks,
+                                  where the footer's "nested" counts sessions only
+                                  and the group count above counts direct children.
+                                  A bare numeral beside those reads as any of them,
+                                  and a unit that lives only in a title is one a
+                                  touch reader never sees. */}
+                              {!grouped && row.getCanExpand() && !row.getIsExpanded() && (() => {
+                                // The hidden rows' memory rides on the badge: a folded parent's
+                                // own figure is not a family total, and without the roll-up
+                                // beside it the fold reads as one.
+                                const hidden = row.getLeafRows()
+                                const rows = i18nT('pages.sessionsTab.hidden_rows', { count: hidden.length })
+                                const memory = hidden.reduce((sum, leaf) => sum + (leaf.original.rssMb ?? 0), 0)
+                                return (
+                                  <span className="shrink-0 ml-2 text-[10.5px] text-muted font-mono cursor-default whitespace-nowrap">
+                                    {memory > 0
+                                      ? i18nT('pages.sessionsTab.hidden_rows_memory', { rows, memory: fmtMb(memory) })
+                                      : rows}
+                                  </span>
+                                )
+                              })()}
+                              {/* On a LEAF row the badge qualifies that row's own
+                                  rss/cpu as an attributed share. On a GROUP row it
+                                  says the fold contains a multiplexed runtime --
+                                  the group's own total is de-duplicated per pid, but
+                                  the member figures it rolls up are still shares, and
+                                  a group row's `original` is a synthetic placeholder
+                                  whose `shared` says nothing, so the answer comes
+                                  from the leaves. */}
+                              {(grouped
+                                ? row.getLeafRows().some(leaf => leaf.original.shared)
+                                : r.shared) && (
+                                <span className="shrink-0 ml-1.5 text-[10px] px-1.5 rounded border border-warn/40 text-warn">
+                                  {i18nT('pages.sessionsTab.shared')}
+                                </span>
+                              )}
+                            </span>
+                            {/* A created row sitting under its creator needs no
+                                citation: its place in the tree is one, and the
+                                creator's expander names the relation. A created
+                                row that could not be nested (nothing open above
+                                it, a cycle) says who opened it here, as visible
+                                text and not a title: a keyboard or touch reader
+                                never sees a native tooltip, and this row has
+                                nothing else that says it. `nested` comes from
+                                buildTree, not from the row tree: under a fold a
+                                top-level row's parent row is a group row.
+
+                                A row placed on an `ancestor` edge is the one
+                                nested row that still needs the line, and the
+                                reason is the rule above: its place in the tree
+                                is NOT its creator. It hangs from the nearest
+                                open ancestor, so the expander above it names a
+                                session that did not open it, and without this
+                                line nothing on screen says the creator closed. */}
+                            {!grouped && creatorOf(r) != null && (!r.nested || r.parent?.ancestor === true) && (
+                              <span className="block whitespace-normal break-words leading-tight text-[10.5px] text-muted cursor-default">
+                                {r.parent?.ancestor === true
+                                  ? i18nT('pages.sessionsTab.created_by_closed', { name: creatorOf(r) })
+                                  : i18nT('pages.sessionsTab.created_by', { name: creatorOf(r) })}
                               </span>
                             )}
-                            {r.shared && !grouped && (
-                              <span className="ml-1.5 text-[10px] px-1.5 rounded border border-warn/40 text-warn align-[1px]">
-                                {i18nT('pages.sessionsTab.shared')}
-                              </span>
-                            )}
-                          </>
+                          </span>
                         ) : (
                           flexRender(cell.column.columnDef.cell, cell.getContext())
                         )}
@@ -633,18 +742,49 @@ export default function SessionsTab({ planeStateRef }: Props) {
         <FooterStat label={i18nT('pages.sessionsTab.footer_kirocrew_gb')} value={fmtGb(usedMb)} />
         <FooterStat label={i18nT('pages.sessionsTab.footer_share_of_machine')} value={totals?.host_pct != null ? fmtPercent(totals.host_pct / 100, { maximumFractionDigits: 2 }) : '—'} />
         <FooterStat label={i18nT('pages.sessionsTab.footer_largest_session_gb')} value={fmtGb(largestMb)} />
-        <FooterStat label={i18nT('pages.sessionsTab.footer_sessions')} value={fmtNumber(sessions.length)} />
+        {/* Nesting broke the old 1:1 between this count and the top-level rows a
+            reader can see, so when any session sits under another the value
+            also says how many are top-level. */}
+        <FooterStat
+          label={i18nT('pages.sessionsTab.footer_sessions')}
+          value={
+            topLevelSessions < sessions.length
+              ? i18nT('pages.sessionsTab.footer_sessions_nested', {
+                  total: fmtNumber(sessions.length),
+                  top: fmtNumber(topLevelSessions),
+                  // Named in the value, not only in the hint: beside "Task
+                  // sessions N" a bare "(M top-level)" reads as if the
+                  // difference were the tasks whenever the two numbers agree.
+                  nested: fmtNumber(sessions.length - topLevelSessions),
+                })
+              : fmtNumber(sessions.length)
+          }
+          {...(topLevelSessions < sessions.length
+            ? { hint: i18nT('pages.sessionsTab.footer_sessions_nested_hint', { tasks: fmtNumber(tasks.length) }) }
+            : {})}
+        />
         <FooterStat label={i18nT('pages.sessionsTab.footer_task_sessions')} value={fmtNumber(tasks.length)} />
         <FooterStat label={i18nT('pages.sessionsTab.footer_session_procs')} value={fmtNumber(procTotal)} />
-        {showUnattributed && (
+        {/* The store holds more session logs than the backend's lineage scan
+            admits. What the stat says is that old logs are piling up, as a "N+"
+            and not a count (counting them would mean walking them all), under
+            a label that names logs on disk, since the strip already counts
+            sessions, task sessions and session procs; the hint names the cap
+            itself, because it opens away from the value it explains. Shown
+            only when there is something to say. The retention command sits
+            beside the stat as a SettingRef, not in the hint: a hint is a
+            tooltip, and a command a reader has to copy cannot live in one. */}
+        {totals?.lineage_over_cap === true && (
           <FooterStat
-            label={i18nT('pages.sessionsTab.unattributed')}
-            value={`${fmtNumber(unattributed!.procs)} · ${fmtGb(unattributed!.rss_mb)}`}
-            warn
+            label={i18nT('pages.sessionsTab.footer_lineage_over_cap')}
+            value={`${fmtNumber(totals.lineage_cap)}+`}
+            hint={i18nT('pages.sessionsTab.footer_lineage_over_cap_hint', { cap: fmtNumber(totals.lineage_cap) })}
+            action={<SettingRef configKey="session.archive_retention_days" valuePlaceholder="7" />}
           />
         )}
       </div>
       )}
+      </div>
     </Card>
   )
 }
@@ -652,19 +792,42 @@ export default function SessionsTab({ planeStateRef }: Props) {
 /** Map column ids to their InfoTip i18n key. */
 function headerInfoTip(colId: string): string | null {
   switch (colId) {
+    // Nesting invites reading a parent's figure as a sum of the rows under
+    // it; the hint says each row is its own runtime's usage.
+    case 'rssMb': return 'pages.sessionsTab.memory_hint'
     case 'cpuCores': return 'pages.sessionsTab.cpu_cores_hint'
     case 'mcp': return 'pages.sessionsTab.mcp_stubs_hint'
     default: return null
   }
 }
 
-function FooterStat({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
+function FooterStat({
+  label,
+  value,
+  warn,
+  hint,
+  action,
+}: {
+  label: string
+  value: string
+  warn?: boolean
+  /** The page's "?" hint (the column-header pattern), for a stat a reader cannot act on from its label alone. */
+  hint?: string
+  /** An interactive affordance for the stat, rendered after the value; never inside the hint's tooltip. */
+  action?: ReactNode
+}) {
+  // An inline-flex row: the hint's button is a flex box of its own, and inline
+  // text beside a block would break the stat over two lines.
   return (
-    <span className="text-[11px] text-muted pr-3.5 mr-3.5 border-r border-border last:border-r-0 last:mr-0 last:pr-0">
-      {label}
-      <span className={`ml-1.5 font-mono tabular-nums text-[12px] font-medium ${warn ? 'text-warn' : 'text-text-strong'}`}>
+    <span className="inline-flex items-center gap-1.5 text-[11px] text-muted pr-3.5 mr-3.5 border-r border-border last:border-r-0 last:mr-0 last:pr-0">
+      <span>{label}</span>
+      {/* Above, not beside: the default placement opens to the right, over
+          the very value the hint explains. */}
+      {hint && <InfoTip text={hint} placement="top" />}
+      <span className={`font-mono tabular-nums text-[12px] font-medium ${warn ? 'text-warn' : 'text-text-strong'}`}>
         {value}
       </span>
+      {action}
     </span>
   )
 }

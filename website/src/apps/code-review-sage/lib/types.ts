@@ -34,6 +34,12 @@ export interface RunProgressEntry {
   posted?: number
   expected?: number
   error?: string
+  /** The failure cause as a stable backend token (`skipped_reason`), carried
+   *  BESIDE `error` rather than instead of it. `error` is prose, so keying a
+   *  translation off it alone means a backend rewording silently drops the card
+   *  to untranslated pass-through. Absent on runs recorded before the backend
+   *  carried it, and on non-failure phases. */
+  reason?: string
   coverage?: string
 }
 
@@ -81,6 +87,10 @@ export interface Run {
   summary?: RunSummary
   report_slug?: string | null
   error?: string
+  /** The run-level failure cause as a stable backend token, beside `error`.
+   *  Named to mirror `RunProgressEntry.reason` so the token resolves through the
+   *  same per-change-then-run precedence the prose already uses. */
+  reason?: string
   force?: boolean
   skipped_inflight?: number
   /** Set once this run's findings have been published to the pull request. */
@@ -92,8 +102,15 @@ export interface Run {
    *  delivery happened; this proves the draft still on the pull request is that one,
    *  because a later run replaces the draft rather than editing it. */
   posted_review_ids?: Record<string, string>
+  /** Findings the user chose not to send, keyed by change id then comment key,
+   *  each with the reason given. A dismissed finding is never posted. */
+  dismissed?: Record<string, Record<string, DismissedFinding>>
   posting?: boolean
   post_error?: string | null
+}
+
+export interface DismissedFinding {
+  reason: string
 }
 
 export interface PoolStats {
@@ -237,6 +254,13 @@ export interface RepoPr {
   reviewed: boolean
   reviewed_stale: boolean
   reviewed_at?: string
+  /** GitHub label names, in GitHub's order. Optional here and not on the wire:
+   *  the backend always sends a list, but a response cached by an older build
+   *  (`lib/persist.ts` keeps a 24h snapshot) predates the field, so a reader
+   *  must tolerate its absence. */
+  labels?: string[]
+  /** `owner/name`; set only on review-queue rows, which span repos. */
+  repo?: string
 }
 
 /** The minimum needed to open a PR in the detail pane.
@@ -255,6 +279,13 @@ export interface PrRef {
   draft?: boolean
   reviewed?: boolean
   reviewed_stale?: boolean
+}
+
+/** The "awaiting my review" queue: `RepoPr` rows spanning many repos. */
+export interface ReviewQueueResponse {
+  prs: RepoPr[]
+  truncated?: boolean
+  setup_required?: boolean
 }
 
 export interface RepoPrsResponse {
@@ -327,5 +358,50 @@ export interface LearningsResponse {
 
 export type MainView = 'reviews' | 'learning' | 'settings'
 /** Which list the middle column shows: the active repo's PRs, or the threads. */
-export type ListTab = 'pulls' | 'reviews'
+export type ListTab = 'pulls' | 'reviews' | 'queue'
 export type RailSection = 'repos' | 'reviews' | 'learning' | 'settings'
+
+// --- Follow-up sessions ------------------------------------------------------
+
+/** One exchange from a review discussed before follow-ups became sessions. */
+export interface ChatTurn {
+  /** 'user' | 'reviewer' — widened to string because it is worker-written JSON
+   *  crossing a trust boundary, and an unknown role must render as unknown
+   *  rather than crash the panel. */
+  role: string
+  text: string
+  /** The reviewer's reasoning for this answer. Empty when it did not think aloud. */
+  thinking: string
+  /** Titles of tools it ran while answering. */
+  tools: string[]
+  /** Tools it was NOT allowed to run. Non-empty means the answer is degraded. */
+  refusals: string[]
+  ts: number
+}
+
+export interface ChatState {
+  run_id: string
+  change_id: string
+  /** Stored exchanges from before follow-ups became chat sessions. */
+  turns: ChatTurn[]
+  /** Whether opening a follow-up would restore the reviewer's own context. False
+   *  means the session transcript is gone or was never kept, and a session opened
+   *  anyway would answer without knowing what was reviewed. */
+  resumable: boolean
+  /** Why not, when `resumable` is false. */
+  reason: string
+  /** The chat session a follow-up on this review uses. */
+  slot_key: string
+  /** Whether that session already exists, so the panel offers to continue the
+   *  conversation instead of inviting the user to start one they already had. */
+  followup_open: boolean
+}
+
+/** What the follow-up endpoint hands back for the slot the caller then creates. */
+export interface FollowupStart {
+  ok: boolean
+  slot_key: string
+  agent: string
+  folder_id: string
+  title: string
+}

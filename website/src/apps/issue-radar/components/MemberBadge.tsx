@@ -46,7 +46,7 @@ const ROLE_MUTED = new Set(['read'])
 
 /** Small role badge next to an author. Maintainers (owner/member/collaborator)
  * read as accent; first-timers as warn (a triage signal — they may need extra
- * guidance); other associations stay muted. NONE renders nothing. */
+ * help); other associations stay muted. NONE renders nothing. */
 function AssociationBadge({ assoc }: { assoc?: string | null }) {
   if (!assoc || assoc === 'NONE') return null
   // `hasOwnProperty`, not a bare index: `assoc` is provider data, so a value like
@@ -56,7 +56,7 @@ function AssociationBadge({ assoc }: { assoc?: string | null }) {
   const label = i18nT(ASSOC_LABEL_KEY[assoc])
   const isFirst = assoc === 'FIRST_TIME_CONTRIBUTOR' || assoc === 'FIRST_TIMER'
   const isMaint = assoc === 'OWNER' || assoc === 'MEMBER' || assoc === 'COLLABORATOR'
-  const cls = isFirst ? 'bg-warn-subtle text-warn' : isMaint ? 'bg-accent-subtle text-accent' : 'bg-bg-elevated text-muted'
+  const cls = isFirst ? 'bg-warn-subtle text-warn-text' : isMaint ? 'bg-accent-subtle text-accent' : 'bg-bg-elevated text-muted'
   return <span className={`text-[10.5px] px-1.5 py-0.5 rounded-full font-medium ${cls}`}>{label}</span>
 }
 

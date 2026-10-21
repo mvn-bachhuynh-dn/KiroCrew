@@ -6,7 +6,7 @@ Ported behaviour-first from the Crew Companion desktop app's
 *intentionally* changed: several behaviours below look like quirks and are
 deliberate, and each one is called out where it lives. The original module's own
 tests (``src/test/reminders.test.ts``, 29 cases) are ported alongside as
-``test_crew_companion_reminders.py`` so the port is pinned rather than asserted.
+``tests/test_reminders.py`` so the port is pinned rather than asserted.
 
 A deliberately small model: one interval, one time. Six fields and a time
 comparison is the whole of it.
@@ -22,10 +22,10 @@ business knowing what a row looks like.
 
 The natural-language parser also stays in TypeScript. It already lives at
 ``website/src/apps/crew-companion/reminderParse.ts`` (+ ``reminderParseZh``,
-``reminderText``), hardened over ten review rounds, and the page POSTs an
-already-resolved ``{text, fireAt, everyMinutes}``. Re-implementing 900 lines of
-span-alignment and day-part rules in a second language would re-earn every one of
-those bugs for no gain.
+``reminderParseKo``, ``reminderParseParts``, ``reminderText``), and the page POSTs
+an already-resolved ``{text, fireAt, everyMinutes}``. Re-implementing roughly
+2,000 lines of span-alignment and day-part rules in a second language would
+re-learn every edge case the TypeScript already handles, for no gain.
 """
 
 from __future__ import annotations
@@ -142,10 +142,6 @@ BREAK_NUDGES: tuple[tuple[str, tuple[str, ...]], ...] = (
 #: offered rather than nagged. The user can always start it themselves from the
 #: panel — this caps the PROMPT, never the exercise.
 MAX_BREATHE_PROMPTS_PER_DAY = 2
-
-#: Break-interval choices offered as one-tap presets. The panel and the dashboard
-#: page render this same list, so the two surfaces cannot drift.
-BREAK_PRESETS = (30, 45, 60, 90)
 
 #: Bounds for a custom interval. Below 5 the companion would be a pest; above 8h
 #: it would never fire in a working day.

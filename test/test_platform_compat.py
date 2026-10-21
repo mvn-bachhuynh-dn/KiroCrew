@@ -7,37 +7,115 @@ signal constants, the file-lock context managers (POSIX path on
 this host; the Windows branch is asserted via its dispatch shape), the
 strftime directive translation (the one piece with a deterministic Windows
 output we can assert directly), and the process-helper return contracts.
+
+Ten topic siblings, ``test_platform_compat_<topic>.py``, hold process identity,
+the process tree, Windows process trees, kill and reap, owner-only permissions,
+filesystem primitives, resource readings, trusted binaries, pinned host tools and
+port listeners. This file keeps the platform flags, the runtime and console
+seams, the file lock and the no-replace rename, the process helpers, the TCP peer
+and listening-pid lookups and the RSS reading.
 """
 
 from __future__ import annotations
 
+import ctypes
 import errno
-import logging
+import io
+import json
+import mmap
 import os
-import shutil
-import stat
+import socket
 import subprocess
 import sys
-import tempfile
-import time
 import types
+from pathlib import Path
 
 import pytest
 
 from kiro_crew import platform_compat as pc
 
+# Tests here read or build the macOS libc and libproc handles, so each one starts
+# with both caches unbuilt and puts them back after (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
 
-def _fake_windows_bins(monkeypatch):
-    """Resolve Windows system binaries while ``IS_WINDOWS`` is faked on POSIX.
 
-    The Windows branches are deliberately exercised on the Linux CI fleet by
-    flipping ``IS_WINDOWS``. Those branches resolve their binary from the
-    trusted system directories before spawning, which a Linux host cannot
-    satisfy, so the lookup is faked alongside the platform flag — otherwise the
-    spawn reports the tool missing before the branch under test is reached.
-    """
+@pytest.mark.skipif(
+    sys.platform not in {"win32", "linux", "darwin"}, reason="supported kernel identity contract"
+)
+@pytest.mark.parametrize(
+    "family, host",
+    [
+        (socket.AF_INET, "127.0.0.1"),
+        pytest.param(socket.AF_INET6, "::1", marks=pytest.mark.ipv6_required),
+    ],
+)
+def test_native_tcp_peer_identifies_client_process_not_server(family, host):
+    with socket.socket(family) as listener:
+        listener.settimeout(10)
+        listener.bind((host, 0))
+        listener.listen()
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,socket,sys; s=socket.socket(int(sys.argv[1])); "
+                "s.connect((sys.argv[2],int(sys.argv[3]))); print(os.getpid(),flush=True); "
+                "sys.stdin.read(1)",
+                str(int(family)),
+                host,
+                str(listener.getsockname()[1]),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            accepted, _ = listener.accept()
+            # A Windows venv launcher may exec a different interpreter PID.
+            assert child.stdout is not None
+            client_pid = int(child.stdout.readline())
+            with accepted:
+                server = accepted.getsockname()[:2]
+                client = accepted.getpeername()[:2]
+                assert pc.get_tcp_peer_pid(server, client) == client_pid
+                start = pc.get_process_start_id(client_pid)
+                assert start and start == pc.get_process_start_id(client_pid)
+                assert start != pc.get_process_start_id(os.getpid())
+                assert pc.get_tcp_peer_pid((server[0], server[1] % 65535 + 1), client) is None
+                assert pc.get_tcp_peer_pid(("203.0.113.1", server[1]), client) is None
+        finally:
+            child.communicate(b"x", timeout=10)
 
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: rf"C:\Windows\System32\{name}.exe")
+
+def test_tcp_peer_identity_unavailable_on_unknown_platform(monkeypatch):
+    monkeypatch.setattr(pc, "IS_WINDOWS", False)
+    monkeypatch.setattr(pc.sys, "platform", "unsupported")
+    assert pc.get_tcp_peer_pid(("127.0.0.1", 1000), ("127.0.0.1", 2000)) is None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+@pytest.mark.parametrize("scenario", ["match", "other_port", "ambiguous", "unreadable"])
+def test_macos_tcp_peer_requires_an_exact_unique_connection(monkeypatch, host, scenario):
+    monkeypatch.setattr(pc, "IS_WINDOWS", False)
+    monkeypatch.setattr(pc.sys, "platform", "darwin")
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: "/usr/sbin/lsof")
+    rendered = f"[{host}]" if ":" in host else host
+    port = 2001 if scenario == "other_port" else 2000
+    data = f"p2468\nn{rendered}:{port}->{rendered}:1000\n"
+    if scenario == "ambiguous":
+        data += f"p9753\nn{rendered}:{port}->{rendered}:1000\n"
+
+    def query(argv, **kwargs):
+        assert argv == ["/usr/sbin/lsof", "-nP", "-a", "-iTCP:2000", "-sTCP:ESTABLISHED", "-Fpn"]
+        assert kwargs["timeout"] == 2
+        if scenario == "unreadable":
+            raise subprocess.TimeoutExpired(argv, 2)
+        return data.encode("ascii")
+
+    monkeypatch.setattr(subprocess, "check_output", query)
+    assert pc.get_tcp_peer_pid((host, 1000), (host, 2000)) == (
+        2468 if scenario == "match" else None
+    )
 
 
 class TestPlatformFlags:
@@ -53,6 +131,223 @@ class TestPlatformFlags:
         # callers (kill_pid/kill_process_tree) never AttributeError.
         assert isinstance(pc.SIGKILL, int) and pc.SIGKILL > 0
         assert isinstance(pc.SIGTERM, int) and pc.SIGTERM > 0
+
+
+class TestReexecPythonModule:
+    def test_windows_uses_space_free_argv0(self, monkeypatch, nonbundled_python_without_user_site):
+        executable = (
+            r"C:\Users\alice\AppData\Local\Programs\KiroCrew Nightly"
+            r"\resources\backend-dist\kirocrew-backend\python.exe"
+        )
+        calls = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.sys, "executable", executable)
+        monkeypatch.setattr(pc.os, "execv", lambda path, argv: calls.append((path, argv)))
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+
+        pc.reexec_python_module("kiro_crew", ["gateway", "--port", "5476"])
+
+        assert calls == [
+            (
+                executable,
+                ["python.exe", "-s", "-P", "-m", "kiro_crew", "gateway", "--port", "5476"],
+            )
+        ]
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+
+    def test_posix_preserves_full_argv0_and_pins_utf8(
+        self, monkeypatch, nonbundled_python_without_user_site
+    ):
+        executable = "/opt/Kiro Crew/bin/python3"
+        calls = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc.sys, "executable", executable)
+        monkeypatch.setattr(pc.os, "execv", lambda path, argv: calls.append((path, argv)))
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "latin-1")
+
+        pc.reexec_python_module("kiro_crew", ["gateway"])
+
+        assert calls == [(executable, [executable, "-s", "-P", "-m", "kiro_crew", "gateway"])]
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+
+    def test_reexec_successor_survives_hostile_parent_encoding(self, tmp_path):
+        """Exercise the real failure shape behind desktop in-app restarts.
+
+        The first interpreter intentionally starts with cp1252 streams on every
+        OS.  It re-execs without calling ensure_utf8_console, so only the
+        environment published by reexec_python_module can make the successor's
+        first emoji print safe.
+        """
+        probe = tmp_path / "utf8_reexec_probe.py"
+        probe.write_text(
+            "import os\n"
+            "from kiro_crew.platform_compat import reexec_python_module\n"
+            "if os.environ.get('_KIROCREW_UTF8_REEXEC_PROBE') == '1':\n"
+            "    print('👻 restarted')\n"
+            "else:\n"
+            "    os.environ['_KIROCREW_UTF8_REEXEC_PROBE'] = '1'\n"
+            "    reexec_python_module('utf8_reexec_probe', [])\n",
+            encoding="utf-8",
+        )
+        source_root = str(Path(__file__).resolve().parents[1] / "src")
+        inherited_path = os.environ.get("PYTHONPATH", "")
+        # The probe directory rides on PYTHONPATH, not on the cwd: the re-exec
+        # passes -P, which keeps the successor's cwd off sys.path, so a probe
+        # found only through the cwd would vanish on the second hop.
+        env = {
+            **os.environ,
+            "PYTHONUTF8": "0",
+            "PYTHONIOENCODING": "cp1252",
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (str(tmp_path), source_root, inherited_path) if p
+            ),
+        }
+
+        result = subprocess.run(
+            [sys.executable, "-m", "utf8_reexec_probe"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert "👻 restarted".encode() in result.stdout
+
+
+class TestCancelWheelAppliesInFlight:
+    """Every exit path cancels a managed-venv apply through ONE lookup, not a registry.
+
+    The apply module is found in ``sys.modules`` and never imported, so an exit
+    in a process that never loaded it costs nothing and imports nothing from a
+    tree an update may have changed.
+    """
+
+    _MODULE = "kiro_crew.platform.wheel_apply"
+
+    def _stub_module(self, monkeypatch, cancel) -> None:
+        stub = types.ModuleType(self._MODULE)
+        stub.cancel_wheel_applies = cancel  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, self._MODULE, stub)
+
+    def test_calls_the_loaded_module_with_the_reason(self, monkeypatch):
+        reasons: list[str] = []
+        self._stub_module(monkeypatch, reasons.append)
+
+        pc.cancel_wheel_applies_in_flight("shutdown")
+
+        assert reasons == ["shutdown"]
+
+    def test_does_nothing_and_imports_nothing_when_the_module_is_not_loaded(self, monkeypatch):
+        monkeypatch.delitem(sys.modules, self._MODULE, raising=False)
+
+        pc.cancel_wheel_applies_in_flight("exit")
+
+        assert self._MODULE not in sys.modules
+
+    @pytest.mark.parametrize("seam", ["reexec_launcher", "reexec_python_module", "hard_exit"])
+    def test_every_exit_path_cancels_first_and_survives_a_raising_cancel(
+        self, monkeypatch, tmp_path, seam, nonbundled_python_without_user_site
+    ):
+        """The cancel runs before the exec / ``os._exit``; one that raises never stops it."""
+        order: list[str] = []
+
+        def cancel(reason: str) -> None:
+            order.append(f"cancel:{reason}")
+            raise RuntimeError("the apply's cancel blew up")
+
+        self._stub_module(monkeypatch, cancel)
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc.os, "execv", lambda path, argv: order.append("execv"))
+        monkeypatch.setattr(pc.os, "_exit", lambda code: order.append(f"_exit:{code}"))
+
+        if seam == "hard_exit":
+            pc.hard_exit(3)
+            assert order == ["cancel:exit", "_exit:3"]
+        elif seam == "reexec_launcher":
+            pc.reexec_launcher(str(tmp_path / "kirocrew"), ["gateway"])
+            assert order == ["cancel:exec", "execv"]
+        else:
+            pc.reexec_python_module("kiro_crew", ["gateway"], executable=str(tmp_path / "python"))
+            assert order == ["cancel:exec", "execv"]
+
+
+class TestWindowsOnArm:
+    """``is_windows_on_arm`` answers "will pip accept a win_amd64 wheel here?".
+
+    Callers use it to refuse a package that publishes no win-arm64 wheel, so the
+    predicate has to be a property of the running PROCESS rather than of the host
+    CPU — the two disagree under Windows' x86-64 emulation, and only the process
+    answer matches what pip does.
+    """
+
+    def test_true_for_a_native_arm64_interpreter(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.platform, "machine", lambda: "ARM64")
+        assert pc.is_windows_on_arm() is True
+
+    def test_accepts_the_aarch64_spelling(self, monkeypatch):
+        # Reaches Windows through cross-built and MSYS/Cygwin interpreters.
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.platform, "machine", lambda: "aarch64")
+        assert pc.is_windows_on_arm() is True
+
+    def test_case_is_irrelevant(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.platform, "machine", lambda: "aRm64")
+        assert pc.is_windows_on_arm() is True
+
+    def test_false_for_an_emulated_x86_64_interpreter(self, monkeypatch):
+        """The case a host-architecture probe would get WRONG.
+
+        Windows on ARM runs x86-64 processes under emulation, and such an
+        interpreter reports AMD64 and installs win_amd64 wheels perfectly well.
+        Reporting it as ARM would refuse a package that works.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.platform, "machine", lambda: "AMD64")
+        assert pc.is_windows_on_arm() is False
+
+    def test_false_on_apple_silicon(self, monkeypatch):
+        # arm64 alone must not trip it: macOS and Linux both publish arm64 wheels
+        # for the packages this gate exists to refuse on Windows.
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc.platform, "machine", lambda: "arm64")
+        assert pc.is_windows_on_arm() is False
+
+    def test_does_not_consult_machine_off_windows(self, monkeypatch):
+        """Short-circuits on the platform constant.
+
+        Keeps the predicate loop-safe for the dashboard's STT config GET, which
+        calls it inline rather than from the threaded probe block.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        calls = []
+
+        def _machine():
+            calls.append(1)
+            return "arm64"
+
+        monkeypatch.setattr(pc.platform, "machine", _machine)
+        assert pc.is_windows_on_arm() is False
+        assert calls == []
+
+    def test_uses_the_modules_own_windows_predicate(self, monkeypatch):
+        """Keyed off IS_WINDOWS, not a second platform.system() call.
+
+        Two Windows predicates in one module can drift; this pins that there is
+        one. Flipping only IS_WINDOWS must flip the answer.
+        """
+        monkeypatch.setattr(pc.platform, "machine", lambda: "arm64")
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        assert pc.is_windows_on_arm() is True
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc.is_windows_on_arm() is False
 
 
 class TestFileLock:
@@ -103,6 +398,111 @@ class TestFileLock:
             os.close(fd)
 
 
+class TestRenameNoReplace:
+    @pytest.mark.skipif(
+        not pc.RENAME_NOREPLACE_AVAILABLE,
+        reason="native atomic no-replace rename is unavailable",
+    )
+    def test_rename_is_atomic_and_preserves_an_existing_destination(self, tmp_path):
+        first = tmp_path / "first"
+        first.mkdir()
+        (first / "payload").write_text("published")
+        parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            pc.rename_noreplace("first", "published", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            assert not first.exists()
+            assert (tmp_path / "published" / "payload").read_text() == "published"
+
+            losing = tmp_path / "losing"
+            losing.mkdir()
+            destination = tmp_path / "occupied"
+            destination.mkdir(mode=0o700)
+            before = destination.stat()
+            with pytest.raises(FileExistsError):
+                pc.rename_noreplace(
+                    "losing",
+                    "occupied",
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            after = destination.stat()
+            assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+            assert losing.is_dir()
+        finally:
+            os.close(parent_fd)
+
+    def test_unavailable_native_contract_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(pc, "_RENAME_NOREPLACE_FN", None)
+        with pytest.raises(NotImplementedError):
+            pc.rename_noreplace("source", "target", src_dir_fd=-1, dst_dir_fd=-1)
+
+    def test_syscall_fallback_builds_working_callable_on_known_arch(self, tmp_path, monkeypatch):
+        # Verify marshalling on every host. Linux additionally exercises the
+        # native syscall, independent of which libc path import-time chose.
+        host_machine = pc.platform.machine()
+        calls = []
+
+        def syscall(*args):
+            calls.append(args)
+            ctypes.set_errno(errno.EEXIST)
+            return -1
+
+        for machine, number in pc._SYS_RENAMEAT2_BY_MACHINE.items():
+            with monkeypatch.context() as patcher:
+                patcher.setattr(pc.platform, "machine", lambda: machine)
+                fn = pc._build_renameat2_via_syscall(types.SimpleNamespace(syscall=syscall))
+                assert fn is not None
+                assert fn(11, b"first", 12, b"published", 1) == -1
+                assert calls[-1] == (number, 11, b"first", 12, b"published", 1)
+                assert syscall.restype is ctypes.c_long
+                assert syscall.argtypes == [
+                    ctypes.c_long,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_uint,
+                ]
+                assert ctypes.get_errno() == errno.EEXIST
+        assert len(calls) == len(pc._SYS_RENAMEAT2_BY_MACHINE)
+        if not pc.IS_LINUX or host_machine not in pc._SYS_RENAMEAT2_BY_MACHINE:
+            # Portable marshalling above still runs; never issue a Linux
+            # syscall against another OS or guess an unmapped syscall number.
+            return
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = pc._build_renameat2_via_syscall(libc)
+        assert fn is not None
+
+        first = tmp_path / "first"
+        first.mkdir()
+        (first / "payload").write_text("published")
+        parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            rc = fn(parent_fd, b"first", parent_fd, b"published", 1)  # RENAME_NOREPLACE
+            assert rc == 0
+            assert (tmp_path / "published" / "payload").read_text() == "published"
+
+            # Occupied destination must refuse (EEXIST), not clobber.
+            (tmp_path / "loser").mkdir()
+            ctypes.set_errno(0)
+            rc = fn(parent_fd, b"loser", parent_fd, b"published", 1)
+            assert rc != 0
+            assert ctypes.get_errno() == errno.EEXIST
+        finally:
+            os.close(parent_fd)
+
+    def test_syscall_fallback_returns_none_on_unknown_arch(self, monkeypatch):
+        # An unmapped architecture must fail closed rather than issue a
+        # wrong-numbered syscall.
+        monkeypatch.setattr(pc.platform, "machine", lambda: "totally-made-up-arch")
+
+        class UnavailableLibc:
+            def __getattr__(self, name):
+                raise AssertionError(f"unknown architecture must not access libc.{name}")
+
+        assert pc._build_renameat2_via_syscall(UnavailableLibc()) is None
+
+
 class TestProcessHelpers:
     def test_pid_exists_true_for_self(self):
         # The current process obviously exists — on POSIX via os.kill(0), on
@@ -119,9 +519,7 @@ class TestProcessHelpers:
         # still report False via GetExitCodeProcess, or every session recycle
         # logs a false "PID survived kill" and leaks a dead PID into the tracker.
         # On POSIX this reaps normally and is equally False.
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"]
-        )
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
             assert pc.pid_exists(child.pid) is True
             child.kill()
@@ -132,19 +530,126 @@ class TestProcessHelpers:
                 child.kill()
                 child.wait()
 
+    def test_pid_is_zombie_reads_the_running_state_of_self(self):
+        # A running process is not a zombie on the platforms that expose the
+        # state (Linux /proc, macOS kinfo); elsewhere the answer is "unknown".
+        expected = False if sys.platform in ("linux", "darwin") else None
+        assert pc.pid_is_zombie(os.getpid()) is expected
+
+    def test_pid_is_zombie_is_unknown_for_an_unreadable_or_invalid_pid(self):
+        assert pc.pid_is_zombie(0) is None
+        assert pc.pid_is_zombie(-1) is None
+        if sys.platform == "linux":
+            # No /proc entry: unreadable, not "not a zombie".
+            assert pc.pid_is_zombie(2_000_000_000) is None
+
+    def test_pid_is_zombie_reads_the_linux_stat_state_field(self, monkeypatch, tmp_path):
+        # The comm field is parenthesised and may itself contain spaces and
+        # parentheses, so the state is the first field after the LAST ')'.
+        tail = " ".join(str(i) for i in range(4, 24))
+        real_path = pc.Path
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc, "Path", lambda p: tmp_path if p == "/proc" else real_path(p))
+        (tmp_path / "4242").mkdir()
+        stat = tmp_path / "4242" / "stat"
+        for state, expected in (("Z", True), ("X", True), ("x", True), ("S", False), ("R", False)):
+            stat.write_bytes(f"4242 (kiro (cli) worker) {state} 1 {tail}".encode())
+            assert pc.pid_is_zombie(4242) is expected, state
+
+        stat.unlink()
+        assert pc.pid_is_zombie(4242) is None
+
+    def test_kill_process_group_signals_the_captured_id_and_resolves_nothing(self, monkeypatch):
+        # The caller hands over a group id it captured while the leader was alive;
+        # the primitive addresses THAT id -- no pid is consulted, so a recycled pid
+        # cannot redirect the signal. The POSIX branch, on every platform: the
+        # branch flag is pinned and the two group syscalls are supplied through
+        # the seams the primitive reads (created where the runner lacks them).
+        signalled: list[tuple[int, int]] = []
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(
+            os, "killpg", lambda pgid, sig: signalled.append((pgid, sig)), raising=False
+        )
+        monkeypatch.setattr(
+            os,
+            "getpgid",
+            lambda _pid: pytest.fail("kill_process_group resolved a group from a pid"),
+            raising=False,
+        )
+
+        assert pc.kill_process_group(2**22 + 4242, pc.SIGKILL) is True
+
+        assert signalled == [(2**22 + 4242, pc.SIGKILL)]
+
+    def test_kill_process_group_refuses_broadcast_and_self_instead_of_degrading(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(
+            os, "killpg", lambda pgid, sig: pytest.fail(f"signalled group {pgid}"), raising=False
+        )
+        for refused in (0, 1, -1, pc._OWN_PGID, "4242", 4242.0):
+            with pytest.raises(ValueError, match="refusing broadcast/self process group"):
+                pc.kill_process_group(refused, pc.SIGKILL)  # type: ignore[arg-type]
+
+    def test_kill_process_group_lets_the_signal_s_errors_propagate(self, monkeypatch):
+        def _gone(pgid, sig):
+            raise ProcessLookupError("[Errno 3] No such process")
+
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(os, "killpg", _gone, raising=False)
+        with pytest.raises(ProcessLookupError):
+            pc.kill_process_group(2**22 + 4343, pc.SIGKILL)
+
+    def test_kill_process_group_is_posix_only(self, monkeypatch):
+        # The other branch: no group syscall is reached, whatever the runner has.
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(
+            os, "killpg", lambda pgid, sig: pytest.fail(f"signalled group {pgid}"), raising=False
+        )
+        with pytest.raises(OSError, match="no POSIX process groups"):
+            pc.kill_process_group(2**22 + 4444, pc.SIGKILL)
+
     def test_get_ppid_returns_int(self):
         # Returns the parent (>0 normally) or -1 on failure — never raises.
         ppid = pc.get_ppid(os.getpid())
         assert isinstance(ppid, int)
 
-    def test_kill_pid_nonexistent_is_safe(self):
-        # Both platforms raise on non-existent pid — same exception shape so
+    def test_kill_pid_nonexistent_is_safe(self, monkeypatch):
+        # Both platforms raise ProcessLookupError on a non-existent pid, so
         # callers' ``except (ProcessLookupError, OSError)`` handlers fire
-        # uniformly. POSIX: os.kill raises ProcessLookupError. Windows:
-        # taskkill returns rc=128 which _raise_taskkill_error re-badges as
-        # ProcessLookupError.
+        # uniformly. POSIX: os.kill raises it. Windows: taskkill's rc=128 is
+        # re-badged to it by _raise_taskkill_error.
+        #
+        # On POSIX this is a REAL SIGKILL, so "nonexistent" has to hold by
+        # construction, not by luck: any number inside the kernel's pid range
+        # can be handed to an unrelated process between the premise and the
+        # signal. Linux caps pids at PID_MAX_LIMIT (4194304) and macOS at
+        # PID_MAX (99998), so a probe pid above both is refused by the range
+        # check itself and never resolves to a process. Pinned against the
+        # running host where the ceiling is readable, so a kernel that raised
+        # it would fail here rather than turn this test into a kill at whatever
+        # holds that number.
+        #
+        # Windows exposes no readable pid ceiling, so no pid can be proven
+        # unused there and a real ``taskkill /F`` at this number could stop an
+        # unrelated process. The Windows arm therefore runs the same call with
+        # ``taskkill`` stubbed to the rc=128 it returns for a missing pid, so the
+        # contract stays asserted on the Windows shard without the real kill.
+        nonexistent = 2_000_000_000
+        if pc.IS_WINDOWS:
+            recorded: list[list[str]] = []
+
+            def _taskkill_not_found(argv, *_a, **_kw):
+                recorded.append(list(argv))
+                return types.SimpleNamespace(returncode=128, stdout=b"", stderr=b"not found")
+
+            monkeypatch.setattr(pc.subprocess, "run", _taskkill_not_found)
+        elif pc.IS_LINUX:
+            assert nonexistent > int(Path("/proc/sys/kernel/pid_max").read_text())
         with pytest.raises(ProcessLookupError):
-            pc.kill_pid(2_000_000_000, pc.SIGKILL)
+            pc.kill_pid(nonexistent, pc.SIGKILL)
+        if pc.IS_WINDOWS:
+            assert len(recorded) == 1 and str(nonexistent) in recorded[0], recorded
 
     def test_process_matches_false_for_unused_pid(self):
         assert pc.process_matches(2_000_000_000, ("kiro-cli", "claude")) is False
@@ -195,13 +700,15 @@ class TestProcessCwd:
 
     def test_darwin_reads_the_path_at_the_cwd_offset(self, monkeypatch):
         monkeypatch.setattr(
-            pc, "_darwin_libproc_handle", lambda: self._fake_libproc(b"/Users/u/proj"),
+            pc,
+            "_darwin_libproc_handle",
+            lambda: self._fake_libproc(b"/Users/u/proj"),
         )
         assert pc._darwin_process_cwd(4242) == "/Users/u/proj"
 
     def test_darwin_refuses_a_short_write(self, monkeypatch):
         # A byte count other than the exact struct size means the layout the
-        # offsets assume no longer matches the kernel's, so the path cannot be
+        # offsets assume does not match the kernel's, so the path cannot be
         # sliced out safely — the caller falls back instead of getting garbage.
         monkeypatch.setattr(
             pc,
@@ -212,7 +719,9 @@ class TestProcessCwd:
 
     def test_darwin_refuses_an_error_return(self, monkeypatch):
         monkeypatch.setattr(
-            pc, "_darwin_libproc_handle", lambda: self._fake_libproc(b"/x", filled=-1),
+            pc,
+            "_darwin_libproc_handle",
+            lambda: self._fake_libproc(b"/x", filled=-1),
         )
         assert pc._darwin_process_cwd(4242) is None
 
@@ -256,6 +765,74 @@ class TestFindListeningPids:
         finally:
             s.close()
 
+    def test_linux_per_process_probe_runs_on_every_runner(self, tmp_path, monkeypatch):
+        proc_root = tmp_path / "proc"
+        (proc_root / "net").mkdir(parents=True)
+        (proc_root / "4242" / "fd").mkdir(parents=True)
+        (proc_root / "4242" / "fd" / "7").touch()
+        (proc_root / "net" / "tcp").write_text(
+            "header\n"
+            "0: 0100007F:1E61 00000000:0000 0A 00000000:00000000 "
+            "00:00000000 00000000 1000 0 12345\n",
+            encoding="ascii",
+        )
+        (proc_root / "net" / "tcp6").write_text("header\n", encoding="ascii")
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.os, "readlink", lambda path: "socket:[12345]")
+
+        assert pc.process_owns_loopback_listener(4242, 7777, proc_root=proc_root) is True
+
+    def test_windows_listener_probe_marks_browser_capable(self, monkeypatch):
+        """Use real Windows/Darwin attribution there; both synthetic shapes elsewhere."""
+        from kiro_crew.browser_cli import view as browser_view
+
+        def _assert_capable(port: int) -> None:
+            assert pc.process_owns_loopback_listener(os.getpid(), port) is True
+            browser_view._invalidate_listener_lookup_self_test_cache()
+            try:
+                assert browser_view._listener_lookup_functional() is True
+                assert browser_view._structurally_blind_listener_attribution() is False
+            finally:
+                browser_view._invalidate_listener_lookup_self_test_cache()
+
+        if sys.platform in {"win32", "darwin"}:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                _assert_capable(int(listener.getsockname()[1]))
+            return
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(
+            pc,
+            "_windows_loopback_listener_owner_pids",
+            lambda port: {os.getpid()},
+        )
+        _assert_capable(45613)
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc, "listening_pid_tool", lambda: "lsof")
+        monkeypatch.setattr(
+            pc,
+            "trusted_system_bin",
+            lambda name: "/usr/bin/lsof" if name == "lsof" else None,
+        )
+        monkeypatch.setattr(
+            pc,
+            "probe_port_listeners",
+            lambda port, process_pid=None: (
+                [pc.PortListener(os.getpid(), "127.0.0.1", "4")],
+                True,
+            ),
+        )
+        _assert_capable(45613)
+
 
 class TestProcessCommandLine:
     def test_self_cmdline_mentions_python(self):
@@ -277,6 +854,53 @@ class TestProcessCommandLine:
     def test_dead_pid_returns_empty_string(self):
         # A non-existent PID yields "" (fail-closed), never an exception.
         assert pc.process_command_line(2_000_000_000) == ""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="the WMI/PowerShell arm is Windows-only")
+    def test_windows_cmdline_survives_a_character_outside_the_code_page(self):
+        # The Windows arm reads the command line back through PowerShell, and
+        # both ends of that pipe are pinned to UTF-8 so a character the host
+        # code page cannot represent survives the round trip. With either end
+        # left on the code page it is silently best-fitted away and the probe
+        # answers a plausible string that does not equal the real command line
+        # -- which is what the callers compare to decide whether a listening
+        # PID is our own gateway.
+        #
+        # The needle is chosen against the live code page rather than hardcoded:
+        # which characters are lost depends on the host (cp1252 loses the CJK
+        # one, cp950 loses the accented one), and on a UTF-8 host nothing is
+        # lost and there is nothing to assert.
+        import locale
+
+        code_page = locale.getpreferredencoding(False)
+        needle = ""
+        for candidate in ("張", "é", "Ж", "क"):
+            try:
+                candidate.encode(code_page)
+            except UnicodeEncodeError:
+                needle = candidate
+                break
+        if not needle:
+            pytest.skip(f"{code_page} encodes every probe character; no divergence to assert")
+        # Guard the guard: an encodable needle would make this test pass against
+        # the unfixed decode, so prove the chosen one really is unrepresentable.
+        with pytest.raises(UnicodeEncodeError):
+            needle.encode(code_page)
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", f"import time; _ = {needle!r}; time.sleep(30)"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            cl = pc.process_command_line(child.pid)
+            # "" stays tolerated for the same reason as the probe above: a cold
+            # PowerShell plus a WMI query can exceed the 10s timeout on a loaded
+            # runner, and that is the documented failure return, not a defect.
+            # A NON-empty answer, though, is the real command line or it is wrong.
+            if cl:
+                assert needle in cl
+        finally:
+            child.kill()
+            child.wait(timeout=10)
 
 
 class TestProcessOwnerUid:
@@ -314,7 +938,7 @@ class TestStrftime:
         if pc.IS_WINDOWS:
             assert dt.fmt == "%#I:%M %p"
         else:
-            assert dt.fmt == "%-I:%M %p"   # untouched on POSIX
+            assert dt.fmt == "%-I:%M %p"  # untouched on POSIX
 
     def test_real_datetime_formats_without_error(self):
         # End-to-end against a real datetime: must not raise ValueError on
@@ -334,11 +958,11 @@ class TestIsExecutableFile:
         f.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(f, 0o644)  # no x-bit
         if pc.IS_WINDOWS:
-            assert pc.is_executable_file(f) is True   # .sh extension → runnable
+            assert pc.is_executable_file(f) is True  # .sh extension → runnable
         else:
             assert pc.is_executable_file(f) is False  # no x-bit → not runnable
         os.chmod(f, 0o755)  # +x
-        assert pc.is_executable_file(f) is True       # runnable on both now
+        assert pc.is_executable_file(f) is True  # runnable on both now
 
     def test_missing_file_is_not_executable(self, tmp_path):
         assert pc.is_executable_file(tmp_path / "nope.sh") is False
@@ -395,16 +1019,14 @@ class TestFindPythonInterpreter:
             return stub if name in ("python", "python3") else real
 
         monkeypatch.setattr("shutil.which", fake_which)
-        monkeypatch.setattr(
-            pc.subprocess, "check_output", lambda *a, **k: "3.12\n"
-        )
+        monkeypatch.setattr(pc.subprocess, "check_output", lambda *a, **k: "3.12\n")
         got = pc.find_python_interpreter()
         assert got == real
         assert pc._is_windows_store_python_stub(got) is False
 
     def test_returns_none_when_only_stub_or_too_old(self, monkeypatch):
         # No usable interpreter: which() yields only the stub (Windows) / nothing,
-        # or an interpreter that reports < 3.10. Either way → None, never the stub.
+        # or an interpreter that reports < 3.12. Either way → None, never the stub.
         if pc.IS_WINDOWS:
             stub = r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\python3.EXE"
             monkeypatch.setattr("shutil.which", lambda name: stub)
@@ -415,10 +1037,24 @@ class TestFindPythonInterpreter:
 
 
 class TestUtf8Console:
+    @pytest.mark.parametrize("is_windows", [False, True])
+    def test_call_publishes_utf8_for_children(self, monkeypatch, is_windows):
+        monkeypatch.setattr(pc, "IS_WINDOWS", is_windows)
+        monkeypatch.setattr(pc.sys, "stdout", None)
+        monkeypatch.setattr(pc.sys, "stderr", None)
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+
+        pc.ensure_utf8_console()
+
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+
     def test_ensure_utf8_console_is_safe_to_call(self):
-        # No-op on POSIX; reconfigures stdout/stderr on Windows. Either way it
-        # must never raise (it swallows non-reconfigurable streams), and must be
-        # idempotent (safe to call from both __main__ and cli.main).
+        # Publishes the child environment on every OS and reconfigures the
+        # current stdout/stderr only on Windows. Either way it must never raise
+        # (it swallows non-reconfigurable streams), and must be idempotent (safe
+        # to call from both __main__ and cli.main).
         pc.ensure_utf8_console()
         pc.ensure_utf8_console()
 
@@ -432,17 +1068,15 @@ class TestUtf8Console:
         assert "KiroCrew" in out
 
     def test_rewraps_cp1252_stream_so_emoji_log_record_survives(self, monkeypatch):
-        # Regression for the gateway-worker UnicodeEncodeError: when the worker's
-        # stderr is a cp1252 TextIOWrapper that reconfigure() can't flip (observed
-        # through the 3-layer Windows spawn), a logging StreamHandler bound to it
-        # crashed on the first non-ASCII log record. ensure_utf8_console() must
-        # re-wrap the underlying buffer so the record emits cleanly.
+        # When the worker's stderr is a cp1252 TextIOWrapper that reconfigure()
+        # can't flip (the 3-layer Windows spawn), a logging StreamHandler bound to
+        # it crashes on the first non-ASCII log record, so ensure_utf8_console()
+        # must re-wrap the underlying buffer so the record emits cleanly.
         #
-        # This is a WINDOWS-only behavior: ensure_utf8_console() is a deliberate
-        # no-op on POSIX (which already defaults to UTF-8), so forcing a cp1252
-        # stderr here and asserting emoji survives only makes sense on Windows —
-        # on POSIX the function intentionally leaves the forced cp1252 stream
-        # alone, so the emoji would (correctly) fail to encode. Gate accordingly.
+        # This stream repair is WINDOWS-only behavior: on POSIX the function
+        # publishes the environment for children but leaves current streams
+        # alone. Forcing a cp1252 stderr and asserting emoji survives therefore
+        # only makes sense on Windows. Gate accordingly.
         if not pc.IS_WINDOWS:
             pytest.skip("ensure_utf8_console re-wrap is Windows-only (no-op on POSIX)")
 
@@ -470,6 +1104,142 @@ class TestUtf8Console:
         assert errors == []
 
 
+class _TtyTextIOWrapper(io.TextIOWrapper):
+    """A text stream that answers like a terminal and counts reconfigure calls."""
+
+    reconfigures = 0
+
+    def isatty(self) -> bool:
+        return True
+
+    def reconfigure(self, **kwargs) -> None:
+        type(self).reconfigures += 1
+        super().reconfigure(**kwargs)
+
+
+class TestLineBufferedStdout:
+    STATUS_LINE = "👻 Kiro Crew gateway starting…"
+
+    def test_status_line_reaches_a_non_tty_stdout_as_printed(self, monkeypatch):
+        # A pipe or a file (the journal under systemd, the Desktop supervisor's
+        # log fd, a detached gateway's own gateway.log) gets a block-buffered
+        # stdout, so a status line sits in the buffer until it fills or the
+        # process exits. After the gateway's stdout setup, one plain print()
+        # with no flush must already be in the underlying bytes.
+        raw = io.BytesIO()
+        # newline="\n": one byte per newline on every OS, so the compare is about buffering.
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n", line_buffering=False)
+        assert not stream.isatty()
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        pc.ensure_line_buffered_stdout()
+        print(self.STATUS_LINE)
+
+        assert raw.getvalue() == f"{self.STATUS_LINE}\n".encode("utf-8")
+
+    def test_a_terminal_stdout_is_left_alone(self, monkeypatch):
+        # A terminal is line-buffered by the interpreter itself; the seam must
+        # not touch it (not even a flush through reconfigure).
+        stream = _TtyTextIOWrapper(
+            io.BytesIO(), encoding="utf-8", newline="\n", line_buffering=True
+        )
+        _TtyTextIOWrapper.reconfigures = 0
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        pc.ensure_line_buffered_stdout()
+
+        assert _TtyTextIOWrapper.reconfigures == 0
+        assert stream.line_buffering is True
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            pytest.param(None, id="absent-pythonw"),
+            pytest.param(io.StringIO(), id="no-reconfigure"),
+            pytest.param(types.SimpleNamespace(), id="plain-object"),
+        ],
+    )
+    def test_a_stream_that_cannot_be_reconfigured_does_not_raise(self, monkeypatch, stdout):
+        # Boot must survive a replaced or captured stdout: a launcher's plain
+        # object up a multi-process spawn chain, a test's StringIO, or no
+        # stream at all. Nothing to buffer means nothing to do.
+        monkeypatch.setattr(sys, "stdout", stdout)
+
+        pc.ensure_line_buffered_stdout()  # must not raise
+
+    def test_a_closed_stdout_does_not_raise(self, monkeypatch):
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", newline="\n")
+        stream.close()
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        pc.ensure_line_buffered_stdout()  # must not raise
+
+
+def _wire_mapping(buf: mmap.mmap, length: int) -> bool:
+    """Pin *buf*'s pages resident with ``mlock``; True when the kernel agreed.
+
+    Faulting a page in does not keep it in the resident set. Under memory
+    pressure macOS hands anonymous pages to its compressor the moment they
+    are touched, and a compressed page is not counted by
+    ``task_info().resident_size`` -- so on a loaded 3-shard runner a 128 MB
+    mapping that was written end to end read back as a 40 MB rise, and the
+    "rose while held" precondition below failed on a reading that was
+    exactly what ``ps -o rss=`` showed. Wired pages cannot be compressed or
+    evicted, which turns "how much of the mapping is resident" from the
+    kernel's discretion into a fixed quantity for the duration of the sample.
+
+    Best-effort by design: ``RLIMIT_MEMLOCK`` is unlimited on macOS but a few
+    megabytes on a stock Linux, where the call fails with ``ENOMEM`` and the
+    plain fault-in is enough because Linux does not compress anonymous pages.
+    Windows has no ``mlock``. Whatever happens, the mapping is still faulted
+    in by the caller; the return value only records which case ran so a
+    failing sample says so.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mlock = libc.mlock
+    except (AttributeError, OSError):
+        return False
+    mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    mlock.restype = ctypes.c_int
+    # ``from_buffer`` takes an export on the mapping; it must be dropped
+    # before ``buf.close()`` or the close raises BufferError.
+    view = ctypes.c_char.from_buffer(buf)
+    try:
+        addr = ctypes.addressof(view)
+    finally:
+        del view
+    return mlock(addr, length) == 0
+
+
+def _measure_rss_release():
+    """Sample one real mapping's lifetime in the calling process."""
+    chunk = 128 * 1024 * 1024
+    page = 4096
+    baseline = pc.proc_rss_bytes()
+    buf = mmap.mmap(-1, chunk)
+    try:
+        wired = _wire_mapping(buf, chunk)
+        for offset in range(0, chunk, page):  # fault the pages in
+            buf[offset] = 1
+        while_held = pc.proc_rss_bytes()
+        peak_while_held = pc.proc_peak_rss_bytes()
+    finally:
+        buf.close()
+    after_free = pc.proc_rss_bytes()
+    peak_after = pc.proc_peak_rss_bytes()
+    return {
+        "baseline": baseline,
+        "while_held": while_held,
+        "peak_while_held": peak_while_held,
+        "after_free": after_free,
+        "peak_after": peak_after,
+        "wired": wired,
+    }
+
+
 class TestResourceShims:
     def test_proc_rss_bytes_nonnegative(self):
         # Returns this process's RSS (>0 normally) or 0 on failure — never raises.
@@ -482,6 +1252,117 @@ class TestResourceShims:
         # watchdog's RSS ceiling.
         assert pc.proc_rss_bytes() > 0
 
+    def test_proc_rss_bytes_falls_back_down_when_memory_is_released(self, tmp_path):
+        """The reading must be CURRENT residency, not the high-water mark.
+
+        Reported symptom: the dashboard's per-process memory figure only ever
+        rose, so it disagreed with Activity Monitor / ``ps -o rss=`` by however
+        much the gateway had ever transiently used. ``ru_maxrss`` never
+        decreases, so this drives a real allocation and requires the number to
+        come back down — the one property a peak cannot have.
+
+        The allocation is an ``mmap`` rather than a ``bytearray`` because the
+        RELEASE has to be observable on every platform, and only ``munmap`` is:
+        freeing a ``bytearray`` returns the pages to the allocator, which decides
+        for itself whether to hand them back to the OS. macOS's keeps all 128MB
+        resident, so the current reading did not move and this failed there while
+        agreeing exactly with ``ps -o rss=`` — a correct reading judged against an
+        allocator's discretion rather than against the property under test.
+        Closing a mapping unmaps immediately on Linux, macOS and Windows alike.
+
+        RSS covers the whole process: unrelated allocations released by a prior
+        test's threads or finalizers can cancel out this mapping's growth.
+        A fresh interpreter removes that inherited state, not OS variability.
+
+        The mapping is also WIRED where the platform allows (``mlock``), because
+        faulting a page in does not keep it resident: under memory pressure the
+        macOS compressor takes touched anonymous pages straight out of the
+        resident set, and on a loaded 3-shard runner the 128 MB mapping read back
+        as a 40 MB rise -- a correct reading that failed the "rose while held"
+        precondition. Wired pages are the one thing the kernel cannot compress or
+        evict, so the rise is the mapping's size rather than the compressor's
+        mood. ``samples["wired"]`` records whether the lock took, so a failure
+        here says which case it measured.
+        """
+        import kiro_crew
+
+        root = Path(__file__).resolve().parents[1]
+        source_root = root / "src"
+        assert Path(kiro_crew.__file__).resolve().parent == source_root / "kiro_crew"
+        assert Path(pc.__file__).resolve() == source_root / "kiro_crew" / "platform_compat.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                "import json, sys; from pathlib import Path; "
+                "sys.path[:0] = sys.argv[1:]; "
+                "import kiro_crew, test_platform_compat as probe; "
+                "assert Path(kiro_crew.__file__).resolve().parent "
+                "== Path(sys.argv[1]) / 'kiro_crew'; "
+                "assert Path(probe.pc.__file__).resolve() "
+                "== Path(sys.argv[1]) / 'kiro_crew' / 'platform_compat.py'; "
+                "assert Path(probe.__file__).resolve() "
+                "== Path(sys.argv[2]) / 'test_platform_compat.py'; "
+                "print(json.dumps(probe._measure_rss_release()))",
+                str(source_root),
+                str(root / "test"),
+                str(root),
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        samples = json.loads(result.stdout)
+        baseline = samples["baseline"]
+        while_held = samples["while_held"]
+        peak_while_held = samples["peak_while_held"]
+        after_free = samples["after_free"]
+        chunk = 128 * 1024 * 1024
+
+        # Rose by most of the buffer while it was resident.
+        assert while_held - baseline > chunk // 2, samples
+        # And gave a real part of it back. Deliberately relative to `while_held`
+        # rather than an absolute `baseline + chunk // 2` ceiling: how much the
+        # OS actually returns on free is its decision, not ours. Windows keeps
+        # freed pages in the working set until there is pressure, so it returned
+        # ~45MB of a 128MB buffer where Linux returns nearly all of it, and an
+        # absolute ceiling failed there on a reading that was behaving correctly.
+        # A peak-based implementation cannot pass this at any tolerance, because
+        # it returns a number that has not moved at all.
+        assert after_free < while_held - chunk // 8, samples
+        # The decisive property, and the one the bug got wrong: after a free the
+        # CURRENT reading must be strictly below the peak. `ru_maxrss` returns
+        # exactly the peak here, so this is the assertion that fails for it.
+        assert after_free < peak_while_held, samples
+        # The peak, by contrast, is not allowed to fall.
+        assert samples["peak_after"] >= peak_while_held, samples
+
+    def test_proc_peak_rss_bytes_reads_the_same_unit_as_the_current_reading(self):
+        # The property under test is the UNIT, not the ordering: ru_maxrss is KiB on
+        # Linux and bytes on macOS, so a missing or spurious conversion puts the two
+        # readings 1024x apart. Asserted as a bounded ratio rather than
+        # `peak >= current`, which reads as the tighter and more obvious invariant but
+        # is not atomically observable on Linux: the two come from DIFFERENT kernel
+        # accounting paths. proc_rss_bytes reads /proc/self/statm, recomputed on
+        # read, while proc_peak_rss_bytes reads getrusage's high-water mark, which
+        # the kernel maintains from per-CPU RSS deltas it syncs in batches. So while
+        # the process is allocating, the live reading legitimately sits a little
+        # above the last-synced peak -- measured up to 1.02x on this 32-core host,
+        # which is what made the strict form fail under a loaded full-suite run.
+        # 4x leaves that mechanism ~250x of headroom before a real unit error passes.
+        current = pc.proc_rss_bytes()
+        peak = pc.proc_peak_rss_bytes()
+        assert peak > 0
+        assert peak * 4 >= current, (
+            f"peak {peak} is more than 4x under the live reading {current} -- too far "
+            "apart to be counter-sync lag, so one side is in the wrong unit"
+        )
+
     def test_proc_rss_bytes_for_pid_self_positive(self):
         rss = pc.proc_rss_bytes_for_pid(os.getpid())
         # macOS has no ctypes-only per-pid path and returns None by design.
@@ -491,2235 +1372,3 @@ class TestResourceShims:
 
     def test_proc_rss_bytes_for_pid_none_for_unused_pid(self):
         assert pc.proc_rss_bytes_for_pid(2_000_000_000) is None
-
-    def test_proc_rss_tree_mb_for_pid_windows_only(self):
-        # Windows-only: the lineage-validated tree walk. On POSIX it returns None
-        # (callers keep their /proc or ps route), and it must never raise.
-        result = pc.proc_rss_tree_mb_for_pid(os.getpid())
-        if not pc.IS_WINDOWS:
-            assert result is None
-            return
-        # On Windows self (no children spawned by this test) reads a positive
-        # tree total that is at least the single-process RSS.
-        assert result is not None and result > 0
-        single = pc.proc_rss_bytes_for_pid(os.getpid())
-        assert single is not None
-        assert result >= single / (1024 * 1024) - 1  # -1: sampled microseconds apart
-
-    def test_proc_rss_tree_mb_for_pid_rejects_reserved_pid(self):
-        # A reserved/non-int pid must not anchor a tree walk (recycled-root risk).
-        assert pc.proc_rss_tree_mb_for_pid(1) is None
-        assert pc.proc_rss_tree_mb_for_pid(0) is None
-
-    def test_proc_cpu_seconds_nonnegative(self):
-        assert pc.proc_cpu_seconds() >= 0.0
-
-    def test_proc_cpu_seconds_is_positive_for_a_running_process(self):
-        # A running interpreter has always consumed some CPU. This must be > 0
-        # on every supported platform: on Windows GetCurrentProcess's handle was
-        # truncated without argtypes, so GetProcessTimes failed and this read 0.0.
-        assert pc.proc_cpu_seconds() > 0.0
-
-    def test_raise_nofile_soft_limit_is_safe(self):
-        # No-op on Windows; best-effort raise on POSIX. Must never raise.
-        pc.raise_nofile_soft_limit(4096)
-
-
-class TestChmodShims:
-    def test_chmod_safe_noop_on_missing_is_safe(self):
-        # chmod_safe logs + swallows on failure (POSIX) and is a no-op on
-        # Windows — a non-existent path must not raise either way.
-        pc.chmod_safe(os.path.join(tempfile.gettempdir(), "no-such-mc-file"), 0o600)
-
-    def test_fchmod_safe_on_real_fd_is_safe(self, tmp_path):
-        f = tmp_path / "f.txt"
-        f.write_text("x")
-        fd = os.open(str(f), os.O_RDONLY)
-        try:
-            pc.fchmod_safe(fd, 0o600)   # applies on POSIX, no-op on Windows
-        finally:
-            os.close(fd)
-
-
-class TestDirLinkShims:
-    """``symlink_or_junction`` / ``is_link_or_junction`` / ``unlink_link_or_junction``.
-
-    These run on every platform: the contract is the same everywhere (a name
-    that means another directory), only the mechanism differs — a symlink on
-    POSIX, a directory junction on Windows, where an ordinary account holds no
-    ``SeCreateSymbolicLinkPrivilege`` and ``os.symlink`` fails with
-    ``WinError 1314``.
-    """
-
-    def test_link_is_created_and_transparent(self, tmp_path):
-        target = tmp_path / "target"
-        target.mkdir()
-        (target / "index.html").write_text("hi")
-        link = tmp_path / "link"
-
-        pc.symlink_or_junction(target, link)
-
-        assert pc.is_link_or_junction(link)
-        assert link.is_dir()
-        assert link.resolve() == target.resolve()
-        # Reads go through, and later writes to the target are visible via the
-        # link — the property the dist resolver relies on for rebuild pickup.
-        assert (link / "index.html").read_text(encoding="utf-8") == "hi"
-        (target / "later.txt").write_text("fresh")
-        assert (link / "later.txt").read_text(encoding="utf-8") == "fresh"
-
-    def test_plain_dir_and_file_are_not_links(self, tmp_path):
-        plain = tmp_path / "plain"
-        plain.mkdir()
-        regular = tmp_path / "f.txt"
-        regular.write_text("x")
-
-        assert not pc.is_link_or_junction(plain)
-        assert not pc.is_link_or_junction(regular)
-        assert not pc.is_link_or_junction(tmp_path / "does-not-exist")
-
-    def test_dangling_link_is_still_reported_as_a_link(self, tmp_path):
-        """A link whose target is gone must still answer True.
-
-        The dist resolver's replace path keys off exactly this: ``exists()``
-        follows the link and is already False, so only the link-ness test can
-        tell "stale link to clean up" from "nothing here".
-        """
-        target = tmp_path / "target"
-        target.mkdir()
-        link = tmp_path / "link"
-        pc.symlink_or_junction(target, link)
-        shutil.rmtree(target)
-
-        assert pc.is_link_or_junction(link)
-        assert not link.exists()
-
-    def test_unlink_removes_the_link_and_spares_the_target(self, tmp_path):
-        target = tmp_path / "target"
-        target.mkdir()
-        (target / "keep.txt").write_text("keep")
-        link = tmp_path / "link"
-        pc.symlink_or_junction(target, link)
-
-        pc.unlink_link_or_junction(link)
-
-        assert not pc.is_link_or_junction(link)
-        assert not os.path.lexists(str(link))
-        assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
-
-    def test_unlink_removes_a_dangling_link(self, tmp_path):
-        target = tmp_path / "target"
-        target.mkdir()
-        link = tmp_path / "link"
-        pc.symlink_or_junction(target, link)
-        shutil.rmtree(target)
-
-        pc.unlink_link_or_junction(link)
-
-        assert not os.path.lexists(str(link))
-
-    def test_unlink_refuses_a_real_directory(self, tmp_path):
-        """A non-link must raise on both platforms, empty or not.
-
-        POSIX ``os.unlink`` refuses a directory outright, so the Windows
-        ``rmdir`` fallback has to be fenced to reparse points: unfenced it
-        DELETES a real empty directory, so a caller that mis-detects link-ness
-        loses data on Windows only while POSIX raises.
-        """
-        empty = tmp_path / "real-empty"
-        empty.mkdir()
-        full = tmp_path / "real-full"
-        full.mkdir()
-        (full / "keep.txt").write_text("keep")
-
-        with pytest.raises(OSError):
-            pc.unlink_link_or_junction(empty)
-        with pytest.raises(OSError):
-            pc.unlink_link_or_junction(full)
-
-        assert empty.is_dir()
-        assert (full / "keep.txt").read_text(encoding="utf-8") == "keep"
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="junctions exist only on Windows")
-    def test_windows_link_is_usable_without_elevation(self, tmp_path):
-        """Windows gets a working directory link either way it is made.
-
-        ``symlink_or_junction`` tries ``os.symlink`` FIRST and only falls back to
-        a junction, so which mechanism lands depends on whether the host holds
-        ``SeCreateSymbolicLinkPrivilege`` — GitHub's runners do, an ordinary
-        account does not. Asserting "junction, never symlink" would therefore
-        pin the unprivileged host as if it were universal, and fail on CI.
-
-        What matters to every caller is the same on both paths, so that is what
-        is asserted: the name is a reparse point that ``is_link_or_junction``
-        recognises (an ``is_symlink()``-only test does NOT see a junction, which
-        is the bug this shim exists for), it is transparent to path operations,
-        and ``rmtree`` refuses it — which is why ``unlink_link_or_junction``
-        exists. The junction branch specifically is covered by
-        ``test_junction_is_recognised_and_removable`` below.
-        """
-        target = tmp_path / "target"
-        target.mkdir()
-        (target / "f.txt").write_text("hi", encoding="utf-8")
-        link = tmp_path / "link"
-
-        pc.symlink_or_junction(target, link)
-
-        assert pc.is_link_or_junction(link)
-        assert link.is_dir()  # transparent to path operations
-        assert (link / "f.txt").read_text(encoding="utf-8") == "hi"
-        # rmtree refuses any directory link, which is why unlink_link_or_junction exists.
-        with pytest.raises(OSError):
-            shutil.rmtree(str(link))
-        pc.unlink_link_or_junction(link)
-        assert not link.exists()
-        assert target.is_dir(), "removing the link must spare the target"
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="junctions exist only on Windows")
-    def test_junction_is_recognised_and_removable(self, tmp_path):
-        """A JUNCTION specifically — the form an unprivileged Windows user gets.
-
-        Created directly via ``_winapi.CreateJunction`` rather than through the
-        shim, so this covers the unprivileged branch even on a runner that holds
-        the symlink privilege and would otherwise take the symlink path.
-        """
-        import _winapi
-
-        target = tmp_path / "target"
-        target.mkdir()
-        link = tmp_path / "junction"
-        _winapi.CreateJunction(str(target), str(link))
-
-        # A junction reports is_symlink() False — the whole reason the shim's
-        # detector cannot be an is_symlink() test.
-        assert not link.is_symlink()
-        assert pc.is_link_or_junction(link)
-        # 0xA0000003 = IO_REPARSE_TAG_MOUNT_POINT, spelled literally rather than
-        # read from the module under test (so the assertion is independent of it)
-        # and rather than via os.path.isjunction (3.12+ only; this project
-        # supports 3.10).
-        assert os.lstat(str(link)).st_reparse_tag == 0xA0000003
-        pc.unlink_link_or_junction(link)
-        assert not link.exists()
-        assert target.is_dir()
-
-    @pytest.mark.skipif(not pc.IS_POSIX, reason="POSIX symlink mechanism")
-    def test_posix_link_is_a_symlink(self, tmp_path):
-        target = tmp_path / "target"
-        target.mkdir()
-        link = tmp_path / "link"
-
-        pc.symlink_or_junction(target, link)
-
-        assert link.is_symlink()
-        assert os.readlink(str(link)) == str(target)
-
-
-# ---------------------------------------------------------------------------
-# POSIX-branch coverage for the new platform_compat helpers. The
-# tests below deliberately exercise the ``if IS_POSIX:`` / Linux ``/proc`` paths
-# and the POSIX ``except`` fall-throughs that run on the Linux build fleet. The
-# Windows branches (msvcrt / ctypes / wintypes / netstat / taskkill / WMI /
-# OpenProcess) cannot execute here and are intentionally left to Windows CI.
-# ---------------------------------------------------------------------------
-
-
-class TestFileLockContention:
-    def test_try_acquire_lock_fails_under_exclusive_contention(self, tmp_path):
-        # flock is per open-file-description: two independent os.open() calls to
-        # the same path are independent OFDs, so a second LOCK_EX|LOCK_NB on a
-        # path already held exclusively raises BlockingIOError -> the helper's
-        # POSIX failure branch returns False (this is what we're covering).
-        lock = tmp_path / ".contend.lock"
-        fd_holder = os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600)
-        fd_contender = os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600)
-        try:
-            # Real blocking exclusive lock on the holder fd.
-            pc.acquire_lock(fd_holder, exclusive=True)
-            # Non-blocking exclusive acquire on the *other* OFD must fail.
-            assert pc.try_acquire_lock(fd_contender, exclusive=True) is False
-            # Once the holder releases, the same contender fd can take it.
-            pc.release_lock(fd_holder)
-            assert pc.try_acquire_lock(fd_contender, exclusive=True) is True
-            pc.release_lock(fd_contender)
-        finally:
-            os.close(fd_holder)
-            os.close(fd_contender)
-
-    def test_shared_try_acquire_then_release_relocks(self, tmp_path):
-        # Take a shared non-blocking lock, release it, and confirm an independent
-        # OFD can then take an EXCLUSIVE lock -- which is only possible if the
-        # shared lock was genuinely released by release_lock.
-        lock = tmp_path / ".sh-release.lock"
-        fd_shared = os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600)
-        fd_other = os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600)
-        try:
-            assert pc.try_acquire_lock(fd_shared, exclusive=False) is True
-            pc.release_lock(fd_shared)
-            # Exclusive acquire from a separate OFD now succeeds (lock is free).
-            assert pc.try_acquire_lock(fd_other, exclusive=True) is True
-            pc.release_lock(fd_other)
-        finally:
-            os.close(fd_shared)
-            os.close(fd_other)
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows LK_LOCK ceiling regression")
-    def test_windows_blocking_acquire_waits_past_lk_lock_ceiling(self, tmp_path):
-        # Regression for issue #470: msvcrt's LK_LOCK "blocking" code gives up
-        # after ~10s with EDEADLOCK and the old shim treated that as "acquired".
-        # A holder that keeps the lock LONGER than that ceiling must make a
-        # blocking contender WAIT (until release or its own timeout) — never
-        # fall through and enter the critical section unserialized at ~10s.
-        #
-        # Drive _win_acquire_blocking directly with an EXPLICIT timeout past the
-        # ceiling: the module default is a short on-loop-safety ceiling, but the
-        # bug being pinned is specifically the ~10s LK_LOCK give-up point.
-        import threading
-
-        lock = tmp_path / ".ceiling.lock"
-        hold_secs = 13.0
-        fd_holder = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
-        fd_contender = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
-        released_at = {"t": 0.0}
-        entered_at = {"t": 0.0}
-        holder_ready = threading.Event()
-
-        def _hold():
-            with pc.file_lock(fd_holder, exclusive=True, required=True):
-                holder_ready.set()
-                time.sleep(hold_secs)
-                released_at["t"] = time.monotonic()
-
-        holder = threading.Thread(target=_hold)
-        holder.start()
-        try:
-            assert holder_ready.wait(timeout=10.0), "holder never took the lock"
-            # Blocking acquire on the OTHER fd with a timeout past the ~10s
-            # ceiling: it must not succeed until the holder releases at ~13s.
-            got = pc._win_acquire_blocking(fd_contender, timeout=30.0)
-            entered_at["t"] = time.monotonic()
-            assert got is True, "contender never acquired the lock after release"
-            # It entered only AFTER the holder released — proving it waited past
-            # the 10s ceiling that used to let it slip through early.
-            assert entered_at["t"] >= released_at["t"], (
-                "contender entered the critical section before the holder "
-                "released — the blocking acquire fell through the LK_LOCK ceiling"
-            )
-            pc.release_lock(fd_contender)
-        finally:
-            holder.join(timeout=20.0)
-            os.close(fd_holder)
-            os.close(fd_contender)
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows on-loop single-shot acquire")
-    def test_windows_contended_lock_on_event_loop_fails_fast(self, tmp_path):
-        # On the asyncio event-loop thread a contended lock must NOT spin-sleep
-        # (that freezes chat/heartbeat): _win_acquire_blocking is single-shot
-        # there, so file_lock fails closed immediately instead of waiting out
-        # the timeout. Assert both the fast-fail AND that it took ~no time.
-        import asyncio
-
-        lock = tmp_path / ".onloop.lock"
-        fd_holder = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
-        fd_contender = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
-
-        async def _contend_on_loop():
-            # Hold on THIS fd (non-blocking), then a second in-loop acquire on
-            # the other fd must raise at once rather than sleep to the ceiling.
-            assert pc.try_acquire_lock(fd_holder, exclusive=True) is True
-            start = time.monotonic()
-            with pytest.raises(OSError):
-                with pc.file_lock(fd_contender, exclusive=True):
-                    pass
-            elapsed = time.monotonic() - start
-            pc.release_lock(fd_holder)
-            # Single-shot: nowhere near the multi-second timeout ceiling.
-            assert elapsed < 1.0, f"on-loop acquire spun for {elapsed:.2f}s"
-
-        try:
-            asyncio.run(_contend_on_loop())
-        finally:
-            os.close(fd_holder)
-            os.close(fd_contender)
-
-
-class TestProcessIdentityPosix:
-    def test_get_ppid_of_self_is_positive_on_posix(self):
-        # POSIX: get_ppid parses /proc/<pid>/status PPid: and returns it as a
-        # positive int (every live process has a real parent). The existing
-        # test_get_ppid_returns_int only checks the type, not the parsed value.
-        ppid = pc.get_ppid(os.getpid())
-        assert isinstance(ppid, int)
-        if pc.IS_POSIX:
-            assert ppid > 0
-
-    def test_get_ppid_of_unused_pid_returns_minus_one(self):
-        # No /proc/<pid>/status entry -> read_text() raises -> swallowed by the
-        # bare except -> get_ppid returns the -1 failure sentinel (never raises).
-        assert pc.get_ppid(2_000_000_000) == -1
-
-    def test_get_ppid_of_child_equals_self(self):
-        # A child we spawn must report THIS process as its parent. Exercises the
-        # Linux /proc PPid parse + int(...) return for a non-self pid.
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            assert child.poll() is None  # alive
-            ppid = pc.get_ppid(child.pid)
-            assert isinstance(ppid, int)
-            if pc.IS_POSIX:
-                assert ppid == os.getpid()
-        finally:
-            child.kill()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-
-    def test_process_matches_true_for_a_child_with_a_known_token(self):
-        # Asserts against a token we KNOW is in the child's command line,
-        # instead of assuming the running interpreter's own command line
-        # contains "python". That assumption held on Linux (/proc/<pid>/cmdline
-        # names the interpreter) and failed on the first macOS run: there
-        # process_matches shells out to `ps -o command=`, the hosted runner
-        # launches the suite as `.../hostedtoolcache/Python/3.12/x64/bin/pytest`,
-        # and the needle comparison is case-sensitive -- "python" is not in
-        # "Python". Production needles ("kiro-cli", "claude") appear verbatim in
-        # the argv they guard, so only the test's choice of needle was fragile.
-        token = "kirocrew-procmatch-probe"
-        # Use a readiness pipe: the child signals after exec completes, so we
-        # never race /proc/<pid>/cmdline population on a loaded runner.
-        child = subprocess.Popen(
-            [
-                sys.executable, "-c",
-                f"import sys, time; sys.stdout.write('R'); sys.stdout.flush(); "
-                f"time.sleep(30)  # {token}",
-            ],
-            start_new_session=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            # Wait for the readiness byte (generous timeout for slow CI).
-            ready = child.stdout.read(1)
-            assert ready == b"R", f"child did not signal readiness: {ready!r}"
-            assert child.poll() is None  # still alive after signalling
-            if pc.IS_POSIX:
-                # /proc/<pid>/cmdline is guaranteed populated after exec, but
-                # keep a short retry for edge cases on exotic kernels.
-                deadline = time.monotonic() + 10.0
-                result = pc.process_matches(child.pid, (token,))
-                while not result and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                    result = pc.process_matches(child.pid, (token,))
-                assert result is True
-        finally:
-            child.kill()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-
-    def test_process_matches_false_for_self_with_absent_needle(self):
-        # Same /proc read as the True case, but a needle that cannot occur in a
-        # python interpreter's argv -> any() is False (not via an exception).
-        result = pc.process_matches(os.getpid(), ("zzz-not-in-any-cmdline",))
-        assert isinstance(result, bool)
-        if pc.IS_POSIX:
-            assert result is False
-
-
-class TestPidLivenessPosix:
-    def test_pid_liveness_alive_for_self(self):
-        # POSIX ALIVE path: os.kill(getpid(), 0) succeeds for our own live
-        # process, so pid_liveness reports PID_ALIVE.
-        assert pc.pid_liveness(os.getpid()) == pc.PID_ALIVE
-
-    def test_pid_liveness_dead_for_unused_pid(self):
-        # ProcessLookupError path: a PID well above pid_max is not running,
-        # so os.kill(pid, 0) raises ProcessLookupError -> PID_DEAD.
-        if pc.IS_POSIX:
-            assert pc.pid_liveness(2_000_000_000) == pc.PID_DEAD
-
-    def test_pid_liveness_unsignalable_on_permission_error(self, monkeypatch):
-        # EPERM path (cannot be reached as an unprivileged test user): force
-        # os.kill to raise PermissionError so pid_liveness returns
-        # PID_UNSIGNALABLE. Patch the module's own os.kill; monkeypatch
-        # auto-restores it after the test.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX EPERM-via-os.kill branch")
-
-        def fake_kill(pid, sig):
-            raise PermissionError(errno.EPERM, "Operation not permitted")
-
-        monkeypatch.setattr(pc.os, "kill", fake_kill)
-        assert pc.pid_liveness(os.getpid()) == pc.PID_UNSIGNALABLE
-
-    def test_pid_liveness_unsignalable_on_generic_oserror(self, monkeypatch):
-        # Generic-OSError fallback: an unknown errno from os.kill is treated
-        # conservatively as PID_UNSIGNALABLE. A bare OSError (not
-        # PermissionError) skips the PermissionError clause and hits this one.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX generic-OSError-via-os.kill branch")
-
-        def fake_kill(pid, sig):
-            raise OSError(errno.EINVAL, "Invalid argument")
-
-        monkeypatch.setattr(pc.os, "kill", fake_kill)
-        assert pc.pid_liveness(os.getpid()) == pc.PID_UNSIGNALABLE
-
-    def test_pid_exists_true_on_permission_error(self, monkeypatch):
-        # pid_exists EPERM branch: a PID we exist-but-cannot-signal must still
-        # count as existing. Force os.kill to raise PermissionError; pid_exists
-        # returns True. monkeypatch auto-restores.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX EPERM-via-os.kill branch")
-
-        def fake_kill(pid, sig):
-            raise PermissionError(errno.EPERM, "Operation not permitted")
-
-        monkeypatch.setattr(pc.os, "kill", fake_kill)
-        assert pc.pid_exists(os.getpid()) is True
-
-
-class TestProcessDescendants:
-    def test_descendants_from_parent_map_walks_full_tree(self):
-        parent_map = {
-            11: 10,
-            12: 11,
-            13: 10,
-            14: 12,
-            99: 1,
-            10: 14,
-        }
-
-        assert pc._descendants_from_parent_map(10, parent_map) == [11, 13, 12, 14]
-
-    @pytest.mark.asyncio
-    async def test_descendant_termination_handles_async_is_empty_on_posix(self):
-        if pc.IS_WINDOWS:
-            pytest.skip("POSIX process groups do not need retained descendants")
-
-        assert await pc.descendant_termination_handles_async(os.getpid()) == {}
-
-    def test_windows_parent_map_raises_when_snapshot_creation_fails(self, monkeypatch):
-        class FakeCall:
-            def __init__(self, result):
-                self.result = result
-
-            def __call__(self, *_args):
-                return self.result
-
-        kernel32 = types.SimpleNamespace(
-            CreateToolhelp32Snapshot=FakeCall(pc.wintypes.HANDLE(-1).value),
-            Process32First=FakeCall(False),
-            Process32Next=FakeCall(False),
-            CloseHandle=FakeCall(True),
-        )
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            pc.ctypes,
-            "windll",
-            types.SimpleNamespace(kernel32=kernel32),
-            raising=False,
-        )
-
-        with pytest.raises(OSError, match="process snapshot"):
-            pc._windows_process_parent_map()
-
-    def test_windows_parent_map_raises_when_initial_enumeration_fails(self, monkeypatch):
-        class FakeCall:
-            def __init__(self, result):
-                self.result = result
-                self.calls = 0
-
-            def __call__(self, *_args):
-                self.calls += 1
-                return self.result
-
-        close_handle = FakeCall(True)
-        kernel32 = types.SimpleNamespace(
-            CreateToolhelp32Snapshot=FakeCall(123),
-            Process32First=FakeCall(False),
-            Process32Next=FakeCall(False),
-            CloseHandle=close_handle,
-        )
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            pc.ctypes,
-            "windll",
-            types.SimpleNamespace(kernel32=kernel32),
-            raising=False,
-        )
-
-        with pytest.raises(OSError, match="first process"):
-            pc._windows_process_parent_map()
-
-        assert close_handle.calls == 1
-
-    def test_windows_parent_map_raises_when_later_enumeration_fails(self, monkeypatch):
-        class FakeCall:
-            def __init__(self, result):
-                self.result = result
-                self.calls = 0
-
-            def __call__(self, *_args):
-                self.calls += 1
-                return self.result
-
-        close_handle = FakeCall(True)
-        kernel32 = types.SimpleNamespace(
-            CreateToolhelp32Snapshot=FakeCall(123),
-            Process32First=FakeCall(True),
-            Process32Next=FakeCall(False),
-            CloseHandle=close_handle,
-            SetLastError=FakeCall(True),
-            GetLastError=FakeCall(5),
-        )
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            pc.ctypes,
-            "windll",
-            types.SimpleNamespace(kernel32=kernel32),
-            raising=False,
-        )
-        with pytest.raises(OSError, match="process enumeration"):
-            pc._windows_process_parent_map()
-
-        assert close_handle.calls == 1
-
-    def test_windows_descendant_lifetime_accepts_genuine_pre_exit_child(
-        self,
-        monkeypatch,
-    ):
-        parent_maps = iter(({101: 100}, {101: 100}))
-        closed: list[int] = []
-        identities = {
-            8001: (100, 10, 20),
-            9001: (101, 15, None),
-        }
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_windows_process_parent_map", lambda: next(parent_maps))
-        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid: 9001)
-        monkeypatch.setattr(
-            pc,
-            "_windows_process_handle_identity",
-            identities.get,
-        )
-        monkeypatch.setattr(pc, "close_process_handle", closed.append)
-
-        assert pc.descendant_termination_handles(100, {}, 8001) == {101: 9001}
-        assert closed == []
-
-    def test_windows_descendant_lifetime_rejects_post_exit_recycled_child(
-        self,
-        monkeypatch,
-    ):
-        parent_maps = iter(({101: 100}, {101: 100}))
-        closed: list[int] = []
-        identities = {
-            8001: (100, 10, 20),
-            9001: (101, 21, None),
-        }
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_windows_process_parent_map", lambda: next(parent_maps))
-        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid: 9001)
-        monkeypatch.setattr(
-            pc,
-            "_windows_process_handle_identity",
-            identities.get,
-        )
-        monkeypatch.setattr(pc, "close_process_handle", closed.append)
-
-        assert pc.descendant_termination_handles(100, {}, 8001) == {}
-        assert closed == [9001]
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows process handles only")
-    def test_retained_handle_targets_original_windows_child(self):
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            creationflags=pc.CREATE_NEW_PROCESS_GROUP,
-        )
-        handles: dict[int, int] = {}
-        root_handle = pc._open_process_termination_handle(os.getpid())
-        assert root_handle is not None
-        try:
-            deadline = time.monotonic() + 5
-            while child.pid not in handles and time.monotonic() < deadline:
-                handles.update(
-                    pc.descendant_termination_handles(
-                        os.getpid(),
-                        handles,
-                        root_handle,
-                    )
-                )
-                if child.pid not in handles:
-                    time.sleep(0.05)
-            assert child.pid in handles
-            assert pc.terminate_process_handle(handles[child.pid]) is True
-            child.wait(timeout=5)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=5)
-            for handle in handles.values():
-                pc.close_process_handle(handle)
-            pc.close_process_handle(root_handle)
-
-
-@pytest.mark.skipif(
-    not pc.IS_WINDOWS,
-    reason="exercises the real Windows ctypes identity path (ctypes.WinDLL, "
-    "wintypes.FILETIME); the logic is Windows-native and runs on the Windows shard",
-)
-class TestWindowsHandleIdentityExitFiletimeRace:
-    """GetExitCodeProcess reports the exit before the exit FILETIME is published.
-
-    A handle read inside that window looks exited-with-exit_time==0. Treating it
-    as "no identity" made ``descendant_termination_handles`` raise on a healthy
-    tree, which surfaced as a ~1-in-3 false "Install Kiro CLI" on Windows.
-    """
-
-    # The pid every faked handle below reports.
-    FAKE_PID = 4242
-
-    @classmethod
-    def _kernel32(cls, exit_filetimes):
-        """Fake kernel32 replaying *exit_filetimes* from successive time reads.
-
-        A ``0`` entry is the exited-but-unpublished window; a non-zero entry is a
-        published exit FILETIME. The process always reports as exited.
-        """
-
-        reads = iter(exit_filetimes)
-
-        class _Fn:
-            """Stands in for a ctypes function pointer (assignable argtypes)."""
-
-            argtypes: list = []
-            restype = None
-
-            def __init__(self, impl):
-                self._impl = impl
-
-            def __call__(self, *args):
-                return self._impl(*args)
-
-        def _get_process_times(_handle, creation, exit_, _kernel, _user):
-            creation._obj.dwHighDateTime = 0
-            creation._obj.dwLowDateTime = 100
-            exit_._obj.dwHighDateTime = 0
-            exit_._obj.dwLowDateTime = next(reads, 0)
-            return 1
-
-        def _get_exit_code(_handle, code):
-            code._obj.value = 0  # any value but STILL_ACTIVE (259)
-            return 1
-
-        return types.SimpleNamespace(
-            GetProcessId=_Fn(lambda _handle: cls.FAKE_PID),
-            GetProcessTimes=_Fn(_get_process_times),
-            GetExitCodeProcess=_Fn(_get_exit_code),
-        )
-
-    def test_identity_retries_until_exit_filetime_is_published(self, monkeypatch):
-        # First two reads land inside the unpublished window; the third has the
-        # real exit time. The identity must be returned, not refused.
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        fake = self._kernel32([0, 0, 0, 777])
-        monkeypatch.setattr(pc.ctypes, "WinDLL", lambda *_a, **_k: fake)
-        monkeypatch.setattr(pc.time, "sleep", lambda _s: None)
-
-        identity = pc._windows_process_handle_identity(5)
-
-        assert identity is not None
-        pid, creation, exit_time = identity
-        assert (pid, creation, exit_time) == (4242, 100, 777)
-
-    def test_identity_gives_up_when_exit_filetime_never_publishes(self, monkeypatch):
-        # A handle whose exit time never appears must still be refused, so the
-        # PID-recycling guard the caller depends on is not weakened into a
-        # blanket "assume it is fine".
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        fake = self._kernel32([0] * 500)
-        monkeypatch.setattr(pc.ctypes, "WinDLL", lambda *_a, **_k: fake)
-        monkeypatch.setattr(pc.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(pc, "_WINDOWS_EXIT_FILETIME_TIMEOUT_SECS", 0.01)
-
-        assert pc._windows_process_handle_identity(5) is None
-
-    def test_descendant_scan_does_not_raise_for_a_root_inside_the_window(
-        self,
-        monkeypatch,
-    ):
-        # The defect's actual blast radius: an exited root whose FILETIME has not
-        # published yet must not make the scan raise "root handle identity
-        # mismatch" at its caller, which is what failed the whole kiro-cli probe.
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        fake = self._kernel32([0, 0, 555])
-        monkeypatch.setattr(pc.ctypes, "WinDLL", lambda *_a, **_k: fake)
-        monkeypatch.setattr(pc.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(pc, "_windows_process_parent_map", lambda: {})
-
-        # 4242 is the pid the fake handle reports, so the root identity matches.
-        assert pc.descendant_termination_handles(4242, {}, 8001) == {}
-
-
-class TestKillSubprocessPosix:
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="POSIX os.kill path; Windows uses taskkill")
-    def test_kill_pid_terminates_real_child_posix(self):
-        # POSIX kill_pid success path (os.kill + return True): spawn a real
-        # long-lived child, confirm it is alive, SIGKILL it via the shim, then
-        # reap it so its PID leaves the table and pid_exists() flips to False.
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        try:
-            assert pc.pid_exists(child.pid) is True
-            assert pc.kill_pid(child.pid, pc.SIGKILL) is True
-            # Reap the killed child so it is no longer a zombie occupying the
-            # PID; otherwise os.kill(pid, 0) would still report it as existing.
-            child.wait(timeout=5)
-            deadline = time.monotonic() + 2.0
-            while pc.pid_exists(child.pid) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert pc.pid_exists(child.pid) is False
-        finally:
-            if child.poll() is None:
-                child.kill()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="POSIX killpg path; Windows uses taskkill /T")
-    def test_kill_process_tree_kills_group_posix(self):
-        # POSIX kill_process_tree success path (os.getpgid + os.killpg + return
-        # True): spawn the child in its OWN session/process group so its pgid
-        # equals its pid, then tree-kill the group and confirm it is gone.
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            start_new_session=True,
-        )
-        try:
-            assert os.getpgid(child.pid) == child.pid
-            assert pc.pid_exists(child.pid) is True
-            assert pc.kill_process_tree(child.pid, pc.SIGKILL) is True
-            child.wait(timeout=5)
-            deadline = time.monotonic() + 2.0
-            while pc.pid_exists(child.pid) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert pc.pid_exists(child.pid) is False
-        finally:
-            if child.poll() is None:
-                child.kill()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-
-
-class TestTaskkillErrorMapping:
-    """Regression guards for the Windows taskkill rc -> exception mapping.
-
-    Ensures the shim raises the same exception TYPES the POSIX branch raises
-    so callers' ``except (ProcessLookupError, PermissionError, OSError)``
-    guards fire uniformly on both platforms. Runs on POSIX by monkeypatching
-    IS_WINDOWS + subprocess.run — the mapping is platform-independent code,
-    and doing so keeps the Windows security branches regression-guarded on
-    the Linux CI fleet.
-    """
-
-    @staticmethod
-    def _fake_run(rc: int, stderr: bytes = b""):
-        def _run(*_a, **_kw):
-            r = types.SimpleNamespace(returncode=rc, stdout=b"", stderr=stderr)
-            return r
-        return _run
-
-    def test_taskkill_rc128_maps_to_process_lookup(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run",
-                            self._fake_run(128, b"process not found"))
-        with pytest.raises(ProcessLookupError):
-            pc.kill_pid(99999, pc.SIGKILL)
-        with pytest.raises(ProcessLookupError):
-            pc.kill_process_tree(99999, pc.SIGKILL)
-
-    def test_taskkill_rc5_maps_to_permission_error(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run",
-                            self._fake_run(5, b"access denied"))
-        with pytest.raises(PermissionError):
-            pc.kill_pid(99999, pc.SIGKILL)
-        with pytest.raises(PermissionError):
-            pc.kill_process_tree(99999, pc.SIGKILL)
-
-    def test_taskkill_generic_rc_maps_to_oserror(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run",
-                            self._fake_run(42, b"weird error"))
-        with pytest.raises(OSError) as ei:
-            pc.kill_pid(99999, pc.SIGKILL)
-        # not one of the more specific subclasses
-        assert not isinstance(ei.value, (ProcessLookupError, PermissionError))
-
-    def test_taskkill_success_returns_true_on_windows(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run", self._fake_run(0))
-        assert pc.kill_pid(99999, pc.SIGKILL) is True
-        assert pc.kill_process_tree(99999, pc.SIGKILL) is True
-
-    def test_taskkill_subprocess_error_wraps_as_oserror(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-
-        def _boom(*_a, **_kw):
-            raise FileNotFoundError(2, "taskkill.exe not found")
-        monkeypatch.setattr(pc.subprocess, "run", _boom)
-        with pytest.raises(OSError):
-            pc.kill_pid(99999, pc.SIGKILL)
-        with pytest.raises(OSError):
-            pc.kill_process_tree(99999, pc.SIGKILL)
-
-
-class TestRestrictToOwnerArgvOnLinux:
-    """Regression guard for the Windows icacls DACL argv fix.
-
-    Runs on the Linux CI fleet by monkeypatching IS_WINDOWS + subprocess.run —
-    the argv construction is platform-independent code, and without this the
-    security-critical `icacls /inheritance:r /grant:r "*S-1-3-4:F" /grant:r
-    "*<user-sid>:F"` string is only exercised on the author's manual Windows
-    E2E (skipif-Windows tests don't run on AL2). A regression that mangles
-    the flags or the S-1-3-4 SID silently reopens the parent-inherited-DACL
-    gap.
-    """
-
-    def test_icacls_argv_includes_owner_and_user_grants(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        # Reset the success-only SID memo so the monkeypatched stub wins
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid",
-                            lambda: "*S-1-5-21-1-2-3-1000")
-        captured: dict = {}
-
-        def fake_run(argv, **_kw):
-            captured["argv"] = list(argv)
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-        pc.restrict_to_owner(f)
-        argv = captured["argv"]
-        # icacls + path + /inheritance:r + Owner Rights grant + user-SID grant.
-        assert argv[0].endswith("icacls") or "icacls" in argv[0]
-        assert os.fspath(f) in argv
-        assert "/inheritance:r" in argv
-        # Grants come in (flag, "SID:F") pairs — assert both are present.
-        grants = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "/grant:r"]
-        assert "*S-1-3-4:F" in grants, grants
-        assert "*S-1-5-21-1-2-3-1000:F" in grants, grants
-
-    def test_icacls_nonzero_rc_raises_oserror_on_linux_shim_path(self, tmp_path, monkeypatch):
-        # With a resolvable SID, an icacls non-zero rc still raises OSError so
-        # the caller's warn-and-continue handler fires. Complements the
-        # None-SID early-raise test below.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid",
-                            lambda: "*S-1-5-21-9-9-9-9")
-        monkeypatch.setattr(pc.subprocess, "run",
-                            lambda *a, **k: types.SimpleNamespace(
-                                returncode=1, stdout=b"", stderr=b"denied"))
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-        with pytest.raises(OSError):
-            pc.restrict_to_owner(f)
-
-    def test_none_sid_raises_before_icacls_to_avoid_lockout(self, tmp_path, monkeypatch):
-        # When _current_user_sid() returns None (whoami absent / fails /
-        # unparseable), restrict_to_owner MUST refuse to apply a lockdown —
-        # granting only S-1-3-4 (Owner Rights) with inheritance stripped
-        # locks non-owner users out of their own file (elevated first-run,
-        # backup restore, SYSTEM-context service scenarios). Fail-loud with
-        # OSError BEFORE invoking icacls; the caller's warn handler fires
-        # and the pre-existing DACL is preserved unchanged.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: None)
-        called = []
-
-        def fake_run(argv, **_kw):
-            called.append(list(argv))
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-        with pytest.raises(OSError) as ei:
-            pc.restrict_to_owner(f)
-        assert "current user SID" in str(ei.value) or "whoami" in str(ei.value)
-        # icacls must NOT have been spawned — the whole point is to avoid
-        # applying a half-configured lockdown.
-        assert called == [], f"icacls should not run when SID is unknown: {called}"
-
-    def test_sid_failure_is_not_cached_success_is(self, monkeypatch):
-        # A transient whoami failure (timeout under AV scan, non-zero rc) must
-        # NOT be memoized: with lru_cache the first failure poisoned every
-        # later restrict_to_owner for the process lifetime. The success-only
-        # memo retries after a failure and caches only a resolved SID.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        # Force the whoami fallback, which is what this test covers. On a real
-        # Windows host the non-spawn primary (the process token) succeeds, so
-        # without this the flaky_run below is never reached and the first
-        # assertion sees a genuine SID instead of the simulated failure.
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        attempts = []
-
-        def flaky_run(argv, **_kw):
-            attempts.append(argv)
-            if len(attempts) == 1:
-                return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
-            return types.SimpleNamespace(
-                returncode=0, stdout=b'"ANT\\user","S-1-5-21-1-2-3-500"', stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", flaky_run)
-        assert pc._current_user_sid() is None          # first call fails...
-        assert pc._current_user_sid() == "*S-1-5-21-1-2-3-500"  # ...retry succeeds
-        assert pc._current_user_sid() == "*S-1-5-21-1-2-3-500"  # ...and is cached
-        assert len(attempts) == 2, "success must be memoized (no third spawn)"
-
-
-class TestChmodShimsApply:
-    def test_fchmod_safe_applies_mode_on_posix(self, tmp_path):
-        # POSIX: fchmod_safe must actually apply the mode to the open fd. Verify
-        # via os.fstat (the assert is POSIX-only; Windows has no perm bits).
-        f = tmp_path / "fchmod-apply.txt"
-        f.write_text("x")
-        fd = os.open(str(f), os.O_RDONLY)
-        try:
-            pc.fchmod_safe(fd, 0o600)
-            if pc.IS_POSIX:
-                assert os.fstat(fd).st_mode & 0o777 == 0o600
-        finally:
-            os.close(fd)
-
-    def test_fchmod_safe_swallows_oserror(self, tmp_path, monkeypatch):
-        # The except branch: os.fchmod raising OSError must be logged + swallowed,
-        # never propagated. Force the error since a real fd would just succeed.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX os.fchmod branch")
-        f = tmp_path / "fchmod-err.txt"
-        f.write_text("x")
-        fd = os.open(str(f), os.O_RDONLY)
-
-        def boom(*args, **kwargs):
-            raise OSError("forced")
-
-        monkeypatch.setattr(pc.os, "fchmod", boom)
-        try:
-            pc.fchmod_safe(fd, 0o600)  # must NOT raise out
-        finally:
-            os.close(fd)
-
-    def test_chmod_safe_applies_mode_on_posix(self, tmp_path):
-        # POSIX: chmod_safe must apply the mode to the path on disk.
-        f = tmp_path / "chmod-apply.txt"
-        f.write_text("x")
-        pc.chmod_safe(str(f), 0o640)
-        if pc.IS_POSIX:
-            assert oct(os.stat(str(f)).st_mode & 0o777) == "0o640"
-
-    def test_chmod_safe_swallows_oserror(self, tmp_path, monkeypatch):
-        # The except branch: os.chmod raising OSError is logged + swallowed.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX os.chmod branch")
-        f = tmp_path / "chmod-err.txt"
-        f.write_text("x")
-
-        def boom(*args, **kwargs):
-            raise OSError("forced")
-
-        monkeypatch.setattr(pc.os, "chmod", boom)
-        pc.chmod_safe(str(f), 0o640)  # must NOT raise out
-
-
-class TestRestrictToOwner:
-    """Fail-loud owner-only lockdown used by every ~/.kirocrew secret writer.
-
-    The review finding was that the earlier
-    ``if IS_POSIX: os.chmod(...)`` guard left Windows with NO per-file owner-only
-    restriction on the token signing key, per-app secrets, refresh-token state,
-    snapshot tarball, and cron internal-secret temp file — a secret-at-rest
-    posture regression. ``restrict_to_owner`` closes that: POSIX chmod 0o600,
-    Windows an owner-only DACL applied via icacls (S-1-3-4 = Owner Rights).
-    """
-
-    def test_applies_owner_only_mode_on_posix(self, tmp_path):
-        # POSIX path: exact 0o600 mode on disk. Verified only on POSIX because
-        # NTFS has no ``st_mode`` perm bits and would report 0o666/0o444 based
-        # on the read-only attribute, not the DACL.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX chmod branch")
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-        pc.restrict_to_owner(f)
-        assert os.stat(str(f)).st_mode & 0o777 == 0o600
-
-    def test_propagates_oserror_on_posix(self, tmp_path, monkeypatch):
-        # The fail-loud contract: OSError from os.chmod MUST propagate so the
-        # security-warning handlers in the callers (token_secret,
-        # refresh_tokens, snapshot, cron_script, server, token_auth) fire.
-        # Distinct from chmod_safe (which swallows). Regression guard.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX chmod branch")
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-
-        def boom(*args, **kwargs):
-            raise OSError(errno.EPERM, "forced")
-
-        monkeypatch.setattr(pc.os, "chmod", boom)
-        with pytest.raises(OSError):
-            pc.restrict_to_owner(f)
-
-    def test_applies_owner_only_dacl_on_windows(self, tmp_path):
-        # Windows path: shell out to icacls, then re-read the DACL via icacls
-        # to confirm the expected owner-only shape (S-1-3-4 with F, no inherit).
-        # This is the actual defect the review flagged, so verify it end-to-end.
-        if not pc.IS_WINDOWS:
-            pytest.skip("Windows DACL branch")
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-        pc.restrict_to_owner(f)
-        out = subprocess.check_output(
-            ["icacls", str(f)], stderr=subprocess.DEVNULL,
-        ).decode("utf-8", "replace")
-        # Owner Rights SID rendered as "OWNER RIGHTS" in the DACL dump, with (F)
-        # for full control; inheritance stripping means "(I)" (inherited) markers
-        # from parent ACEs are gone.
-        assert "OWNER RIGHTS:(F)" in out
-        assert "(I)(F)" not in out  # no inherited full-control ACEs left
-
-    def test_propagates_oserror_on_windows_when_icacls_missing(self, tmp_path, monkeypatch):
-        # The fail-loud contract on Windows: icacls returning nonzero or
-        # failing to launch MUST raise OSError so the caller's warn-and-continue
-        # handler fires (dead-code otherwise, per review-bot). Simulate by pointing
-        # the resolver at a nonexistent binary; the SubprocessError branch of
-        # subprocess.run is what raises FileNotFoundError -> OSError below.
-        if not pc.IS_WINDOWS:
-            pytest.skip("Windows icacls branch")
-        f = tmp_path / "secret.key"
-        f.write_bytes(b"s" * 32)
-
-        real_run = subprocess.run
-
-        def failing_run(argv, **kwargs):
-            if argv and "icacls" in str(argv[0]).lower():
-                raise FileNotFoundError(2, "icacls.exe not found")
-            return real_run(argv, **kwargs)
-
-        monkeypatch.setattr(pc.subprocess, "run", failing_run)
-        monkeypatch.setattr(pc.shutil, "which", lambda _name: None)
-        with pytest.raises(OSError):
-            pc.restrict_to_owner(f)
-
-
-class TestResourceShimFailures:
-    def test_proc_rss_bytes_returns_zero_on_getrusage_failure(self, monkeypatch):
-        # The failure branch: getrusage raising OSError must yield 0, not raise.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX resource.getrusage branch")
-
-        def boom(*args, **kwargs):
-            raise OSError("getrusage failed")
-
-        monkeypatch.setattr(pc.resource, "getrusage", boom)
-        assert pc.proc_rss_bytes() == 0
-
-    def test_proc_cpu_seconds_returns_zero_on_getrusage_failure(self, monkeypatch):
-        # The failure branch: getrusage raising OSError must yield 0.0, not raise.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX resource.getrusage branch")
-
-        def boom(*args, **kwargs):
-            raise OSError("getrusage failed")
-
-        monkeypatch.setattr(pc.resource, "getrusage", boom)
-        assert pc.proc_cpu_seconds() == 0.0
-
-    def test_raise_nofile_soft_limit_executes_setrlimit(self):
-        # Exercise the POSIX getrlimit/setrlimit branch with a real limit nudge,
-        # then restore the original limit so no other test is affected. Lower the
-        # soft limit first (never the hard limit) so the subsequent shim call
-        # takes the `soft < target` setrlimit path; restore in finally.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX RLIMIT_NOFILE branch")
-        soft, hard = pc.resource.getrlimit(pc.resource.RLIMIT_NOFILE)
-        lowered = max(64, (soft if soft != pc.resource.RLIM_INFINITY else hard) // 2)
-        try:
-            pc.resource.setrlimit(pc.resource.RLIMIT_NOFILE, (lowered, hard))
-            # target above the lowered soft limit -> setrlimit branch executes.
-            pc.raise_nofile_soft_limit(lowered + 1)
-            new_soft = pc.resource.getrlimit(pc.resource.RLIMIT_NOFILE)[0]
-            assert new_soft >= lowered + 1
-        finally:
-            pc.resource.setrlimit(pc.resource.RLIMIT_NOFILE, (soft, hard))
-
-    def test_raise_nofile_soft_limit_swallows_setrlimit_error(self, monkeypatch):
-        # The except branch: if setrlimit raises (e.g. EPERM raising the soft
-        # limit on a locked-down host), the shim logs at debug and never raises.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX RLIMIT_NOFILE branch")
-
-        def boom(*args, **kwargs):
-            raise OSError("setrlimit denied")
-
-        # getrlimit reports a soft below the target so the setrlimit call is
-        # attempted (and then fails), exercising the try-body + except.
-        monkeypatch.setattr(pc.resource, "getrlimit", lambda which: (100, 1_000_000))
-        monkeypatch.setattr(pc.resource, "setrlimit", boom)
-        pc.raise_nofile_soft_limit(500)  # must NOT raise out
-
-
-class TestFindPythonInterpreterReal:
-    def test_real_resolve_returns_none_or_valid_python(self):
-        # No mocks: drive the REAL resolution loop. On the Linux build host a
-        # versioned python3.1x resolves and runs the version probe, returning
-        # its path; in a stripped sandbox nothing resolves and we get None.
-        # Tolerant either-way so it can never flake.
-        got = pc.find_python_interpreter()
-        assert got is None or isinstance(got, str)
-        if got is not None:
-            assert os.path.exists(got)
-            assert "python" in got.lower()
-
-    def test_returns_none_when_version_probe_raises(self, monkeypatch):
-        # Force the version-probe subprocess to fail for a resolvable, non-stub
-        # path: the except (OSError, ValueError, SubprocessError) -> continue
-        # branch fires for every candidate, so the loop exhausts -> None.
-        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/python3.99")
-
-        def boom(*args, **kwargs):
-            raise subprocess.SubprocessError("probe failed")
-
-        monkeypatch.setattr(pc.subprocess, "check_output", boom)
-        assert pc.find_python_interpreter() is None
-
-
-class TestFindListeningPidsErrors:
-    def test_returns_empty_when_lsof_missing(self, monkeypatch):
-        # Simulate lsof not being installed: check_output raises
-        # FileNotFoundError -> the except returns [] (fail-closed).
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX lsof branch")
-
-        def no_lsof(*args, **kwargs):
-            raise FileNotFoundError("lsof")
-
-        monkeypatch.setattr(pc.subprocess, "check_output", no_lsof)
-        assert pc.find_listening_pids(59998) == []
-
-    def test_dedupes_pids_from_lsof_output(self, monkeypatch):
-        # lsof can emit the same PID multiple times (one row per fd); the helper
-        # must dedupe while preserving first-seen order.
-        if not pc.IS_POSIX:
-            pytest.skip("POSIX lsof branch")
-        monkeypatch.setattr(pc.subprocess, "check_output", lambda *a, **k: "111\n111\n222\n")
-        assert pc.find_listening_pids(7777) == [111, 222]
-
-    def _fake_netstat(self, blob: str):
-        """Return a fake subprocess.check_output that returns *blob*."""
-        def _run(*_a, **_kw):
-            return blob
-        return _run
-
-    def test_windows_finds_ipv6_listener_via_netstat(self, monkeypatch):
-        # Regression:. Windows netstat -ano prints IPv6 LISTEN rows
-        # with proto column "TCP" (NOT "TCP6") and address form [::1]:<port>.
-        # Before this fix `-p tcp` on the netstat argv dropped these entirely,
-        # so `kirocrew stop` / `kirocrew restart` silently no-op'd when the
-        # gateway bound v6. This canned blob mirrors what real Windows netstat
-        # actually prints (verified on Windows 11 24H2 with an AF_INET6
-        # loopback listener) — regression-guards without a Windows CI lane.
-        blob = (
-            "  Proto  Local Address          Foreign Address        State           PID\n"
-            "  TCP    [::1]:7777             [::]:0                 LISTENING       12345\n"
-        )
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
-        assert pc.find_listening_pids(7777) == [12345]
-
-    def test_windows_dedupes_dualstack_v4_and_v6_rows(self, monkeypatch):
-        # A dual-stack listener shows up as TWO netstat rows sharing a PID
-        # (very common for aiohttp / http.server with an empty host). Existing
-        # dict.fromkeys() dedup must collapse them and preserve first-seen
-        # order.
-        blob = (
-            "  TCP    0.0.0.0:7777           0.0.0.0:0              LISTENING       99\n"
-            "  TCP    [::]:7777              [::]:0                 LISTENING       99\n"
-        )
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
-        assert pc.find_listening_pids(7777) == [99]
-
-    def test_windows_accepts_tcp6_label_defensively(self, monkeypatch):
-        # Today Windows netstat prints plain "TCP" for both families, but we
-        # relaxed the proto check from `== "TCP"` to `startswith("TCP")` to
-        # future-proof against a hypothetical Windows build that switches to
-        # "TCP6" (the netstat -p flag already accepts "tcpv6"). Guard the
-        # defensive path so a future relabel doesn't silently re-break this.
-        blob = (
-            "  TCP6   [::1]:7777             [::]:0                 LISTENING       77\n"
-        )
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
-        assert pc.find_listening_pids(7777) == [77]
-
-    def test_windows_ignores_non_listening_rows(self, monkeypatch):
-        # ESTABLISHED / TIME_WAIT etc. must never match: their foreign
-        # endpoint is a real peer (not the 0.0.0.0:0 / [::]:0 wildcard) and
-        # their state is not LISTENING, so both signals reject them.
-        blob = (
-            "  TCP    127.0.0.1:7777         127.0.0.1:9999         ESTABLISHED     55\n"
-            "  TCP    127.0.0.1:7777         0.0.0.0:0              LISTENING       88\n"
-        )
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
-        assert pc.find_listening_pids(7777) == [88]
-
-    def test_windows_finds_listener_on_localized_netstat(self, monkeypatch):
-        # netstat localizes state names (German "ABHÖREN", French, Cyrillic…),
-        # so matching the English "LISTENING" literal alone returns [] on any
-        # non-English Windows and stop/restart silently no-op with the gateway
-        # still holding the port. Listener detection therefore keys off the
-        # wildcard FOREIGN endpoint (0.0.0.0:0 / [::]:0), which is
-        # locale-independent; the English literal remains as a second signal.
-        blob = (
-            "  Proto  Lokale Adresse         Remoteadresse          Status          PID\n"
-            "  TCP    127.0.0.1:7777         0.0.0.0:0              ABHÖREN         44\n"
-            "  TCP    [::1]:7777             [::]:0                 ABHÖREN         44\n"
-            "  TCP    127.0.0.1:7777         127.0.0.1:9999         HERGESTELLT     66\n"
-        )
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
-        assert pc.find_listening_pids(7777) == [44]
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows netstat branch")
-    def test_windows_finds_real_ipv6_loopback_listener(self):
-        # End-to-end guard on a live host: bind AF_INET6 to ::1 at an ephemeral
-        # port and confirm find_listening_pids returns THIS process's pid.
-        # Loopback-only (::1) so no firewall prompt fires. Complements the
-        # canned-blob tests above by exercising the real netstat parse against
-        # whatever this Windows build actually prints.
-        import socket as _socket
-        s = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
-        try:
-            s.bind(("::1", 0))
-            s.listen()
-            port = s.getsockname()[1]
-            pids = pc.find_listening_pids(port)
-            assert os.getpid() in pids, f"expected pid {os.getpid()} in {pids}"
-        finally:
-            s.close()
-
-
-class TestKillAsyncVariants:
-    """Regression guards for the async ``kill_pid_async`` / ``kill_process_tree_async``
-    variants (Mesh-2801).
-
-    The async wrappers exist so async call sites can offload the blocking
-    Windows ``taskkill`` spawn to :func:`kiro_crew.executors.subprocess_executor`
-    without stalling the event loop. The POSIX branch dispatches inline to the
-    sync ``kill_pid`` / ``kill_process_tree`` (``os.kill`` / ``os.killpg`` are
-    non-blocking, and preserving the same callable keeps existing tests that
-    patch the sync entrypoints working). Windows offload is exercised via
-    monkeypatching IS_WINDOWS + subprocess.run so the branch is covered on
-    the Linux CI fleet.
-    """
-
-    def test_posix_kill_pid_async_dispatches_inline_to_kill_pid(self, monkeypatch):
-        """POSIX branch: kill_pid_async calls kill_pid synchronously so tests
-        that patch platform_compat.kill_pid observe the call unchanged."""
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        monkeypatch.setattr(pc, "IS_WINDOWS", False)
-        seen: list[tuple[int, int]] = []
-
-        def fake_kill_pid(pid: int, sig: int) -> bool:
-            seen.append((pid, sig))
-            return True
-
-        monkeypatch.setattr(pc, "kill_pid", fake_kill_pid)
-        import asyncio as _asyncio
-
-        result = _asyncio.new_event_loop().run_until_complete(
-            pc.kill_pid_async(4242, pc.SIGKILL)
-        )
-        assert result is True
-        assert seen == [(4242, pc.SIGKILL)]
-
-    def test_posix_kill_process_tree_async_dispatches_inline(self, monkeypatch):
-        """POSIX branch: kill_process_tree_async calls kill_process_tree inline
-        (same-callable dispatch keeps existing patch-based tests working)."""
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        monkeypatch.setattr(pc, "IS_WINDOWS", False)
-        seen: list[tuple[int, int]] = []
-
-        def fake_kill_tree(pid: int, sig: int) -> bool:
-            seen.append((pid, sig))
-            return True
-
-        monkeypatch.setattr(pc, "kill_process_tree", fake_kill_tree)
-        import asyncio as _asyncio
-
-        result = _asyncio.new_event_loop().run_until_complete(
-            pc.kill_process_tree_async(9999, pc.SIGTERM)
-        )
-        assert result is True
-        assert seen == [(9999, pc.SIGTERM)]
-
-    def test_posix_kill_pid_async_propagates_process_lookup_error(self, monkeypatch):
-        """POSIX branch propagates ProcessLookupError from kill_pid — callers'
-        ``except (ProcessLookupError, OSError)`` guards must still fire."""
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        monkeypatch.setattr(pc, "IS_WINDOWS", False)
-
-        def raiser(*_a, **_kw):
-            raise ProcessLookupError("gone")
-
-        monkeypatch.setattr(pc, "kill_pid", raiser)
-        import asyncio as _asyncio
-
-        loop = _asyncio.new_event_loop()
-        with pytest.raises(ProcessLookupError):
-            loop.run_until_complete(pc.kill_pid_async(1, pc.SIGKILL))
-
-    def test_windows_kill_pid_async_offloads_via_subprocess_executor(self, monkeypatch):
-        """Windows branch: kill_pid_async submits the taskkill spawn to
-        subprocess_executor() (so the event loop never blocks on taskkill.exe).
-
-        Monkeypatched on Linux by flipping IS_WINDOWS and stubbing the executor
-        to a synchronous callable-runner; asserts the run_in_executor path was
-        taken by observing the executor sentinel captured at call time.
-        """
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-
-        # Fake subprocess_executor sentinel — anything hashable-and-truthy.
-        sentinel = object()
-        seen_executors: list[object] = []
-
-        # Stub subprocess.run so kill_pid returns success without spawning.
-        def fake_run(*_a, **_kw):
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
-
-        # Patch the `subprocess_executor` name bound in the platform_compat
-        # module namespace (top-level `from kiro_crew.executors import ...`)
-        # to return our sentinel.
-        monkeypatch.setattr(pc, "subprocess_executor", lambda: sentinel)
-
-        # Intercept the loop's run_in_executor to record which executor is used.
-        import asyncio as _asyncio
-
-        real_loop = _asyncio.new_event_loop()
-
-        async def _driver() -> bool:
-            loop = _asyncio.get_running_loop()
-            orig_rie = loop.run_in_executor
-
-            def spy(executor, func, *args):
-                seen_executors.append(executor)
-                # Run the callable inline in a completed future so we don't
-                # actually need the sentinel to be a real Executor.
-                fut: _asyncio.Future[bool] = loop.create_future()
-                try:
-                    fut.set_result(func(*args))
-                except BaseException as exc:  # pragma: no cover — defensive
-                    fut.set_exception(exc)
-                return fut
-
-            loop.run_in_executor = spy  # type: ignore[method-assign]
-            try:
-                return await pc.kill_pid_async(1234, pc.SIGKILL)
-            finally:
-                loop.run_in_executor = orig_rie  # type: ignore[method-assign]
-
-        result = real_loop.run_until_complete(_driver())
-        assert result is True
-        assert seen_executors == [sentinel], (
-            f"expected the subprocess_executor sentinel, got {seen_executors!r}"
-        )
-
-    def test_windows_kill_process_tree_async_offloads_via_subprocess_executor(
-        self, monkeypatch
-    ):
-        """Same offload contract as kill_pid_async but for the /T variant."""
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-
-        sentinel = object()
-        seen_executors: list[object] = []
-
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_kw: types.SimpleNamespace(
-                returncode=0, stdout=b"", stderr=b""
-            ),
-        )
-        monkeypatch.setattr(pc, "subprocess_executor", lambda: sentinel)
-
-        import asyncio as _asyncio
-
-        real_loop = _asyncio.new_event_loop()
-
-        async def _driver() -> bool:
-            loop = _asyncio.get_running_loop()
-
-            def spy(executor, func, *args):
-                seen_executors.append(executor)
-                fut: _asyncio.Future[bool] = loop.create_future()
-                fut.set_result(func(*args))
-                return fut
-
-            loop.run_in_executor = spy  # type: ignore[method-assign]
-            return await pc.kill_process_tree_async(5678, pc.SIGTERM)
-
-        assert real_loop.run_until_complete(_driver()) is True
-        assert seen_executors == [sentinel]
-
-    def test_windows_kill_pid_async_propagates_taskkill_rc128(self, monkeypatch):
-        """Windows offload preserves the taskkill rc→exception mapping:
-        rc=128 must still surface as ProcessLookupError so the callers'
-        ``except (ProcessLookupError, OSError)`` guards fire.
-        """
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_kw: types.SimpleNamespace(
-                returncode=128, stdout=b"", stderr=b"not found"
-            ),
-        )
-        monkeypatch.setattr(pc, "subprocess_executor", lambda: object())
-
-        import asyncio as _asyncio
-
-        async def _driver() -> None:
-            loop = _asyncio.get_running_loop()
-
-            def spy(_executor, func, *args):
-                fut: _asyncio.Future = loop.create_future()
-                try:
-                    fut.set_result(func(*args))
-                except BaseException as exc:
-                    fut.set_exception(exc)
-                return fut
-
-            loop.run_in_executor = spy  # type: ignore[method-assign]
-            await pc.kill_pid_async(99999, pc.SIGKILL)
-
-        loop = _asyncio.new_event_loop()
-        with pytest.raises(ProcessLookupError):
-            loop.run_until_complete(_driver())
-
-
-class TestProcessTokenSid:
-    """The non-spawn SID lookup.
-
-    ``whoami`` is the fallback, not the primary, because the primary sits on
-    the gateway's bind path: a Windows CI run showed the spawn returning
-    nothing under parallel test load, which made every named pipe refuse to be
-    created (the DACL cannot be built without a SID).
-    """
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows access tokens")
-    def test_reads_a_real_sid_from_our_own_token(self) -> None:
-        # The unguarded body on purpose: a ctypes prototype mistake surfaces as
-        # a traceback naming the failing call instead of collapsing to None.
-        sid = pc._process_token_sid_unguarded()
-        assert sid is not None
-        assert sid.startswith("S-1-")
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows SID lookup")
-    def test_some_path_always_resolves_our_sid(self) -> None:
-        """The property the gateway depends on: without a SID it cannot build
-        the pipe DACL and refuses to bind at all."""
-        assert pc.current_user_sid()
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows access tokens")
-    def test_agrees_with_the_public_accessor(self) -> None:
-        assert pc.current_user_sid() == pc._process_token_sid()
-
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="the off-Windows guard")
-    def test_returns_none_off_windows(self) -> None:
-        assert pc._process_token_sid() is None
-
-
-class TestWin32StructsAreModuleScoped:
-    """``ctypes.POINTER(T)`` memoises T -> POINTER(T) forever.
-
-    ctypes keeps that memo in a module-level dict with no eviction, so a
-    Structure subclass declared inside a function body pins a fresh pair of type
-    objects on EVERY call. The Windows metrics/enumeration helpers are polled
-    (the dashboard's system-metrics endpoint, the RSS-recycle watchdog, the
-    tree-kill parent-map walk, the MCP pipe's per-connection peer check), which
-    turned that into unbounded growth in a long-running gateway -- measured at
-    ~8 KiB per ``proc_rss_bytes`` call, never reclaimed.
-
-    Asserting on the source keeps this enforceable from the POSIX fleet, where
-    the Windows branches never execute.
-    """
-
-    #: Helpers whose Win32 struct layouts must come from module scope.
-    _WIN32_STRUCT_USERS = (
-        "get_ppid",
-        "_windows_process_parent_map",
-        "_win_process_image_name",
-        "_process_token_sid_unguarded",
-        "proc_rss_bytes",
-        "proc_rss_bytes_for_pid",
-        "system_memory",
-    )
-
-    def test_the_shared_layouts_are_defined_once_at_module_scope(self) -> None:
-        import ctypes
-
-        for name in (
-            "_ProcessEntry32",
-            "_ProcessMemoryCounters",
-            "_MemoryStatusEx",
-            "_SidAndAttributes",
-            "_TokenUser",
-        ):
-            assert issubclass(getattr(pc, name), ctypes.Structure), name
-
-    @pytest.mark.parametrize("func_name", _WIN32_STRUCT_USERS)
-    def test_no_helper_declares_a_structure_in_its_body(self, func_name: str) -> None:
-        import ast
-        import inspect
-        import textwrap
-
-        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(pc, func_name))))
-        local_structs = [
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef)
-            and any(
-                isinstance(base, ast.Attribute) and base.attr in ("Structure", "Union")
-                for base in node.bases
-            )
-        ]
-        assert not local_structs, (
-            f"{func_name} declares {local_structs} in its body; each call would pin a new "
-            "type in ctypes' pointer-type memo. Hoist the layout to module scope."
-        )
-
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Win32 metrics paths")
-    def test_repeated_metrics_calls_add_no_pointer_memo_entries(self) -> None:
-        """The behavioural half: polling must not grow ctypes' memo at all."""
-        import ctypes
-
-        memo = ctypes._pointer_type_cache  # type: ignore[attr-defined]
-        pid = os.getpid()
-        probes = (
-            pc.proc_rss_bytes,
-            lambda: pc.proc_rss_bytes_for_pid(pid),
-            pc.system_memory,
-            lambda: pc.get_ppid(pid),
-            lambda: pc.process_owner_sid(pid),
-        )
-        for probe in probes:
-            probe()  # a first call may legitimately populate the memo once
-        before = len(memo)
-        for _ in range(25):
-            for probe in probes:
-                probe()
-        assert len(memo) == before
-
-
-class TestLocalUserId:
-    """The pool-partitioning identity. Must stay an int on every platform."""
-
-    def test_matches_getuid_on_posix(self) -> None:
-        if pc.IS_WINDOWS:
-            pytest.skip("POSIX uid")
-        assert pc.local_user_id() == os.getuid()
-
-    def test_is_an_int_not_a_bool(self) -> None:
-        """PoolKey type-checks this dimension and refuses to coerce, because
-        bool is a subclass of int and would slip into the wrong partition."""
-        value = pc.local_user_id()
-        assert isinstance(value, int) and not isinstance(value, bool)
-
-    def test_windows_derives_a_stable_int_from_the_sid(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-9-8-7-1001")
-        first = pc.local_user_id()
-        assert isinstance(first, int) and not isinstance(first, bool)
-        assert pc.local_user_id() == first  # stable across calls
-        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-9-8-7-1002")
-        assert pc.local_user_id() != first  # and distinct per user
-
-    def test_windows_without_a_sid_collapses_to_zero(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A partition collapse, not a privilege change: the endpoint is already
-        per-user, so two users cannot reach the same pool regardless."""
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "current_user_sid", lambda: None)
-        assert pc.local_user_id() == 0
-
-
-class TestMakeOwnerOnlyDir:
-    def test_creates_nested_directory_owner_only_on_posix(self, tmp_path) -> None:
-        if pc.IS_WINDOWS:
-            pytest.skip("POSIX mode bits")
-        target = tmp_path / "a" / "b" / "c"
-        pc.make_owner_only_dir(target)
-        assert target.is_dir()
-        assert stat.S_IMODE(target.stat().st_mode) == 0o700
-
-    def test_tightens_a_preexisting_loose_directory_on_posix(self, tmp_path) -> None:
-        """The case a bare mkdir(mode=...) cannot cover: the mode argument is
-        ignored entirely when the directory already exists."""
-        if pc.IS_WINDOWS:
-            pytest.skip("POSIX mode bits")
-        loose = tmp_path / "loose"
-        loose.mkdir(mode=0o755)
-        pc.make_owner_only_dir(loose)
-        assert stat.S_IMODE(loose.stat().st_mode) == 0o700
-
-    def test_uses_the_dacl_helper_on_windows(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Windows derives access from the DACL, so the mode argument is inert
-        and restrict_to_owner is the only thing that protects the directory."""
-        calls: list[str] = []
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: calls.append(str(p)))
-        target = tmp_path / "win"
-        pc.make_owner_only_dir(target)
-        assert target.is_dir()
-        assert calls == [str(target)]
-
-    def test_directory_still_exists_when_tightening_fails(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Best-effort on the tightening step: the caller decides whether an
-        un-tightened directory is fatal, so creation must not be rolled back."""
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            pc, "restrict_to_owner", lambda p: (_ for _ in ()).throw(OSError("nope"))
-        )
-        target = tmp_path / "partial"
-        pc.make_owner_only_dir(target)
-        assert target.is_dir()
-
-
-class TestCurrentUserSidNeverSpawns:
-    """``current_user_sid`` is called from three event-loop paths: the gatewayd
-    admission check, the client-side server check, and the pipe DACL builder --
-    which runs once per pipe instance and so sits on the accept path.
-
-    It used to delegate to ``_current_user_sid``, whose fallback is a ``whoami``
-    subprocess with a 5 s timeout. A token-lookup failure therefore stalled
-    accepts for seconds at a time, repeatedly. ``restrict_to_owner`` keeps that
-    fallback because it always runs through ``asyncio.to_thread``.
-    """
-
-    @staticmethod
-    def _forbid_spawn(*_a, **_kw):
-        raise AssertionError(
-            "current_user_sid must not spawn -- it runs on the event loop"
-        )
-
-    def test_returns_none_without_spawning_when_the_token_read_fails(
-        self, monkeypatch
-    ):
-        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.subprocess, "run", self._forbid_spawn)
-
-        # Fails closed: every caller treats None as "principal unverifiable".
-        assert pc.current_user_sid() is None
-
-    def test_returns_the_bare_token_sid_and_memoises_it(self, monkeypatch):
-        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        calls: list[int] = []
-
-        def _token():
-            calls.append(1)
-            return "S-1-5-21-1-2-3-1001"
-
-        monkeypatch.setattr(pc, "_process_token_sid", _token)
-        monkeypatch.setattr(pc.subprocess, "run", self._forbid_spawn)
-
-        assert pc.current_user_sid() == "S-1-5-21-1-2-3-1001"
-        assert pc.current_user_sid() == "S-1-5-21-1-2-3-1001"
-        assert len(calls) == 1, "the SID is constant for the process lifetime"
-
-    def test_strips_the_icacls_star_prefix(self, monkeypatch):
-        """The icacls form carries a leading ``*``; SDDL and the Win32 security
-        APIs want the bare SID."""
-        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: "*S-1-5-21-9-9-9-500")
-        monkeypatch.setattr(pc.subprocess, "run", self._forbid_spawn)
-
-        assert pc.current_user_sid() == "S-1-5-21-9-9-9-500"
-
-
-def test_process_descendants_snapshots_a_new_session_grandchild():
-    """A grandchild in its OWN session is still a descendant.
-
-    This is the case a bare ``killpg`` misses, so the walk that broadens a kill
-    must be able to see it.
-    """
-    from kiro_crew import platform_compat
-
-    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX session semantics
-        pytest.skip("POSIX session semantics")
-
-    grandchild: int | None = None
-    child_code = (
-        "import subprocess,sys,time;"
-        "c=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
-        "start_new_session=True);"
-        "print(c.pid,flush=True);time.sleep(30)"
-    )
-    proc = subprocess.Popen(
-        [sys.executable, "-c", child_code],
-        stdout=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        assert proc.stdout is not None
-        grandchild = int(proc.stdout.readline().strip())
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if grandchild in platform_compat.process_descendants(proc.pid):
-                break
-            time.sleep(0.05)
-        descendants = platform_compat.process_descendants(proc.pid)
-        assert grandchild in descendants
-        # It is genuinely outside the parent's process group -- otherwise this
-        # test would pass even without the escape it exists to describe.
-        assert os.getpgid(grandchild) != os.getpgid(proc.pid)
-    finally:
-        for pid in (grandchild, proc.pid):
-            if pid is None:
-                continue
-            try:
-                platform_compat.kill_process_tree(pid)
-            except (ProcessLookupError, OSError, ValueError):
-                pass
-        proc.wait(timeout=5)
-
-
-def test_process_descendants_is_best_effort_on_unreadable_table(monkeypatch):
-    """Introspection failure must not raise into a caller's kill path."""
-    from kiro_crew import platform_compat
-
-    monkeypatch.setattr(
-        platform_compat,
-        "_posix_process_parent_map",
-        lambda: (_ for _ in ()).throw(OSError("boom")),
-    )
-    monkeypatch.setattr(
-        platform_compat, "_windows_process_parent_map", lambda: (_ for _ in ()).throw(OSError("boom"))
-    )
-    assert platform_compat.process_descendants(os.getpid()) == []
-
-
-def test_process_descendants_refuses_reserved_pids():
-    from kiro_crew import platform_compat
-
-    assert platform_compat.process_descendants(1) == []
-    assert platform_compat.process_descendants(0) == []
-
-
-def test_parent_map_ignores_a_planted_ps_earlier_on_path(tmp_path, monkeypatch):
-    """A gateway PATH can lead with agent-writable dirs, so PATH is not trusted.
-
-    The shim below would report a bogus tree (and could run any code) if the
-    lookup honored PATH.
-    """
-    from kiro_crew import platform_compat
-
-    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
-        pytest.skip("POSIX binary resolution")
-
-    shim = tmp_path / "ps"
-    shim.write_text("#!/bin/sh\necho '999999 999998'\n")
-    shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
-
-    parent_map = platform_compat._posix_process_parent_map()
-    assert 999999 not in parent_map, "planted PATH shim was executed"
-    # A real snapshot still came back, so this is not passing by returning {}.
-    assert os.getpid() in parent_map
-
-
-def test_trusted_system_bin_rejects_a_name_not_in_system_dirs(tmp_path, monkeypatch):
-    from kiro_crew import platform_compat
-
-    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
-        pytest.skip("POSIX binary resolution")
-
-    fake = tmp_path / "definitely-not-a-system-tool"
-    fake.write_text("#!/bin/sh\nexit 0\n")
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    assert platform_compat.trusted_system_bin("definitely-not-a-system-tool") is None
-    assert platform_compat.trusted_system_bin("ps") is not None
-
-
-def test_trusted_system_bin_dirs_are_not_limited_to_fhs():
-    # A distribution may keep ps/lsof/systemd-run outside /usr/{s}bin; an
-    # FHS-only pin resolves nothing at all there.
-    from kiro_crew import platform_compat
-
-    fhs = {"/usr/bin", "/bin", "/usr/sbin", "/sbin"}
-    assert set(platform_compat._TRUSTED_SYSTEM_BIN_DIRS) - fhs
-
-
-def test_trusted_system_bin_resolves_outside_fhs(tmp_path, monkeypatch):
-    # A tool reachable only through a non-FHS pinned directory still resolves.
-    from kiro_crew import platform_compat
-
-    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
-        pytest.skip("POSIX binary resolution")
-
-    system_dir = tmp_path / "sw" / "bin"
-    system_dir.mkdir(parents=True)
-    tool = system_dir / "definitely-not-a-system-tool"
-    tool.write_text("#!/bin/sh\nexit 0\n")
-    tool.chmod(0o755)
-
-    monkeypatch.setattr(platform_compat, "_TRUSTED_SYSTEM_BIN_DIRS", (str(system_dir),))
-    assert platform_compat.trusted_system_bin("definitely-not-a-system-tool") == str(tool)
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason=(
-        "asserts the POSIX degradation path: neutering trusted_system_bin only "
-        "disarms _posix_process_parent_map, while process_descendants on Windows "
-        "goes through the Win32 snapshot and still reports this process's real "
-        "live children -- so the == [] assertion depends on whether the xdist "
-        "worker happens to have a subprocess alive at that instant"
-    ),
-)
-def test_parent_map_is_empty_when_no_trusted_ps_exists(monkeypatch):
-    """No trusted binary must degrade to best-effort, never fall back to PATH."""
-    from kiro_crew import platform_compat
-
-    monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
-    assert platform_compat._posix_process_parent_map() == {}
-    assert platform_compat.process_descendants(os.getpid()) == []
-
-
-def _listening_port(sock):
-    """Bind and listen on an ephemeral loopback port, returning it."""
-
-    sock.bind(("127.0.0.1", 0))
-    sock.listen(1)
-    return sock.getsockname()[1]
-
-
-def test_listening_pid_lookup_ignores_a_planted_tool_on_path(tmp_path, monkeypatch):
-    """A PATH-planted lsof must never answer the port->PID lookup.
-
-    This lookup feeds ``cli_server._gateway_owns_port``, so a shim that names an
-    attacker-chosen PID as the port holder subverts an ownership gate rather
-    than merely returning bad diagnostics.
-
-    POSIX-only by necessity: a faithful Windows shim would have to be a real
-    ``.exe``, because ``CreateProcess`` appends only that extension when it
-    resolves a bare argv name and so never reaches a planted ``.bat``. The
-    Windows guarantee is covered at the resolution level instead, by
-    ``test_trusted_system_bin_resolves_system32_and_rejects_path_on_windows``.
-    """
-
-    import socket
-
-    if pc.IS_WINDOWS:  # pragma: no cover - POSIX binary resolution
-        pytest.skip("POSIX binary resolution")
-
-    bogus = 999_999
-    tool = pc.listening_pid_tool()
-    shim = tmp_path / tool
-    shim.write_text(f"#!/bin/sh\necho {bogus}\n")
-    shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        pids = pc.find_listening_pids(_listening_port(sock))
-
-    assert bogus not in pids, "planted PATH shim was executed"
-    if pc.trusted_system_bin(tool) is not None:
-        # A trusted tool exists on this host, so an empty list would not be a
-        # real answer — the lookup must still see this process holding the port.
-        # Without this the test could pass simply by returning nothing.
-        assert os.getpid() in pids
-
-
-def test_listening_pid_lookup_still_resolves_the_pinned_tool(tmp_path, monkeypatch):
-    """Pinning must not cost the lookup its real answer, PATH notwithstanding.
-
-    Guards the other direction from the shim test: a pin that resolved nothing
-    would make every port read as unheld, which is silent and fails open into
-    "no gateway is running".
-    """
-
-    import socket
-
-    tool = pc.listening_pid_tool()
-    if pc.trusted_system_bin(tool) is None:  # pragma: no cover - host lacks the tool
-        pytest.skip(f"no trusted {tool} on this host")
-
-    # An empty PATH proves the resolution owes nothing to it.
-    monkeypatch.setenv("PATH", str(tmp_path))
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        pids = pc.find_listening_pids(_listening_port(sock))
-
-    assert os.getpid() in pids
-
-
-def test_listening_pid_tool_available_ignores_a_planted_tool_on_path(tmp_path, monkeypatch):
-    """The availability probe must agree with the lookup it describes.
-
-    Probing PATH here while the lookup resolves from the trusted directories
-    would let the two disagree: a shim would answer "available" for a tool the
-    lookup refuses to run, and a live gateway would read as stopped.
-    """
-
-    tool = pc.listening_pid_tool()
-    planted = tmp_path / (f"{tool}.exe" if pc.IS_WINDOWS else tool)
-    planted.write_text("")
-    if not pc.IS_WINDOWS:
-        planted.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
-
-    # Empty the trusted directories so the only resolvable copy of the tool is
-    # the planted one. A host that genuinely ships the tool would otherwise
-    # answer True for both the pinned and the PATH lookup, and the test could
-    # not tell them apart.
-    monkeypatch.setattr(pc, "_TRUSTED_SYSTEM_BIN_DIRS", ())
-    monkeypatch.setattr(pc, "_windows_system_dirs", lambda: ())
-
-    assert pc.trusted_system_bin(tool) is None
-    assert pc.listening_pid_tool_available() is False
-
-
-def test_listening_pid_lookup_degrades_when_no_trusted_tool_exists(monkeypatch):
-    """No trusted tool must read as "absent", never as a silent empty answer."""
-
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
-    assert pc.find_listening_pids(8000) == []
-    assert pc.listening_pid_tool_available() is False
-
-
-def test_process_owner_uid_ignores_a_planted_ps_on_path(tmp_path, monkeypatch):
-    """The uid backing the port-trust gate must not come from a PATH shim.
-
-    ``process_owner_uid`` reads ``/proc`` on Linux and shells out to ``ps`` only
-    on macOS, so the darwin branch is selected explicitly to exercise the spawn
-    on any POSIX host rather than leaving it covered on macOS CI alone.
-    """
-
-    if pc.IS_WINDOWS:  # pragma: no cover - POSIX binary resolution
-        pytest.skip("POSIX binary resolution")
-
-    shim = tmp_path / "ps"
-    shim.write_text("#!/bin/sh\necho 999999\n")
-    shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
-    monkeypatch.setattr(sys, "platform", "darwin")
-
-    assert pc.process_owner_uid(os.getpid()) == os.getuid()
-
-
-def test_process_owner_uid_denies_when_no_trusted_ps_exists(monkeypatch):
-    """An unresolvable ``ps`` must report "unknown owner", which the gate denies on."""
-
-    if pc.IS_WINDOWS:  # pragma: no cover - POSIX binary resolution
-        pytest.skip("POSIX binary resolution")
-
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    assert pc.process_owner_uid(os.getpid()) is None
-
-
-def test_trusted_system_bin_resolves_system32_and_rejects_path_on_windows(tmp_path, monkeypatch):
-    """Windows argv names must resolve from the real system directory only."""
-
-    if not pc.IS_WINDOWS:  # pragma: no cover - Windows binary resolution
-        pytest.skip("Windows binary resolution")
-
-    planted = tmp_path / "definitely-not-a-system-tool.exe"
-    planted.write_text("")
-    monkeypatch.setenv("PATH", str(tmp_path))
-
-    assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
-    # A bare argv name still resolves, extension supplied by the lookup.
-    resolved = pc.trusted_system_bin("taskkill")
-    assert resolved is not None and resolved.lower().endswith("taskkill.exe")
-    assert os.path.isfile(resolved)
-
-
-def test_kill_helpers_fail_loud_when_taskkill_is_unresolvable(monkeypatch):
-    """Windows kills must raise, not silently report success, with no taskkill.
-
-    Callers branch on the exception to escalate; a quiet ``True`` would strand a
-    live process while reporting it terminated.
-    """
-
-    if not pc.IS_WINDOWS:  # pragma: no cover - Windows kill path
-        pytest.skip("Windows kill path")
-
-    # A PID that does not exist, so a regression that reaches the real taskkill
-    # cannot terminate the test runner; ``match`` pins the failure to the
-    # resolution step rather than to taskkill rejecting an unknown PID.
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
-    with pytest.raises(OSError, match="trusted system directories"):
-        pc.kill_pid(999_999)
-    with pytest.raises(OSError, match="trusted system directories"):
-        pc.kill_process_tree(999_999)
-
-
-def _plant_on_path(tmp_path, monkeypatch, name):
-    """Make *name* the only thing PATH can resolve, and return its path."""
-
-    planted = tmp_path / (f"{name}.exe" if pc.IS_WINDOWS else name)
-    planted.write_text("")
-    if not pc.IS_WINDOWS:
-        planted.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    return planted
-
-
-def _pin_warnings(caplog):
-    """Only this module's records, so an unrelated warning cannot skew the count."""
-
-    return [r for r in caplog.records if r.name == "kiro_crew.platform_compat"]
-
-
-def test_a_tool_installed_outside_the_trusted_dirs_is_diagnosable(tmp_path, monkeypatch, caplog):
-    """A non-FHS host must learn the pin is why its tool reads as unavailable.
-
-    NixOS and Homebrew/conda prefixes keep a perfectly good ``lsof`` outside the
-    system directories. The pin still refuses it, but without this line the
-    operator sees only ``kirocrew stop`` no-opping and a prompt to install a
-    tool they already have.
-    """
-
-    monkeypatch.setattr(pc, "_UNPINNED_TOOL_PROBED", set())
-    planted = _plant_on_path(tmp_path, monkeypatch, "definitely-not-a-system-tool")
-
-    with caplog.at_level(logging.WARNING, logger="kiro_crew.platform_compat"):
-        assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
-
-    records = _pin_warnings(caplog)
-    assert len(records) == 1
-    message = records[0].getMessage()
-    # Case-insensitive: Windows resolution reports the PATHEXT entry's own
-    # casing (".EXE"), not the casing the file was created with.
-    assert str(planted).casefold() in message.casefold(), "must name where the tool actually is"
-    assert "unavailable" in message
-
-
-def test_the_unpinned_tool_diagnostic_does_not_repeat(tmp_path, monkeypatch, caplog):
-    """One line per name: these lookups run on every teardown and gate check."""
-
-    monkeypatch.setattr(pc, "_UNPINNED_TOOL_PROBED", set())
-    _plant_on_path(tmp_path, monkeypatch, "definitely-not-a-system-tool")
-
-    with caplog.at_level(logging.WARNING, logger="kiro_crew.platform_compat"):
-        for _ in range(3):
-            assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
-
-    assert len(_pin_warnings(caplog)) == 1
-
-
-def test_a_genuinely_absent_tool_is_not_reported_as_misplaced(tmp_path, monkeypatch, caplog):
-    """Nothing on PATH means nothing to explain, so the line must stay quiet.
-
-    Claiming a tool sits outside the trusted directories when it is simply not
-    installed would send the operator hunting for a path that does not exist.
-    """
-
-    monkeypatch.setattr(pc, "_UNPINNED_TOOL_PROBED", set())
-    monkeypatch.setenv("PATH", str(tmp_path))
-
-    with caplog.at_level(logging.WARNING, logger="kiro_crew.platform_compat"):
-        assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
-
-    assert _pin_warnings(caplog) == []
-
-
-def test_a_resolvable_tool_is_never_reported_as_sitting_outside_the_pin(monkeypatch):
-    """Nothing to explain when the pinned lookup succeeded."""
-
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: os.path.join("/usr/bin", name))
-    assert pc.tool_outside_trusted_dirs("lsof") is None
-
-
-def test_the_unpinned_path_is_reported_so_stop_can_name_it(tmp_path, monkeypatch):
-    """``stop`` needs the real location to tell a NixOS operator what happened."""
-
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
-    planted = _plant_on_path(tmp_path, monkeypatch, "definitely-not-a-system-tool")
-
-    found = pc.tool_outside_trusted_dirs("definitely-not-a-system-tool")
-
-    assert found is not None
-    assert found.casefold() == str(planted).casefold()
-
-
-def test_an_absent_tool_reports_no_unpinned_path(tmp_path, monkeypatch):
-    """Absent everywhere must stay ``None``, or ``stop`` would claim a path that
-    does not exist instead of saying the tool is missing."""
-
-    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
-    monkeypatch.setenv("PATH", str(tmp_path))
-
-    assert pc.tool_outside_trusted_dirs("definitely-not-a-system-tool") is None

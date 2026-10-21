@@ -10,200 +10,88 @@ main agent's turn-resilience ladder:
    preserved, ``user_stop`` tombstone, ``subagent_done`` carries ``stopped: true``.
 3. Unexpected-cancel one-shot auto-continue (``_schedule_cancel_recovery``):
    a non-user, non-shutdown task cancellation respawns the run exactly once.
-   Mirrors the main path's cancel recovery (PR #173).
+   Mirrors the main path's cancel recovery.
 4. Orphan-notification wiring: ``_try_inject_orphan_notification`` /
    ``_send_orphan_slack_dm`` delegate to the gateway-wired callbacks instead of
    being stubs.
+
+The cases under the ``1.`` and ``1b.`` section banners, and the default-budget case, are in
+``test_subagent_turn_resilience_retry.py``; the context-window overflow cases are in
+``test_subagent_turn_resilience_context_overflow.py``; the helpers the three modules share
+are in ``subagent_turn_resilience_helpers.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from subagent_turn_resilience_helpers import (  # noqa: F401 -- the autouse fixture registers by import
+    _close_subagent_managers,
+    _complete_event,
+    _FatalError,
+    _manager,
+    _mock_ctx_builder,
+    _mock_sessions,
+    _spawn_and_wait,
+    _text_event,
+    _TransientError,
+)
 
 from kiro_crew.llm_helpers import TRANSIENT_RETRIES
-from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.subagent import (
     _TRANSIENT_CONTINUE_MSG,
     SubagentInfo,
     SubagentManager,
 )
+from kiro_crew.testing.wait import async_wait_until, await_until, default_timeout
+
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py``.
 
+# POSITIVE WAITS here -- the mocked stream reaching its first yield, a cancelled run's
+# replacement task appearing in ``_tasks``, a recovery task ending -- ride on the
+# event, task or state the code emits (``await_until`` / ``async_wait_until``), under
+# the helpers' lost-run bound: half the suite's ``--timeout=120``, so a real hang
+# fails by name instead of as an opaque pytest-timeout kill, quoting the tasks the
+# manager holds and ``info.error``. The fixed ``asyncio.sleep`` windows that prove a
+# respawn has NOT fired yet are deliberately left alone -- those are negative
+# assertions, where the duration IS the test.
 
-class _TransientError(Exception):
-    """Duck-typed AcpError carrying the structured transient verdict."""
-
-    transient = True
-
-
-class _FatalError(Exception):
-    transient = False
-
-
-def _text_event(text: str) -> SimpleNamespace:
-    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text)
-
-
-def _complete_event() -> SimpleNamespace:
-    return SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn")
-
-
-def _mock_sessions(stream_factory) -> MagicMock:
-    sessions = MagicMock()
-    sessions.get_pid = MagicMock(return_value=None)
-    provider = AsyncMock()
-    provider.start = AsyncMock()
-    provider.shutdown = AsyncMock()
-    provider.context_usage_pct = lambda: 0.0
-    provider.stream = MagicMock(side_effect=stream_factory)
-    sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-    sessions.release = MagicMock()
-    sessions.reset = AsyncMock()
-    sessions.record_success = MagicMock()
-    sessions.get_agent = MagicMock(return_value="")
-    sessions.get_approval_policy = MagicMock(return_value="auto")
-    sessions.has_session = MagicMock(return_value=True)
-    sessions._provider = provider
-    return sessions
+# An UPPER BOUND, not a positive wait -- not a lost-run bound to widen.
+# ``test_cancel_recovery_failure_emits_done_and_delivers`` patches the production
+# give-up (``subagent._RECOVERY_SLOT_WAIT_SECS``, normally 60.0) down to 0.4s, and
+# this bound is what asserts the patch actually took effect: the recovery must fail
+# FAST. Widening it opens a band in which a refactor that stops reading that module
+# global -- inlining the literal, moving it onto the instance, renaming it -- leaves
+# every terminal assertion still passing, for the wrong reason.
+_GIVE_UP_BOUND = 10.0
 
 
-def _mock_ctx_builder() -> MagicMock:
-    ctx = MagicMock()
-    ctx.build_message = MagicMock(return_value=("built_message", None))
-    ctx.hooks.on_tool_call = MagicMock()
-    ctx.hooks.auto_approve_subagent_spawn = True
-    ctx.hooks.auto_approve_subagent_tools = False
-    return ctx
+async def _respawned_task(mgr: SubagentManager, info: SubagentInfo, original: asyncio.Task):
+    """The replacement task registered under the run's id, once it is not *original*.
 
+    A recovery that never respawns fails here by name, quoting the tasks the manager
+    holds and the run's error.
+    """
 
-def _manager(sessions: MagicMock) -> SubagentManager:
-    mgr = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder())
-    # Force the dedicated-process path (deterministic under MagicMock sessions).
-    mgr._should_use_session_sharing = MagicMock(return_value=False)
-    return mgr
+    # A truth value, not the task: the helper awaits an awaitable a predicate returns.
+    def respawned() -> bool:
+        task = mgr._tasks.get(info.id)
+        return task is not None and task is not original
 
-
-async def _spawn_and_wait(mgr: SubagentManager, task: str = "do work") -> SubagentInfo:
-    with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-        info = mgr.spawn(task)
-        assert info is not None
-        await mgr._tasks[info.id]
-    return info
-
-
-# ── 1. Transient-backend retry ───────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_transient_error_pretoken_retries_same_prompt():
-    """A transient error before any token re-sends the SAME prompt and succeeds."""
-    calls: list[str] = []
-
-    def stream_factory(msg: str, *a, **kw):
-        calls.append(msg)
-
-        async def _gen():
-            if len(calls) == 1:
-                raise _TransientError("backend 500")
-            yield _text_event("recovered result")
-            yield _complete_event()
-
-        return _gen()
-
-    mgr = _manager(_mock_sessions(stream_factory))
-    events: list[tuple[str, dict]] = []
-    _orig_fire = mgr._fire_event
-
-    async def _spy(etype, info, extra=None):
-        events.append((etype, extra or {}))
-        await _orig_fire(etype, info, extra)
-
-    mgr._fire_event = _spy
-
-    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
-        info = await _spawn_and_wait(mgr)
-
-    assert info.error == ""
-    assert "recovered result" in info.result
-    assert calls == ["built_message", "built_message"]  # pre-token: same prompt
-    assert any(e[0] == "subagent_retrying" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_transient_error_posttoken_sends_continue_prompt():
-    """A transient error AFTER tokens streamed sends the CONTINUE prompt."""
-    calls: list[str] = []
-
-    def stream_factory(msg: str, *a, **kw):
-        calls.append(msg)
-
-        async def _gen():
-            if len(calls) == 1:
-                yield _text_event("partial ")
-                raise _TransientError("mid-stream 500")
-            yield _text_event("finished")
-            yield _complete_event()
-
-        return _gen()
-
-    mgr = _manager(_mock_sessions(stream_factory))
-    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
-        info = await _spawn_and_wait(mgr)
-
-    assert info.error == ""
-    assert "partial" in info.result and "finished" in info.result
-    assert calls[0] == "built_message"
-    assert calls[1] == _TRANSIENT_CONTINUE_MSG  # post-token: continue, not re-run
-
-
-@pytest.mark.asyncio
-async def test_transient_budget_exhausted_propagates():
-    """Persistent transient errors fail after TRANSIENT_RETRIES attempts."""
-    calls: list[str] = []
-
-    def stream_factory(msg: str, *a, **kw):
-        calls.append(msg)
-
-        async def _gen():
-            raise _TransientError("backend 500")
-            yield  # noqa: unreachable — async generator marker
-
-        return _gen()
-
-    mgr = _manager(_mock_sessions(stream_factory))
-    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
-        info = await _spawn_and_wait(mgr)
-
-    assert info.done is True
-    assert "500" in info.error
-    assert len(calls) == 1 + TRANSIENT_RETRIES  # initial + retries
-
-
-@pytest.mark.asyncio
-async def test_non_transient_error_fails_immediately():
-    calls: list[str] = []
-
-    def stream_factory(msg: str, *a, **kw):
-        calls.append(msg)
-
-        async def _gen():
-            raise _FatalError("auth denied")
-            yield  # noqa: unreachable
-
-        return _gen()
-
-    mgr = _manager(_mock_sessions(stream_factory))
-    info = await _spawn_and_wait(mgr)
-
-    assert info.done is True
-    assert "auth denied" in info.error
-    assert len(calls) == 1  # no retry
+    await async_wait_until(
+        respawned, describe=lambda: f"tasks={sorted(mgr._tasks)}; error={info.error!r}"
+    )
+    return mgr._tasks[info.id]
 
 
 # ── 2. User-stop semantics ───────────────────────────────────────────
@@ -236,7 +124,7 @@ async def test_user_cancel_is_neutral_stopped_with_partial():
     with patch("kiro_crew.subagent.Stats") as stats, patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("long job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         cancelled = await mgr.cancel(info.id)
         await asyncio.gather(*mgr._tasks.values(), return_exceptions=True)
 
@@ -268,7 +156,7 @@ async def test_unexpected_cancel_auto_continues_once():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("interruptible job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         task1 = mgr._tasks[info.id]
         task1.cancel()  # UNEXPECTED cancel (not via mgr.cancel, not shutdown)
         await asyncio.gather(task1, return_exceptions=True)
@@ -280,23 +168,47 @@ async def test_unexpected_cancel_auto_continues_once():
         # Recovery respawns on a fresh task AFTER the original task's
         # teardown fully completes (explicit handshake, not a timed sleep).
         started.clear()
-        task2 = None
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < deadline:
-            task2 = mgr._tasks.get(info.id)
-            if task2 is not None and task2 is not task1:
-                break
-            await asyncio.sleep(0.05)
-        assert task2 is not None and task2 is not task1
+        task2 = await _respawned_task(mgr, info, task1)
         assert task1.done()  # respawn never races the original teardown
 
         # Second unexpected cancel → terminal (budget spent).
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         task2.cancel()
         await asyncio.gather(task2, return_exceptions=True)
 
     assert info.done is True
     assert info.error == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_cancel_hand_off_is_visible_to_a_wait_for_waiter():
+    """A waiter whose ``wait_for`` deadline cancels the run must see
+    ``TimeoutError``, and the original task must end cancelled, because the run
+    has moved to the ``:recovery`` task and has not finished. A task that
+    swallowed the cancel made ``wait_for`` return normally instead."""
+    started = asyncio.Event()
+    mgr = _manager(_mock_sessions(_hanging_stream_factory(started)))
+
+    with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+        info = mgr.spawn("interruptible job")
+        assert info is not None
+        await await_until(started, what="the stream's first yield")
+        task1 = mgr._tasks[info.id]
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(task1, timeout=0.05)
+
+        assert task1.cancelled()
+        assert info.done is False
+        assert info._cancel_retry_used is True
+
+        # The continuation still happens on a fresh task.
+        started.clear()
+        await await_until(started, what="the continuation's first yield")
+        task2 = mgr._tasks.get(info.id)
+        assert task2 is not None and task2 is not task1
+        await mgr.cancel_all()
+
+    assert info.done is True
 
 
 @pytest.mark.asyncio
@@ -321,6 +233,7 @@ async def test_unexpected_cancel_after_tool_activity_finalizes_without_respawn()
                 tool_kind="edit",
                 tool_call_id="tc1",
                 tool_input={},
+                runtime_global=False,
             )
             started.set()
             await asyncio.Event().wait()  # hang until cancelled — NO text ever
@@ -332,7 +245,7 @@ async def test_unexpected_cancel_after_tool_activity_finalizes_without_respawn()
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("side-effecting job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         assert info.tool_count > 0 and info.streaming_text == ""
         task1 = mgr._tasks[info.id]
         task1.cancel()  # UNEXPECTED cancel after tool ran
@@ -369,17 +282,17 @@ async def test_cancel_recovery_text_only_respawn_gets_resume_preamble():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("resumable job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         assert info.streaming_text and info.tool_count == 0
         task1 = mgr._tasks[info.id]
         task1.cancel()  # UNEXPECTED cancel after text, no tools
         await asyncio.gather(task1, return_exceptions=True)
 
-        # Wait for the respawn's build_message call (second entry).
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while len(build_msgs) < 2 and asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(0.05)
-        assert len(build_msgs) >= 2
+        # The respawn's build_message call is the second entry.
+        await async_wait_until(
+            lambda: len(build_msgs) >= 2,
+            describe=lambda: f"{len(build_msgs)} build_message call(s); error={info.error!r}",
+        )
 
         # First attempt: bare prompt. Respawn: preamble present.
         assert not build_msgs[0].startswith(_CANCEL_RESUME_PREFIX)
@@ -400,7 +313,7 @@ async def test_shutdown_cancel_does_not_auto_continue():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("job at shutdown")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         await mgr.cancel_all()
 
     assert mgr._shutting_down is True
@@ -414,19 +327,67 @@ async def test_shutdown_cancel_does_not_auto_continue():
 @pytest.mark.asyncio
 async def test_orphan_injection_delegates_to_callback():
     notify = AsyncMock(return_value=True)
-    mgr = SubagentManager(
-        sessions=MagicMock(), ctx_builder=None, on_orphan_notify=notify
-    )
+    mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None, on_orphan_notify=notify)
     with patch("kiro_crew.subagent.sel"):
         ok = await mgr._try_inject_orphan_notification("dashboard:main", "msg")
     assert ok is True
-    notify.assert_awaited_once_with("dashboard:main", "msg")
+    # The structured completion facts are forwarded as a third arg;
+    # a direct call with no meta passes None through unchanged.
+    notify.assert_awaited_once_with("dashboard:main", "msg", None)
 
 
 @pytest.mark.asyncio
 async def test_orphan_injection_false_without_callback():
     mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None)
     assert await mgr._try_inject_orphan_notification("dashboard:main", "msg") is False
+
+
+@pytest.mark.asyncio
+async def test_orphan_injection_callback_error_returns_false():
+    notify = AsyncMock(side_effect=RuntimeError("dashboard unavailable"))
+    mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None, on_orphan_notify=notify)
+
+    assert await mgr._try_inject_orphan_notification("dashboard:main", "msg") is False
+    notify.assert_awaited_once_with("dashboard:main", "msg", None)
+
+
+@pytest.mark.asyncio
+async def test_delivered_orphan_survives_audit_and_tombstone_failures():
+    notify = AsyncMock(return_value=True)
+    audit = MagicMock()
+    audit.log_api_access.side_effect = RuntimeError("audit unavailable")
+    mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None, on_orphan_notify=notify)
+    state = {
+        "id": "orphan-1",
+        "task": "recover work",
+        "parent_session": "dashboard:main",
+    }
+
+    with (
+        patch("kiro_crew.subagent.has_dashboard_surface", return_value=True),
+        patch("kiro_crew.subagent.sel", return_value=audit),
+        patch(
+            "kiro_crew.subagent.write_tombstone", side_effect=OSError("disk unavailable")
+        ) as write_tombstone,
+    ):
+        result = await mgr._notify_orphan("orphan-1", state, False)
+
+    assert result is None
+    notify.assert_awaited_once()
+    audit.log_api_access.assert_called_once_with(
+        caller="dashboard:main",
+        operation="subagent.orphan_notification_injected",
+        outcome="ok",
+        source="subagent",
+    )
+    write_tombstone.assert_called_once_with(
+        "orphan-1",
+        cause="gateway_restart",
+        recovery_action="delivered",
+        pid=None,
+        turns=0,
+        last_tool="",
+    )
 
 
 @pytest.mark.asyncio
@@ -458,7 +419,7 @@ async def test_cancel_recovery_waits_for_slow_teardown():
 
     reset_done = asyncio.Event()
 
-    async def _slow_reset(key):
+    async def _slow_reset(key, **_):
         await asyncio.sleep(0.5)
         reset_done.set()
 
@@ -468,20 +429,13 @@ async def test_cancel_recovery_waits_for_slow_teardown():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("slow teardown job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         task1 = mgr._tasks[info.id]
         task1.cancel()
         await asyncio.gather(task1, return_exceptions=True)
 
         # Poll for the respawn; when it appears, teardown MUST already be done.
-        task2 = None
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < deadline:
-            task2 = mgr._tasks.get(info.id)
-            if task2 is not None and task2 is not task1:
-                break
-            await asyncio.sleep(0.05)
-        assert task2 is not None and task2 is not task1
+        task2 = await _respawned_task(mgr, info, task1)
         assert reset_done.is_set()  # respawn strictly after the slow reset
         assert task1.done()
         # The new task is tracked — a user Stop can still find and cancel it.
@@ -499,7 +453,7 @@ async def test_cancel_recovery_waits_for_free_slot():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("capacity job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         task1 = mgr._tasks[info.id]
 
         # Simulate the freed slot being immediately taken by a queued spawn.
@@ -520,14 +474,7 @@ async def test_cancel_recovery_waits_for_free_slot():
 
         # Free the slot — recovery proceeds and count never exceeds the cap.
         mgr._running_count = 0
-        task2 = None
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < deadline:
-            task2 = mgr._tasks.get(info.id)
-            if task2 is not None and task2 is not task1:
-                break
-            await asyncio.sleep(0.05)
-        assert task2 is not None and task2 is not task1
+        task2 = await _respawned_task(mgr, info, task1)
         assert mgr._running_count <= mgr._max_concurrent
         task2.cancel()
         await asyncio.gather(task2, return_exceptions=True)
@@ -543,9 +490,7 @@ async def test_cancel_recovery_failure_emits_done_and_delivers():
     started = asyncio.Event()
     on_done = AsyncMock()
     sessions = _mock_sessions(_hanging_stream_factory(started))
-    mgr = SubagentManager(
-        sessions=sessions, ctx_builder=_mock_ctx_builder(), on_done=on_done
-    )
+    mgr = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder(), on_done=on_done)
     mgr._should_use_session_sharing = MagicMock(return_value=False)
     events: list[tuple[str, dict]] = []
 
@@ -561,7 +506,7 @@ async def test_cancel_recovery_failure_emits_done_and_delivers():
     ):
         info = mgr.spawn("doomed recovery job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         task1 = mgr._tasks[info.id]
         task1.cancel()
         await asyncio.gather(task1, return_exceptions=True)
@@ -575,7 +520,9 @@ async def test_cancel_recovery_failure_emits_done_and_delivers():
         # failure path's subagent_done emit and on_done delivery run.
         rec = mgr._tasks.get(f"{info.id}:recovery")
         assert rec is not None, "pending recovery must be registered in _tasks"
-        await asyncio.wait_for(asyncio.gather(rec, return_exceptions=True), timeout=10)
+        await asyncio.wait_for(  # flake-ok: _GIVE_UP_BOUND asserts the patched give-up took effect
+            asyncio.gather(rec, return_exceptions=True), timeout=_GIVE_UP_BOUND
+        )
 
     assert info.done is True
     assert info.error == "cancelled (recovery failed)"
@@ -583,6 +530,127 @@ async def test_cancel_recovery_failure_emits_done_and_delivers():
     assert done_events, "recovery failure must emit subagent_done"
     assert done_events[-1][1].get("error")
     on_done.assert_awaited_once_with(info)
+
+
+class _WallSteppedClock:
+    """The ``time`` module with its wall clock offset and its monotonic clock real.
+
+    ``reads`` counts the clock reads made through it: the slot wait reads the clock
+    on every poll, so a test waits for its next polls instead of sleeping.
+    """
+
+    def __init__(self) -> None:
+        self.wall = 0.0
+        self.reads = 0
+
+    def time(self) -> float:
+        self.reads += 1
+        return time.time() + self.wall
+
+    def monotonic(self) -> float:
+        self.reads += 1
+        return time.monotonic()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+@pytest.mark.asyncio
+async def test_cancel_recovery_slot_wait_survives_a_forward_wall_clock_step():
+    """The slot wait is measured on the monotonic clock: a wall-clock step forward
+    (an NTP step, a manual change, a resume from suspend) does not end it early and
+    fail the run as "cancelled (recovery failed)"."""
+    started = asyncio.Event()
+    mgr = _manager(_mock_sessions(_hanging_stream_factory(started)))
+    clock = _WallSteppedClock()
+
+    with (
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+        patch("kiro_crew.subagent.time", clock),
+    ):
+        info = mgr.spawn("recovery under a wall-clock step")
+        assert info is not None
+        await await_until(started, what="the stream's first yield")
+        task1 = mgr._tasks[info.id]
+        task1.cancel()
+        # Waited on directly, under the helpers' lost-run bound: the test must resume
+        # right after the run ends, before the recovery's first capacity check, and
+        # ``await_until`` adds a loop turn (its waiter on a ``gather``) that let the
+        # recovery respawn first.
+        done, _ = await asyncio.wait({task1}, timeout=default_timeout())
+        assert task1 in done, "the cancelled run never ended"
+
+        # Keep the pool full so the recovery waits for a slot.
+        mgr._max_concurrent = 1
+        mgr._running_count = 1
+        rec = mgr._tasks.get(f"{info.id}:recovery")
+        assert rec is not None, "pending recovery must be registered in _tasks"
+        polled = clock.reads
+        await async_wait_until(lambda: clock.reads >= polled + 2 or info.done)
+        assert not info.done
+
+        # Two minutes forward on the wall clock, none on the monotonic one: a
+        # recovery measured on the wall clock gives up on its next 0.25 s poll.
+        clock.wall = 120.0
+        polled = clock.reads
+        await async_wait_until(lambda: clock.reads >= polled + 2 or info.done)
+        assert not info.done, f"the slot wait ended on a wall-clock step: {info.error!r}"
+
+        # Free the slot: the recovery respawns the run.
+        mgr._running_count = 0
+        await await_until(asyncio.gather(rec, return_exceptions=True), what="the recovery ending")
+        task2 = mgr._tasks.get(info.id)
+        assert task2 is not None and task2 is not task1
+        task2.cancel()
+        await await_until(
+            asyncio.gather(task2, return_exceptions=True), what="the cancelled replacement ending"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_recovery_slot_wait_without_a_clock_step_gives_up_at_its_deadline():
+    """Control for the test above: with no clock step, a slot wait on a pool that
+    stays full still ends at its deadline, now read on the monotonic clock, and the
+    run fails as "cancelled (recovery failed)", as before."""
+    started = asyncio.Event()
+    mgr = _manager(_mock_sessions(_hanging_stream_factory(started)))
+    clock = _WallSteppedClock()
+    give_up = 0.4
+
+    with (
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+        patch("kiro_crew.subagent.time", clock),
+        patch("kiro_crew.subagent._RECOVERY_SLOT_WAIT_SECS", give_up),
+    ):
+        info = mgr.spawn("recovery that never finds a slot")
+        assert info is not None
+        await await_until(started, what="the stream's first yield")
+        task1 = mgr._tasks[info.id]
+        # Taken before the cancel, so it precedes the deadline the recovery sets.
+        t0 = time.monotonic()
+        task1.cancel()
+        # Waited on directly, under the helpers' lost-run bound: the test must resume
+        # right after the run ends, before the recovery's first capacity check, and
+        # ``await_until`` adds a loop turn (its waiter on a ``gather``) that let the
+        # recovery respawn first.
+        done, _ = await asyncio.wait({task1}, timeout=default_timeout())
+        assert task1 in done, "the cancelled run never ended"
+
+        # Keep the pool permanently full so the slot wait reaches its deadline.
+        mgr._max_concurrent = 1
+        mgr._running_count = 1
+        rec = mgr._tasks.get(f"{info.id}:recovery")
+        assert rec is not None, "pending recovery must be registered in _tasks"
+        await asyncio.wait_for(  # flake-ok: _GIVE_UP_BOUND asserts the patched give-up took effect
+            asyncio.gather(rec, return_exceptions=True), timeout=_GIVE_UP_BOUND
+        )
+        waited = time.monotonic() - t0
+
+    assert info.done is True
+    assert info.error == "cancelled (recovery failed)"
+    assert waited >= give_up, f"gave up after {waited:.2f} s, before its {give_up} s deadline"
 
 
 @pytest.mark.asyncio
@@ -594,9 +662,7 @@ async def test_cancel_all_reaches_pending_recovery_and_finalizes():
     started = asyncio.Event()
     on_done = AsyncMock()
     sessions = _mock_sessions(_hanging_stream_factory(started))
-    mgr = SubagentManager(
-        sessions=sessions, ctx_builder=_mock_ctx_builder(), on_done=on_done
-    )
+    mgr = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder(), on_done=on_done)
     mgr._should_use_session_sharing = MagicMock(return_value=False)
     mgr._fire_event = AsyncMock()
 
@@ -606,7 +672,7 @@ async def test_cancel_all_reaches_pending_recovery_and_finalizes():
     ):
         info = mgr.spawn("job interrupted by shutdown")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the stream's first yield")
         task1 = mgr._tasks[info.id]
         task1.cancel()
         await asyncio.gather(task1, return_exceptions=True)
@@ -645,6 +711,7 @@ async def test_transient_error_after_tool_call_sends_continue_prompt():
                     tool_kind="edit",
                     tool_call_id="tc1",
                     tool_input={},
+                    runtime_global=False,
                 )
                 raise _TransientError("500 before first token")
             yield _text_event("done after tool")
@@ -701,14 +768,18 @@ def test_no_raw_cancel_outside_chokepoint():
     pending cancel-recovery scheduler task — none of the latter two are managed
     runs, so the marker contract (and recovery) never applies to them."""
     import inspect
+    from pathlib import Path
 
     import kiro_crew.subagent as subagent_mod
 
-    source = inspect.getsource(subagent_mod)
-    lines = source.splitlines()
+    source_root = Path(subagent_mod.__file__).resolve().parent
+    source_paths = [Path(subagent_mod.__file__).resolve()]
+    source_paths.extend(sorted((source_root / "subagent_manager").glob("*.py")))
+    source_paths.extend(sorted((source_root / "subagent_parts").glob("*.py")))
     raw_sites = [
-        (i + 1, line.strip())
-        for i, line in enumerate(lines)
+        (path.relative_to(source_root).as_posix(), i + 1, line.strip())
+        for path in source_paths
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines())
         if ".cancel()" in line
         and not line.strip().startswith("#")
         and "``" not in line  # docstring mentions, not call sites
@@ -727,27 +798,31 @@ def test_no_raw_cancel_outside_chokepoint():
         # trigger a respawn (it only ever DISPATCHES via continue_conversation,
         # which cancel_all pre-empts by cancelling watchers first).
         "followup_watcher.cancel()",
+        # The pending async OPEN of the durable task store, cancelled by ``close()``.
+        # It is a store-open task, not a managed run: no terminal marker applies and
+        # cancelling it cannot trigger a respawn. Left pending it would complete after
+        # the close and re-attach the connection this method exists to release.
+        "taskq_open_task.cancel()",
     )
-    chokepoint_src = inspect.getsource(
-        subagent_mod.SubagentManager._cancel_task_intentionally
-    )
+    chokepoint_src = inspect.getsource(subagent_mod.SubagentManager._cancel_task_intentionally)
     assert "task.cancel()" in chokepoint_src
-    for lineno, line in raw_sites:
+    for rel, lineno, line in raw_sites:
         assert any(s in line for s in allowed_substrings), (
-            f"raw .cancel() at subagent.py:{lineno} ({line!r}) — route it "
+            f"raw .cancel() at {rel}:{lineno} ({line!r}) — route it "
             "through _cancel_task_intentionally with a terminal marker"
         )
     # The generic 'task.cancel()' form must appear ONLY inside the chokepoint.
     generic = [
-        (n, l) for n, l in raw_sites
-        if "task.cancel()" in l
-        and "_reaper_task" not in l
-        and "recovery_task" not in l
-        and "report_task" not in l
+        (rel, n, line)
+        for rel, n, line in raw_sites
+        if "task.cancel()" in line
+        and "_reaper_task" not in line
+        and "recovery_task" not in line
+        and "report_task" not in line
+        and "taskq_open_task" not in line
     ]
     assert len(generic) == 1, (
-        f"expected exactly one raw task.cancel() (the chokepoint body), "
-        f"found: {generic}"
+        f"expected exactly one raw task.cancel() (the chokepoint body), " f"found: {generic}"
     )
 
 
@@ -832,3 +907,136 @@ async def test_reconcile_single_orphan_dm_is_not_wrapped_in_digest():
     msg = dm.await_args.args[0]
     assert "solo-1" in msg
     assert "restart digest" not in msg
+
+
+def _streams_then_fails(error: Exception, text: str = "the answer "):
+    def stream_factory(msg: str, *a, **kw):
+        async def _gen():
+            if text:
+                yield _text_event(text)
+            raise error
+
+        return _gen()
+
+    return stream_factory
+
+
+_GENERATE_FAILED = "The model failed to generate a response (transient error)."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep", ["head", "tail"])
+async def test_generate_failed_after_output_keeps_the_output_with_a_warning(keep):
+    """Output already streamed survives a transient generate failure the retry cannot fix.
+
+    Longer than the keep cap, so a warning added before the cap would be cut off."""
+    error, text = _TransientError(_GENERATE_FAILED), "x" * 4000
+    calls: list[str] = []
+    factory = _streams_then_fails(error, text)
+
+    def _recording(msg: str, *a, **kw):
+        calls.append(msg)
+        return factory(msg, *a, **kw)
+
+    mgr = _manager(_mock_sessions(_recording))
+    mgr.update_completion_keep(keep, 3000)
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "completed"
+    assert not info.error
+    assert info.partial is True
+    assert info.result.startswith("_Warning: the backend failed to generate")
+    assert "xxxx" in info.result
+    # The output is kept only after the one continue turn was tried.
+    assert len(calls) == 2 and calls[1] == _TRANSIENT_CONTINUE_MSG
+    # The disk copy, read by spawn_status / spawn_run, carries the warning too.
+    from pathlib import Path
+
+    assert info.result_path
+    assert "_Warning: the backend failed to generate" in Path(info.result_path).read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (_TransientError("500 mid-stream"), "the answer "),  # transient, not generate-failed
+        (_FatalError(_GENERATE_FAILED), "the answer "),  # not transient
+        (_TransientError(_GENERATE_FAILED), " "),  # whitespace-only output
+    ],
+)
+async def test_other_failures_after_output_still_fail(error, text):
+    mgr = _manager(_mock_sessions(_streams_then_fails(error, text)))
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "failed"
+    assert info.error
+
+
+@pytest.mark.asyncio
+async def test_control_tag_only_output_still_fails():
+    """Output that is only an [OPTIONS: ...] tag is empty once the tag is stripped."""
+    calls: list[str] = []
+
+    def stream_factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            if len(calls) == 1:
+                yield _text_event("[OPTIONS: Retry | Stop]")
+            raise _TransientError(_GENERATE_FAILED)
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(stream_factory))
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "failed"
+    assert info.error
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_frames_carry_the_tool_call_id():
+    """Both ``subagent_tool`` fire sites send the call's ``tool_call_id``.
+
+    The Subagents card lists each call once by matching that id: a gated call's
+    ``EVENT_TOOL_CALL`` frame and its permission-request frame share it and the
+    same ``tool_count``, while a backend child's permission request has its own
+    id but an unchanged count. Without the id on the wire the card can only
+    compare counts, and the child's request overwrites the parent's last call.
+    """
+    from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, EVENT_TOOL_CALL, LLMEvent
+
+    async def stream(*_args, **_kwargs):
+        yield LLMEvent(
+            kind=EVENT_TOOL_CALL, title="Terminal", tool_call_id="call-1", tool_kind="execute"
+        )
+        yield LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="Running: git status",
+            request_id=1,
+            tool_call_id="call-1",
+            tool_kind="execute",
+        )
+        yield _text_event("done")
+        yield _complete_event()
+
+    mgr = _manager(_mock_sessions(stream))
+    frames: list[dict] = []
+    _orig_fire = mgr._fire_event
+
+    async def _spy(etype, info, extra=None):
+        if etype == "subagent_tool":
+            frames.append(dict(extra or {}))
+        await _orig_fire(etype, info, extra)
+
+    mgr._fire_event = _spy
+    info = await _spawn_and_wait(mgr)
+
+    assert info.error == ""
+    assert [f.get("tool_call_id") for f in frames] == ["call-1", "call-1"]
+    # Same call, same count: the second frame must not look like a new call.
+    assert frames[0]["tool_count"] == frames[1]["tool_count"] == 1

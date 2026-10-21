@@ -5,7 +5,7 @@ Ported from Nous Research's Hermes Agent ``gateway/platforms/weixin.py``
 imported lazily inside :meth:`WeixinClient.connect` so a missing extra never
 breaks boot.
 
-This module owns ONLY protocol I/O + credential persistence + the small
+This module owns ONLY protocol I/O + the small
 context-token / typing-ticket caches. Turn handling, authorization, rendering
 and chunking live in the sibling transport / dispatch / renderer modules.
 """
@@ -25,8 +25,6 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
 import aiohttp
-
-from kiro_crew.platform_compat import restrict_to_owner
 
 logger = logging.getLogger(__name__)
 
@@ -135,41 +133,11 @@ def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
 # PUT) lands with outbound media rather than sitting here unreachable.
 
 
-# --- Credential + ephemeral state persistence ---------------------------------
+# --- Ephemeral state persistence ----------------------------------------------
 def _account_dir(home: str) -> Path:
     path = Path(home) / "weixin" / "accounts"
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def save_weixin_account(home: str, *, account_id: str, token: str, base_url: str, user_id: str = "") -> None:
-    """Persist account credentials owner-only.
-
-    The file holds the bot credential, so it is locked down with
-    :func:`platform_compat.restrict_to_owner` — a bare ``chmod(0o600)`` is a no-op
-    against Windows ACLs.
-    """
-    path = _account_dir(home) / f"{account_id}.json"
-    _atomic_json_write(path, {
-        "token": token,
-        "base_url": base_url,
-        "user_id": user_id,
-        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
-    try:
-        restrict_to_owner(str(path))
-    except OSError:
-        logger.warning("weixin: could not restrict account file permissions", exc_info=True)
-
-
-def load_weixin_account(home: str, account_id: str) -> Optional[Dict[str, Any]]:
-    path = _account_dir(home) / f"{account_id}.json"
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 class ContextTokenStore:
@@ -278,6 +246,7 @@ class WeixinClient:
         self.base_url = base_url.rstrip("/")
         self.account_id = account_id
         self._session: Any = None  # aiohttp.ClientSession, created in connect()
+        self._handler_tasks: set[asyncio.Task[Any]] = set()
 
     async def connect(self) -> None:
         if self._session is None or self._session.closed:

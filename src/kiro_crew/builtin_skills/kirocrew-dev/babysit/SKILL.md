@@ -1,298 +1,364 @@
 ---
 name: babysit
-description: Same-session monitoring loop for PRs, CI runs, tickets, and deployments using the monitor_start / monitor_update / autonudge_stop MCP tools. The loop re-injects your check instructions into THIS session on an idle interval — same context, same tools — and works from dashboard chat, Slack threads, and Discord DMs. Use when the user says "babysit", "monitor", "keep checking", "keep an eye on", "loop on this PR", "let me know when", or wants polling that outlives a wait+poll window. NOT for fresh-session work (use cron_add) or external-system callbacks (use register_hook).
-tags: [skill, kirocrew, monitor, babysit, autonudge, loop]
+description: Use when a user asks to babysit, monitor, keep checking, keep an eye on, or report when a pull request, CI run, ticket, deployment, or other changing target reaches an outcome.
+inject_on_trigger: false
+triggers: babysit, keep checking, keep an eye on, let me know when, monitor pull request, monitor pr, watch pull request, watch pr
+tags: [skill, kirocrew, monitor, babysit]
 ---
 
-# Babysit (same-session monitoring loop)
+# Babysit
 
-## Overview
+General-purpose monitoring: this skill works without a Kiro Crew checkout or
+kirocrew-prepare-pr installed. It owns loop mechanics, not a repository's repair policy.
+For Kiro Crew PR CI AI comments ONLY, MUST load
+[kirocrew-prepare-pr: Review repair routing](../kirocrew-prepare-pr/SKILL.md#review-repair-routing)
+before any fix. That procedure requires model-pinned repair subagents; parent
+self-fixing does not satisfy it. Prepare-pr owns that repo's local reviewers,
+PR gates, dispositions and publication rules. Do not require it for other work.
 
-`monitor_start(message, interval_secs?, max_cycles?)` binds a monitoring loop
-to **your current session**. After each of your turns completes and the
-session sits idle for `interval_secs`, the message is re-injected as your
-next turn. You keep the full conversation context, memory, and tools on every
-cycle. Loops persist to `~/.kiro/crew/autonudge.json` and survive gateway
-restarts.
+## Choose one driver
 
-Works from:
+Use a structured monitor only when its typed provider observes every fact needed
+to decide the objective. Use the finite legacy path for evidence it cannot see.
+Structured watches support dashboard, Slack, and Discord sessions.
+On Webex, use the finite legacy path even for a supported pull request.
 
-| Surface | Binding | Cadence |
-|---|---|---|
-| Dashboard chat | bare slot key | idle timer (re-armed after every turn) |
-| Slack thread | `slack:<thread_ts>` | fixed interval after each unattended turn |
-| Discord DM | `discord:{agent}:direct:{user}` | fixed interval after each unattended turn |
+| Work | Driver |
+|---|---|
+| User is waiting, total work under 30 minutes | Bounded in-turn `wait` + poll |
+| One supported pull request, readiness decided by typed provider facts | `monitor_watch` |
+| Generic comments/advisory findings, or a required final report or notification | Finite `monitor_start` with `gate=false` |
+| Act on a schedule, multiple subjects, unsupported ticket or deployment | Finite `monitor_start` |
+| Fresh-session work needing no approval-bound tools | `cron_add` |
+| Post-merge cleanup after verified merge | Script cron, roughly every 5 minutes |
+| External system calls back | `register_hook` |
 
-`autonudge_stop(reason?)` stops the loop bound to the current session from
-any of those surfaces. `monitor_update(message?, interval_secs?, max_cycles?)`
-revises the loop already bound to this session in place, keeping its cycle
-count — use it when the instruction you armed has gone stale, or to raise the
-cap on a loop that is still doing useful work.
+Never use an agent cron or `HEARTBEAT.md` to fix and push review findings. Cron
+has no owning chat slot's trust and can time out at tool approval while still
+recording `last_status: ok`; heartbeat's allowlist has no shell or push.
+Use one session-owned driver, not two watchers.
 
-### `interval_secs` is an idle gap, not a period
+A gated `monitor_start` hands its whole pull-request reading, comment and review
+bodies included, to the wake judge, so `wake_when` may name prose. No
+judge lane: only an unchanged subject is free.
 
-The timer arms when your turn **ends**, so the real cadence is
-`interval_secs` + however long each cycle's work takes. A 300s interval with
-5-minute checks wakes you roughly every 10 minutes. Size it for the gap you
-want *between* cycles.
+An installation can set how firmly this table's facts-decided row points at the
+structured path. With `monitoring.prefer_structured_arming` on, `monitor_watch` is
+this gateway's default for a supported pull request and the prompt loop is the
+exception; off (the default) the table reads as written. The setting changes what
+the two tool descriptions say and refuses neither tool, so the row that matters
+never moves: evidence the typed provider cannot see -- generic comments, advisory
+findings, a required final report -- is `monitor_start` with `gate=false` in
+either position. Read the descriptions you were given rather than assuming a
+position.
 
-### You must stop the loop yourself
+### Structured pull-request watch
 
-`max_cycles` (default 24) is a **runaway backstop, not a finish line**. A loop
-that coasts into its cap did not complete — it ran out of rope, and whatever
-it was watching is still unresolved. Real loop stores show this is the common
-failure: two live babysit loops ended at exactly 24/24 and 20/20 delivered
-cycles, neither having called `autonudge_stop`. Evaluate the exit condition
-every single cycle and stop deliberately.
+Use this only for pull-request lifecycle, mergeability, review decision,
+canonical review facts and check conclusions. Choose the kind from the canonical
+URL; do not translate one provider's URL into another provider's shape.
 
-### Context grows every cycle
+| URL | `kind` |
+|---|---|
+| `https://github.com/OWNER/REPO/pull/NUMBER` | `github_pull_request` |
+| `https://gitlab.com/GROUP/REPO/-/merge_requests/NUMBER` | `gitlab_merge_request` |
+| `https://GITLAB_HOST/GROUP/REPO/-/merge_requests/NUMBER` | `gitlab_merge_request` when that exact self-managed host is configured |
+| `https://dev.azure.com/ORG/PROJECT/_git/REPO/pullrequest/NUMBER` | `azure_devops_pull_request` |
+| `https://bitbucket.org/WORKSPACE/REPO/pull-requests/NUMBER` | `bitbucket_pull_request` |
 
-Each cycle appends a full turn — tool calls, CI output, diffs — to the **same**
-session. That shared context is the point of a same-session loop, but nothing
-bounds it: long babysits walk into compaction, which can summarise away the
-very instructions the loop keeps re-injecting. Keep per-cycle output minimal.
+Call once with the selected kind and unchanged canonical URL:
 
-### Verify the loop armed — the return string is not evidence
+```
+monitor_watch(kind=<kind>, target=<full PR URL>, objective="review_ready",
+              interval_secs=300, max_runtime_secs=14400,
+              wake_instructions=<actions and exit>)
+```
 
-`monitor_start` returns an acknowledgement whether or not the loop was
-actually armed. The applier runs after the tool returns, and its failure
-message is not visible to you, so a confident-looking success string is
-consistent with nothing being scheduled at all.
+Inspect the schema: positive `max_tokens`/`max_provider_errors`, and
+`max_agent_turns` where 0 = no wake cap. Ordinary unchanged/pending/retry/terminal probes
+spend no agent turn; a new actionable fingerprint wakes the owning session at
+most once with a bounded summary. Fetch logs, comments or diffs only when needed
+on that wake. The token cap applies only when usage is reported;
+`token_usage_known` exposes that gap; runtime always caps, turns only if
+set positive. Provider errors are bounded too. GitLab uses installed
+`glab` credentials, Azure DevOps uses `az login` or the protected
+`AZURE_DEVOPS_EXT_PAT`, and Bitbucket may use the protected `BITBUCKET_EMAIL`
+plus `BITBUCKET_API_TOKEN`. A setup or authentication refusal is authoritative;
+do not replace it with a legacy full-turn loop.
 
-Confirm against state, not the reply: read `~/.kiro/crew/autonudge.json` (or
-`GET /api/autonudge`) and check the loop is present, then that `cycle_count`
-advances on the next cycle. If it never appears, no monitoring is running —
-fall back to an in-turn `wait`+poll loop and tell the user monitoring is not
-active.
+The reply is a pending application request, not proof that the monitor armed.
+END THE TURN so the owning session can apply it. The operator can confirm it in
+the dashboard; call `monitor_inspect()` at the start of a later user/wake turn,
+not after arming in the same turn. It takes no monitor id, target or session key.
+Its retained session-bound state is authoritative.
 
-If `monitor_start` explicitly reports it could not arm, believe it. That
-message is distinct from the transient MCP reconnects you retry through — do
-not write it off as flakiness.
+A terminal success uses zero model turns, so a structured watch does not create
+a final reporting turn. If the user requires a final report or notification even
+when no action is needed, use the finite legacy path.
 
-## Decision table
+Typed providers do not observe generic issue/pull-request comments or advisory
+review findings outside their canonical review and check facts. When readiness
+depends on those, call the finite legacy path directly with `gate=false`; a typed
+fingerprint cannot stand in for missing evidence.
 
-- User is waiting and total time < 30 min → `wait` + poll, no loop.
-- "Babysit / monitor / keep checking" in THIS conversation → `monitor_start`.
-- Reacting to review feedback or CI on a PR → `monitor_start` or in-turn
-  `wait`+poll. **Never `cron_add`, never HEARTBEAT.md** (see below).
-- Work belongs in a fresh isolated session each cycle, and needs no tools that
-  require approval → `cron_add`.
-- Cleaning up after a merge you have already verified → `cron_add`, as a
-  `script` cron at roughly a 5-minute interval.
-- External system will call back → `register_hook`.
+Use `monitor_update` without an id for cadence, positive budgets or
+`wake_instructions`: these preserve the comparison baseline. Changing `target`
+or `objective` starts a new baseline. Terminal records are read-only; restarting
+requires an explicit new watch. Stop with `monitor_stop(reason=...)`, retaining
+`user_stop`; `autonudge_stop` is a compatibility alias, not the preferred path.
+A retained user stop cannot be replaced by rearming: ask its owner to use
+**Clear stopped monitor** (legacy **Clear stopped goal**) or the dashboard's
+explicit restart action. Never erase that evidence or retry the refusal.
 
-### Never use cron or heartbeat to react to reviewer feedback
+## Example: legacy comment-aware recipe
 
-Both are structurally incapable of it, and both fail in ways that look like
-success:
+```text
+monitor_start({
+  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow kirocrew-prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
+  "interval_secs": 300,
+  "max_cycles": 48,
+  "max_runtime_secs": 14400,
+  "gate": false
+})
+```
 
-- **Cron.** A cron job has no owning chat slot, so it can never earn per-slot
-  trust: its tool calls land on a deny-by-default approval path and time out
-  after 180 seconds unless a global auto-approve grant happens to be active.
-  Worse, a denied *tool* inside a *completed* turn still records
-  `last_status: ok`, so the job registry reports health while the job does
-  nothing. Measured on a real PR watcher: 101 runs over 25 hours, 23 blocked at
-  approval, hours of model time, zero commits pushed, and a green-looking
-  registry throughout.
-- **Heartbeat.** Its approval path is a strict name allowlist
-  (`HEARTBEAT_SAFE_TOOLS`), deny-by-default, with no shell and no `git push`.
-  It cannot amend a commit or push a revision, so it can never close the loop
-  it was asked to watch.
+Replace the example URL with the real target. Keep `gate: false`: provider-fact
+gating cannot observe generic comments or advisory findings and could suppress
+a cycle while that evidence waits. All three limits must be positive and finite;
+never use `0` for unlimited work. Every delivered legacy cycle is a full model
+turn even if nothing changed. Name the readiness conditions below by reference
+rather than copying their text into the message: a copy inside the instruction
+drifts from the list it duplicates while still reading as authoritative.
+Follow the execution steps below.
 
-Cron *is* the right tool for post-merge cleanup — but as a `script` cron, which
-bypasses the LLM approval layer entirely, at roughly a 5-minute interval. An
-hourly job loses the race: one observed merge-to-teardown window was 17
-minutes.
+### Same-session timer
 
-## Reading PR/MR state — ask the host for its verdict, don't hand-roll a filter
+The legacy timer binds to THIS session. Slot-less subagents, cron, webhook and
+task-runner turns cannot arm it; use bounded in-turn wait/poll instead.
+Loops persist in the data home's `autonudge.json`. User turns defer a due fire
+until their end but do not restart its countdown. Each delivered cycle's next
+countdown starts after its own work, so cadence includes turn time. Busy cycles
+can be skipped, not queued, and skips do not spend `max_cycles`. Gateway restarts
+preserve state. Keep Slack/Discord unattended turns small; they have a 30-minute
+bound and no blanket grant: normal PreToolUse governance and approvals apply.
+A rejected or timed-out approval is a stall, not success or permission to loosen
+security. Fix, commit and push only within the user's authorization.
 
-Whatever you are babysitting, the read step is **not** yours to invent. These
-five rules hold on GitHub, GitLab and Bitbucket alike; only the command changes.
+- Name ONE public GitHub PR by full URL in `message` to select gating. A
+  bare `PR <n>` gates only if this session already named its URL.
+- `gate=true` is the default. Quiet subjects avoid turns, with eventual delivery
+  after enough quiet intervals. Use `gate=false` for generic comments/advisory
+  scans and duties that act despite silence, such as chasing a missing reviewer
+  or tracking a moving base. `max_cycles` counts DELIVERED turns, including
+  quiet-floor deliveries and fallbacks, not just useful changes.
+- A short `banner` keeps a long instruction out of stored transcript rows while
+  the model receives it whole. Dashboard only; channel loops refuse it with 400.
+  `monitor_update(banner="")` clears it.
+- `monitor_update(message?, interval_secs?, max_cycles?, max_runtime_secs?, banner?)`
+  preserves the count and omitted fields. Do not mix these with structured-only
+  `target`, `objective`, `max_agent_turns`, `max_tokens`, `max_provider_errors`
+  or `wake_instructions`. On Webex, stop and create a new finite loop instead.
+- One automation occupies a session. `monitor_start` is create-only; update an
+  active loop rather than replacing it. A new arm replaces a cap/budget-stopped
+  legacy loop, only with user authorization. Manual pauses and user
+  stops stay preserved; retained evidence needs the owner action above. Do not
+  rearm merged/closed work as if it still needed repairs.
 
-1. **Ask the host for its own aggregate verdict.** Do not reduce a list of
-   individual checks into a pass/fail yourself. Every host computes a merge
-   verdict and exposes it; a filter you write over the raw list is a second,
-   worse implementation of it that silently disagrees.
-2. **Classify every state you see, and fail closed on the ones you don't.** An
-   unrecognized or unmapped status must count as *not passing*, never as
-   passing. Collapse superseded runs to the newest attempt per check identity
-   before counting failures, or a stale cancelled run reads as a live failure.
-3. **"Checks are green" is not "nothing is outstanding."** Unresolved review
-   threads and *advisory* (non-blocking) results are separate axes that the
-   aggregate verdict does not cover, by design. Read them separately, every
-   cycle, or the loop will declare readiness over an open thread.
-4. **Lifecycle state is terminal — read it every cycle.** Merged, closed, or
-   declined means stop, report the real outcome, and call `autonudge_stop`.
-   Do not infer this from the checks; ask for the state field.
-5. **Mergeability is computed asynchronously.** "Unknown", "checking" or
-   "unchecked" means **wait**, not pass — and on a non-open object it may never
-   resolve at all (see the GitHub limits below).
+## Execute the legacy loop
 
-### Where each host keeps those answers
+1. Write a self-contained instruction naming subject, allowed actions, success,
+   blocker/stall conditions and stop tool. Include worktree/branch and whether
+   pushes are authorized. Pass positive cycle and runtime bounds. For Kiro Crew
+   preparation use kirocrew-prepare-pr's budget; never raise its cap yourself.
+2. Load the MCP tool by exact `tool_search` ID before calling it. Report only
+   that monitoring was REQUESTED and END YOUR TURN immediately. Application
+   happens when the turn's result is processed, not synchronously with the call.
+3. On a later turn, verify the applied transcript notice and session-bound state
+   through `monitor_inspect()` where supported, the dashboard monitor/goal-loop
+   surface or `GET /api/autonudge`. Prepare-pr's `monitor_armed.py` is an optional
+   legacy helper. Check `cycle_count` advances on later cycles; never claim an
+   acknowledgement alone proves active monitoring.
+4. A create-only refusal means a loop may already be active: inspect state,
+   never add wait/poll beside it. Missing hosting context permits bounded in-turn
+   wait/poll. A retained-stop refusal needs the owner, not a retry or another driver.
+   Read an absent/frozen loop's reason and report the blocker; do not silently
+   substitute an unbounded poll or retry arming before the pending request applies.
+5. Each wake reads durable state, checks the subject and acts only on real
+   changes. Report real signals only; update stale instructions in place.
+6. Persist the progress key AND streak below. Keep cycle output small; the same
+   conversation grows each turn and compaction can erase an in-memory counter.
+7. On success, terminal state, user stop, external blocker or spent budget,
+   report the real outcome and any open findings, then call `autonudge_stop`
+   with a reason. A cap is a backstop, never successful completion. Do not rearm
+   automatically after a user stop or spent budget.
 
-| host | one-shot verdict | unresolved-thread axis | the local trap |
-|---|---|---|---|
-| **GitHub** | `pr_status.py` (below); optionally an aggregate status context | review threads via GraphQL (`pr_status.py` prints the count) | `statusCheckRollup` is a `CheckRun \| StatusContext` union — `.conclusion` vs `.state` |
-| **GitLab** | `detailed_merge_status` on the MR (`glab mr view <iid>`, or `glab api projects/:id/merge_requests/:iid`) | `glab mr view <iid> --unresolved`, or the Discussions API | a pipeline reports `success` while its `allow_failure: true` jobs failed |
-| **Bitbucket Cloud** | none — combine PR `state` with the commit's build statuses (`/2.0/repositories/{ws}/{repo}/commit/{sha}/statuses`) | PR comments/tasks on the PR resource | below Premium, unresolved merge checks only **warn**; the host still allows the merge |
+## Read state from the host
 
-GitLab specifics worth knowing: use `detailed_merge_status`, not `merge_status`
-(deprecated since 15.6 and it does not account for every state). Its values are
-themselves the loop's decision — `ci_still_running` / `checking` / `preparing` /
-`unchecked` are *wait*; `mergeable` is clean; `conflict`, `need_rebase`,
-`not_approved`, `draft_status`, `discussions_not_resolved`,
-`status_checks_must_pass` and `requested_changes` are each a distinct blocked
-reason worth reporting as itself. Note that `blocking_discussions_resolved` is
-**not** an unresolved-thread count: it only tells you whether resolution is
-required *and* satisfied, so on a project that does not require resolution it can
-be `true` with threads still open. Count threads from the discussions, and treat
-external status checks as their own axis, separate from the pipeline.
+Read lifecycle every cycle: merged, closed or declined means report that outcome
+and stop, regardless of check colors. Ask the host for its aggregate verdict;
+never hand-roll a green result by filtering only check conclusions. Unknown or
+unmapped states fail closed. Mergeability can be asynchronous: `unknown`,
+`checking` or `unchecked` means wait, never pass; a closed object may never settle.
+Collapse superseded attempts to the newest per workflow/check identity when you
+read the rollup yourself, ordering by the RUN ID, which increases monotonically --
+never a job's start time, which waits on a runner queue, nor the run's creation time,
+which is second-granular and often tied. Keep every row you cannot strictly order.
+A typed provider collapses the same way,
+keyed on the workflow DEFINITION's id plus the check name rather than the display name,
+since two files may share one `name:`, and on the run's triggering event, since one file
+on `push` and `pull_request` dispatches twice for one commit. Highest RUN ID wins, but
+recency alone licenses nothing: the rollup has no lineage edge. Drop a row only
+when its own RUN concluded CANCELLED, the row itself is COMPLETED+CANCELLED, and a newer
+run of its identity exists. Read that cancellation from the RUN, never the row:
+`fail-fast`, a failed `needs`, or an operator cancelling one job all leave a CANCELLED
+row inside a run that concluded FAILURE and is live. Conversely, a cancelled NEWEST run
+is never droppable; that revives the verdict it superseded. Two
+rows of ONE run are not a retry and both stay, because a workflow can publish a check
+run under its own job's display name. Finally,
+any completed row of a replaced round still reads as live, not only a cancelled one.
+The bundled `pr_status.py` applies this rule.
 
-Bitbucket specifics: there is no single "can this merge" field to poll, so rule 1
-becomes "combine the two sources the host does give you" — the PR's `state`
-(non-`OPEN` is terminal) and the head commit's build statuses. And because merge
-checks are advisory below Premium, a Bitbucket "green" is weaker evidence than
-elsewhere: rule 3 is not optional there.
+Green checks do not answer review threads or advisory findings. Establish once
+per repo what its reviewer check means, and repeat when its fleet changes:
+red may mean successful review with findings; green may carry findings; a job log
+may hold a verdict that never posted; identical trees may receive different
+verdicts; duplicate dispatch can inflate failure counts. If conclusions are not
+trustworthy, use the current-head marker/comment body and needed job logs.
+Record that finding in the repo's own tracker, not this general skill.
 
-Provenance: the GitHub path below is exercised (including against an unrelated
-public repo); the GitLab and Bitbucket rows come from those vendors' API docs and
-are **not** something this skill has run. Verify the exact flag or field against
-your host before trusting a value you have not seen come back.
+On GitHub, read the repo's aggregate commit status when present, otherwise the
+full `statusCheckRollup` (`gh pr view <n> --json
+state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup`), and read
+review threads plus comments/reviews for the current head separately. The rollup
+is a `CheckRun | StatusContext` union: classify `.conclusion` AND `.state`,
+respecting the repo's named aggregate status. A same-named CheckRun is not that
+commit status.
 
-### On GitHub: use `pr_status.py`
+Other-host guidance is not live-verified here. On another host (GitLab, Bitbucket,
+an enterprise forge) derive the same two answers, lifecycle plus aggregate merge
+verdict and a separate review-thread axis, from that host's own verdict fields,
+using its CLI or API help rather than field names remembered from elsewhere. Wait
+states, hidden allowed-failure jobs and "no single merge verdict" hosts all fail
+closed until you have confirmed the mapping on the actual host.
 
-The `prepare-pr` skill owns the tool, and it is project-agnostic — stdlib Python
-over `gh`, no repo-specific assumptions baked in. Call it by path from the target
-repo (do **not** `cd` into the skill folder; the scripts read which repo they are
-talking about from your cwd):
+Conflict, `BEHIND`, or `green_age.py` exit 30 requires an authorized sync, not
+another unchanged poll:
+GitHub cannot build a conflicted merge ref, so `pull_request` checks may never
+start while old checks look green. `BEHIND` is the weakest of the three and on
+some repositories never appears at all: `mergeStateStatus` reports it only under
+strict up-to-date protection, so where that is off, a base that moved underneath
+a green head is visible only through the green-age reading below. Rebase
+unambiguous conflicts under the repo's history rules, re-verify and push only
+with authorization; escalate ambiguous conflicts. A draft or `CHANGES_REQUESTED`
+also survives waiting. Read the reviewer:
+a product hold needs a human decision, not repeated patches. Report it once and
+stop with the blocking review quoted.
+
+### Optional GitHub helper
+
+If kirocrew-prepare-pr is installed, run its complete script bundle from the TARGET repo,
+not the skill directory. Resolve an absolute `SKILL_DIR` first from the active
+installation; never use an unresolved default expansion as a path argument.
 
 ```bash
-SKILL_DIR="${KIROCREW_HOME:-$HOME/.kiro/crew}/skills/kirocrew-dev/prepare-pr"
-python3 "$SKILL_DIR/scripts/pr_status.py" <pr#>     # exit 0 clean / 10 running / 20 blocked / 2 env
-python3 "$SKILL_DIR/scripts/pr_findings.py" <pr#>   # only after 20: failed steps, log tails, threads
+python3 "$SKILL_DIR/scripts/pr_status.py" <pr#> --json --reviewers <known-lanes>
+python3 "$SKILL_DIR/scripts/pr_findings.py" <pr#>
+python3 "$SKILL_DIR/scripts/green_age.py" --pr <pr#>
 ```
 
-Drive the cycle off the **exit code**, not off prose: `10` → report nothing and
-wait for the next cycle; `20` → drill in with `pr_findings.py` and act; `2` →
-environment problem, escalate rather than loop on it.
+Pin a known fleet with `--reviewers` / `PREPARE_PR_REVIEWERS`; discovery mode only
+checks stamps it finds and cannot detect an absent lane. Set the repo's aggregate
+via `--readiness-context` / `PREPARE_PR_READINESS_CONTEXT` where needed. The scripts
+require sibling `_review_contract.py`; missing scripts are not permission to
+pretend the helper ran. Use the host interfaces above for general monitoring.
 
-**Exit `0` is necessary but not sufficient — do not stop on it alone** (rule 3).
-The script's decision is fail-closed about *checks*, but the unresolved-thread
-count it prints is **advisory: it is not part of the exit code**, so a PR with
-open review threads still exits `0`. Before you declare review-ready and call
-`autonudge_stop`, confirm all three:
+- `0`: checks clean, but still apply the readiness conditions below.
+- `10`: genuinely running. End the cycle silently, without rereading bot bodies,
+  logs or diffs; it neither counts nor resets the stall streak.
+- `20`: use findings and the reason before acting. Terminal PR state means stop;
+  stale reviewer stamps can mean a comment-triggered bot has not posted yet,
+  not a code defect. `?`/JSON `null` threads mean unknown, never zero.
+- `2`: environment error, escalate rather than loop on it.
 
-1. `pr_status.py` exits `0`;
-2. its `unresolved threads (advisory)` line reads `0` — a `?` means the count
-   could not be retrieved, which is not a zero, so treat it as unresolved and
-   check the threads yourself with `pr_findings.py`;
-3. every reviewer that raised something has an answer from you on the PR. An
-   **advisory** reviewer posts its concerns *and* passes its own check, so its
-   verdict appears in neither the exit code nor the aggregate. In this repo that
-   is `Design Review` / `UX Review` reporting `🟡 CONCERNS` while green; in
-   another repo it is whatever non-blocking bots and human reviewers comment
-   there. See `prepare-pr`'s "Answer every concern".
+`green_age.py` answers the separate question of whether a clean rollup still
+describes today's base: `0` fresh, `30` the base moved in files this PR also
+touches since the commit this head's CI ran on (an authorized sync, per the
+conflict rule above), `2` could not measure — which is neither fresh nor stale.
+`pr_status.py --json` carries the same reading in `advisory.green_age`, so a
+cycle that already polled does not need a second call. Keep it out of the stall
+key: on a busy repository the base moves constantly, and a commit count in the
+key would reset the streak forever.
 
-If any of the three is unmet, the loop has not reached its exit condition —
-keep cycling (or escalate), and do not report the PR as review-ready.
+`--json` appends a last-line object without changing the exit code. Compare ONLY
+`progress_key` for stalls. Its `advisory` fields include unresolved threads,
+findings, stale/blocking reviewers and `elided_stamp_reviewers`. Report an elided
+stamp once per head as a lane-quality note, not a new blocker; the script already
+checks whether that shortened stamp matches the current head.
 
-Two GitHub-shaped traps this closes, both of which produce a confidently wrong
-reading:
+Always use the target checkout even for a full PR URL: thread lookup also uses
+cwd, so a foreign checkout can mix two repositories. An unreadable/discarded CI
+rollup is an environment blocker, not a bug count or a passing empty list.
 
-- **`.conclusion` is not universal — this is a GitHub API shape, not a
-  per-repo quirk.** `statusCheckRollup` is a union: **CheckRun** entries carry
-  `.conclusion`, while **StatusContext** entries (the legacy commit-status API,
-  still how many third-party integrations and any home-grown aggregate report)
-  carry `.state` instead. So
-  `gh pr view --jq '.statusCheckRollup[] | select(.conclusion==...)'` silently
-  drops every status context in any repo that has one, and the PR reads cleaner
-  than it is. `pr_status.py` classifies both shapes, and treats an aggregate
-  status as authoritative over the individual rollup when one is published —
-  naming it with `--readiness-context NAME` (or `PREPARE_PR_READINESS_CONTEXT`;
-  the default is this repo's `PR Readiness`, and `resolve_profile.py` reports
-  the right name for another project, which you then pass in). With no aggregate
-  published it falls back to the full rollup, so it still works on a repo that
-  publishes none.
-- **The failing count is fail-closed, not a bug count** (rule 2). Any
-  unrecognized COMPLETED conclusion counts as a failure, and superseded re-run
-  attempts are collapsed to the newest run per check identity before counting —
-  so every remaining `[fail]` line is live. Read the per-check lines before
-  naming causes to the user.
+### Readiness and handoff
 
-Two limits worth knowing before you trust it on an arbitrary PR:
+For comment-aware legacy monitoring, declare review-ready only when all hold:
 
-- **Run it from a checkout of the target repo.** A bare PR number resolves
-  against your cwd's repo. A full PR URL works for any repo, but the
-  unresolved-thread count re-resolves the repo from cwd (`gh repo view`), so a
-  URL from a foreign checkout mixes two repos: usually that prints `?` (the
-  number does not exist there), but if the cwd repo happens to have a PR with
-  the same number you get a thread count for the *wrong* PR with nothing marking
-  it as such.
-- **A merged, closed or declined PR exits `20`** with `PR state is ... (not
-  OPEN; terminal)` — that satisfies rule 4, so on that message report the real
-  outcome and stop the loop rather than triaging it as a failure.
-- **`?` is not `0`.** It means the count could not be established (auth, page
-  cap, wrong repo). Treat it as unresolved.
+- The host aggregate (or optional `pr_status.py`) is clean for the current SHA.
+- Threads are confirmed resolved; an unknown count needs inspection, not a guess.
+- Every bot/human concern has an individual answer, including advisory comments
+  on passing checks. The current head has every required reviewer's fresh verdict
+  and no blocking marker. Do not wait for zero findings: a rebutted or deferred
+  finding can remain visible after it is answered.
+- Before rebutting a finding a lane has raised a third time, re-run that lane on
+  the unchanged head and re-derive the claim. A third raise is either a rebuttal
+  that did not answer the finding or a lane whose verdict is not reproducible on
+  an identical tree, and only the re-run separates those.
+- No conflict, behind-base state, draft or changes-requested hold remains, and
+  where the optional helper is installed, `green_age.py` is not reporting exit 30.
+- No current-head finding lacks a disposition. For Kiro Crew, use kirocrew-prepare-pr's
+  disposition contract rather than inventing a second ledger format.
 
-## Workflow
+Never stop silently with an unanswered finding. A blocker, budget or user stop
+requires an open-findings handoff, not a success claim. Structured success proves
+only the provider facts above; it does not satisfy this comment-aware contract.
 
-1. **Write the message as instructions to your future self.** Include:
-   - what to check (PR URL, job id, ticket),
-   - what to do with findings (fix + push, summarize, escalate),
-   - the exit condition, ending with: "when met, tell the user and call
-     `autonudge_stop`".
-2. **Call `monitor_start`.** `interval_secs` default 300 suits CI/review
-   polling. `max_cycles` defaults to 24 (≈2h of idle gaps at 300s); raise it
-   for longer work, and pass `0` for unlimited only when the user explicitly
-   asks for an unbounded loop.
-3. **Confirm it armed.** Read `~/.kiro/crew/autonudge.json` and check your
-   loop is there. The tool's reply is not evidence — see above.
-4. **Tell the user monitoring is active and END YOUR TURN.** The loop wakes
-   you — do not wait+poll on top of it.
-5. **Each cycle:** do the check, act, and report only real signals. Don't
-   post "nothing new" every cycle. If the instruction no longer matches
-   reality, `monitor_update` it rather than working around it.
-6. **On the exit condition** (or the user saying stop): report, then call
-   `autonudge_stop` with a reason. Do not let the cap do this for you.
+## Stall tripwire
 
-## Example
+For legacy cycles, persist a JSON progress key AND an integer streak count,
+read before each settled cycle. Use a durable file in the active data home's
+`workspace/` beside loop state, e.g. `.babysit-key-<loop-id>`, NOT scratch/TMPDIR
+or conversation memory. Resolve the home first; a tilde inside a shell default
+does not expand. The engine does not track this streak for you.
 
-User: "babysit PR #247 until it's review-ready"
+For GitHub the optional helper emits these key fields; otherwise derive equivalent
+fields from the host verdict above. GitLab and Bitbucket need their own equivalent
+key before applying this rule:
 
-```
-monitor_start(
-  message="Check PR #247 with
-           python3 \"${KIROCREW_HOME:-$HOME/.kiro/crew}/skills/kirocrew-dev/prepare-pr/scripts/pr_status.py\" 247
-           and act on its exit code (10 = still running, report nothing;
-           20 = drill in with pr_findings.py, or stop if the reason is a
-           terminal PR state). Fix legitimate High/Medium findings and push,
-           following this repo's history convention. Rebut false positives.
-           Stop ONLY when exit 0 AND the unresolved-thread count is 0 AND
-           every reviewer that raised something has a reply: then tell the
-           user the PR is review-ready and call autonudge_stop.",
-  interval_secs=300,
-  max_cycles=20,
-)
-```
+| Field | Meaning |
+|---|---|
+| `head_sha` | Exact revision |
+| `failing_checks` | Sorted workflow-qualified identities, not just names |
+| `checks_failing` | Failure count |
+| `readiness_kind` | Running, failing or unpublished |
+| `exit_code` | Verdict |
+| `status` | Verdict reason, so changed blockers count as progress |
 
-On GitLab or Bitbucket the shape is identical — only the first line changes (the
-host's own verdict call from the table above), plus its own thread axis and its
-own "green is weaker than it looks" caveat.
+On a settled cycle (`0` or `20`), matching key increments the streak; a new key
+sets it to 1. Three byte-identical settled keys with no push means stop and
+escalate when nothing can be changed without a human. Apply a diagnosed fix
+within authorization instead of waiting for this tripwire. Running (`10`) cycles
+are skipped, not counted AND not reset; environment (`2`) escalates. The wall-clock
+budget bounds a wait that never settles.
 
-## Rules & gotchas
+Exclude finding counts (rewording/rebuttals keep changing them) and thread counts
+(unknown API results are not progress). Preserve both key and count through
+compaction. A deliberate stop reason names success, the blocker or the terminal
+state; merely exhausting a cap is never success.
 
-- **One loop per session** — a new `monitor_start` replaces the existing loop.
-- **Busy sessions skip a cycle** (never queue) — a long-running turn delays
-  the next check to the following interval; skipped cycles don't count
-  toward `max_cycles`.
-- **Unattended turns are bounded to 30 min** on Slack/Discord; keep each
-  cycle's work small and incremental.
-- **Slack/Discord loops auto-approve tools** on the unattended turn
-  (Slack always; Discord follows the gateway approval mode — under
-  interactive approval a Discord cycle cannot use tools, so prefer
-  dashboard/Slack for tool-heavy babysitting or run the gateway with
-  `--approval yolo`/`auto`).
-- **Kill switches:** `autonudge_stop` (preferred), the dashboard 🎯 popover
-  (dashboard loops), `max_cycles`, or the per-loop STOP sentinel file.
-- Loops fire `[auto-nudge cycle N]`-tagged messages — treat them as your own
-  scheduled wake-ups, not user input.
+With an active loop do not also wait/poll. On a deliberate early end of `wait`,
+read its end reason; do not reissue a wait the user stopped.
+
+Kill switches: the driver's stop tool, dashboard automation popover, cycle/turn
+cap and runtime budget. A STOP sentinel exists only if explicitly configured
+through `stop_sentinel_path` on the HTTP arming path; `monitor_start` creates none.
+Treat `[auto-nudge cycle N]` as your scheduled wake, not a new human request.

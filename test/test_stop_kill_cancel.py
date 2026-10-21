@@ -19,8 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import abort as abort_mod
 from kiro_crew.mcp_gateway import gatewayd as gw
+from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.backend import Backend, _PendingRequest
 from kiro_crew.mcp_gateway.pool import BackendPool, PoolKey
 
@@ -44,7 +46,6 @@ def _make_pool_key(server: str = "test-mcp") -> PoolKey:
         "autoapprove_set_hash": "c" * 64,
         "approval_mode": "interactive",
         "trust_all_tools": False,
-        "user_identity": "test-user",
         "config_snapshot_hash": "d" * 64,
     })
 
@@ -164,6 +165,10 @@ class TestCancelInFlight:
 class TestRecycleIfIdle:
     """Tests for Backend.recycle_if_idle."""
 
+    @pytest.mark.skipif(
+        pc.IS_WINDOWS,
+        reason="asserts POSIX killpg path; Windows uses taskkill /T",
+    )
     @pytest.mark.asyncio
     async def test_recycle_kills_when_refcount_zero(self):
         """refcount 0 → SIGKILL the backend."""
@@ -192,13 +197,20 @@ class TestRecycleIfIdle:
         backend = _make_mock_backend()
         backend.refcount = 2
 
-        with patch("os.killpg") as mock_killpg:
+        with patch(
+            "kiro_crew.platform_compat.kill_process_tree_async",
+            new_callable=AsyncMock,
+        ) as mock_kill_tree:
             result = await backend.recycle_if_idle()
 
         assert result is False
         assert backend.quarantined is True
-        mock_killpg.assert_not_called()
+        mock_kill_tree.assert_not_awaited()
 
+    @pytest.mark.skipif(
+        pc.IS_WINDOWS,
+        reason="asserts POSIX init PID 1 guard; Windows uses taskkill",
+    )
     @pytest.mark.asyncio
     async def test_recycle_guards_against_pid_1(self):
         """Never kill PID 1 (init)."""
@@ -227,7 +239,7 @@ class TestKillPathIsPlatformCorrect:
        ``recycle_if_idle`` / ``shutdown`` instead of degrading, and in
        ``shutdown`` it also skipped the ``process.kill()`` fallback so the
        backend was never killed at all.
-    2. Per Mesh-2801 the ``_async`` variant is mandatory from a coroutine: the
+    2. The ``_async`` variant is mandatory from a coroutine: the
        Windows branch spawns ``taskkill`` with a 5s timeout, which stalls the
        loop. Patching only the async symbol would let a regression back to the
        sync helper pass silently, so both symbols are pinned and the sync one
@@ -261,13 +273,14 @@ class TestKillPathIsPlatformCorrect:
                 side_effect=self._forbid_sync,
             ),
             # os.killpg/os.getpgid must not be reached directly any more.
-            patch("os.killpg", side_effect=self._forbid_sync),
+            patch("os.getpgid", side_effect=self._forbid_sync, create=True),
+            patch("os.killpg", side_effect=self._forbid_sync, create=True),
         ):
             result = await backend.recycle_if_idle()
 
         assert result is True
         assert mock_async.await_count == 1
-        assert mock_async.await_args.args == (pid, signal.SIGKILL)
+        assert mock_async.await_args.args == (pid, pc.SIGKILL)
 
     @pytest.mark.asyncio
     async def test_shutdown_escalation_awaits_async_tree_kill_not_sync(self):
@@ -284,16 +297,17 @@ class TestKillPathIsPlatformCorrect:
                 "kiro_crew.platform_compat.kill_process_tree",
                 side_effect=self._forbid_sync,
             ),
-            patch("os.killpg", side_effect=self._forbid_sync),
+            patch("os.getpgid", side_effect=self._forbid_sync, create=True),
+            patch("os.killpg", side_effect=self._forbid_sync, create=True),
         ):
             await backend.shutdown(timeout=0.01)
 
         assert mock_async.await_count == 1
-        assert mock_async.await_args.args[1] == signal.SIGKILL
+        assert mock_async.await_args.args[1] == pc.SIGKILL
 
     @pytest.mark.asyncio
     async def test_shutdown_falls_back_to_process_kill_when_tree_kill_fails(self):
-        """The fallback that the uncaught AttributeError used to skip.
+        """The fallback that an uncaught AttributeError would skip.
 
         A Windows ``kill_process_tree`` failure must still reach
         ``process.kill()`` -- otherwise a backend that ignores stdin close is
@@ -374,57 +388,67 @@ class TestTeardownUsesPortableSignalConstant:
 
         self._hide_sigkill(monkeypatch)
         socket_path = tmp_path / "gateway.sock"
-        (tmp_path / "gateway.sock.backends").write_text("111\n", encoding="utf-8")
+        (tmp_path / "gateway.sock.backends").write_text("111 s\n", encoding="utf-8")
 
         manager = object.__new__(mgr.GatewayManager)
         manager._spec = MagicMock()
         manager._spec.socket_path = str(socket_path)
-
-        with patch(
-            "kiro_crew.platform_compat.kill_process_tree_async",
-            new_callable=AsyncMock,
-        ) as mock_async:
-            await manager._reap_orphaned_backends()
-
-        assert mock_async.await_args.args == (111, 9)
-
-
-class TestOrphanReapIsPlatformCorrect:
-    """``_reap_orphaned_backends`` used a bare ``os.killpg`` per recorded pid.
-
-    On Windows that raises ``AttributeError`` (uncaught by its handler), and it
-    is awaited from ``_terminate_process``, so the sync helper would also spawn
-    one 5s-timeout ``taskkill`` per pid directly on the loop.
-    """
-
-    @pytest.mark.asyncio
-    async def test_reap_awaits_async_tree_kill_for_each_pid(self, tmp_path):
-        from kiro_crew.mcp_gateway import manager as mgr
-
-        socket_path = tmp_path / "gateway.sock"
-        (tmp_path / "gateway.sock.backends").write_text("111 222\n", encoding="utf-8")
-
-        manager = object.__new__(mgr.GatewayManager)
-        manager._spec = MagicMock()
-        manager._spec.socket_path = str(socket_path)
-
-        def _forbid_sync(*_a: Any, **_kw: Any) -> None:
-            raise AssertionError("sync kill_process_tree must not be called from a coroutine")
 
         with (
+            patch("kiro_crew.platform_compat.IS_WINDOWS", False),
             patch(
-                "kiro_crew.platform_compat.kill_process_tree_async",
-                new_callable=AsyncMock,
-            ) as mock_async,
-            patch(
-                "kiro_crew.platform_compat.kill_process_tree",
-                side_effect=_forbid_sync,
+                "kiro_crew.process_identity.isolated_group_of",
+                side_effect=lambda pid, start: pid,
             ),
-            patch("os.killpg", side_effect=_forbid_sync),
+            patch(
+                "kiro_crew.platform_compat.kill_process_group", return_value=True
+            ) as mock_group,
         ):
             await manager._reap_orphaned_backends()
 
-        assert [c.args[0] for c in mock_async.await_args_list] == [111, 222]
+        assert mock_group.call_args.args == (111, 9)
+
+
+class TestOrphanReapIsPlatformCorrect:
+    """On Windows ``_reap_orphaned_backends`` must not reach ``os.killpg``
+    (absent there), and the blocking handle-pinned ``taskkill`` must run off the
+    loop: the reap is awaited from ``_terminate_process``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reap_runs_the_pinned_tree_kill_off_the_loop_for_each_pid(self, tmp_path):
+        import threading
+
+        from kiro_crew.mcp_gateway import manager as mgr
+
+        socket_path = tmp_path / "gateway.sock"
+        (tmp_path / "gateway.sock.backends").write_text("111 7\n222 8\n", encoding="utf-8")
+
+        manager = object.__new__(mgr.GatewayManager)
+        manager._spec = MagicMock()
+        manager._spec.socket_path = str(socket_path)
+
+        def _forbid(*_a: Any, **_kw: Any) -> None:
+            raise AssertionError("no POSIX group call and no unpinned taskkill on Windows")
+
+        loop_thread = threading.get_ident()
+        calls: list[tuple[int, bool]] = []
+
+        def _pinned(pid: int, start: str, sig: int) -> bool:
+            calls.append((pid, threading.get_ident() != loop_thread))
+            return True
+
+        with (
+            patch("kiro_crew.platform_compat.IS_WINDOWS", True),
+            patch("kiro_crew.platform_compat.kill_process_tree_pinned", side_effect=_pinned),
+            patch("kiro_crew.platform_compat.kill_process_tree", side_effect=_forbid),
+            patch("kiro_crew.platform_compat.kill_process_group", side_effect=_forbid),
+            patch("os.getpgid", side_effect=_forbid, create=True),
+            patch("os.killpg", side_effect=_forbid, create=True),
+        ):
+            await manager._reap_orphaned_backends()
+
+        assert calls == [(111, True), (222, True)]
 
 
 # --- Scope A (gatewayd): abort frame handler tests ---------------------------
@@ -468,13 +492,16 @@ class TestDetachOnCancelFailure:
 
         class _RaisingBackend:
             supports_caller_identity = True
+            control_plane = False
             quarantined = False
 
             def __init__(self) -> None:
                 self.detach_called = False
                 self._pending_requests: dict = {}
 
-            async def attach_stub(self, _uuid: str) -> "asyncio.Queue[bytes]":
+            async def attach_stub(
+                self, _uuid: str, *, agent: str = ""
+            ) -> "asyncio.Queue[bytes]":
                 return asyncio.Queue()
 
             async def detach_stub(self, _uuid: str) -> int:
@@ -491,7 +518,7 @@ class TestDetachOnCancelFailure:
 
         fake_backend = _RaisingBackend()
 
-        async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any):
+        async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any, **_kw: Any):
             return fake_backend, True
 
         async def _fake_drain(_inbox: Any, _writer: Any, _stub_uuid: str = "") -> None:
@@ -527,7 +554,6 @@ class TestDetachOnCancelFailure:
             "autoapprove_set_hash": "2" * 64,
             "approval_mode": "interactive",
             "trust_all_tools": False,
-            "user_identity": "leak",
             "channel_id": "C_LEAK",
             "config_snapshot_hash": "3" * 64,
             "session_key": "dashboard:chat-leak",
@@ -604,16 +630,23 @@ class TestAbortModule:
         }
 
     @pytest.mark.asyncio
-    async def test_schedule_abort_noop_without_socket(self):
-        """No socket → no-op."""
-        abort_mod.schedule_abort(None, [100])
+    async def test_schedule_abort_for_noop_on_none_target(self):
+        """None target → no-op (provider has no reachable runtime)."""
+        abort_mod.schedule_abort_for(None)
         # Should not raise
 
-    @pytest.mark.asyncio
-    async def test_schedule_abort_noop_without_valid_pids(self):
-        """Empty/invalid pids → no-op."""
-        abort_mod.schedule_abort("/tmp/test.sock", [0, -1])
-        # Should not raise
+    def test_build_rejects_missing_socket(self):
+        """build is the single judge: no socket → None, so no target to abort."""
+        assert abort_mod.RuntimeAbortTarget.build(100, None) is None
+        assert abort_mod.RuntimeAbortTarget.build(100, "") is None
+
+    def test_build_rejects_invalid_pids(self):
+        """build is the single judge: init/process-group/non-int pids → None."""
+        assert abort_mod.RuntimeAbortTarget.build(0, "/tmp/test.sock") is None
+        assert abort_mod.RuntimeAbortTarget.build(1, "/tmp/test.sock") is None
+        assert abort_mod.RuntimeAbortTarget.build(-1, "/tmp/test.sock") is None
+        assert abort_mod.RuntimeAbortTarget.build(True, "/tmp/test.sock") is None
+        assert abort_mod.RuntimeAbortTarget.build("100", "/tmp/test.sock") is None
 
     @pytest.mark.asyncio
     async def test_send_abort_timeout(self):
@@ -648,12 +681,15 @@ class TestConservativeShutdown:
         mgr._tasks = {}
         mgr._report_tasks = set()
         mgr._report_owners = {}
+        # The reap coalesces concurrent stops through this per-run map.
+        mgr._reaps_in_flight = {}
         # Fork adaptation: _force_reap pumps the spawn queue after freeing a
         # slot (a1933a4b, ported earlier in this branch); an empty queue makes
         # _drain_queue return immediately without touching other attrs.
         mgr._queue = []
         mgr._running_count = 1
         mgr._default_timeout = 300
+        mgr._default_turn_limit = 100
         mgr._write_tombstone = MagicMock()
         mgr._record_cost = MagicMock()
         mgr._on_event = None
@@ -713,10 +749,13 @@ class TestConservativeShutdown:
         mgr._tasks = {}
         mgr._report_tasks = set()
         mgr._report_owners = {}
+        # The reap coalesces concurrent stops through this per-run map.
+        mgr._reaps_in_flight = {}
         # Fork adaptation: see test_session_sharing_never_kills_runtime.
         mgr._queue = []
         mgr._running_count = 2
         mgr._default_timeout = 300
+        mgr._default_turn_limit = 100
         mgr._write_tombstone = MagicMock()
         mgr._record_cost = MagicMock()
         mgr._on_event = None
@@ -766,7 +805,7 @@ class TestAbortAckLogging:
             await writer.drain()
             writer.close()
 
-        server = await asyncio.start_unix_server(_fake_gatewayd, path=socket_path)
+        server = await transport.serve(socket_path, _fake_gatewayd, limit=1 << 16)
         try:
             with caplog.at_level(logging.INFO, logger=abort_mod.logger.name):
                 resp = await abort_mod.send_abort(socket_path, [100], "test stop")
@@ -791,7 +830,7 @@ class TestAbortAckLogging:
             await writer.drain()
             writer.close()
 
-        server = await asyncio.start_unix_server(_fake_gatewayd, path=socket_path)
+        server = await transport.serve(socket_path, _fake_gatewayd, limit=1 << 16)
         try:
             with caplog.at_level(logging.WARNING, logger=abort_mod.logger.name):
                 resp = await abort_mod.send_abort(socket_path, [100], "test stop")

@@ -1,19 +1,28 @@
 import { useState, useEffect, useReducer, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { FlaskConical, Play, Pause, Square, MessageCircle, ChevronDown, ChevronRight, Sparkles, ThumbsUp, ArrowRight, HelpCircle, XCircle, CheckCircle, AlertTriangle, Lock, X, Trash2, GitFork, Flame, BookOpen, FileText, RefreshCw, ExternalLink, Loader2 } from 'lucide-react'
+import { FlaskConical, Play, Pause, Square, MessageCircle, ChevronDown, ChevronRight, Sparkles, ThumbsUp, ArrowRight, HelpCircle, XCircle, CheckCircle, AlertTriangle, Info, Lock, X, Trash2, GitFork, Flame, BookOpen, FileText, RefreshCw, ExternalLink, Loader2 } from 'lucide-react'
 import { api } from '../../api/client'
 import Clickable from '../../components/Clickable'
 import Modal from '../../components/Modal'
 import { Btn } from '../../components/ui'
 import SimpleSelect from '../../components/SimpleSelect'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
+import ErrorNotice from '../../components/ErrorNotice'
+import { useAvailableModels } from '../../hooks/useAvailableModels'
 import GrillTree from './GrillTree'
 import { grillReducer, promotedResearch, answeredClarifiers, suggestedMaxCycles, GrillNode } from './grillTreeModel'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
+import { copyToClipboard } from '../../utils/clipboard'
+
+/** The thrown value's own sentence — the api client rejects with an `ApiError`,
+ *  so this is the backend's message; anything else is stringified rather than
+ *  swallowed. */
+const errMsg = (e: unknown): string => (e instanceof Error && e.message ? e.message : String(e))
 const ACTIVE_STATUSES = ['running', 'paused', 'stagnant', 'needs_input']
 
-interface Campaign { id: string; name: string; question: string; sub_questions: string; sources: string; max_cycles: number; idle_secs: number; status: string; total_cycles: number; findings?: Finding[]; error_message?: string; pending_question?: string; parent_id?: string; parallel_workers?: number }
+interface Campaign { id: string; name: string; question: string; sub_questions: string; sources: string; max_cycles: number; idle_secs: number; status: string; total_cycles: number; findings?: Finding[]; error_message?: string; pending_question?: string; parent_id?: string; parallel_workers?: number; model?: string; model_withheld?: boolean | null; served_model?: string }
 interface Finding { cycle: number; summary: string; sources_checked: string[]; sources_empty: string[]; new_findings_count: number; evidence_strength: string; key_insight: string; verification?: { passed: boolean; detail?: string } }
 interface Validation { can_start: boolean; errors: string[]; warnings: string[]; estimated_cycles: number; estimated_duration_min: number }
 
@@ -28,6 +37,7 @@ function GrowTextarea({ value, onChange, onSubmit, placeholder, className = '', 
   className?: string
   ariaLabel?: string
 }) {
+  const ime = useImeGuard()
   const ref = useRef<HTMLTextAreaElement>(null)
   useEffect(() => {
     const el = ref.current
@@ -45,9 +55,9 @@ function GrowTextarea({ value, onChange, onSubmit, placeholder, className = '', 
       value={value}
       placeholder={placeholder}
       onChange={e => onChange(e.target.value)}
+      {...ime.bindComposition<HTMLTextAreaElement>()}
       onKeyDown={e => {
-        if (onSubmit && e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault()
+        if (onSubmit && e.key === 'Enter' && !e.shiftKey && ime.claimEnter(e)) {
           onSubmit()
         }
       }}
@@ -133,7 +143,7 @@ function FindingCard({ f }: { f: Finding }) {
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.cycle')} {f.cycle}</span>
             <EvidenceBadge s={f.evidence_strength} />
-            {f.verification && <span className={`text-xs px-1.5 py-0.5 rounded inline-flex items-center gap-0.5 ${f.verification.passed ? 'bg-ok/15 text-ok' : 'bg-bg-elevated text-muted'}`}>{f.verification.passed ? <><CheckCircle size={10} /> {i18nT('apps.autoResearch.researchLabPage.goal_met')}</> : i18nT('apps.autoResearch.researchLabPage.goal_not_yet')}</span>}
+            {f.verification && <span className={`text-xs px-1.5 py-0.5 rounded inline-flex items-center gap-0.5 ${f.verification.passed ? 'bg-ok/15 text-ok-text' : 'bg-bg-elevated text-muted'}`}>{f.verification.passed ? <><CheckCircle size={10} /> {i18nT('apps.autoResearch.researchLabPage.goal_met')}</> : i18nT('apps.autoResearch.researchLabPage.goal_not_yet')}</span>}
           </div>
           <div className="text-sm font-medium mt-0.5">{"\u201c"}{f.key_insight || f.summary}{"\u201d"}</div>
         </div>
@@ -161,6 +171,11 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
   const [autoApprove, setAutoApprove] = useState(false)
   const [parallelWorkers, setParallelWorkers] = useState(1)
   const [executionMode, setExecutionMode] = useState<'agent' | 'workflow'>('agent')
+  // Explicit model pick for the campaign's worker. '' = inherit the research
+  // agent's / backend's default (never a concrete id). Options come from the
+  // shared advertised-models list (GET /api/models), same as every picker.
+  const [model, setModel] = useState('')
+  const availableModels = useAvailableModels()
   const [validation, setValidation] = useState<Validation | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -215,7 +230,7 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
     setSubmitting(true)
     setError(null)
     try {
-      const c = await api.researchCreate({ question, sub_questions: buildSubs(), scope_constraints: scopeConstraints, max_cycles: maxCycles, idle_secs: idleSecs, success_criteria: successCriteria, auto_approve: autoApprove, parallel_workers: parallelWorkers, execution_mode: executionMode })
+      const c = await api.researchCreate({ question, sub_questions: buildSubs(), scope_constraints: scopeConstraints, max_cycles: maxCycles, idle_secs: idleSecs, success_criteria: successCriteria, auto_approve: autoApprove, parallel_workers: parallelWorkers, execution_mode: executionMode, model: executionMode === 'agent' ? model : '' })
       if (c?.id) { await api.researchAction(c.id, 'start'); onDone() }
     } catch {
       setError(i18nT('apps.autoResearch.researchLabPage.failed_to_start_campaign_please_try_again'))
@@ -243,7 +258,7 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
               <div className="font-medium text-sm">{i18nT('apps.autoResearch.researchLabPage.agent')} <span className="text-muted font-normal">{i18nT('apps.autoResearch.researchLabPage.adaptive')}</span></div>
               <div className="text-xs text-muted mt-0.5">{i18nT('apps.autoResearch.researchLabPage.the_ai_drives_every_round_itself_deciding_what_t')}</div>
             </button>
-            <button type="button" onClick={() => setExecutionMode('workflow')} className={`text-left p-2 rounded border ${executionMode === 'workflow' ? 'border-accent bg-accent/10' : 'border-border'}`}>
+            <button type="button" onClick={() => { setExecutionMode('workflow'); setModel('') }} className={`text-left p-2 rounded border ${executionMode === 'workflow' ? 'border-accent bg-accent/10' : 'border-border'}`}>
               <div className="font-medium text-sm">{i18nT('apps.autoResearch.researchLabPage.dynamic_workflow')} <span className="text-muted font-normal">{i18nT('apps.autoResearch.researchLabPage.scripted')}</span></div>
               <div className="text-xs text-muted mt-0.5">{i18nT('apps.autoResearch.researchLabPage.the_ai_writes_an_orchestration_script_up_front_a')}</div>
             </button>
@@ -277,7 +292,7 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
       {step === 1 && <div className="space-y-4">
         <span className="text-sm font-medium block">{i18nT('apps.autoResearch.researchLabPage.when_should_the_agent_stop')}</span>
         <div className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.stops_at_the_cycle_cap_when_the_definition_of_do')}</div>
-        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.max_cycles')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.max_cycles_2')} min={5} max={100} value={maxCycles} className="w-20 text-sm px-3 py-2 rounded-md bg-bg-elevated border border-border text-text outline-none focus-ring" onChange={e => { setMaxCyclesTouched(true); setMaxCycles(Number(e.target.value)) }} />{subCount > 0 && !maxCyclesTouched && <span className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.suggested_from')} {subCount} {i18nT('apps.autoResearch.researchLabPage.sub_questions_2')}</span>}</div>
+        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.max_cycles')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.max_cycles_2')} min={5} max={100} value={maxCycles} className="w-20 text-sm px-3 py-2 rounded-md bg-bg-elevated border border-border text-text outline-hidden focus-ring" onChange={e => { setMaxCyclesTouched(true); setMaxCycles(Number(e.target.value)) }} />{subCount > 0 && !maxCyclesTouched && <span className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.suggested_from')} {subCount} {i18nT('apps.autoResearch.researchLabPage.sub_questions_2')}</span>}</div>
         {/* Values are seconds; SimpleSelect is string-only, so they round-trip through
             String/Number. `options` and `optionLabels` are positional — keep them in step. */}
         <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.idle_between_cycles')}</span><SimpleSelect aria-label={i18nT('apps.autoResearch.researchLabPage.idle_between_cycles_2')} options={['30', '60', '120']} optionLabels={[i18nT('apps.autoResearch.researchLabPage.30s'), i18nT('apps.autoResearch.researchLabPage.60s'), i18nT('apps.autoResearch.researchLabPage.120s')]} value={String(idleSecs)} onChange={v => setIdleSecs(Number(v))} /></div>
@@ -290,7 +305,14 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
           <input id="auto-approve" type="checkbox" aria-label={i18nT('apps.autoResearch.researchLabPage.run_unattended_skip_clarification_questions')} checked={autoApprove} onChange={e => setAutoApprove(e.target.checked)} />
           {i18nT('apps.autoResearch.researchLabPage.run_unattended_skip_clarification_questions')}
         </label>
-        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.parallel_workers')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.parallel_workers_2')} min={1} max={5} value={parallelWorkers} className="w-16 text-sm px-3 py-2 rounded-md bg-bg-elevated border border-border text-text outline-none focus-ring" onChange={e => setParallelWorkers(Math.min(5, Math.max(1, Number(e.target.value))))} /><span className="text-xs text-muted">{parallelWorkers > 1 ? `${parallelWorkers} sub-questions investigated in parallel each cycle` : 'sequential (default)'}</span></div>
+        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.parallel_workers')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.parallel_workers_2')} min={1} max={5} value={parallelWorkers} className="w-16 text-sm px-3 py-2 rounded-md bg-bg-elevated border border-border text-text outline-hidden focus-ring" onChange={e => setParallelWorkers(Math.min(5, Math.max(1, Number(e.target.value))))} /><span className="text-xs text-muted">{parallelWorkers > 1 ? `${parallelWorkers} sub-questions investigated in parallel each cycle` : 'sequential (default)'}</span></div>
+        {/* Explicit model pick — agent mode only (the workflow engine resolves
+            its own models, and the backend rejects a pick there). '' = inherit.
+            'auto' is filtered out, mirroring issue-radar's CrewEditor: it would
+            sit next to the clearLabel row as a second "default" with different
+            mechanics ('' inherits the research agent's pin; 'auto' overrides it
+            with an explicit pin subject to the availability withhold). */}
+        {executionMode === 'agent' && <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.model')}</span><SimpleSelect aria-label={i18nT('apps.autoResearch.researchLabPage.model')} options={availableModels.map(m => m.name).filter(n => n !== 'auto')} clearLabel={i18nT('apps.autoResearch.researchLabPage.model_default_inherit')} value={model} onChange={setModel} /></div>}
       </div>}
 
       {step === 2 && <div className="space-y-3">
@@ -303,9 +325,12 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
             <div>{i18nT('apps.autoResearch.researchLabPage.research_question', { question: `${question.slice(0, 50)}${question.length > 50 ? '...' : ''}` })}</div>
             <div className="text-muted">{i18nT('apps.autoResearch.researchLabPage.up_to')} {maxCycles} {i18nT('apps.autoResearch.researchLabPage.cycles')} {idleSecs}{i18nT('apps.autoResearch.researchLabPage.s_idle')}{validation.estimated_duration_min} {i18nT('apps.autoResearch.researchLabPage.min')}</div>
             {successCriteria && <div className="text-muted">{i18nT('apps.autoResearch.researchLabPage.done_when')} {successCriteria}</div>}
+            {executionMode === 'agent' && <div className="text-muted">{i18nT('apps.autoResearch.researchLabPage.model_line', { model: model || i18nT('apps.autoResearch.researchLabPage.model_default_inherit') })}</div>}
           </div>
         </> : <div className="text-sm text-muted">{i18nT('apps.autoResearch.researchLabPage.validating')}</div>}
-        {error && <div className="text-sm text-danger flex items-center gap-1"><XCircle size={14} /> {error}</div>}
+        {/* No hand-off: the campaign wizard's question, success criteria and cycle
+            settings above are unsaved until Start campaign succeeds. */}
+        <ErrorNotice message={error} />
       </div>}
 
       <div className="flex justify-between mt-6">
@@ -332,6 +357,33 @@ function loadForkTree(pid: string): GrillNode[] {
   } catch { return [] }
 }
 
+// The worker's picked model is not served for this account, so the session
+// layer runs it on the backend default and keeps the pick. That session's own
+// notice lands in a transcript this page never shows, so the page says it here,
+// naming both the pick and what actually runs. Info styling, not an error: a
+// plan change is not a failed request. Active campaigns only: the worker slot
+// outlives the run, so a finished campaign's verdict describes a session that
+// is no longer running anything.
+const showsWithheld = (c: Campaign) => !!c.model_withheld && !!c.model && ACTIVE_STATUSES.includes(c.status)
+
+function ModelWithheldNotice({ c, className = '' }: { c: Campaign; className?: string }) {
+  if (!showsWithheld(c)) return null
+  const text = c.served_model
+    ? i18nT('apps.autoResearch.researchLabPage.model_withheld_notice', { requested: c.model, actual: c.served_model })
+    : i18nT('apps.autoResearch.researchLabPage.model_withheld_notice_default', { requested: c.model })
+  return <div role="status" className={`p-2 rounded-md border bg-bg-elevated text-xs flex items-start gap-1 ${className}`} style={{ borderColor: 'color-mix(in srgb, var(--info) 45%, transparent)' }}>
+    <Info size={12} className="mt-0.5 shrink-0 text-info" /> <span>{text}</span>
+  </div>
+}
+
+// The campaign's model pick, labelled as the pick everywhere: a finished
+// campaign may have run on a substitute, and an active withheld one does, so
+// "Model:" would name a model that is not necessarily the one that ran.
+function ModelLine({ c }: { c: Campaign }) {
+  if (!c.model) return null
+  return <span>{i18nT('apps.autoResearch.researchLabPage.model_line_picked', { model: c.model })}</span>
+}
+
 function ForkFlow({ parentId, onCancel, onDone }: { parentId: string; onCancel: () => void; onDone: () => void }) {
   const [tree, dispatchTree] = useReducer(grillReducer, parentId, loadForkTree)
   const [grilling, setGrilling] = useState(false)
@@ -342,6 +394,13 @@ function ForkFlow({ parentId, onCancel, onDone }: { parentId: string; onCancel: 
   const { data: parentCampaign } = useQuery<Campaign>({ queryKey: ['research-campaign', parentId], queryFn: () => api.researchCampaign(parentId) })
 
   const question = parentCampaign?.question || ''
+  // The fork starts on the parent's model, shown pre-selected so it never
+  // switches silently; null = untouched, so a late parent load still lands.
+  const availableModels = useAvailableModels()
+  const [forkModel, setForkModel] = useState<string | null>(null)
+  const parentModel = parentCampaign?.model || ''
+  const model = forkModel ?? parentModel
+  const modelOptions = [...new Set([...availableModels.map(m => m.name).filter(n => n !== 'auto'), ...(parentModel ? [parentModel] : [])])]
 
   const clearPersisted = () => {
     try {
@@ -401,7 +460,7 @@ function ForkFlow({ parentId, onCancel, onDone }: { parentId: string; onCancel: 
       const maxCycles = suggestedMaxCycles(subs.length)
       const r = await api.researchAction(parentId, 'fork', {
         sub_questions: subs, scope_constraints: constraints, max_cycles: maxCycles,
-        grill_tree: tree, question,
+        grill_tree: tree, question, model,
       })
       if (r?.id) {
         // Fork created. Try to start it, but navigate away regardless — a
@@ -419,7 +478,13 @@ function ForkFlow({ parentId, onCancel, onDone }: { parentId: string; onCancel: 
 
   return <div className="max-w-2xl mx-auto space-y-4">
     <div className="text-sm text-muted">{i18nT('apps.autoResearch.researchLabPage.challenge_the_findings_from_question', { question: question?.slice(0, 60) })}</div>
-    {error && <div className="text-xs text-danger">{error}</div>}
+    {parentCampaign && <div>
+      <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.model')}</span><SimpleSelect aria-label={i18nT('apps.autoResearch.researchLabPage.model')} options={modelOptions} clearLabel={i18nT('apps.autoResearch.researchLabPage.model_default_inherit')} value={model} onChange={setForkModel} /></div>
+      {model === parentModel && <div className="text-xs text-muted mt-1">{i18nT('apps.autoResearch.researchLabPage.model_fork_hint')}</div>}
+    </div>}
+    {/* No hand-off: the challenge answers typed into the tree below and the
+        manual sub-questions are unsaved until the fork is created. */}
+    <ErrorNotice message={error} />
     {tree.length === 0 ? (
       <button className="text-sm px-3 py-1.5 rounded-md bg-accent text-accent-fg disabled:opacity-50" disabled={grilling || !question} onClick={startChallenge}>{grilling ? i18nT('apps.autoResearch.researchLabPage.challenging') : <><Flame size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.challenge_findings')}</>}</button>
     ) : (
@@ -519,8 +584,9 @@ function splitReportSections(md: string): string[] {
 function ReportSections({ report }: { report: string }) {
   const [copied, setCopied] = useState<number | null>(null)
   const sections = splitReportSections(report)
-  const copy = (text: string, i: number) => {
-    navigator.clipboard?.writeText(text)
+  const copy = async (text: string, i: number) => {
+    const ok = await copyToClipboard(text)
+    if (!ok) return
     setCopied(i)
     setTimeout(() => setCopied(c => (c === i ? null : c)), 1500)
   }
@@ -564,6 +630,9 @@ function SubQuestionAdder({ id, campaign }: { id: string; campaign: Campaign }) 
           <button className="text-xs px-2 py-1 rounded bg-accent text-accent-fg disabled:opacity-50" disabled={!text.trim() || addMut.isPending} onClick={() => addMut.mutate(text.trim())}>{addMut.isPending ? '…' : i18nT('apps.autoResearch.researchLabPage.add')}</button>
         </div>
         <div className="text-[10px] text-muted mt-1">{i18nT('apps.autoResearch.researchLabPage.free_form_a_sub_question_or_an_instruction_the_a')}</div>
+        {/* No hand-off: the guidance text above stays in the box on failure so it
+            can be re-sent — a navigation would discard it. */}
+        {addMut.isError && <ErrorNotice message={errMsg(addMut.error)} variant="inline" className="mt-1" />}
       </div>}
     </div>}
   </div>
@@ -632,7 +701,7 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
       </>}
     >
       <p className="text-sm text-muted m-0">{i18nT('apps.autoResearch.researchLabPage.delete_this_campaign_and_its_report_this_cannot')}</p>
-      {deleteMut.isError && <p className="text-danger text-[12px] mt-2 m-0">{deleteMut.error instanceof Error && deleteMut.error.message ? deleteMut.error.message : i18nT('apps.autoResearch.researchLabPage.delete_failed')}</p>}
+      {deleteMut.isError && <ErrorNotice message={deleteMut.error instanceof Error && deleteMut.error.message ? deleteMut.error.message : i18nT('apps.autoResearch.researchLabPage.delete_failed')} askAgent className="mt-2" />}
     </Modal>
     {campaign.question && (() => {
       const isLong = campaign.question.length > 280
@@ -644,7 +713,7 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
       </div>
     })()}
     <div className="flex items-center justify-between mb-4">
-      <div className="text-sm text-muted">{i18nT('apps.autoResearch.researchLabPage.cycle')} {campaign.total_cycles}/{campaign.max_cycles} · {findings.filter(f => f.new_findings_count > 0).length} {i18nT('apps.autoResearch.researchLabPage.findings')}</div>
+      <div className="text-sm text-muted flex flex-wrap gap-x-3"><span>{i18nT('apps.autoResearch.researchLabPage.cycle')} {campaign.total_cycles}/{campaign.max_cycles} · {findings.filter(f => f.new_findings_count > 0).length} {i18nT('apps.autoResearch.researchLabPage.findings')}</span><ModelLine c={campaign} /></div>
       {isActive && <div className="flex gap-2">
         {campaign.status === 'running' && <button className="text-xs px-2 py-1 rounded bg-bg-elevated" onClick={() => actionMut.mutate('pause')}><Pause size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.pause')}</button>}
         {campaign.status !== 'running' && <button className="text-xs px-2 py-1 rounded bg-bg-elevated" onClick={() => actionMut.mutate('resume')}><Play size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.resume')}</button>}
@@ -652,6 +721,10 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
         <button className="text-xs px-2 py-1 rounded bg-bg-elevated" onClick={() => setShowNudge(true)}><MessageCircle size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.nudge')}</button>
       </div>}
     </div>
+    {/* Pause / resume / stop act on the persisted campaign — nothing on screen is
+        a draft, so a refused action offers the hand-off. */}
+    <ModelWithheldNotice c={campaign} className="mb-4" />
+    {actionMut.isError && <ErrorNotice message={errMsg(actionMut.error)} askAgent className="mb-4" />}
     {campaign.status === 'stagnant' && <div className="p-3 rounded-md mb-4 border border-warn bg-warn/10">
       <div className="text-sm font-medium text-warn flex items-center gap-1"><AlertTriangle size={14} /> {i18nT('apps.autoResearch.researchLabPage.research_stalled')}</div>
       <div className="text-xs mt-1">{i18nT('apps.autoResearch.researchLabPage.no_new_findings_in_the_last_5_cycles')}</div>
@@ -668,11 +741,19 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
       <div className="flex gap-2 mt-2 justify-end">
         <button className="text-xs px-2 py-1 rounded bg-accent text-accent-fg disabled:opacity-50" onClick={() => nudgeMut.mutate(answerText)} disabled={!answerText || nudgeMut.isPending}>{nudgeMut.isPending ? i18nT('apps.autoResearch.researchLabPage.sending') : i18nT('apps.autoResearch.researchLabPage.answer_resume')}</button>
       </div>
+      {/* No hand-off: the answer textarea above is unsaved. */}
+      {nudgeMut.isError && <ErrorNotice message={errMsg(nudgeMut.error)} className="mt-2" />}
     </div>}
-    {campaign.status === 'failed' && <div className="p-3 rounded-md mb-4 border border-danger bg-danger/10">
-      <div className="text-sm font-medium text-danger flex items-center gap-1"><AlertTriangle size={14} /> {i18nT('apps.autoResearch.researchLabPage.research_stopped')}</div>
-      <div className="text-xs mt-1">{campaign.error_message || i18nT('apps.autoResearch.researchLabPage.the_campaign_stopped_unexpectedly')} {i18nT('apps.autoResearch.researchLabPage.findings_so_far_are_preserved_below')}</div>
-      <button className="text-xs px-2 py-1 mt-2 rounded bg-accent text-accent-fg" onClick={() => actionMut.mutate('resume')}><Play size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.resume')}</button>
+    {/* The campaign's persisted last error. Findings and the campaign record are
+        on disk, so the hand-off loses nothing; Resume stays a sibling control. */}
+    {campaign.status === 'failed' && <div className="mb-4 flex flex-col items-start gap-2">
+      <ErrorNotice
+        title={i18nT('apps.autoResearch.researchLabPage.research_stopped')}
+        message={`${campaign.error_message || i18nT('apps.autoResearch.researchLabPage.the_campaign_stopped_unexpectedly')} ${i18nT('apps.autoResearch.researchLabPage.findings_so_far_are_preserved_below')}`}
+        askAgent
+        className="w-full"
+      />
+      <button className="text-xs px-2 py-1 rounded bg-accent text-accent-fg" onClick={() => actionMut.mutate('resume')}><Play size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.resume')}</button>
     </div>}
     {(campaign.status === 'complete' || campaign.status === 'stopped') && !isActive && (
       <div className="p-3 rounded-md mb-4 border border-accent bg-accent/5">
@@ -694,6 +775,8 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
         <button className="text-xs text-muted" onClick={() => setShowNudge(false)}>{i18nT('apps.autoResearch.researchLabPage.cancel')}</button>
         <button className="text-xs px-2 py-1 rounded bg-accent text-accent-fg disabled:opacity-50" onClick={() => nudgeMut.mutate(nudgeText)} disabled={!nudgeText || nudgeMut.isPending}>{nudgeMut.isPending ? i18nT('apps.autoResearch.researchLabPage.sending') : i18nT('apps.autoResearch.researchLabPage.send')}</button>
       </div>
+      {/* No hand-off: the nudge textarea above is unsaved. */}
+      {nudgeMut.isError && <ErrorNotice message={errMsg(nudgeMut.error)} className="mt-2" />}
     </div>}
     <div className="mt-4">
       <div className="flex items-center justify-between mb-2">
@@ -725,11 +808,11 @@ export default function ResearchLabPage() {
 
   const active = campaigns.find((c: Campaign) => ACTIVE_STATUSES.includes(c.status))
 
-  if (view === 'wizard') return <div className="px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.new_campaign')}</h1><SetupWizard onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
-  if (view === 'fork' && forkParentId) return <div className="px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.continue_research')}</h1><ForkFlow parentId={forkParentId} onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
-  if (view === 'detail' && selectedId) return <div className="px-6 py-4"><CampaignDetail id={selectedId} onBack={() => setView('list')} onFork={(id) => { setForkParentId(id); setView('fork') }} onOpen={(pid) => setSelectedId(pid)} /></div>
+  if (view === 'wizard') return <div className="px-4 md:px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.new_campaign')}</h1><SetupWizard onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
+  if (view === 'fork' && forkParentId) return <div className="px-4 md:px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.continue_research')}</h1><ForkFlow parentId={forkParentId} onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
+  if (view === 'detail' && selectedId) return <div className="px-4 md:px-6 py-4"><CampaignDetail id={selectedId} onBack={() => setView('list')} onFork={(id) => { setForkParentId(id); setView('fork') }} onOpen={(pid) => setSelectedId(pid)} /></div>
 
-  return <div className="px-6 py-4">
+  return <div className="px-4 md:px-6 py-4">
     <div className="flex items-center justify-between mb-4">
       <h1 className="text-lg font-semibold flex items-center gap-2"><FlaskConical size={20} /> {i18nT('apps.autoResearch.researchLabPage.research_lab')}</h1>
       <button className="text-sm px-3 py-1.5 rounded-md bg-accent text-accent-fg disabled:opacity-50" disabled={!!active} onClick={() => setView('wizard')} title={active ? i18nT('apps.autoResearch.researchLabPage.one_campaign_at_a_time') : ''}>{i18nT('apps.autoResearch.researchLabPage.new_campaign_2')}</button>
@@ -748,7 +831,8 @@ export default function ResearchLabPage() {
             <StateBadge status={active.status} />
             <div className="font-medium text-sm line-clamp-2 flex-1" title={active.question}>{active.parent_id && <span className="text-[10px] font-medium text-accent bg-accent-subtle rounded px-1 py-0.5 mr-1 inline-flex items-center gap-0.5 align-middle"><GitFork size={10} /> {i18nT('apps.autoResearch.researchLabPage.forked')}</span>}{active.question}</div>
           </div>
-          <div className="text-xs text-muted mt-1">{i18nT('apps.autoResearch.researchLabPage.cycle')} {active.total_cycles}/{active.max_cycles}</div>
+          <div className="text-xs text-muted mt-1 flex flex-wrap gap-x-3"><span>{i18nT('apps.autoResearch.researchLabPage.cycle')} {active.total_cycles}/{active.max_cycles}</span><ModelLine c={active} /></div>
+          <ModelWithheldNotice c={active} className="mt-2" />
         </Clickable></div>}
       {campaigns.filter((c: Campaign) => !ACTIVE_STATUSES.includes(c.status)).length > 0 && <div>
         <div className="text-xs font-medium text-muted mb-1">{i18nT('apps.autoResearch.researchLabPage.history')}</div>
@@ -758,7 +842,7 @@ export default function ResearchLabPage() {
               <StateBadge status={c.status} />
               <div className="text-sm line-clamp-2 flex-1" title={c.question}>{c.parent_id && <span className="text-[10px] font-medium text-accent bg-accent-subtle rounded px-1 py-0.5 mr-1 inline-flex items-center gap-0.5 align-middle"><GitFork size={10} /> {i18nT('apps.autoResearch.researchLabPage.forked')}</span>}{c.question}</div>
             </div>
-            <div className="text-xs text-muted mt-1">{c.total_cycles} {i18nT('apps.autoResearch.researchLabPage.cycles_2')}</div>
+            <div className="text-xs text-muted mt-1 flex flex-wrap gap-x-3"><span>{c.total_cycles} {i18nT('apps.autoResearch.researchLabPage.cycles_2')}</span><ModelLine c={c} /></div>
           </Clickable>
         ))}
       </div>}

@@ -256,7 +256,7 @@ def test_untrusted_ssh_host_stays_strict_under_enterprise(enterprise_ctx) -> Non
 # ── embeddings (point 2) ──
 #
 # Since the in-process embeddings landed (vendored llama.cpp, always-on) the
-# core no longer routes embed requests over HTTP: the async EmbeddingClient +
+# core does not route embed requests over HTTP: the async EmbeddingClient +
 # SigV4 signing were deleted, and the EmbeddingSource endpoint_url/sign_request
 # slots are a dormant seam. The active companion swap path is now
 # embeddings.register_embedding_backend — asserted below. The enterprise overlay's
@@ -344,7 +344,7 @@ def test_register_acp_backends_called_once_at_boot(monkeypatch, manifest_dir) ->
     counting = _CountingProviderRegistry()
     cfg = KiroCrewConfig()
 
-    def _fake_discover(profile, cfg_):
+    def _fake_discover(profile, cfg_, **_kwargs):
         base = build_default_context(cfg_, profile=PROFILE_ENTERPRISE)
         return dataclasses.replace(base, providers=counting)
 

@@ -14,7 +14,7 @@
 
 import { describe, it, expect } from 'vitest'
 
-import { CATALOGS as RUNTIME_CATALOGS } from '../index'
+import { CATALOGS as RUNTIME_CATALOGS } from '../catalogs'
 
 const CJK = /[\u4e00-\u9fff]/
 
@@ -158,7 +158,7 @@ describe('zh-CN punctuation (style/zh-CN.md §1)', () => {
   })
 })
 
-describe('zh-CN tone (style/zh-CN.md §3)', () => {
+describe('zh-CN tone (style/zh-CN.md §4)', () => {
   it('never uses the honorific 您', () => {
     // The catalog is written in neutral second person 你. Mixing registers
     // mid-product reads worse than either register consistently.

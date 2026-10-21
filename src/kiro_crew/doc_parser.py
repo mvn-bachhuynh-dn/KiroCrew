@@ -17,10 +17,13 @@ They never raise — on failure they return an empty string and log a warning.
 from __future__ import annotations
 
 import logging
+import os
+import posixpath
 import re
 import zipfile
 import zlib
 from pathlib import Path
+from typing import IO
 
 # Optional so a stale install (git pull without `pip install -e .`) degrades
 # to "docx/pptx parsing unavailable" instead of killing every CLI entry at
@@ -33,6 +36,12 @@ except ModuleNotFoundError:  # pragma: no cover — exercised via monkeypatch
 
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.zip_vet import (
+    TAIL_WINDOW,
+    ZipInventoryRejected,
+    vet_zip_inventory,
+    vet_zip_inventory_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +49,13 @@ logger = logging.getLogger(__name__)
 
 _MAX_ZIP_ENTRY = 50 * 1024 * 1024  # 50 MB per ZIP entry (decompressed)
 _MAX_DECOMPRESS = 50 * 1024 * 1024  # 50 MB for zlib decompression
+# Inventory bound for OOXML containers. The per-entry cap above bounds what one
+# member can expand to; this bounds how MANY members an archive declares — and
+# ZipFile's construction allocates from the declared central-directory size
+# before any per-entry limit can apply. Generous next to
+# real documents (a large deck with per-slide media is in the low thousands of
+# parts), so this refuses crafted inventories without narrowing legitimate ones.
+_MAX_ARCHIVE_MEMBERS = 20000
 
 # ── Public API ──
 
@@ -64,17 +80,90 @@ def is_parseable_document(mimetype: str = "", filename: str = "") -> bool:
     return ext in DOC_EXTENSIONS
 
 
-def extract_text(path: str, mimetype: str = "", filename: str = "") -> str:
+def extract_text(
+    path: str,
+    mimetype: str = "",
+    filename: str = "",
+    max_chars: int | None = None,
+    fileobj: IO[bytes] | None = None,
+) -> str:
     """Extract readable text from a document file.
 
     Detects format from *mimetype* first, then falls back to file extension.
     Returns empty string on any failure.
+
+    *max_chars*, when given, bounds the AGGREGATE extracted text: parsing
+    stops as soon as at least that many characters have been collected (the
+    result may slightly overshoot, callers truncate to their exact cap).
+    Without it a multi-part container (e.g. a .pptx with thousands of
+    slides, each under the per-entry decompression cap) could accumulate
+    unbounded text in memory. Callers that only need a preview should pass
+    their cap + 1 so truncation stays detectable.
+
+    *fileobj*, when given, is an ALREADY-OPEN binary file the .docx/.pptx
+    ZIP is read from instead of re-opening *path* — callers that stat-gate
+    the file first pass the same handle so the bytes parsed are exactly the
+    bytes measured (no stat→open TOCTOU window). *path* is still used for
+    sensitive-path screening, format detection and logging. PDF extraction
+    is byte-scan based and still reads *path*; no current fileobj caller
+    requests PDFs.
+    """
+    fmt = _admit(path, mimetype, filename, operation="extract_text")
+    if not fmt:
+        return ""
+    try:
+        if fmt == "docx":
+            return _extract_docx(path, max_chars=max_chars, fileobj=fileobj)
+        if fmt == "pptx":
+            return _extract_pptx(path, max_chars=max_chars, fileobj=fileobj)
+        if fmt == "pdf":
+            return _extract_pdf(path)
+    except Exception:
+        logger.warning("Failed to extract text from %s", path, exc_info=True)
+    return ""
+
+
+def extract_slides(
+    path: str,
+    mimetype: str = "",
+    filename: str = "",
+    max_chars: int | None = None,
+    fileobj: IO[bytes] | None = None,
+) -> list[tuple[int, str]]:
+    """Extract a .pptx deck's text one slide at a time.
+
+    Returns ``[(slide_number, slide_text), ...]`` in deck order, holding only
+    the slides that carry text. The structure is what a caller needs to show
+    a deck AS slides -- :func:`extract_text` flattens the same slides into one
+    string with ``--- Slide N ---`` separators, and re-splitting that string
+    on the separator would make its consumer depend on a formatting detail.
+
+    Same admission (sensitive-path screen, format detection, defusedxml
+    gate), the same *max_chars* aggregate budget and the same *fileobj*
+    contract as :func:`extract_text`, and the same failure shape: an empty
+    list for a file that is not a .pptx, has no slide text, or fails to parse.
+    """
+    if _admit(path, mimetype, filename, operation="extract_slides") != "pptx":
+        return []
+    try:
+        return _extract_pptx_slides(path, max_chars=max_chars, fileobj=fileobj)
+    except Exception:
+        logger.warning("Failed to extract slides from %s", path, exc_info=True)
+    return []
+
+
+def _admit(path: str, mimetype: str, filename: str, *, operation: str) -> str:
+    """The shared entry gate: refuse sensitive paths, resolve the format.
+
+    Returns the format tag (``docx`` / ``pptx`` / ``pdf``) or ``""`` when the
+    file must not be parsed -- a refused path (audited under *operation*), an
+    unknown format, or an OOXML format with no hardened XML parser available.
     """
     if is_sensitive_path(path):
         logger.warning("Refusing to read sensitive path: %s", path)
         sel().log_api_access(
             caller="doc_parser",
-            operation="extract_text",
+            operation=operation,
             outcome="denied",
             source="local",
             resources=path,
@@ -94,16 +183,7 @@ def extract_text(path: str, mimetype: str = "", filename: str = "") -> str:
             filename or path,
         )
         return ""
-    try:
-        if fmt == "docx":
-            return _extract_docx(path)
-        if fmt == "pptx":
-            return _extract_pptx(path)
-        if fmt == "pdf":
-            return _extract_pdf(path)
-    except Exception:
-        logger.warning("Failed to extract text from %s", path, exc_info=True)
-    return ""
+    return fmt
 
 
 # ── Decompression safety ──
@@ -118,6 +198,51 @@ def _safe_decompress(data: bytes, max_size: int | None = None) -> bytes:
     if dobj.unconsumed_tail:
         raise ValueError("decompressed stream exceeds size limit")
     return result
+
+
+def _vet_archive_inventory(path: str, fileobj: IO[bytes] | None = None) -> bool:
+    """Preflight an OOXML container's declared inventory before opening it.
+
+    Returns True when the archive is within bounds. Fails closed: a rejected or
+    unreadable tail returns False, and the caller degrades to "" like every
+    other unreadable-document path in this module.
+
+    When *fileobj* is given the tail is read from THAT handle, not from *path*:
+    the handle is what ``zipfile`` will parse, so vetting the path instead
+    would bound a different archive than the one opened -- a swapped path
+    between the two reads would let an over-cap inventory reach the allocation
+    this vet exists to prevent. The position is restored so the caller's
+    ``ZipFile`` still sees the whole file.
+    """
+    try:
+        if fileobj is not None:
+            tail = _read_tail_from(fileobj)
+            vet_zip_inventory_bytes(tail, max_members=_MAX_ARCHIVE_MEMBERS)
+        else:
+            vet_zip_inventory(path, max_members=_MAX_ARCHIVE_MEMBERS)
+    except ZipInventoryRejected as exc:
+        logger.warning("archive inventory rejected (%s)", exc.reason)
+        return False
+    except OSError as exc:
+        # An unseekable or unreadable handle is an unvettable archive, and this
+        # guard fails closed like the path branch does.
+        logger.warning("cannot read archive tail from handle: %s", exc)
+        return False
+    return True
+
+
+def _read_tail_from(fileobj: IO[bytes]) -> bytes:
+    """Read the EOCD search window from an already-open archive handle.
+
+    Mirrors :func:`kiro_crew.zip_vet._read_tail` for the fd-based caller, then
+    rewinds so the handle is still at byte 0 for ``zipfile.ZipFile``.
+    """
+    try:
+        size = fileobj.seek(0, os.SEEK_END)
+        fileobj.seek(max(0, size - TAIL_WINDOW))
+        return fileobj.read(TAIL_WINDOW)
+    finally:
+        fileobj.seek(0)
 
 
 def _read_zip_entry(
@@ -143,7 +268,9 @@ def _read_zip_entry(
 _W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
-def _extract_docx(path: str) -> str:
+def _extract_docx(
+    path: str, max_chars: int | None = None, fileobj: IO[bytes] | None = None,
+) -> str:
     """Extract text from a .docx file (ZIP containing word/document.xml).
 
     Must only be called from extract_text() which enforces is_sensitive_path().
@@ -151,8 +278,11 @@ def _extract_docx(path: str) -> str:
     assert _xml_fromstring is not None  # extract_text() gates the None case
     if is_sensitive_path(path):
         return ""
+    if not _vet_archive_inventory(path, fileobj):
+        return ""
     paragraphs: list[str] = []
-    with zipfile.ZipFile(path, "r") as zf:
+    collected = 0
+    with zipfile.ZipFile(fileobj if fileobj is not None else path, "r") as zf:
         if "word/document.xml" not in zf.namelist():
             return ""
         data = _read_zip_entry(zf, "word/document.xml")
@@ -165,46 +295,133 @@ def _extract_docx(path: str) -> str:
                 if t_elem.text:
                     texts.append(t_elem.text)
             if texts:
-                paragraphs.append("".join(texts))
+                joined = "".join(texts)
+                if paragraphs:
+                    # Count the "\n" separator only BETWEEN paragraphs, so
+                    # `collected` tracks len("\n".join(paragraphs)) exactly.
+                    # Charging the first paragraph a separator too let a
+                    # cap-sized opening paragraph stop extraction while the
+                    # caller's length check read the result as un-truncated,
+                    # silently dropping the rest of the document.
+                    collected += 1
+                paragraphs.append(joined)
+                collected += len(joined)
+                if max_chars is not None and collected >= max_chars:
+                    break
     return "\n".join(paragraphs)
 
 
 # ── PPTX parser (Office Open XML) ──
 
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PACKAGE_R_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_SLIDE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
 _SLIDE_RE = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
 
 
-def _extract_pptx(path: str) -> str:
-    """Extract text from a .pptx file (ZIP containing ppt/slides/*.xml).
+def _pptx_slide_order(zf: zipfile.ZipFile) -> list[tuple[int, str]]:
+    """Resolve presentation positions to internal ZIP members, never filesystem paths."""
+    assert _xml_fromstring is not None
+    names = set(zf.namelist())
+    if "ppt/presentation.xml" not in names:
+        # Keep best-effort extraction for incomplete containers without an order.
+        return sorted(
+            (int(match.group(1)), name)
+            for name in names
+            if (match := _SLIDE_RE.match(name))
+        )
+    presentation = _read_zip_entry(zf, "ppt/presentation.xml")
+    relationships = _read_zip_entry(zf, "ppt/_rels/presentation.xml.rels")
+    if presentation is None or relationships is None:
+        return []
+    root = _xml_fromstring(presentation)
+    rels = _xml_fromstring(relationships)
+    targets = {
+        rel.get("Id"): posixpath.normpath(posixpath.join("ppt", rel.attrib["Target"])).lstrip("/")
+        for rel in rels.findall(f"{_PACKAGE_R_NS}Relationship")
+        if rel.get("Type") == _SLIDE_REL_TYPE
+        and rel.get("TargetMode", "Internal") == "Internal"
+        and rel.get("Id")
+        and rel.get("Target")
+    }
+    # Part numbers and relationship IDs survive reordering; only sldIdLst gives
+    # the order a reader sees. Enumerate before skipping blank or missing slides.
+    ordered: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for number, slide in enumerate(root.iterfind(f"{_P_NS}sldIdLst/{_P_NS}sldId"), 1):
+        rel_id = slide.get(f"{_R_NS}id")
+        if not rel_id:
+            # A sldId without an r:id references no relationship; resolving it
+            # would key targets under None and pull in an orphan part.
+            continue
+        target = targets.get(rel_id)
+        if target is not None and target in names and target not in seen:
+            # A malformed manifest must not multiply decompression and retained
+            # text beyond the vetted inventory by referencing one part repeatedly.
+            seen.add(target)
+            ordered.append((number, target))
+    return ordered
+
+
+def _extract_pptx(
+    path: str, max_chars: int | None = None, fileobj: IO[bytes] | None = None,
+) -> str:
+    """Extract text from a .pptx file as ONE string, ``--- Slide N ---`` per slide.
 
     Must only be called from extract_text() which enforces is_sensitive_path().
+    The slide walk itself is :func:`_extract_pptx_slides`; this is the flat
+    rendering of it that text consumers (knowledge ingest, attachments) read.
     """
-    assert _xml_fromstring is not None  # extract_text() gates the None case
+    return join_slides(_extract_pptx_slides(path, max_chars=max_chars, fileobj=fileobj))
+
+
+def join_slides(slides: list[tuple[int, str]]) -> str:
+    """Flatten per-slide text into the ``--- Slide N ---`` form :func:`extract_text` returns.
+
+    Public so a caller holding the structured slides can produce the flat text
+    without a second extraction; the separator is owned here and nowhere else.
+    """
+    return "\n\n".join(f"--- Slide {num} ---\n{text}" for num, text in slides)
+
+
+def _extract_pptx_slides(
+    path: str, max_chars: int | None = None, fileobj: IO[bytes] | None = None,
+) -> list[tuple[int, str]]:
+    """Walk a .pptx (ZIP containing ppt/slides/*.xml) and collect each slide's text.
+
+    Must only be called through :func:`extract_text` / :func:`extract_slides`,
+    which enforce is_sensitive_path().
+
+    With *max_chars* set, slide iteration stops as soon as the collected
+    text meets the budget — later slides are never decompressed or parsed,
+    so a deck with thousands of slides cannot accumulate unbounded text.
+    """
+    assert _xml_fromstring is not None  # the callers gate the None case
     if is_sensitive_path(path):
-        return ""
+        return []
+    if not _vet_archive_inventory(path, fileobj):
+        return []
     slides: list[tuple[int, str]] = []
-    with zipfile.ZipFile(path, "r") as zf:
-        slide_names = sorted(
-            (n for n in zf.namelist() if _SLIDE_RE.match(n)),
-            key=lambda n: int(_SLIDE_RE.match(n).group(1)),  # type: ignore[union-attr]
-        )
-        for slide_name in slide_names:
+    collected = 0
+    with zipfile.ZipFile(fileobj if fileobj is not None else path, "r") as zf:
+        for num, slide_name in _pptx_slide_order(zf):
             data = _read_zip_entry(zf, slide_name)
             if data is None:
                 continue
-            num = int(_SLIDE_RE.match(slide_name).group(1))  # type: ignore[union-attr]
             root = _xml_fromstring(data)
             texts: list[str] = []
             for t_elem in root.iter(f"{_A_NS}t"):
                 if t_elem.text:
                     texts.append(t_elem.text)
             if texts:
-                slides.append((num, "\n".join(texts)))
-    parts: list[str] = []
-    for num, text in slides:
-        parts.append(f"--- Slide {num} ---\n{text}")
-    return "\n\n".join(parts)
+                slide_text = "\n".join(texts)
+                slides.append((num, slide_text))
+                collected += len(slide_text)
+                if max_chars is not None and collected >= max_chars:
+                    break
+    return slides
 
 
 # ── PDF parser (best-effort binary text extraction) ──

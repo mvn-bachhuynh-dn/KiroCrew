@@ -105,7 +105,21 @@ def verify_signature(raw_body: bytes, provided: str) -> bool:
     if not secret or not provided:
         return False
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, provided.strip().lower())
+    # Compared as BYTES, never as ``str``. ``hmac.compare_digest`` rejects a str
+    # holding a non-ASCII character by raising ``TypeError``, and ``provided`` is
+    # the caller-chosen ``X-OMC-Signature`` header: aiohttp decodes a header byte
+    # that is not valid UTF-8 into a lone surrogate. Encoding first gives every
+    # possible header value a verdict — the same 401 ``signature mismatch`` a
+    # wrong hex signature gets — instead of an unhandled ``TypeError`` that
+    # answers 500 with a traceback and skips this refusal entirely.
+    # ``surrogatepass`` because a lone surrogate must still compare rather than
+    # raise on the way in, and it keeps two distinct strings distinct. ``expected``
+    # is a hex digest by construction, so a signature that matched before still
+    # matches. Same shape as ``apps.proxy_auth.verify_proxy_request``.
+    return hmac.compare_digest(
+        expected.encode("utf-8"),
+        provided.strip().lower().encode("utf-8", "surrogatepass"),
+    )
 
 
 #: Cap on label pairs kept from one delivery. Labels reach the model's context and
@@ -209,18 +223,18 @@ def _suppression_attribution(status: dict[str, Any]) -> tuple[str, str]:
 def _alert_status(raw: dict[str, Any]) -> tuple[str, str, str]:
     """Read one alert's status as ``(state_text, suppressed_by, suppressed_reason)``.
 
-    Two real shapes, and only one of them used to work:
+    Two real shapes, and a scalar-only read handles only one:
 
     - **v4 webhook envelope** — ``status`` is the scalar ``"firing"``/``"resolved"``.
     - **v2 ``gettableAlert``** — ``status`` is the OBJECT
       ``{"state": "suppressed", "silencedBy": [...], "inhibitedBy": [...]}``, which is
       what anything relaying ``GET /api/v2/alerts`` forwards.
 
-    The previous scalar-only read (``str(raw.get("status") or ...)``) stringified that
-    object, so it normalized to ``unknown`` — the suppression became "we could not parse
-    the state" and ``silencedBy`` was dropped on the floor entirely. The caller then had
-    a signal indistinguishable from a garbage one from a sender that was being perfectly
-    explicit about a human having parked the alert.
+    A scalar-only read (``str(raw.get("status") or ...)``) stringifies that object, so it
+    normalizes to ``unknown`` — the suppression reads as "we could not parse the state"
+    and ``silencedBy`` is dropped on the floor entirely, leaving the caller a signal
+    indistinguishable from a garbage one from a sender that is being perfectly explicit
+    about a human having parked the alert.
     """
     status = raw.get("status")
     if isinstance(status, dict):

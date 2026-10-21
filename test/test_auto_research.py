@@ -1,15 +1,29 @@
-"""Tests for auto_research builtin app handlers."""
+"""Tests for auto_research builtin app handlers.
+
+This file holds the campaign model (id, path and create-time validation, stagnation, cycle
+files, the status and guidance files, CRUD and the watchdog stall verdict) and question
+decomposition (the grill question tree, recursive exploration and the finalize reserve),
+with the backend's path and SQLite infrastructure and the prompt trust boundary. The rest
+of the suite sits beside it: ``test_auto_research_http.py`` (the campaign and fork routes;
+the grill expand route is tested here, with the grill tree),
+``test_auto_research_guards.py`` (redaction, audit, handler-side validation and auth),
+``test_auto_research_campaign_store.py`` (persisted campaign fields and SQLite isolation),
+``test_auto_research_worker_loop.py`` (the worker's autonudge loop and agent install) and
+``test_auto_research_watchdog.py`` (the watchdog's deadline and terminal settlement). The
+autouse ``_isolate`` fixture they all share is in ``auto_research_helpers.py``.
+"""
 
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from auto_research_helpers import isolate_fixture  # noqa: F401 - fixture
 
+from conftest import requires_symlinks
 from kiro_crew.apps.builtins.auto_research.handlers import (
     DEFAULT_DEPTH_DECAY,
     DEFAULT_EXECUTION_MODE,
@@ -39,22 +53,6 @@ from kiro_crew.apps.builtins.auto_research.handlers import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate(tmp_path: Path):
-    """Isolate DB and research dir per test."""
-    with (
-        patch(
-            "kiro_crew.apps.builtins.auto_research.handlers.DB_PATH",
-            tmp_path / "test.db",
-        ),
-        patch(
-            "kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR",
-            tmp_path / "research",
-        ),
-    ):
-        yield tmp_path
-
-
 class TestPathValidation:
     def test_valid_hex_id(self):
         assert _validate_campaign_id("a1b2c3d4")
@@ -69,6 +67,20 @@ class TestPathValidation:
 
     def test_rejects_empty(self):
         assert not _validate_campaign_id("")
+
+    def test_worker_slot_key_contract(self):
+        from kiro_crew.apps.builtins.auto_research.session_keys import (
+            is_owned_research_slot,
+            is_research_slot_key,
+            research_slot_key,
+        )
+
+        assert research_slot_key("a1b2c3d4") == "research-a1b2c3d4"
+        assert is_research_slot_key("research-a1b2c3d4")
+        assert is_owned_research_slot("research-a1b2c3d4", "auto-research")
+        assert not is_owned_research_slot("research-a1b2c3d4", "")
+        assert not is_research_slot_key("research-notes")
+        assert not is_research_slot_key("research-a1b2c3d4-extra")
 
     def test_safe_dir_rejects_invalid(self, tmp_path: Path):
         with patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path):
@@ -88,7 +100,7 @@ class TestValidation:
         assert r["can_start"]
 
     def test_sources_optional(self):
-        # Sources are no longer collected/required — the agent decides what to fetch.
+        # Sources are not collected or required — the agent decides what to fetch.
         r = validate_campaign({"question": "A valid research question here ok", "sources": []})
         assert r["can_start"]
 
@@ -132,6 +144,73 @@ class TestValidation:
         )
         assert r["estimated_cycles"] == 40
         assert r["estimated_duration_min"] == 80
+
+    def test_model_allowed_in_agent_mode(self):
+        r = validate_campaign(
+            {
+                "question": "A valid research question here ok",
+                "sources": ["web"],
+                "execution_mode": "agent",
+                "model": "test-model-x",
+            }
+        )
+        assert r["can_start"]
+
+    def test_model_rejected_in_workflow_mode(self):
+        # The workflow engine resolves its own models; a campaign-level pin
+        # would be silently ignored, so the create must be refused instead.
+        r = validate_campaign(
+            {
+                "question": "A valid research question here ok",
+                "sources": ["web"],
+                "execution_mode": "workflow",
+                "model": "test-model-x",
+            }
+        )
+        assert not r["can_start"]
+        assert any("agent mode" in e for e in r["errors"])
+
+    def test_empty_model_fine_in_workflow_mode(self):
+        # '' / missing means "inherit" — valid in every mode.
+        for model in ("", "   ", None):
+            cfg = {
+                "question": "A valid research question here ok",
+                "sources": ["web"],
+                "execution_mode": "workflow",
+            }
+            if model is not None:
+                cfg["model"] = model
+            r = validate_campaign(cfg)
+            assert r["can_start"], f"model={model!r} should validate"
+
+    def test_non_string_model_rejected(self):
+        r = validate_campaign(
+            {
+                "question": "A valid research question here ok",
+                "sources": ["web"],
+                "model": ["not", "a", "string"],
+            }
+        )
+        assert not r["can_start"]
+        assert any("string" in e for e in r["errors"])
+
+    def test_overlength_model_rejected_not_truncated(self):
+        # A sliced id would be a different string that is never served (silent
+        # fallback); the create must be refused with an error naming the cap.
+        from kiro_crew.apps.builtins.auto_research.handlers import _campaign_model
+
+        long_id = "m" * 200
+        r = validate_campaign(
+            {
+                "question": "A valid research question here ok",
+                "sources": ["web"],
+                "model": long_id,
+            }
+        )
+        assert not r["can_start"]
+        assert any("too long" in e for e in r["errors"])
+        # The normalizer does not slice: it returns the trimmed input.
+        assert _campaign_model({"model": f"  {long_id}  "}) == long_id
 
 
 class TestStagnation:
@@ -306,6 +385,22 @@ class TestCRUD:
         assert len(c["id"]) == 8
         assert c["status"] == "ready"
 
+    def test_model_stored_and_defaults_to_inherit(self):
+        # No pick -> '' (inherit); explicit pick stored verbatim (trimmed).
+        c1 = create_campaign(
+            {"question": "How do teams handle rate limiting?", "sources": ["web"]}
+        )
+        assert get_campaign(c1["id"])["model"] == ""
+        update_campaign_status(c1["id"], CampaignStatus.STOPPED)
+        c2 = create_campaign(
+            {
+                "question": "How do teams handle rate limiting?",
+                "sources": ["web"],
+                "model": "  test-model-x  ",
+            }
+        )
+        assert get_campaign(c2["id"])["model"] == "test-model-x"
+
     def test_update_running(self):
         c = create_campaign(
             {"question": "Research question about something here", "sources": ["web"]}
@@ -439,11 +534,12 @@ class TestStatusEnum:
 class TestStalledCampaignVerdict:
     """_stalled_campaign_verdict: not every idle deadline is a failure.
 
-    A worker that ends its run deliberately (writing worker_done.json before
-    autonudge_stop) or has a verified finding on disk finished — it didn't
-    stall. Only genuine silence (no verified finding, no done marker, or no
-    findings at all) may be stamped FAILED. Loop absence is deliberately NOT a
-    signal: the nudge fire path also removes loops for unreachable sessions.
+    A worker that ends its run deliberately (through the source-owned stop
+    tombstone, with worker_done.json as a fallback) or has a verified finding
+    on disk finished — it didn't stall. Only genuine silence (no verified
+    finding, no stop signal, or no findings at all) may be stamped FAILED. Loop
+    absence is deliberately NOT a signal: the nudge fire path also removes
+    loops for unreachable sessions.
     """
 
     CID = "a1b2c3d4"
@@ -483,6 +579,43 @@ class TestStalledCampaignVerdict:
         status, message = _stalled_campaign_verdict(self.CID, [f])
         assert status == CampaignStatus.STOPPED
         assert "preserved" in (message or "")
+
+    def test_stop_tombstone_is_preferred_over_worker_marker(
+        self, _isolate: Path, monkeypatch
+    ):
+        """A source-owned tombstone is sufficient and short-circuits the
+        LLM-written marker fallback."""
+        from kiro_crew.apps.builtins.auto_research import handlers as h
+        from kiro_crew.autonudge import AUTONUDGE_STOP_REASON
+
+        f = self._write_finding(
+            _isolate, 9, {"summary": "final synthesis", "verification": None}
+        )
+        monkeypatch.setattr(
+            h,
+            "_read_worker_done",
+            lambda _cid: pytest.fail("worker_done fallback must not run for a tombstone"),
+        )
+        status, message = h._stalled_campaign_verdict(
+            self.CID,
+            [f],
+            stopped_reason=AUTONUDGE_STOP_REASON,
+        )
+        assert status == CampaignStatus.STOPPED
+        assert "preserved" in (message or "")
+
+    def test_stop_tombstone_without_readable_findings_stays_failed(self):
+        """A deterministic stop source must not claim findings were preserved
+        when the worker produced no readable result."""
+        from kiro_crew.apps.builtins.auto_research.handlers import _stalled_campaign_verdict
+        from kiro_crew.autonudge import AUTONUDGE_STOP_REASON
+
+        status, _ = _stalled_campaign_verdict(
+            self.CID,
+            [],
+            stopped_reason=AUTONUDGE_STOP_REASON,
+        )
+        assert status == CampaignStatus.FAILED
 
     def test_no_marker_and_unverified_is_a_real_stall(self, _isolate: Path):
         """The exact case GPT review flagged: a worker session deleted mid-run
@@ -593,6 +726,7 @@ class TestStalledCampaignVerdict:
         status, _ = _stalled_campaign_verdict(self.CID, [p])
         assert status == CampaignStatus.FAILED
 
+    @requires_symlinks
     def test_marker_symlink_is_not_trusted(self, _isolate: Path):
         """A LINK at the marker path is rejected by the reader outright — a
         marker symlinked to an unbounded source (e.g. /dev/zero) must never
@@ -666,6 +800,7 @@ class TestStalledCampaignVerdict:
         d.mkdir(parents=True, exist_ok=True)
         assert _read_worker_done(self.CID) is None
 
+    @requires_symlinks
     def test_clear_marker_symlink_removes_link_not_target(self, _isolate: Path):
         """A symlink at the marker path is unlinked — its target's contents
         must never be recursively deleted."""
@@ -718,1577 +853,6 @@ class TestStalledCampaignVerdict:
             assert camp["completed_at"] is not None
 
 
-# --- Redaction ---
-class TestRedaction:
-    def test_redact_finding_with_security_module(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_finding
-
-        # Should not crash even if security module has issues
-        finding = {
-            "summary": "test",
-            "sources_checked": ["http://example.com"],
-            "new_findings_count": 1,
-        }
-        result = _redact_finding(finding)
-        assert "summary" in result
-
-    def test_redact_finding_handles_non_string_values(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_finding
-
-        finding = {"cycle": 1, "new_findings_count": 3, "summary": "test"}
-        result = _redact_finding(finding)
-        assert result["cycle"] == 1
-        assert result["new_findings_count"] == 3
-
-    def test_redact_finding_handles_list_values(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_finding
-
-        finding = {"sources_checked": ["http://a.com", "http://b.com"], "sources_empty": []}
-        result = _redact_finding(finding)
-        assert isinstance(result["sources_checked"], list)
-
-
-# --- Audit ---
-
-
-class TestAudit:
-    def test_audit_does_not_crash(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _audit
-
-        # Should not raise even if sel module is unavailable
-        _audit("test_operation", "a1b2c3d4")
-
-    def test_audit_with_extras(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _audit
-
-        _audit("campaign_created", "a1b2c3d4", extra_field="value")
-
-
-# --- Campaign ID validation in handlers ---
-
-
-class TestHandlerValidation:
-    def test_update_rejects_invalid_id(self):
-        result = update_campaign_status("../etc", CampaignStatus.RUNNING)
-        assert "error" in result
-
-    def test_write_guidance_rejects_invalid(self, tmp_path: Path):
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path):
-            write_guidance("../etc", "text")
-            # Should not create any file outside research dir
-            assert not (tmp_path / ".." / "etc" / "guidance.txt").exists()
-
-
-# --- Edge cases in validation ---
-
-
-class TestValidationEdgeCases:
-    def test_max_cycles_exactly_50_no_warning(self):
-        r = validate_campaign(
-            {"question": "A valid research question here ok", "sources": ["web"], "max_cycles": 50}
-        )
-        assert r["can_start"]
-        assert not any("$" in w for w in r["warnings"])
-
-    def test_max_cycles_exactly_100_no_error(self):
-        r = validate_campaign(
-            {"question": "A valid research question here ok", "sources": ["web"], "max_cycles": 100}
-        )
-        assert r["can_start"]
-
-    def test_default_max_cycles_30(self):
-        r = validate_campaign({"question": "A valid research question here ok", "sources": ["web"]})
-        assert r["estimated_cycles"] == 30
-        assert r["estimated_duration_min"] == 60
-
-
-# --- Auth ---
-
-
-class TestRequireAuth:
-    def test_returns_none_when_user_present(self):
-        from unittest.mock import MagicMock
-
-        from kiro_crew.apps.builtins.auto_research.handlers import _require_auth
-
-        request = MagicMock()
-        request.get.return_value = "user123"
-        request.query = {}
-        assert _require_auth(request) is None
-
-    def test_returns_401_when_no_user(self):
-        from unittest.mock import MagicMock
-
-        from kiro_crew.apps.builtins.auto_research.handlers import _require_auth
-
-        request = MagicMock()
-        request.get.return_value = None
-        resp = _require_auth(request)
-        assert resp is not None
-        assert resp.status == 401
-
-    def test_rejects_raw_token(self):
-        # Raw token alone (without middleware-set user) is rejected — no fail-open.
-        from unittest.mock import MagicMock
-
-        from kiro_crew.apps.builtins.auto_research.handlers import _require_auth
-
-        request = MagicMock()
-        request.get.return_value = None
-        resp = _require_auth(request)
-        assert resp is not None
-        assert resp.status == 401
-
-
-# --- Redaction edge cases ---
-
-
-class TestRedactionNested:
-    def test_recursive_nested_dict(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_finding
-
-        finding = {"metadata": {"nested": "value", "deep": {"level": "data"}}, "cycle": 1}
-        result = _redact_finding(finding)
-        assert isinstance(result["metadata"], dict)
-        assert isinstance(result["metadata"]["deep"], dict)
-
-    def test_recursive_list_of_dicts(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_finding
-
-        finding = {"items": [{"name": "a"}, {"name": "b"}], "cycle": 1}
-        result = _redact_finding(finding)
-        assert len(result["items"]) == 2
-
-    def test_mixed_list(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_finding
-
-        finding = {"mixed": ["text", 42, {"k": "v"}, ["nested"]]}
-        result = _redact_finding(finding)
-        assert result["mixed"][1] == 42
-
-
-# --- HTTP Handler tests ---
-
-
-class TestHTTPHandlers:
-    @pytest.fixture
-    def app(self, tmp_path: Path):
-        from aiohttp import web
-
-        from kiro_crew.apps.builtins.auto_research.handlers import register_routes
-
-        @web.middleware
-        async def _inject_user(request, handler):
-            request["user"] = "test-user"
-            return await handler(request)
-
-        with (
-            patch(
-                "kiro_crew.apps.builtins.auto_research.handlers.DB_PATH",
-                tmp_path / "t.db",
-            ),
-            patch(
-                "kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR",
-                tmp_path / "r",
-            ),
-        ):
-            a = web.Application(middlewares=[_inject_user])
-            register_routes(a)
-            yield a
-
-    @pytest.mark.asyncio
-    async def test_validate(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post(
-                    "/api/apps/auto-research/validate",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                assert r.status == 200
-                assert (await r.json())["can_start"] is True
-
-    @pytest.mark.asyncio
-    async def test_nudge_resumes_needs_input(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await cr.json())["id"]
-                (h._campaign_dir(cid) / "questions.json").write_text('{"question": "Which DB?"}')
-                r = await c.post(
-                    f"/api/apps/auto-research/campaigns/{cid}/nudge", json={"text": "Use SQLite"}
-                )
-                assert r.status == 200
-                # Answering clears the question and writes the guidance.
-                assert not (h._campaign_dir(cid) / "questions.json").exists()
-                assert (h._campaign_dir(cid) / "guidance.txt").read_text(encoding="utf-8") == "Use SQLite"
-
-    @pytest.mark.asyncio
-    async def test_report_endpoint(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await cr.json())["id"]
-                (h._campaign_dir(cid) / "FINDINGS.md").write_text("# Report\nKey finding.")
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/report")
-                assert r.status == 200
-                assert "Key finding." in (await r.json())["report"]
-
-    @pytest.mark.asyncio
-    async def test_create_list_get(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                assert r.status == 201
-                cid = (await r.json())["id"]
-                r = await c.get("/api/apps/auto-research/campaigns")
-                assert r.status == 200
-                assert len(await r.json()) == 1
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}")
-                assert r.status == 200
-
-    @pytest.mark.asyncio
-    async def test_action_start_stop(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await r.json())["id"]
-                r = await c.patch(
-                    f"/api/apps/auto-research/campaigns/{cid}", json={"action": "start"}
-                )
-                assert (await r.json())["status"] == "running"
-                r = await c.patch(
-                    f"/api/apps/auto-research/campaigns/{cid}", json={"action": "stop"}
-                )
-                assert (await r.json())["status"] == "stopped"
-
-    @pytest.mark.asyncio
-    async def test_delete_campaign(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await cr.json())["id"]
-                (h._campaign_dir(cid) / "FINDINGS.md").write_text("# Report")
-                r = await c.delete(f"/api/apps/auto-research/campaigns/{cid}")
-                assert r.status == 200
-                assert (await r.json())["deleted"] is True
-                assert await (await c.get("/api/apps/auto-research/campaigns")).json() == []
-                assert (await c.delete(f"/api/apps/auto-research/campaigns/{cid}")).status == 404
-
-    @pytest.mark.asyncio
-    async def test_action_start_on_running_returns_409(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await cr.json())["id"]
-                await c.patch(f"/api/apps/auto-research/campaigns/{cid}", json={"action": "start"})
-                # Re-issuing start on a running campaign must be rejected, not relaunch.
-                r = await c.patch(
-                    f"/api/apps/auto-research/campaigns/{cid}", json={"action": "start"}
-                )
-                assert r.status == 409
-
-    @pytest.mark.asyncio
-    async def test_action_resume_from_failed_clears_error(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await cr.json())["id"]
-                update_campaign_status(cid, CampaignStatus.FAILED, error_message="stalled")
-                # A failed campaign is recoverable: resume must succeed (not 409)
-                # and clear the stale failure message.
-                r = await c.patch(
-                    f"/api/apps/auto-research/campaigns/{cid}", json={"action": "resume"}
-                )
-                assert r.status == 200
-                camp = await (await c.get(f"/api/apps/auto-research/campaigns/{cid}")).json()
-                assert camp["status"] == "running"
-                assert not camp["error_message"]
-
-    @pytest.mark.asyncio
-    async def test_action_unknown(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await r.json())["id"]
-                r = await c.patch(
-                    f"/api/apps/auto-research/campaigns/{cid}", json={"action": "boom"}
-                )
-                assert r.status == 400
-
-    @pytest.mark.asyncio
-    async def test_nudge(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await r.json())["id"]
-                r = await c.post(
-                    f"/api/apps/auto-research/campaigns/{cid}/nudge", json={"text": "focus"}
-                )
-                assert r.status == 200
-
-    @pytest.mark.asyncio
-    async def test_nudge_empty(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post(
-                    "/api/apps/auto-research/campaigns",
-                    json={"question": "How do teams handle rate limiting?", "sources": ["web"]},
-                )
-                cid = (await r.json())["id"]
-                r = await c.post(
-                    f"/api/apps/auto-research/campaigns/{cid}/nudge", json={"text": ""}
-                )
-                assert r.status == 400
-
-    @pytest.mark.asyncio
-    async def test_add_question(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"],
-                    "sub_questions": [{"text": "What patterns exist?", "origin": "grill"}]})
-                cid = (await r.json())["id"]
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/questions",
-                                 json={"text": "What about token buckets?"})
-                assert r.status == 200
-                body = await r.json()
-                assert body["ok"] is True
-                assert len(body["sub_questions"]) == 2
-                assert body["sub_questions"][1]["text"] == "What about token buckets?"
-                assert body["sub_questions"][1]["origin"] == "manual"
-                assert body["sub_questions"][1]["status"] == "open"
-                # Verify brief.md was regenerated with the new question.
-                brief = (h._campaign_dir(cid) / "brief.md").read_text(encoding="utf-8")
-                assert "What about token buckets?" in brief
-                assert "_(user guidance)_" in brief
-
-    @pytest.mark.asyncio
-    async def test_add_question_empty(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"]})
-                cid = (await r.json())["id"]
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/questions",
-                                 json={"text": ""})
-                assert r.status == 400
-
-    @pytest.mark.asyncio
-    async def test_add_question_not_found(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns/deadbeef/questions",
-                                 json={"text": "Something"})
-                assert r.status == 404
-
-    @pytest.mark.asyncio
-    async def test_to_knowledge_no_findings(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"]})
-                cid = (await r.json())["id"]
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-knowledge", json={})
-                assert r.status == 404
-                assert "No findings" in (await r.json())["error"]
-
-    @pytest.mark.asyncio
-    async def test_to_knowledge_no_pipeline(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"]})
-                cid = (await r.json())["id"]
-                d = h._campaign_dir(cid)
-                (d / "FINDINGS.md").write_text("# Summary\nSomething.")
-                # No knowledge store/pipeline in test app → 503
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-knowledge", json={})
-                assert r.status == 503
-
-    @pytest.mark.asyncio
-    async def test_to_knowledge_redacts_before_ingest(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        # Mock knowledge store + pipeline so the handler reaches the ingest path.
-        added: dict = {}
-
-        class _FakeStore:
-            def __init__(self) -> None:
-                self.db = MagicMock()
-
-            def get_source_by_uri(self, uri):
-                return None
-
-            def add_source(self, *, name, source_type, uri, properties):
-                added["uri"] = uri
-                added["name"] = name
-                return "sid1"
-
-        app["state"] = SimpleNamespace(knowledge_store=_FakeStore())
-        app["knowledge_pipeline"] = SimpleNamespace(ingest_file=AsyncMock())
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"]})
-                cid = (await r.json())["id"]
-                d = h._campaign_dir(cid)
-                (d / "FINDINGS.md").write_text(
-                    "# Summary\nFound key aws_secret=AKIAIOSFODNN7EXAMPLE in the config.")
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-knowledge", json={})
-                assert r.status == 201
-                # A sanitized copy is created and the raw credential is gone.
-                sanitized = d / "findings_for_knowledge.md"
-                assert sanitized.exists()
-                assert "AKIAIOSFODNN7EXAMPLE" not in sanitized.read_text(encoding="utf-8")
-                # The source ingested is the sanitized file, never raw FINDINGS.md.
-                assert added["uri"] == str(sanitized.resolve())
-
-    @pytest.mark.asyncio
-    async def test_knowledge_status_unavailable(self, app, tmp_path: Path):
-        # No knowledge store in the test app -> graceful {in_library: false},
-        # never a 503 for a status probe.
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?", "sources": ["web"]})
-                cid = (await cr.json())["id"]
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/knowledge-status")
-                assert r.status == 200
-                assert (await r.json())["in_library"] is False
-
-    @pytest.mark.asyncio
-    async def test_knowledge_status_true_and_false(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        present = {"v": False}
-
-        class _FakeStore:
-            def get_source_by_uri(self, uri):
-                return {"id": "sid9"} if present["v"] else None
-
-        app["state"] = SimpleNamespace(knowledge_store=_FakeStore())
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?", "sources": ["web"]})
-                cid = (await cr.json())["id"]
-                # Not yet in the library.
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/knowledge-status")
-                assert (await r.json()) == {"in_library": False}
-                # Now the dedup key resolves to an existing source.
-                present["v"] = True
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/knowledge-status")
-                body = await r.json()
-                assert body["in_library"] is True
-                assert body["source_id"] == "sid9"
-                # The probe must not write the sanitized file as a side effect.
-                assert not (h._campaign_dir(cid) / "findings_for_knowledge.md").exists()
-
-    @pytest.mark.asyncio
-    async def test_to_artifact(self, app, tmp_path: Path):
-        # Fallback path: when the LLM pool errors, the mechanical render is used
-        # (HTML-escaped + redacted). Patch LLMPool so the startup hook creates a
-        # pool whose send() raises, deterministically exercising the fallback.
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-        from kiro_crew.artifacts import ArtifactStore
-
-        class _RaisingPool:
-            async def send(self, *a: object, **k: object) -> str:
-                raise RuntimeError("no llm in test")
-
-            async def shutdown(self) -> None:
-                pass
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.LLMPool",
-                   lambda *a, **k: _RaisingPool()), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.ArtifactStore",
-                   return_value=ArtifactStore(root=tmp_path / "artifacts")):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"],
-                    "sub_questions": [
-                        {"text": "Token bucket?", "origin": "grill"},
-                        {"text": "XSS?", "origin": "<script>alert(1)</script>"},
-                    ]})
-                cid = (await r.json())["id"]
-                d = h._campaign_dir(cid)
-                # Findings containing a credential-shaped token must be redacted
-                # before it lands in the shareable artifact.
-                (d / "FINDINGS.md").write_text(
-                    "# Summary\nToken bucket is common. aws_secret=AKIAIOSFODNN7EXAMPLE")
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-artifact", json={})
-                assert r.status == 201
-                body = await r.json()
-                assert "slug" in body
-                assert body["slug"]
-                # The stored artifact must not contain the raw credential.
-                art = ArtifactStore(root=tmp_path / "artifacts").get(body["slug"])
-                content = art.content or ""
-                assert "AKIAIOSFODNN7EXAMPLE" not in content
-                # The malicious origin must be HTML-escaped, not raw.
-                assert "<script>alert(1)</script>" not in content
-                assert "&lt;script&gt;" in content
-
-    @pytest.mark.asyncio
-    async def test_to_artifact_llm_authored(self, app, tmp_path: Path):
-        # When the LLM pool is available, the report is LLM-authored (and the
-        # ```html code fence the model adds is stripped). Credentials are still
-        # redacted on this path.
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-        from kiro_crew.artifacts import ArtifactStore
-
-        class _FakePool:
-            async def send(self, prompt: str, timeout: float = 0) -> str:
-                # Include a credential in the LLM's own output so the redaction
-                # step on this path is actually exercised (not vacuously true).
-                return ("```html\n<!DOCTYPE html><html><body><h1>Nice Report</h1>"
-                        "<p>Found aws_secret=AKIAIOSFODNN7EXAMPLE</p>"
-                        "</body></html>\n```")
-
-            async def shutdown(self) -> None:
-                pass
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.LLMPool",
-                   lambda *a, **k: _FakePool()), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.ArtifactStore",
-                   return_value=ArtifactStore(root=tmp_path / "artifacts")):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?", "sources": ["web"]})
-                cid = (await r.json())["id"]
-                d = h._campaign_dir(cid)
-                (d / "FINDINGS.md").write_text(
-                    "# Summary\nToken bucket. aws_secret=AKIAIOSFODNN7EXAMPLE")
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-artifact", json={})
-                assert r.status == 201
-                slug = (await r.json())["slug"]
-                content = ArtifactStore(root=tmp_path / "artifacts").get(slug).content or ""
-                assert "Nice Report" in content  # LLM-authored HTML was used
-                assert "```" not in content       # code fence stripped
-                assert "AKIAIOSFODNN7EXAMPLE" not in content  # still redacted
-
-    @pytest.mark.asyncio
-    async def test_to_artifact_reuse_regenerates(self, app, tmp_path: Path):
-        # Repeated exports update ONE artifact (a new version) instead of
-        # spawning a duplicate on every click; the persisted slug is reused.
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-        from kiro_crew.artifacts import ArtifactStore
-
-        store = ArtifactStore(root=tmp_path / "artifacts")
-
-        class _RaisingPool:
-            async def send(self, *a: object, **k: object) -> str:
-                raise RuntimeError("no llm in test")
-
-            async def shutdown(self) -> None:
-                pass
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.LLMPool",
-                   lambda *a, **k: _RaisingPool()), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.ArtifactStore",
-                   return_value=store):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?", "sources": ["web"]})
-                cid = (await cr.json())["id"]
-                d = h._campaign_dir(cid)
-                (d / "FINDINGS.md").write_text("# Summary\nFinding one.")
-                r1 = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-artifact", json={})
-                assert r1.status == 201
-                b1 = await r1.json()
-                assert b1["regenerated"] is False
-                slug = b1["slug"]
-                # Second export regenerates the SAME artifact (new version).
-                (d / "FINDINGS.md").write_text("# Summary\nFinding two, updated.")
-                r2 = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-artifact", json={})
-                assert r2.status == 200
-                b2 = await r2.json()
-                assert b2["regenerated"] is True
-                assert b2["slug"] == slug  # reused, not a duplicate
-                art = store.get(slug)
-                assert art.version >= 2  # regeneration bumped the version
-                assert "Finding two, updated." in (art.content or "")
-
-    @pytest.mark.asyncio
-    async def test_report_status(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-        from kiro_crew.artifacts import ArtifactStore
-
-        store = ArtifactStore(root=tmp_path / "artifacts")
-
-        class _RaisingPool:
-            async def send(self, *a: object, **k: object) -> str:
-                raise RuntimeError("no llm in test")
-
-            async def shutdown(self) -> None:
-                pass
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.LLMPool",
-                   lambda *a, **k: _RaisingPool()), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.ArtifactStore",
-                   return_value=store):
-            async with TestClient(TestServer(app)) as c:
-                cr = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?", "sources": ["web"]})
-                cid = (await cr.json())["id"]
-                # No export yet -> slug is null.
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/report-status")
-                assert r.status == 200
-                assert (await r.json())["slug"] is None
-                # After exporting, report-status returns the live slug.
-                (h._campaign_dir(cid) / "FINDINGS.md").write_text("# Summary\nFinding.")
-                er = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-artifact", json={})
-                slug = (await er.json())["slug"]
-                r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/report-status")
-                assert (await r.json())["slug"] == slug
-
-    @pytest.mark.asyncio
-    async def test_to_artifact_no_findings(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"), \
-             patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.post("/api/apps/auto-research/campaigns", json={
-                    "question": "How do teams handle rate limiting?",
-                    "sources": ["web"]})
-                cid = (await r.json())["id"]
-                r = await c.post(f"/api/apps/auto-research/campaigns/{cid}/to-artifact", json={})
-                assert r.status == 404
-
-    @pytest.mark.asyncio
-    async def test_auth_rejected(self, tmp_path: Path):
-        from aiohttp import web
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research.handlers import register_routes
-
-        # No middleware → no user set → handlers must reject with 401
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            no_auth_app = web.Application()
-            register_routes(no_auth_app)
-            async with TestClient(TestServer(no_auth_app)) as c:
-                r = await c.get("/api/apps/auto-research/campaigns")
-                assert r.status == 401
-
-    @pytest.mark.asyncio
-    async def test_get_invalid_id(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.get("/api/apps/auto-research/campaigns/ZZZZZZZZ")
-                assert r.status == 400
-
-    @pytest.mark.asyncio
-    async def test_action_nonexistent_404(self, app, tmp_path: Path):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        with (
-            patch("kiro_crew.apps.builtins.auto_research.handlers.DB_PATH", tmp_path / "t.db"),
-            patch("kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR", tmp_path / "r"),
-        ):
-            async with TestClient(TestServer(app)) as c:
-                r = await c.patch(
-                    "/api/apps/auto-research/campaigns/deadbeef", json={"action": "start"}
-                )
-                assert r.status == 404
-
-
-class TestUpdateNonexistent:
-    def test_update_missing_campaign_returns_error(self):
-        assert update_campaign_status("deadbeef", CampaignStatus.RUNNING) == {
-            "error": "campaign not found"
-        }
-
-
-class TestRedactCampaignFields:
-    def test_redacts_sub_questions_and_sources_json(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_campaign
-
-        c = _redact_campaign(
-            {
-                "question": "q",
-                "name": "n",
-                "error_message": None,
-                "sub_questions": json.dumps(["how does X work?", "what about Y?"]),
-                "sources": json.dumps(["web", "internal"]),
-                "success_criteria": "done when build passes",
-            }
-        )
-        # Fields stay JSON-decodable lists after redaction.
-        assert isinstance(json.loads(c["sub_questions"]), list)
-        assert isinstance(json.loads(c["sources"]), list)
-        assert len(json.loads(c["sub_questions"])) == 2
-        # success_criteria flows through redaction (benign text unchanged).
-        assert c["success_criteria"] == "done when build passes"
-
-    def test_handles_malformed_json_fields(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _redact_campaign
-
-        c = _redact_campaign({"sub_questions": "not json{", "sources": "[bad"})
-        # Malformed fields left untouched, no crash.
-        assert c["sub_questions"] == "not json{"
-
-
-# --- Worker loop launch (autonudge) ---
-
-
-class TestLoopLaunch:
-    @pytest.mark.asyncio
-    async def test_launch_arms_autonudge(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        c = create_campaign(
-            {"question": "Research question about something here", "sources": ["web"]}
-        )
-        svc = MagicMock()
-        svc.add = AsyncMock()
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        state = MagicMock()
-        state.get_or_create_slot.return_value = SimpleNamespace(key=f"research-{c['id']}")
-        await h._launch_loop(SimpleNamespace(app={"state": state}), c["id"])
-        svc.add.assert_awaited_once()
-        kw = svc.add.call_args.kwargs
-        assert kw["slot_key"] == f"research-{c['id']}"
-        assert c["id"] in kw["message"]
-        assert state.get_or_create_slot.call_args.kwargs["agent"] == "kirocrew-research"
-        # Worker slot is auto-approved so the loop doesn't stall on tool prompts.
-        assert state.get_or_create_slot.return_value._trust is True
-
-    @pytest.mark.asyncio
-    async def test_launch_sets_slot_title_from_campaign_name(self, monkeypatch):
-        # The worker slot is autonudge-driven (messages are role "nudge", not
-        # "user"), so the LLM auto-titler never fires and the slot would show
-        # the "New Session…" placeholder. _launch_loop must title it from the
-        # campaign's human name, lock _titled, and push a live update.
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        c = create_campaign(
-            {
-                "name": "SQLite vs Postgres deep dive",
-                "question": "Compare SQLite and PostgreSQL for desktop apps",
-                "sources": ["web"],
-            }
-        )
-        svc = MagicMock()
-        svc.add = AsyncMock()
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        state = MagicMock()
-        slot = SimpleNamespace(key=f"research-{c['id']}")
-        state.get_or_create_slot.return_value = slot
-        await h._launch_loop(SimpleNamespace(app={"state": state}), c["id"])
-        assert slot.title == "SQLite vs Postgres deep dive"
-        assert slot._titled is True
-        state.push_slot_title.assert_called_once_with(slot.key, "SQLite vs Postgres deep dive")
-        # Title persisted under the slot's canonical history key so it survives
-        # a gateway restart.
-        state.conversation_log.set_title.assert_called_once()
-        assert state.conversation_log.set_title.call_args.args[1] == "SQLite vs Postgres deep dive"
-
-    @pytest.mark.asyncio
-    async def test_launch_title_persist_failure_still_arms_worker(self, monkeypatch):
-        # Title persistence is best-effort: a set_title I/O failure must NOT
-        # propagate and leave the campaign running without its worker armed.
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        c = create_campaign(
-            {"question": "Research question about something here", "sources": ["web"]}
-        )
-        svc = MagicMock()
-        svc.add = AsyncMock()
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        state = MagicMock()
-        state.get_or_create_slot.return_value = SimpleNamespace(key=f"research-{c['id']}")
-        state.conversation_log.set_title.side_effect = OSError("disk full")
-        await h._launch_loop(SimpleNamespace(app={"state": state}), c["id"])
-        # Worker still armed despite the persistence failure.
-        svc.add.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_launch_title_fails_closed_without_redactors(self, monkeypatch):
-        # The campaign name is user-controlled. If the security redactors are
-        # unavailable (_HAS_SECURITY False), the title MUST fall back to the
-        # non-user-derived key rather than persisting/broadcasting raw input.
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        c = create_campaign(
-            {
-                "name": "http://evil.example/leak?token=abc",
-                "question": "Research question about something here",
-                "sources": ["web"],
-            }
-        )
-        svc = MagicMock()
-        svc.add = AsyncMock()
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        monkeypatch.setattr(h, "_HAS_SECURITY", False)
-        state = MagicMock()
-        slot = SimpleNamespace(key=f"research-{c['id']}")
-        state.get_or_create_slot.return_value = slot
-        await h._launch_loop(SimpleNamespace(app={"state": state}), c["id"])
-        assert slot.title == f"research-{c['id']}"
-        assert "evil.example" not in slot.title
-
-    @pytest.mark.asyncio
-    async def test_launch_writes_brief(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        c = create_campaign(
-            {
-                "question": "Compare SQLite and PostgreSQL for desktop apps",
-                "sub_questions": ["concurrency model?", "deployment tradeoffs?"],
-                "sources": ["web"],
-                "success_criteria": "tests pass and build is green",
-            }
-        )
-        svc = MagicMock()
-        svc.add = AsyncMock()
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        state = MagicMock()
-        state.get_or_create_slot.return_value = SimpleNamespace(key=f"research-{c['id']}")
-        await h._launch_loop(SimpleNamespace(app={"state": state}), c["id"])
-        brief = (h._campaign_dir(c["id"]) / "brief.md").read_text(encoding="utf-8")
-        assert "Compare SQLite and PostgreSQL" in brief
-        assert "concurrency model?" in brief
-        assert "Definition of Done" in brief
-        assert "tests pass and build is green" in brief
-
-    @pytest.mark.asyncio
-    async def test_launch_noop_without_service(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: None)
-        await h._launch_loop(SimpleNamespace(app={}), "a1b2c3d4")  # must not raise
-
-    @pytest.mark.asyncio
-    async def test_stop_removes_loop(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        svc = MagicMock()
-        svc.remove = AsyncMock()
-        svc.get_by_slot.return_value = SimpleNamespace(id="loop1")
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        await h._stop_loop("a1b2c3d4", remove=True)
-        svc.remove.assert_awaited_once_with("loop1")
-
-    @pytest.mark.asyncio
-    async def test_pause_deactivates_loop(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        svc = MagicMock()
-        svc.update = AsyncMock()
-        svc.get_by_slot.return_value = SimpleNamespace(id="loop1")
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        await h._stop_loop("a1b2c3d4", remove=False)
-        svc.update.assert_awaited_once_with("loop1", active=False)
-
-
-class TestSuspendResearchLoopsWhileDisabled:
-    """Disabling the app must deactivate research autonudge loops AND clear their
-    slot trust, so a disabled app grants no standing auto-approval past the 24h cap
-    (the watchdog's per-campaign trust expiry is skipped while disabled)."""
-
-    @pytest.mark.asyncio
-    async def test_deactivates_research_loops_and_clears_trust(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        svc = MagicMock()
-        svc.update = AsyncMock()
-        research_loop = SimpleNamespace(id="loopR", slot_key="research-c1", active=True)
-        other_loop = SimpleNamespace(id="loopX", slot_key="chat:main", active=True)
-        svc.list_all.return_value = [research_loop, other_loop]
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-
-        research_slot = SimpleNamespace(_trust=True)
-        state = SimpleNamespace(_slots={"research-c1": research_slot})
-
-        await h._suspend_research_loops_while_disabled(state)
-
-        # Only the research loop is deactivated; the unrelated chat loop is left alone.
-        svc.update.assert_awaited_once_with("loopR", active=False)
-        # The research slot's standing trust is revoked.
-        assert research_slot._trust is False
-
-    @pytest.mark.asyncio
-    async def test_idempotent_when_already_inactive_and_untrusted(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        svc = MagicMock()
-        svc.update = AsyncMock()
-        svc.list_all.return_value = [
-            SimpleNamespace(id="loopR", slot_key="research-c1", active=False)
-        ]
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        state = SimpleNamespace(_slots={"research-c1": SimpleNamespace(_trust=False)})
-
-        await h._suspend_research_loops_while_disabled(state)
-
-        # Nothing to do: an already-inactive loop is not re-updated.
-        svc.update.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_no_autonudge_service_is_safe(self, monkeypatch):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        monkeypatch.setattr(h, "_autonudge_instance", lambda: None)
-        # Must not raise when the service is unavailable.
-        await h._suspend_research_loops_while_disabled(SimpleNamespace(_slots={}))
-
-
-# --- kirocrew-research core agent install ---
-
-
-class TestResearchAgentInstall:
-    def test_installs_kirocrew_research(self, monkeypatch, tmp_path):
-        from kiro_crew import agent
-
-        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", tmp_path)
-        monkeypatch.setattr(
-            agent,
-            "build_agent_config",
-            lambda: {"name": "kirocrew", "prompt": "file://x", "mcpServers": {}, "tools": []},
-        )
-        agent._install_research_agent()
-        data = json.loads((tmp_path / "kirocrew-research.json").read_text(encoding="utf-8"))
-        assert data["name"] == "kirocrew-research"
-        assert "research" in data["prompt"].lower()
-
-
-# --- Watchdog unresponsive grace ---
-
-
-class TestUnresponsiveDeadline:
-    def test_generous_floor_and_scaling(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import (
-            _FIRST_CYCLE_GRACE_SECS,
-            _unresponsive_deadline,
-        )
-
-        # Small idle -> generous floor (deep research cycles take minutes), not
-        # the tight idle*2 that falsely failed healthy slow cycles.
-        assert _unresponsive_deadline(60) == _FIRST_CYCLE_GRACE_SECS
-        # Large idle scales above the floor.
-        assert _unresponsive_deadline(400) == 800
-
-
-# --- auto_approve (unattended) persistence ---
-
-
-class TestAutoApprovePersist:
-    def test_auto_approve_persists(self):
-        c = create_campaign(
-            {
-                "question": "Research question about something here",
-                "sources": ["web"],
-                "auto_approve": True,
-            }
-        )
-        assert get_campaign(c["id"])["auto_approve"] == 1
-
-    def test_auto_approve_defaults_off(self):
-        c = create_campaign(
-            {"question": "Research question about something here", "sources": ["web"]}
-        )
-        assert get_campaign(c["id"])["auto_approve"] == 0
-
-
-# --- D11 clarification questions + question-mode brief ---
-
-
-class TestClarificationQuestions:
-    def test_pending_question_surfaced(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _campaign_dir
-
-        c = create_campaign(
-            {"question": "Research question about something here", "sources": ["web"]}
-        )
-        (_campaign_dir(c["id"]) / "questions.json").write_text(
-            json.dumps({"question": "Which framework should I assume?"})
-        )
-        assert get_campaign(c["id"])["pending_question"] == "Which framework should I assume?"
-
-    def test_brief_question_mode(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import (
-            _campaign_dir,
-            _get_db,
-            _write_brief,
-        )
-
-        for auto in (True, False):
-            c = create_campaign(
-                {
-                    "question": "Research question about something here",
-                    "sources": ["web"],
-                    "auto_approve": auto,
-                }
-            )
-            db = _get_db()
-            row = db.execute(
-                "SELECT question, sub_questions, sources, max_cycles, idle_secs, "
-                "success_criteria, auto_approve FROM campaigns WHERE id = ?",
-                (c["id"],),
-            ).fetchone()
-            db.close()
-            _write_brief(c["id"], row)
-            brief = (_campaign_dir(c["id"]) / "brief.md").read_text(encoding="utf-8")
-            # Attended exposes the questions directive; unattended omits it entirely
-            # (no LLM-facing "you may ask" — no-pause is code-enforced instead).
-            assert ("Questions allowed" in brief) is (not auto)
-
-
-class TestUnattendedQuestionEnforcement:
-    """Code-enforced guarantee: unattended campaigns never pause for input."""
-
-    def _seed(self, tmp_path: Path):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        d = tmp_path / "a1b2c3d4"
-        d.mkdir()
-        (d / "questions.json").write_text('{"question": "?"}')
-        return h, d
-
-    def test_unattended_discards_question_and_does_not_pause(self, tmp_path: Path):
-        h, d = self._seed(tmp_path)
-        with patch.object(h, "RESEARCH_DIR", tmp_path):
-            assert h._should_pause_for_question("a1b2c3d4", True) is False
-            assert not (d / "questions.json").exists()  # discarded
-
-    def test_attended_keeps_question_and_pauses(self, tmp_path: Path):
-        h, d = self._seed(tmp_path)
-        with patch.object(h, "RESEARCH_DIR", tmp_path):
-            assert h._should_pause_for_question("a1b2c3d4", False) is True
-            assert (d / "questions.json").exists()  # preserved for the user
-
-    def test_no_question_no_pause(self, tmp_path: Path):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        (tmp_path / "a1b2c3d4").mkdir()
-        with patch.object(h, "RESEARCH_DIR", tmp_path):
-            assert h._should_pause_for_question("a1b2c3d4", False) is False
-
-
-class TestSqliteIsolation:
-    def test_concurrent_reader_writer_no_deadlock(self, tmp_path: Path):
-        """Two connections open *simultaneously*: with isolation_level=None +
-        explicit BEGIN/COMMIT each write commits and releases its lock, so a
-        second still-open connection can read AND write without hitting a
-        leaked write lock ("database is locked"). Under the old default
-        isolation the first connection's implicit transaction would leak the
-        lock and the second connection's write would block/raise.
-        """
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        camp = h.create_campaign(
-            {
-                "question": "Concurrent test question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        cid = camp["id"]
-
-        # Open TWO connections at once and keep BOTH alive for the whole test.
-        writer = h._get_db()
-        reader = h._get_db()
-        # Fail fast instead of waiting out the default 5s busy timeout if a
-        # lock leaks, so a regression surfaces as a quick error not a hang.
-        writer.execute("PRAGMA busy_timeout = 500")
-        reader.execute("PRAGMA busy_timeout = 500")
-        try:
-            # Writer commits a change; its write lock must be released after.
-            writer.execute("BEGIN")
-            writer.execute("UPDATE campaigns SET status='running' WHERE id=?", (cid,))
-            writer.execute("COMMIT")
-
-            # The still-open reader sees the committed write...
-            row = reader.execute("SELECT status FROM campaigns WHERE id=?", (cid,)).fetchone()
-            assert row["status"] == "running"
-
-            # ...and can itself write while the writer connection is STILL open.
-            # This is the real concurrency assertion: a leaked write lock from
-            # the writer would make this raise sqlite3.OperationalError
-            # ("database is locked").
-            reader.execute("BEGIN")
-            reader.execute("UPDATE campaigns SET status='paused' WHERE id=?", (cid,))
-            reader.execute("COMMIT")
-
-            row2 = writer.execute("SELECT status FROM campaigns WHERE id=?", (cid,)).fetchone()
-            assert row2["status"] == "paused"
-        finally:
-            reader.close()
-            writer.close()
-
-        # Sanity: the handler API path (BEGIN + UPDATE + COMMIT) still works.
-        h.update_campaign_status(cid, "running")
-        db = h._get_db()
-        try:
-            row3 = db.execute("SELECT status FROM campaigns WHERE id=?", (cid,)).fetchone()
-            assert row3["status"] == "running"
-        finally:
-            db.close()
-
-    def test_isolation_level_is_none(self, tmp_path: Path):
-        """Verify _get_db returns a connection with isolation_level=None."""
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        db = h._get_db()
-        assert db.isolation_level is None
-        db.close()
-
-
-class TestForkAndGrillTreeHTTP:
-    @pytest.fixture
-    def app(self, tmp_path: Path):
-        from aiohttp import web
-
-        from kiro_crew.apps.builtins.auto_research.handlers import register_routes
-
-        @web.middleware
-        async def _inject_user(request, handler):
-            request["user"] = "test-user"
-            return await handler(request)
-
-        with (
-            patch(
-                "kiro_crew.apps.builtins.auto_research.handlers.DB_PATH",
-                tmp_path / "t.db",
-            ),
-            patch(
-                "kiro_crew.apps.builtins.auto_research.handlers.RESEARCH_DIR",
-                tmp_path / "r",
-            ),
-        ):
-            a = web.Application(middlewares=[_inject_user])
-            register_routes(a)
-            yield a
-
-    @pytest.mark.asyncio
-    async def test_fork_creates_child_with_parent_link(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        parent = h.create_campaign(
-            {
-                "question": "Parent question padded long enough here",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        pid = parent["id"]
-        h.update_campaign_status(pid, h.CampaignStatus.COMPLETE)
-        (h._campaign_dir(pid) / "FINDINGS.md").write_text("# Parent findings\nsome evidence")
-
-        async with TestClient(TestServer(app)) as c:
-            r = await c.patch(
-                f"/api/apps/auto-research/campaigns/{pid}",
-                json={
-                    "action": "fork",
-                    "sub_questions": ["Follow-up sub-question one"],
-                    "scope_constraints": ["stay on topic"],
-                    "max_cycles": 7,
-                },
-            )
-            assert r.status == 201
-            child = await r.json()
-        child_id = child["id"]
-        assert child_id != pid
-        assert child["name"].startswith("Forked: ")
-        row = h.get_campaign(child_id)
-        assert row is not None and row["parent_id"] == pid
-        assert row["name"].startswith("Forked: ")
-        assert (h._campaign_dir(child_id) / "parent_findings.md").read_text(encoding="utf-8") == (
-            "# Parent findings\nsome evidence"
-        )
-
-    def test_fork_name_helper(self):
-        from kiro_crew.apps.builtins.auto_research.handlers import _fork_name
-
-        # Prefixes, caps at 50 chars, and never double-prefixes a re-fork.
-        assert _fork_name("Migrate auth").startswith("Forked: ")
-        assert len(_fork_name("x" * 200)) <= 50
-        assert _fork_name("Forked: already a fork") == "Forked: already a fork"
-
-    @pytest.mark.asyncio
-    async def test_fork_missing_parent_404(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as c:
-            r = await c.patch("/api/apps/auto-research/campaigns/deadbeef", json={"action": "fork"})
-            assert r.status == 404
-
-    @pytest.mark.asyncio
-    async def test_fork_incomplete_parent_409(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        parent = h.create_campaign(
-            {
-                "question": "Running parent question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        pid = parent["id"]
-        h.update_campaign_status(pid, h.CampaignStatus.RUNNING)
-        async with TestClient(TestServer(app)) as c:
-            r = await c.patch(f"/api/apps/auto-research/campaigns/{pid}", json={"action": "fork"})
-            assert r.status == 409
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_returns_persisted_tree(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        tree = [{"id": "n1", "kind": "research", "text": "sub q", "origin": "grill"}]
-        camp = h.create_campaign(
-            {
-                "question": "Persisted tree question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-                "grill_tree": tree,
-            }
-        )
-        cid = camp["id"]
-        async with TestClient(TestServer(app)) as c:
-            r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/grill-tree")
-            assert r.status == 200
-            body = await r.json()
-        assert body["tree"] == tree
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_redacts_node_text(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        tree = [{"id": "n1", "kind": "research", "text": "leaked AKIAIOSFODNN7EXAMPLE in node"}]
-        camp = h.create_campaign(
-            {
-                "question": "Redacted tree question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-                "grill_tree": tree,
-            }
-        )
-        cid = camp["id"]
-        async with TestClient(TestServer(app)) as c:
-            r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/grill-tree")
-            assert r.status == 200
-            body = await r.text()
-        assert "AKIAIOSFODNN7EXAMPLE" not in body
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_redacts_string_elements(self, app):
-        """Non-dict (string) elements are LLM-generated too: a stray string
-        from a malformed/drifted model response must be scanned, not served
-        unredacted."""
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        camp = h.create_campaign(
-            {
-                "question": "String node question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        cid = camp["id"]
-        # Simulate a malformed tree mixing a dict node with a bare string.
-        d = h._safe_campaign_dir(cid)
-        assert d is not None
-        (d / "grill_tree.json").write_text(
-            json.dumps([{"id": "n1", "text": "ok"}, "leaked AKIAIOSFODNN7EXAMPLE here"])
-        )
-        async with TestClient(TestServer(app)) as c:
-            r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/grill-tree")
-            assert r.status == 200
-            body = await r.text()
-        assert "AKIAIOSFODNN7EXAMPLE" not in body
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_redacts_nested_list_elements(self, app):
-        """A nested list element (schema drift) is scanned recursively — a
-        secret buried inside a nested list must not be served unredacted."""
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        camp = h.create_campaign(
-            {
-                "question": "Nested list question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        cid = camp["id"]
-        # A list element nested inside the tree, carrying a secret string.
-        d = h._safe_campaign_dir(cid)
-        assert d is not None
-        (d / "grill_tree.json").write_text(
-            json.dumps([{"id": "n1", "text": "ok"}, ["benign", "leaked AKIAIOSFODNN7EXAMPLE here"]])
-        )
-        async with TestClient(TestServer(app)) as c:
-            r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/grill-tree")
-            assert r.status == 200
-            body = await r.text()
-        assert "AKIAIOSFODNN7EXAMPLE" not in body
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_non_list_fails_closed(self, app):
-        """A non-list payload (file corruption/tampering) is dropped to [] —
-        never served unredacted (fail-closed)."""
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        camp = h.create_campaign(
-            {
-                "question": "Non list question padded long enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        cid = camp["id"]
-        # A dict (not a list) with an embedded secret simulates tampering.
-        d = h._safe_campaign_dir(cid)
-        assert d is not None
-        (d / "grill_tree.json").write_text(json.dumps({"text": "leaked AKIAIOSFODNN7EXAMPLE here"}))
-        async with TestClient(TestServer(app)) as c:
-            r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/grill-tree")
-            assert r.status == 200
-            body = await r.json()
-            text = json.dumps(body)
-        assert body["tree"] == []
-        assert "AKIAIOSFODNN7EXAMPLE" not in text
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_empty_when_absent(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        camp = h.create_campaign(
-            {
-                "question": "No tree question padded long enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 5,
-            }
-        )
-        cid = camp["id"]
-        async with TestClient(TestServer(app)) as c:
-            r = await c.get(f"/api/apps/auto-research/campaigns/{cid}/grill-tree")
-            assert r.status == 200
-            body = await r.json()
-        assert body["tree"] == []
-
-    @pytest.mark.asyncio
-    async def test_grill_tree_invalid_id_400(self, app):
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as c:
-            # Non-hex id fails _safe_campaign_dir -> 400 (no traversal/leak).
-            r = await c.get("/api/apps/auto-research/campaigns/ZZZZZZZZ/grill-tree")
-            assert r.status == 400
-
-
-class TestWatchdogFindingHelpers:
-    def test_list_cycle_files_sorted_newest_last(self):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        camp = h.create_campaign(
-            {
-                "question": "Watchdog helper question padded enough",
-                "sub_questions": [],
-                "sources": ["web"],
-                "max_cycles": 20,
-            }
-        )
-        cid = camp["id"]
-        fdir = h._campaign_dir(cid) / "findings"
-        fdir.mkdir(parents=True, exist_ok=True)
-        for n in (1, 2, 10, 12):
-            (fdir / f"cycle_{n:03d}.json").write_text(json.dumps({"cycle": n}))
-        files = h._list_cycle_files(cid)
-        assert len(files) == 4
-        assert files[-1].name == "cycle_012.json"
-
-    def test_list_cycle_files_invalid_id_empty(self):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        assert h._list_cycle_files("../../etc") == []
-
-    def test_read_finding_file_redacts(self, tmp_path: Path):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        p = tmp_path / "cycle_001.json"
-        p.write_text(json.dumps({"summary": "leaked AKIAIOSFODNN7EXAMPLE here"}))
-        out = h._read_finding_file(p)
-        assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(out)
-
-    def test_read_finding_file_bad_json_returns_empty(self, tmp_path: Path):
-        from kiro_crew.apps.builtins.auto_research import handlers as h
-
-        p = tmp_path / "cycle_001.json"
-        p.write_text("not json{{{")
-        assert h._read_finding_file(p) == {}
-
-
 # --- Grill question tree ---
 
 
@@ -2316,6 +880,43 @@ class TestGrillParse:
         from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
 
         assert _parse_grill_nodes("no json here") == []
+
+    def test_stray_bracket_in_prose_does_not_corrupt_the_payload(self):
+        # The old outermost find('[') .. rfind(']') span ran from the "[1]:"
+        # marker to the trailing "[12]." citation, so the slice never parsed
+        # and a valid payload was silently lost.
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        raw = (
+            'Expanding item [1]: [{"kind":"research","text":"How is it stored?"}] '
+            "as noted in [12]."
+        )
+        assert _parse_grill_nodes(raw) == [{"kind": "research", "text": "How is it stored?"}]
+
+    def test_two_different_node_arrays_refuse_the_guess(self):
+        # The shared extractor's ambiguity contract: two DIFFERENT node-shaped
+        # arrays mean the caller cannot know which is the real payload.
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        raw = (
+            'For example [{"kind":"research","text":"Example?"}] but my answer is '
+            '[{"kind":"research","text":"Real?"}]'
+        )
+        assert _parse_grill_nodes(raw) == []
+
+    def test_fenced_reply_is_accepted(self):
+        # Fence markers are just prose to the shared scanner.
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        raw = '```json\n[{"kind":"research","text":"How is it stored?"}]\n```'
+        assert _parse_grill_nodes(raw) == [{"kind": "research", "text": "How is it stored?"}]
+
+    def test_nesting_bomb_degrades_to_no_nodes(self):
+        # A RecursionError from the stdlib decoder must not escape into the
+        # grill-expand handler (it would surface as HTTP 500, not empty nodes).
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        assert _parse_grill_nodes("[" * 100_000) == []
 
     def test_node_depth(self):
         from kiro_crew.apps.builtins.auto_research.handlers import _node_depth
@@ -2399,6 +1000,25 @@ class TestGrillSuggestedCycles:
         assert v["suggested_max_cycles"] == 4 + (4 + 2) // 3 + 1  # == 7
 
 
+def _install_fake_pool(app, pool) -> None:
+    """Replace the grill endpoint's LLM pool BEFORE the app starts.
+
+    The production ``on_startup`` hook builds a real ``LLMPool`` (which takes a
+    live-config subscription); hooks run in registration order, so this one
+    runs after it, shuts the real pool down and installs ``pool`` while the app
+    is still mutable. Writing ``app[...]`` once the test server has started is
+    deprecated by aiohttp and left the real pool's subscription alive.
+    """
+
+    async def _swap(app_) -> None:
+        real = app_.get("auto_research_llm_pool")
+        if real is not None:
+            await real.shutdown()
+        app_["auto_research_llm_pool"] = pool
+
+    app.on_startup.append(_swap)
+
+
 class TestGrillHTTP:
     @pytest.fixture
     def app(self, tmp_path: Path):
@@ -2437,8 +1057,8 @@ class TestGrillHTTP:
             async def shutdown(self) -> None:
                 pass
 
+        _install_fake_pool(app, _FakePool())
         async with TestClient(TestServer(app)) as c:
-            app["auto_research_llm_pool"] = _FakePool()
             r = await c.post(
                 "/api/apps/auto-research/grill/expand",
                 json={
@@ -2510,8 +1130,8 @@ class TestGrillHTTP:
             async def shutdown(self) -> None:
                 pass
 
+        _install_fake_pool(app, _FakePool())
         async with TestClient(TestServer(app)) as c:
-            app["auto_research_llm_pool"] = _FakePool()
             r = await c.post(
                 "/api/apps/auto-research/grill/expand",
                 json={

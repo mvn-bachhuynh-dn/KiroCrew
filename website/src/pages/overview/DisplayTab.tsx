@@ -1,18 +1,41 @@
 import { Monitor, Sun, Moon, Pencil } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
 import { useTheme } from '../../hooks/useTheme'
 import { Card, CardTitle } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
+import { FONT_FAMILY_OPTIONS } from '../../utils/fontFamilyOptions'
+import type { FontFamily } from '../../hooks/useZoom'
 
 import { i18nT } from '../../i18n/t'
 const BTN = 'px-3 py-1 rounded-full text-[13px] cursor-pointer border transition-all'
 const active = (on: boolean) => on ? 'bg-accent-subtle text-accent border-accent' : 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'
 
+/**
+ * Font Family button labels for this tab.
+ *
+ * The Sans / Mono / System keys are pre-existing DisplayTab-scoped translations;
+ * OpenDyslexic reuses the DisplayPanel catalog key so the label is a single
+ * source of truth. Kept as a `Record<FontFamily, string>` so every FontFamily
+ * union member is proven to have a label at compile time — a new family added
+ * to `FONT_FAMILY_OPTIONS` without a label here fails typecheck.
+ */
+const FONT_FAMILY_LABEL_KEY: Record<FontFamily, string> = {
+  sans: 'pages.overview.displayTab.sans',
+  mono: 'pages.overview.displayTab.mono',
+  system: 'pages.overview.displayTab.system',
+  opendyslexic: 'pages.settings.displayPanel.font_family_option_opendyslexic',
+  // Labelled for the compile-time proof, but not offered as a quick-toggle here:
+  // 'custom' needs the installed-font picker, which lives in Settings → Display.
+  custom: 'pages.settings.displayPanel.font_family_option_custom',
+}
+
 export default function DisplayTab() {
   const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
   const { preference, setTheme, colorTheme, setColorTheme, allThemes } = useTheme()
   const editor = useThemeEditor()
+  const navigate = useNavigate()
   const modKey = /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl'
 
   return (
@@ -31,12 +54,27 @@ export default function DisplayTab() {
       </Card>
       <Card>
         <CardTitle>{i18nT('pages.overview.displayTab.font')} <InfoTip text={i18nT('pages.overview.displayTab.change_the_dashboard_font_family_persists_across')} /></CardTitle>
-        <div className="flex items-center gap-2">
-          {(['sans', 'mono', 'system'] as const).map(f => (
+        <div className="flex flex-wrap items-center gap-2">
+          {FONT_FAMILY_OPTIONS.filter(({ value: f }) => f !== 'custom').map(({ value: f }) => (
             <button key={f} className={BTN + ' ' + active(family === f)} onClick={() => setFontFamily(f)}>
-              {f === 'sans' ? i18nT('pages.overview.displayTab.sans') : f === 'mono' ? i18nT('pages.overview.displayTab.mono') : i18nT('pages.overview.displayTab.system')}
+              {i18nT(FONT_FAMILY_LABEL_KEY[f])}
             </button>
           ))}
+          {/* When Custom is the active family, show it as a selected, non-toggling
+              chip so the setting never reads as unset here (a habitual click on a
+              preset would otherwise silently leave Custom). The picker itself
+              lives in Settings → Display, so this chip routes there instead — the
+              Pencil icon (the same affordance the theme-edit chip uses) marks it
+              as "opens the editor" rather than another preset that toggles here. */}
+          {family === 'custom' && (
+            <button
+              className={BTN + ' ' + active(true)}
+              onClick={() => navigate('/settings/display/zoom')}
+              title={i18nT('pages.overview.displayTab.custom_font_configure_in_settings')}
+            >
+              <Pencil className="lucide-inline" /> {i18nT(FONT_FAMILY_LABEL_KEY.custom)}
+            </button>
+          )}
         </div>
       </Card>
       <Card>

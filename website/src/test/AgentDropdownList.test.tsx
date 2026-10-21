@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import AgentDropdownList, { ManageAgentsFooter } from '../components/AgentDropdownList'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter , defaultWriteFailureOf } from '../components/AgentDropdownList'
 import type { AgentItem } from '../components/AgentDropdownList'
 
 // jsdom doesn't implement scrollIntoView
@@ -39,6 +41,184 @@ describe('AgentDropdownList', () => {
     render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     expect(screen.getByText('Main agent')).toBeInTheDocument()
   })
+
+  it('declares no scroll container of its own, leaving the host as the single scroll owner', () => {
+    // Both hosts (ChatPage and ChatPane) wrap this list in their own
+    // `overflow-y-auto max-h-[280px]` listbox. When the component also carried
+    // `overflow-y-auto max-h-[300px]`, the panel showed two nested scrollbars
+    // (#6375). Every option row's ancestor inside the component must stay
+    // overflow-free so exactly one scrollbar — the host's — appears. Checked
+    // via class AND inline style, so neither a Tailwind overflow utility nor
+    // a `style={{ overflowY: 'auto' }}` can reintroduce the nested scroller.
+    const { container } = render(
+      <AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />
+    )
+    const option = screen.getAllByRole('option')[0]
+    let checked = 0
+    for (let el: HTMLElement | null = option.parentElement; el && container.contains(el); el = el.parentElement) {
+      checked++
+      expect(el.className).not.toMatch(/overflow-(y-)?(auto|scroll)/)
+      expect(el.style.overflowY).toMatch(/^(|visible)$/)
+      expect(el.style.overflow).toMatch(/^(|visible)$/)
+    }
+    // Guard against the loop passing vacuously (e.g. rows moved into a portal).
+    expect(checked).toBeGreaterThan(0)
+  })
+})
+
+describe('AgentDropdownList namespaces (member vs template)', () => {
+  it('names a crewmate by its label alone; a template by its name', () => {
+    const rows: AgentItem[] = [
+      { name: 'mate', source: 'builtin', selection_kind: 'member', display_name: 'Pebble' },
+      { name: 'mate', source: 'kirocrew', selection_kind: 'template', display_name: 'Ignored' },
+    ]
+    render(<AgentDropdownList agents={rows} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.getByText('Pebble')).toBeInTheDocument()
+    expect(screen.queryByText('Ignored')).toBeNull()
+    // Only the template row reads `mate`: the crewmate's ID is not shown.
+    expect(screen.getAllByText('mate')).toHaveLength(1)
+  })
+
+  const both: AgentItem[] = [
+    { name: 'reviewer', source: 'kirocrew', selection_kind: 'member', description: 'My reviewer' },
+    { name: 'reviewer', source: 'builtin', selection_kind: 'template', description: 'Shared template' },
+    { name: 'test-writer', source: 'package', selection_kind: 'template' },
+  ]
+
+  it('groups by kind and keeps a same-name member and template as two rows', () => {
+    render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    const groups = screen.getAllByRole('group')
+    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Custom agents', 'Crewmates'])
+    expect(screen.getAllByRole('option')).toHaveLength(3)
+    expect(screen.getAllByText('reviewer')).toHaveLength(2)
+  })
+
+  it('drops the origin badge inside the grouped view and explains what a template pick is', () => {
+    // The header already says what each row IS; a grey "package" / "kirocrew"
+    // tag beside it only asks the reader to decode a second vocabulary. The
+    // templates group instead carries the one fact a first-time picker needs:
+    // a custom agent is a reusable agent setup.
+    render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.queryByText('package')).toBeNull()
+    expect(screen.queryByText('kirocrew')).toBeNull()
+    expect(screen.getByText(/a reusable agent setup/i)).toBeInTheDocument()
+  })
+
+  it('drops the header and the templates hint when the list holds one kind only', () => {
+    // With crewmates withheld (the default picker) the list is templates
+    // only. A header then separates nothing and the hint contrasts a template
+    // against a crewmate the list never shows, so both go; the accessible
+    // group label stays, and the rows keep their grouped rendering (no origin
+    // badge) so the flag flips nothing but the chrome.
+    const templatesOnly = both.filter(a => a.selection_kind === 'template')
+    render(<AgentDropdownList agents={templatesOnly} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.getByRole('group', { name: 'Custom agents' })).toBeInTheDocument()
+    expect(screen.queryByText('Custom agents')).toBeNull()
+    expect(screen.queryByText(/a reusable agent setup/i)).toBeNull()
+    expect(screen.queryByText('package')).toBeNull()
+    expect(screen.getAllByRole('option')).toHaveLength(2)
+  })
+
+  it('keeps the origin badge on the flat, name-only list', () => {
+    render(<AgentDropdownList agents={[{ name: 'x', source: 'package' }]} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.getByText('package')).toBeInTheDocument()
+  })
+
+  it('reports the kind with the name, so the caller can send the namespace', () => {
+    const onSelect = vi.fn()
+    render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={onSelect} />)
+    // Templates lead the grouped list: [reviewer/template, test-writer, reviewer/member].
+    const options = screen.getAllByRole('option')
+    fireEvent.click(options[0])
+    fireEvent.click(options[2])
+    expect(onSelect).toHaveBeenNthCalledWith(1, 'reviewer', 'template')
+    expect(onSelect).toHaveBeenNthCalledWith(2, 'reviewer', 'member')
+  })
+
+  it('draws the roster avatar on a crewmate row and none on a template row', () => {
+    // A member is a crewmate with a face; a template is a definition. The same
+    // CrewAvatar the roster renders (a decorative img) sits before the name on
+    // member rows only, so a same-name pair is told apart at a glance.
+    render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    const options = screen.getAllByRole('option')
+    expect(options[0].querySelector('img')).toBeNull()
+    expect(options[2].querySelector('img')).not.toBeNull()
+  })
+
+  it('lights up only the row in the slot\'s recorded namespace', () => {
+    render(<AgentDropdownList agents={both} activeAgent="reviewer" activeKind="template" defaultAgent="" onSelect={() => {}} />)
+    const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
+    expect(selected).toEqual(['true', 'false', 'false'])
+  })
+
+  it('lights the member row when the slot recorded no namespace and a member holds the name', () => {
+    // A slot restored from history (or from an older gateway) carries no kind.
+    // The backend resolves a bare name member-first, so the member row is
+    // what actually runs; the same-name template must not read as current.
+    render(<AgentDropdownList agents={both} activeAgent="reviewer" defaultAgent="" onSelect={() => {}} />)
+    const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
+    expect(selected).toEqual(['false', 'false', 'true'])
+  })
+
+  it('lights the template row when the slot recorded no namespace and no member holds the name', () => {
+    const templateOnly: AgentItem[] = [
+      { name: 'reviewer', source: 'kirocrew', selection_kind: 'member' },
+      { name: 'planner', source: 'builtin', selection_kind: 'template' },
+    ]
+    render(<AgentDropdownList agents={templateOnly} activeAgent="planner" defaultAgent="" onSelect={() => {}} />)
+    const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
+    expect(selected).toEqual(['true', 'false'])
+  })
+
+  it('renders a flat list, with no group headers, for a name-only roster', () => {
+    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.queryByRole('group')).not.toBeInTheDocument()
+  })
+})
+
+describe('AgentDropdownList hosts own the scroll (#6375)', () => {
+  // The component deliberately declares no scroll container (see the test
+  // above), which moves the "exactly one scroll owner" invariant into the two
+  // hosts. Pin it structurally: each render site must wrap the list in a
+  // listbox that carries the overflow + max-height, or the pop-up grows
+  // unbounded with no failing test.
+  // vitest's cwd is website/ (the vitest config root), and import.meta.url is
+  // not file-scheme under its transform, so resolve from cwd instead.
+  // ChatPane's picker menus live in its owner modules, so its host text is the
+  // facade joined with them.
+  const chatPaneSource = () => ['ChatPane.tsx',
+    'ChatPanePickerMenus.tsx',
+    'ChatPaneProps.ts',
+    'ChatPaneTranscript.tsx',
+    'useChatPaneDraft.ts',
+    'useChatPanePickers.ts',
+    'useChatPaneSend.ts',
+    'useChatPaneTurnControl.ts',
+    'useChatPaneUploads.ts',
+  ].map(f => readFileSync(join(process.cwd(), 'src', 'components', f), 'utf8')).join('\n')
+  const pages = join(process.cwd(), 'src', 'pages')
+  const ownerDir = join(pages, 'chat', 'page')
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the ChatPage row reads the page and those owners.
+  const chatPageSource = () => [
+    readFileSync(join(pages, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(ownerDir, f), 'utf8')),
+    ...readdirSync(pages).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => readFileSync(join(pages, f), 'utf8')),
+  ].join('\n')
+  const hosts = [
+    ['ChatPage', chatPageSource],
+    ['ChatPane', chatPaneSource],
+  ] as const
+
+  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, read) => {
+    const src = read()
+    const sites = [...src.matchAll(/<AgentDropdownList[\s>]/g)]
+    expect(sites.length).toBeGreaterThan(0)
+    for (const site of sites) {
+      // The wrapper opens within the few hundred chars above the render site.
+      const windowBefore = src.slice(Math.max(0, site.index! - 600), site.index!)
+      expect(windowBefore).toMatch(/role="listbox"[^>]*className="[^"]*overflow-y-auto[^"]*max-h-\[/)
+    }
+  })
 })
 
 describe('AgentDropdownList default-agent affordance', () => {
@@ -47,62 +227,68 @@ describe('AgentDropdownList default-agent affordance', () => {
     expect(screen.getByText('Default')).toBeInTheDocument()
   })
 
-  it('renders no default toggle at all when onSetDefault is omitted', () => {
+  it('puts no second control inside the option rows', () => {
+    // A row's one job is picking the agent for this session. A nested control had to
+    // stopPropagation to keep the two apart, and its scope ("for new sessions") could
+    // only live in a tooltip — the footer row states it on screen instead.
     render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={() => {}} />)
-    expect(screen.queryByLabelText('Start new sessions with this agent')).not.toBeInTheDocument()
-  })
-
-  it('names the global scope on the toggle rather than saying only "default"', () => {
-    // An unqualified "Set as default" reads as session-scoped in a pop-up whose other
-    // job is switching the agent for this session.
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={() => {}} onSetDefault={() => {}} />)
-    expect(screen.getByLabelText('Start new sessions with this agent')).toBeInTheDocument()
-  })
-
-  it('sets the default without also selecting the agent for this session', () => {
-    const onSelect = vi.fn()
-    const onSetDefault = vi.fn()
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={onSelect} onSetDefault={onSetDefault} />)
-    fireEvent.click(screen.getByLabelText('Start new sessions with this agent'))
-    expect(onSetDefault).toHaveBeenCalledWith('builtin')
-    // The row click handler must not also fire — picking an agent for one session
-    // and changing the global default are different actions.
-    expect(onSelect).not.toHaveBeenCalled()
-  })
-
-  it('offers no toggle on the row that already holds the default', () => {
-    // Clearing the default is destructive (the product ends up with none) and must not
-    // hide behind the same gesture that sets one. Only the Templates page clears it.
-    const onSetDefault = vi.fn()
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={() => {}} onSetDefault={onSetDefault} />)
-    // Two agents, one is the default, so exactly one toggle is offered.
-    expect(screen.getAllByLabelText('Start new sessions with this agent')).toHaveLength(1)
-  })
-
-  it('activates the default toggle from the keyboard without selecting the row', () => {
-    const onSelect = vi.fn()
-    const onSetDefault = vi.fn()
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={onSelect} onSetDefault={onSetDefault} />)
-    const toggles = screen.getAllByLabelText('Start new sessions with this agent')
-    fireEvent.keyDown(toggles[0], { key: 'Enter' })
-    expect(onSetDefault).toHaveBeenCalledWith('kirocrew')
-    expect(onSelect).not.toHaveBeenCalled()
-  })
-
-  it('enrols the toggle in the listbox roving-focus ring so a keyboard user can reach it', () => {
-    // useListboxKeyboard moves focus across `[data-option],[role="option"]`. Without
-    // data-option the control is pointer-only: it cannot take a tab stop of its own
-    // because it is nested inside the option button.
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} onSetDefault={() => {}} />)
-    const toggles = screen.getAllByLabelText('Start new sessions with this agent')
-    expect(toggles).toHaveLength(2)
-    for (const t of toggles) expect(t).toHaveAttribute('data-option')
+    for (const option of screen.getAllByRole('option')) {
+      expect(option.querySelector('[role="button"]')).toBeNull()
+    }
   })
 
   it('explains the two same-row markers rather than relying on colour alone', () => {
     render(<AgentDropdownList agents={agents} activeAgent="kirocrew" defaultAgent="kirocrew" onSelect={() => {}} />)
-    expect(screen.getByTitle('New sessions start with this agent')).toBeInTheDocument()
+    expect(screen.getByTitle('New sessions start with this custom agent')).toBeInTheDocument()
     expect(screen.getByTitle('Active in this session')).toBeInTheDocument()
+  })
+})
+
+describe('DefaultAgentRow', () => {
+  it('names both the agent it writes and the scope it writes it to', () => {
+    // An unqualified "Set as default" reads as session-scoped in a pop-up whose other
+    // job is switching the agent for this session, and a bare icon can only put the
+    // scope in a tooltip.
+    render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={() => {}} />)
+    expect(screen.getByRole('button', { name: 'Set reviewer as the default for new sessions' })).toBeInTheDocument()
+  })
+
+  it('writes the default when activated', () => {
+    const onSetDefault = vi.fn()
+    render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={onSetDefault} />)
+    fireEvent.click(screen.getByRole('button'))
+    expect(onSetDefault).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports the state as a status line, not a control, once the agent holds it', () => {
+    // Clearing the default is destructive (the product ends up with none) and must not
+    // hide behind the same gesture that sets one. Only the Templates page clears it, so
+    // the set state is not a button at all: a disabled one still read as a switch.
+    const onSetDefault = vi.fn()
+    render(<DefaultAgentRow agentName="reviewer" isDefault onSetDefault={onSetDefault} />)
+    // The row NAMES the agent it refers to, so the tick is never a guess about which row is meant.
+    const row = screen.getByRole('status')
+    expect(row).toHaveTextContent('reviewer is the default for new sessions')
+    expect(screen.queryByRole('button')).toBeNull()
+    fireEvent.click(row)
+    expect(onSetDefault).not.toHaveBeenCalled()
+  })
+
+  it('joins the listbox roving-focus ring, the only keyboard path to it', () => {
+    // `useListboxKeyboard` consumes Tab to close the pop-up, so a plain button in
+    // the footer is pointer-only however correct its markup is. The hook moves real
+    // focus across `[data-option],[role="option"]`, and its own wiring notes say an
+    // action row must carry `data-option` + tabIndex={-1} to be reachable.
+    render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={() => {}} />)
+    const row = screen.getByRole('button')
+    expect(row).toHaveAttribute('data-option')
+    expect(row).toHaveAttribute('tabindex', '-1')
+  })
+
+  it('leaves the ring once set, so focus never stops on a dead row', () => {
+    render(<DefaultAgentRow agentName="reviewer" isDefault onSetDefault={() => {}} />)
+    expect(screen.getByRole('status')).not.toHaveAttribute('data-option')
+    expect(document.querySelector('[data-option]')).toBeNull()
   })
 })
 
@@ -110,7 +296,7 @@ describe('ManageAgentsFooter', () => {
   it('calls onManage when the link is activated', () => {
     const onManage = vi.fn()
     render(<ManageAgentsFooter onManage={onManage} />)
-    fireEvent.click(screen.getByText('Manage agents…'))
+    fireEvent.click(screen.getByText('Manage crewmates…'))
     expect(onManage).toHaveBeenCalledTimes(1)
   })
 
@@ -123,6 +309,25 @@ describe('ManageAgentsFooter', () => {
     // The write is fire-and-forget, so without this a rejected request looks exactly
     // like a successful one.
     render(<ManageAgentsFooter onManage={() => {}} error />)
-    expect(screen.getByRole('alert')).toHaveTextContent('Could not change the default agent')
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not change the default custom agent')
+  })
+
+  it('says what to do when the server gives a reason', () => {
+    // Each reason code the route answers becomes one line naming the next step;
+    // an unknown code keeps the plain failure.
+    const { rerender } = render(<ManageAgentsFooter onManage={() => {}} error={{ code: 'default_template_not_installed', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('atlas is not an installed custom agent. Install it, then try again.')
+    rerender(<ManageAgentsFooter onManage={() => {}} error={{ code: 'default_template_overlaid', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('your local settings file (config.local.json) sets it. Change it there.')
+    rerender(<ManageAgentsFooter onManage={() => {}} error={{ code: 'stale_binding', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('atlas changed just now. Reload, then try again.')
+    rerender(<ManageAgentsFooter onManage={() => {}} error={{ code: 'something_else', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent(/^Could not change the default custom agent/)
+  })
+
+  it('reads the reason code out of a rejected write', () => {
+    expect(defaultWriteFailureOf({ body: JSON.stringify({ code: 'stale_binding' }) }, 'atlas')).toEqual({ code: 'stale_binding', name: 'atlas' })
+    expect(defaultWriteFailureOf({ body: 'not json' }, 'atlas')).toEqual({ name: 'atlas' })
+    expect(defaultWriteFailureOf(new Error('boom'), 'atlas')).toEqual({ name: 'atlas' })
   })
 })

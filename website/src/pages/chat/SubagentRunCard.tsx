@@ -14,21 +14,30 @@
  * the Subagents side panel.
  */
 import { memo } from 'react'
-import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square, Hand } from 'lucide-react'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { openActivityToTab, selectSubagent } from '../../store/chatSlice'
+import { openActivityToTab, selectSubagent, switchSlot, isActiveSubagent, isAwaitingSpawnApproval, isSpawnApprovalGone, isSpawnApprovalRetired } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { ChatMessage, SubagentActivity } from '../../types'
 import { SPAWN_LAUNCH_MARKER } from './types'
+import { neverStartedKind, queuedWaitText } from './subagentQueuedReason'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import ErrorNotice from '../../components/ErrorNotice'
 /** The `spawn_run` tool result opens with "Spawned N subagent(s)." followed by
  *  one indented "  <id> (<agent>): <task>" line per accepted agent (see the
  *  spawn_run handler in mcp_core.py). Matching the header identifies the call
  *  as a launch; the per-agent lines carry the ids. Both live in the persisted
  *  `meta.output`, so historical messages render the card too. */
-const SPAWN_HEADER_RE = /^Spawned (\d+) subagent\(s\)\./m
+/** `spawn_run` prints one header per group: `Spawned N subagent(s).` for the
+ *  members that started and `Queued N subagent(s).` for the members the gate
+ *  deferred (memory floor, critical posture, paused cap). Both end in the same
+ *  `subagent(s).` marker and both are followed by `  <id> (<agent>): <task>`
+ *  lines, so a queued-only wave is a launch too — without this it rendered no
+ *  card at all, which is the wave whose waiting the card exists to show. */
+const SPAWN_HEADER_RE = /^(?:Spawned|Queued) (\d+) subagent\(s\)\./gm
 /** Agent ids are hex digests from SubagentManager; the agent name is optional
  *  (spawn_run omits the parenthetical when no agent was pinned). Non-hex ids are
  *  skipped, which is what excludes the `q<n>` queue sentinels in scrollback
@@ -106,14 +115,20 @@ export function extractSpawnRunLaunch(message: ChatMessage): SpawnRunLaunch | nu
 
 /** Pure parse of the already-unwrapped launch text. */
 function parseSpawnRunLaunch(text: string): SpawnRunLaunch | null {
-  const header = SPAWN_HEADER_RE.exec(text)
-  if (!header) return null
+  // Fresh lastIndex per call: both /g regexes are module-scoped and stateful.
+  SPAWN_HEADER_RE.lastIndex = 0
+  let announced = 0
+  let sawHeader = false
+  let h: RegExpExecArray | null
+  while ((h = SPAWN_HEADER_RE.exec(text)) !== null) {
+    sawHeader = true
+    announced += Number(h[1]) || 0
+  }
+  if (!sawHeader) return null
   const ids: string[] = []
-  // Fresh lastIndex per call: the /g regex is module-scoped and stateful.
   SPAWN_AGENT_LINE_RE.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = SPAWN_AGENT_LINE_RE.exec(text)) !== null) ids.push(m[1])
-  const announced = Number(header[1]) || 0
   // A header with no parseable agent lines still means a launch happened —
   // render the card in its neutral state rather than dropping the record.
   return { ids, announced }
@@ -130,26 +145,54 @@ const EMPTY_SUBAGENTS: Record<string, SubagentActivity> = {}
 
 /** Terminal statuses, tallied across the launch's own ids only. */
 function tally(agents: (SubagentActivity | undefined)[]) {
-  let running = 0, done = 0, failed = 0, stopped = 0, unknown = 0
+  let running = 0, awaiting = 0, done = 0, failed = 0, stopped = 0, unknown = 0, neverStarted = 0, neverStartedPressure = 0
   for (const a of agents) {
     if (!a) { unknown++; continue }
-    if (a.status === 'running' || a.status === 'tool' || a.status === 'pending') running++
+    if (isSpawnApprovalRetired(a)) { unknown++; continue }
+    // A run parked on an unanswered spawn approval launched no process, so it
+    // is not running — it used to be counted here, which is what made this card
+    // claim "1 agent running" for a wave that was in fact blocked on the user
+    // (#7318). A `'pending'` entry with no approval_id keeps the old treatment:
+    // it is active but not attributable to an approval.
+    if (isAwaitingSpawnApproval(a)) awaiting++
+    // Its approval proved gone: decided or expired unseen, so it is not owed to
+    // the user and liveness is not yet known. Outcome unknown, like a dropped id.
+    else if (isSpawnApprovalGone(a)) unknown++
+    else if (isActiveSubagent(a)) running++
     else if (a.status === 'done') done++
-    else if (a.status === 'error') failed++
+    else if (a.status === 'error') {
+      failed++
+      // A run the gate ended before it launched anything: the header must not
+      // call it "finished", which the blind reader read as success.
+      const kind = neverStartedKind(a.error)
+      if (kind) neverStarted++
+      if (kind === 'memory_pressure') neverStartedPressure++
+    }
     else if (a.status === 'stopped') stopped++
     else unknown++
   }
-  return { running, done, failed, stopped, unknown }
+  return { running, awaiting, done, failed, stopped, unknown, neverStarted, neverStartedPressure }
 }
 
 const SubagentRunCard = memo(function SubagentRunCard({
   launch,
   slot,
+  onOpenPanel,
 }: {
   launch: SpawnRunLaunch
   slot: string
+  /** How the HOST opens its Subagents view. The chat page leaves it unset and
+   *  the card drives the chat store (`switchSlot` + `openActivityToTab`), which
+   *  is that page's panel. A host whose panel is not the chat store's — the
+   *  Members page, where `chat.activeSlot` is never the member slot and the
+   *  side panel is its own tab model — passes its opener, so the click lands on
+   *  THIS page's panel instead of silently switching the chat page's active
+   *  slot and opening nothing here (#21138). */
+  onOpenPanel?: () => void
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
+  const activeSlot = useAppSelector(s => s.chat.activeSlot)
   const subagents = useAppSelector(s =>
     slot === s.chat.activeSlot ? s.chat.subagents : s.chat.slotActivity[slot]?.subagents ?? EMPTY_SUBAGENTS,
   )
@@ -157,6 +200,10 @@ const SubagentRunCard = memo(function SubagentRunCard({
   // gate) have no per-agent entry — without this the card reads as idle during
   // the exact window the user is most likely to be looking at it.
   const queued = useAppSelector(s => s.chat.subagentQueued?.[slot] ?? 0)
+  // Why they wait, when the gateway said; undefined keeps the concurrency text.
+  const queuedReason = useAppSelector(s => s.chat.subagentQueuedReason?.[slot])
+  // null for the ordinary capacity wait and for a count with no reason.
+  const waitText = queuedWaitText(queuedReason)
 
   const mine = launch.ids.map(id => subagents[id])
   const counts = tally(mine)
@@ -183,7 +230,7 @@ const SubagentRunCard = memo(function SubagentRunCard({
   const fullyObservable = launch.ids.length >= total && counts.unknown === 0
 
   const label = counts.running > 0
-    ? `${counts.running} agent${counts.running === 1 ? '' : 's'} running`
+    ? i18nT('pages.chat.subagentRunCard.agent_running', { count: counts.running })
     // `chat.subagentQueued` is keyed by SLOT, not by launch, so the queued
     // branch must sit BELOW settled: otherwise a second wave queueing behind
     // the cap makes this (already finished) card report the other wave's queue.
@@ -194,83 +241,172 @@ const SubagentRunCard = memo(function SubagentRunCard({
       // "1 of 3 agents finished" would pin a permanently false statement in
       // scrollback, since the unobservable members can never be tallied.
       ? settled >= total && fullyObservable
-        ? `${total} agent${total === 1 ? '' : 's'} finished`
-        : `${total} agent${total === 1 ? '' : 's'} launched`
+        ? counts.neverStarted >= total
+          ? i18nT('pages.chat.subagentRunCard.agent_never_started', { count: total })
+          // A mixed wave says how many actually ran: "3 agents finished" over
+          // one that never started read as if all three had.
+          : counts.neverStarted > 0
+            ? i18nT('pages.chat.subagentRunCard.agent_ran_of_total', {
+              count: total - counts.neverStarted,
+              total,
+            })
+            : i18nT('pages.chat.subagentRunCard.agent_finished', { count: total })
+        : i18nT('pages.chat.subagentRunCard.agent_launched', { count: total })
       : queued > 0
         // Whole wave still behind the cap: "0 agents running" is technically
         // true and useless — name what is actually happening.
-        ? `${queued} agent${queued === 1 ? '' : 's'} queued`
-        : `${total} agent${total === 1 ? '' : 's'}`
+        ? i18nT('pages.chat.subagentRunCard.agent_queued', { count: queued })
+        : i18nT('pages.chat.subagentRunCard.agent', { count: total })
 
   const open = () => {
+    // The Subagents panel is mounted for `activeSlot`, and split view
+    // deliberately never moves `activeSlot` with pane focus. Opening from a
+    // background pane therefore has to make THIS card's session active first,
+    // or the panel that opens belongs to a different session and typically
+    // reads "No subagents running" — the card's own label promising otherwise.
+    // Safe inside split view: the auto-enter effect is gated on splitMode being
+    // off, so switching does not reseed or leave the grid.
     // Deep-link to the first agent of THIS wave so the panel lands on the
     // transcript the card refers to, not whatever was last selected.
     const first = launch.ids.find(id => subagents[id])
+    // A host with its own panel: select the wave's agent in the store (its
+    // Subagents view reads the same selection) and let the host reveal it.
+    // Never `switchSlot` here -- the host's active slot is not the chat store's.
+    if (onOpenPanel) {
+      if (first) dispatch(selectSubagent(first))
+      onOpenPanel()
+      return
+    }
+    if (slot && slot !== activeSlot) dispatch(switchSlot({ key: slot, announceOnMissing: true }))
     if (first) dispatch(selectSubagent(first))
     dispatch(openActivityToTab('subagents'))
   }
 
   const idPreview = sanitizeLlmOutput(launch.ids.slice(0, 4).join(' · '))
 
-  return (
-    <div className="px-5 mx-auto w-full py-0.5" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <button
-        type="button"
-        onClick={open}
-        title={i18nT('pages.chat.subagentRunCard.open_in_the_subagents_panel')}
-        data-testid="subagent-run-card"
-        className="pi-morph group w-full text-left rounded-md bg-accent/10 border border-accent/20 hover:bg-accent/15 hover:border-accent/40 transition-colors px-3 py-2 flex items-start gap-2"
-      >
-        <span className="shrink-0 mt-0.5">
-          {counts.running > 0
-            ? <Loader2 size={15} className="text-accent animate-spin" />
+  // Row geometry -- the px-4 gutter and the --mc-content-width clamp -- belongs to
+  // the HOST row wrapper, never to this card. ChatTranscriptView wraps every renderMessage
+  // result, and the shared registries wrap this card through ctx.row. Re-applying
+  // it here nested one clamp inside another and inset the card by a second full
+  // gutter, so it sat 20px right of every sibling row and 40px narrower.
+  // A member a memory wait ended is a failure the card states in full, whether
+  // or not the rest of its wave ran: a mixed wave's header still says
+  // "finished", and without this the one member that never started would read
+  // as success. Each note names the reason those members actually ended with:
+  // the macOS pressure hold, or the low-memory wait running past its bound. It
+  // renders through the shared error surface, as a sibling AFTER the card's
+  // button, never inside it.
+  const neverStartedLowMemory = counts.neverStarted - counts.neverStartedPressure
+  const neverStartedNotes = [
+    counts.neverStartedPressure > 0
+      ? i18nT('pages.chat.subagentRunCard.never_started_memory_pressure', { count: counts.neverStartedPressure })
+      : null,
+    neverStartedLowMemory > 0
+      ? i18nT('pages.chat.subagentRunCard.never_started_low_memory', { count: neverStartedLowMemory })
+      : null,
+  ].filter((note): note is string => note !== null)
+
+  const card = (
+    <button
+      type="button"
+      onClick={open}
+      title={i18nT('pages.chat.subagentRunCard.open_in_the_subagents_panel')}
+      data-testid="subagent-run-card"
+      className="pi-morph group w-full text-left rounded-md bg-accent/10 ring-1 ring-inset forced-colors:border ring-accent/20 hover:bg-accent/15 hover:ring-accent/40 transition px-3 py-2 flex items-start gap-2"
+    >
+      <span className="shrink-0 mt-0.5">
+        {counts.running > 0
+          ? <Loader2 size={15} className="text-accent animate-spin" />
+          // Nothing is executing but something is blocked on the user. Ranked
+          // above `failed` deliberately: a failure is history, an unanswered
+          // approval is the one state on this card the user can still act on.
+          : counts.awaiting > 0
+            ? <Hand size={15} className="text-warn" />
             : counts.failed > 0
               ? <AlertCircle size={15} className="text-danger" />
               : settled > 0
-                ? <CheckCircle2 size={15} className="text-green-500" />
+                ? <CheckCircle2 size={15} className="text-ok" />
                 : queued > 0
                   ? <Clock size={15} className="text-muted" />
                   : <Bot size={15} className="text-accent/70" />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <Bot size={12} className="text-accent/70 shrink-0" aria-hidden />
-            <span className="truncate text-[13px] font-medium text-text-strong">{label}</span>
-            {queued > 0 && settled === 0 && (
-              <span
-                className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted"
-                data-testid="subagent-card-queued"
-                title={i18nT('pages.chat.subagentRunCard.waiting_to_start_queued_behind_the_concurrency_l')}
-              >
-                <Clock size={10} aria-hidden /> {queued} {i18nT('pages.chat.subagentRunCard.waiting')}
-              </span>
-            )}
-            {counts.done > 0 && (
-              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-ok-subtle border border-ok/20 text-ok">
-                <CheckCircle2 size={10} aria-hidden /> {counts.done}
-              </span>
-            )}
-            {counts.failed > 0 && (
-              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-danger-subtle border border-danger/20 text-danger">
-                <AlertCircle size={10} aria-hidden /> {counts.failed}
-              </span>
-            )}
-            {counts.stopped > 0 && (
-              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted">
-                <Square size={10} aria-hidden /> {counts.stopped}
-              </span>
-            )}
-          </div>
-          <div className="text-[10px] text-muted font-mono truncate mt-0.5">
-            {idPreview ? `${idPreview}${launch.ids.length > 4 ? ` +${launch.ids.length - 4}` : ''} · ` : ''}
-            {i18nT('pages.chat.subagentRunCard.open_subagents_panel')}
-          </div>
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Bot size={12} className="text-accent/70 shrink-0" aria-hidden />
+          <span className="truncate text-[13px] leading-5 font-medium text-text-strong">{label}</span>
+          {queued > 0 && settled === 0 && (
+            <span
+              className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted"
+              data-testid="subagent-card-queued"
+              title={waitText ?? i18nT('pages.chat.subagentRunCard.waiting_to_start_queued_behind_the_concurrency_l')}
+            >
+              <Clock size={10} aria-hidden /> {queued} {i18nT('pages.chat.subagentRunCard.waiting')}
+            </span>
+          )}
+          {counts.awaiting > 0 && (
+            <span
+              className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-warn-subtle border border-warn/20 text-warn-text"
+              data-testid="subagent-card-awaiting"
+              title={i18nT('pages.chat.subagentRunCard.waiting_for_your_approval_to_start')}
+            >
+              <Hand size={10} aria-hidden /> {counts.awaiting}
+            </span>
+          )}
+          {counts.done > 0 && (
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-ok-subtle border border-ok/20 text-ok-text">
+              <CheckCircle2 size={10} aria-hidden /> {counts.done}
+            </span>
+          )}
+          {counts.failed > 0 && (
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-danger-subtle border border-danger/20 text-danger-text">
+              <AlertCircle size={10} aria-hidden /> {counts.failed}
+            </span>
+          )}
+          {counts.stopped > 0 && (
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted">
+              <Square size={10} aria-hidden /> {counts.stopped}
+            </span>
+          )}
         </div>
-        <PanelRightSolid
-          size={14}
-          className="text-muted shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity"
+        {queued > 0 && settled < total && waitText && (
+          // A deferral can hold for hours; the tooltip above is invisible on
+          // touch and to a keyboard user, so the same sentence is also rendered,
+          // for as long as this card's wave still has members that have not
+          // finished (a finished wave must not wear a later wave's queue: the
+          // count is keyed by slot, not by launch). Absent for the ordinary
+          // capacity wait, which keeps the card as it was.
+          <div className="text-[11px] leading-4 text-warn mt-1" data-testid="subagent-card-wait-reason" role="status">
+            {waitText}
+          </div>
+        )}
+        <div className="text-[10px] leading-4 text-muted font-mono truncate mt-1">
+          {idPreview ? `${idPreview}${launch.ids.length > 4 ? ` +${launch.ids.length - 4}` : ''} · ` : ''}
+          {i18nT('pages.chat.subagentRunCard.open_subagents_panel')}
+        </div>
+      </div>
+      <SidePanelGlyph
+        size={14}
+        className="text-muted shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity"
+      />
+    </button>
+  )
+
+  if (neverStartedNotes.length === 0) return card
+  return (
+    <div className="w-full">
+      {card}
+      {/* No hand-off: the chat composer beside this card may hold an unsent
+          draft, which the hand-off's navigation to a new chat would discard;
+          the Subagents panel's own error rows carry the hand-off. */}
+      {neverStartedNotes.map(note => (
+        <ErrorNotice
+          key={note}
+          variant="inline"
+          className="mt-1 px-3"
+          testId="subagent-card-never-started-reason"
+          message={note}
         />
-      </button>
+      ))}
     </div>
   )
 })

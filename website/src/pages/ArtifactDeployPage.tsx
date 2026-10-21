@@ -2,30 +2,109 @@ import { useState } from 'react'
 import Clickable from '../components/Clickable'
 import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Globe, Copy, ExternalLink, RefreshCw, Trash2, Undo2, ShieldCheck, Terminal, ChevronDown, ChevronRight, Lock, CheckCircle, XCircle, Rocket, Plus, Star } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Globe, Copy, Check, ExternalLink, RefreshCw, Trash2, Undo2, ShieldCheck, Terminal, ChevronDown, ChevronRight, Lock, CheckCircle, Rocket, Plus, Star } from 'lucide-react'
 import type { Artifact } from '../types'
 import { PageHeader, Card, CardTitle, StatCard, Btn, Input, Toggle , Badge} from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
 import SimpleSelect from '../components/SimpleSelect'
+import { useConfirm } from '../components/ConfirmDialog'
+import PublicPublishAckModal from '../components/PublicPublishAckModal'
+import ErrorDetails from '../components/ErrorDetails'
+import DirectDeployFlow from '../components/DirectDeployFlow'
+import { useDirectDeploy, TTL_CHOICES } from '../hooks/useDirectDeploy'
 import InfoTip from '../components/InfoTip'
 import { safeHttpUrl } from '../lib/safeUrl'
+import { copyToClipboard, copyCode } from '../utils/clipboard'
 import { formatCost } from '../utils/formatCost'
 
 import { i18nT } from '../i18n/t'
+import { toApiError } from '../api/apiError'
+import { errMessage } from '../utils/thunkError'
 const BASE = '/api/deploy'
+
+// Shared copy affordance for this page's three copy sites. `code` routes a
+// pasted-at-a-prompt shell command through copyCode (trims incidental
+// whitespace); the two JSON/text sites use copyToClipboard verbatim. The check
+// glyph is gated on the resolved boolean — never shown for a copy that did not
+// actually land. Hoisted to module scope (rather than defined inside the page
+// component) so its own `copied` state survives the page's re-renders instead
+// of being torn down and rebuilt as a fresh component identity every time.
+function CopyBtn({ text, code, size, children }: { text: string; code?: boolean; size: number; children: React.ReactNode }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <Btn onClick={async () => {
+      const ok = await (code ? copyCode(text) : copyToClipboard(text))
+      if (ok) {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      }
+    }}>
+      {copied ? <Check size={size} className="text-ok" /> : <Copy size={size} />} {children}
+    </Btn>
+  )
+}
+
+// A one-line shell command with its own copy button — hoisted alongside
+// CopyBtn for the same reason: kept inside the page component, a fresh
+// function identity on every render would unmount/remount CopyBtn's `copied`
+// state before the user ever saw the confirmation.
+function CmdRow({ text }: { text: string }) {
+  return (
+    <div style={cmd}>
+      <code style={{ overflow: 'auto', whiteSpace: 'nowrap' }}>{text}</code>
+      <CopyBtn text={text} code size={11}>{i18nT('pages.artifactDeployPage.copy')}</CopyBtn>
+    </div>
+  )
+}
 
 interface ProfileEntry { name: string; region: string; account: string; verified_at: string; note: string }
 interface ProfilesResp { profiles: ProfileEntry[]; default: string; available: string[] }
 interface Site { site_id: string; bucket: string; distribution_id: string; status?: string; url?: string; profile?: string }
 interface Reach { reachable: boolean; account?: string; s3_reachable?: boolean; cloudfront_reachable?: boolean; note?: string; detail?: string; profile?: string; error?: string }
+// The LIVE resources a recall/destroy preview echoes back, resolved from the
+// account by tag. Read defensively: an id the lookup could not see must degrade
+// to '' so the confirmed call sends no expectation for it, rather than binding
+// the teardown to the string "undefined".
+interface SiteResources { bucket?: string; distribution_id?: string; distribution_arn?: string }
+// One shape for both calls of the recall/destroy two-call guard: the unconfirmed
+// call answers `requires_confirm` + `resources`, the confirmed one the teardown
+// result, and `cancelled` marks the reply this page synthesizes locally when the
+// user dismisses the dialog (paired with `status: 0`, which onSuccess filters).
+interface SiteMutationResp {
+  requires_confirm?: boolean
+  action?: string
+  site_id?: string
+  resources?: SiteResources
+  destructive?: boolean
+  message?: string
+  error?: string
+  cancelled?: boolean
+}
 
 // Route all fetches through proper X-Session-Key header (client.ts pattern).
 const _sk = { 'X-Session-Key': 'dashboard:ui' }
+/** Catalog key per "Ready to deploy" column, resolved where the header renders —
+ *  the same shape as `FILTER_LABEL_KEY` in chat-sidebar/SearchDock.tsx. `null` is the actions
+ *  column, which carries no label. */
+const READY_COLUMN_KEY: (string | null)[] = [
+  'pages.artifactDeployPage.col_name',
+  'pages.artifactDeployPage.col_status',
+  'pages.artifactDeployPage.col_est_cost',
+  'pages.artifactDeployPage.col_profile',
+  'pages.artifactDeployPage.col_expiry',
+  null,
+]
+// A non-2xx reply becomes a thrown `ApiError` (status + the backend's own
+// `error`/`detail` text, via the shared factory), so a 4xx/5xx body reaches
+// useQuery/useMutation `.error` instead of being handed back as `data`.
 async function jget<T>(path: string): Promise<T> {
   const r = await fetch(BASE + path, { headers: { ..._sk } })
+  if (!r.ok) throw await toApiError(r)
   return (await r.json()) as T
 }
 async function jsend<T>(path: string, body: unknown, method = 'POST'): Promise<{ status: number; data: T }> {
   const r = await fetch(BASE + path, { method, headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify(body) })
+  if (!r.ok) throw await toApiError(r)
   return { status: r.status, data: (await r.json()) as T }
 }
 
@@ -36,12 +115,16 @@ const linkBtn: React.CSSProperties = { background: 'transparent', color: 'var(--
 
 export default function ArtifactDeployPage() {
   const qc = useQueryClient()
+  const { confirm, confirmDialog } = useConfirm()
   const [reach, setReach] = useState<Reach | null>(null)
   const [policy, setPolicy] = useState('')
   const [boundaryPolicy, setBoundaryPolicy] = useState('')
   const [boundaryNote, setBoundaryNote] = useState('')
   const [policyTier, setPolicyTier] = useState<'static' | 'fullstack'>('static')
   const [notice, setNotice] = useState<string | null>(null)
+  // Failed actions land here, separate from `notice` (success text only) so
+  // the two never share one accent-styled card.
+  const [failure, setFailure] = useState<string | null>(null)
   const [showGuide, setShowGuide] = useState(true)
   const [showSecurity, setShowSecurity] = useState(false)
   const [showNewProfile, setShowNewProfile] = useState(false)
@@ -51,29 +134,49 @@ export default function ArtifactDeployPage() {
   const [npRole, setNpRole] = useState('')
   const [npCreate, setNpCreate] = useState(false)
 
-  const { data: profilesResp } = useQuery<ProfilesResp>({
+  const cfgQ = useQuery<{ cloudDeploymentEnabled?: boolean; reaperInstallScript?: string }>({
+    queryKey: ['deploy-web', 'config'],
+    queryFn: () => jget('/config'),
+  })
+  const deployCfg = cfgQ.data
+  // Resolved server-side: the install path differs between a ~/.kirocrew and a
+  // ~/.kiro/crew root, so the browser cannot spell it. Falls back to the bare
+  // name only on an older gateway that does not send it.
+  const cleanupScriptPath = deployCfg?.reaperInstallScript || 'install-reaper.sh'
+  // Absent means an older backend that predates the flag — treat as enabled so a
+  // version skew never hides a working deploy surface. Only an explicit false
+  // withholds it.
+  const cloudDeploymentDisabled = deployCfg?.cloudDeploymentEnabled === false
+
+  const profilesQ = useQuery<ProfilesResp>({
     queryKey: ['deploy-web', 'profiles'],
     queryFn: () => jget('/profiles'),
+    enabled: !cloudDeploymentDisabled,
   })
+  const profilesResp = profilesQ.data
   const profiles = profilesResp?.profiles || []
   const defaultProfile = profilesResp?.default || ''
   const availableProfiles = profilesResp?.available || []
 
-  const { data: sitesResp } = useQuery<{ sites: Site[]; configured: boolean; profile_errors?: string[] }>({
+  const sitesQ = useQuery<{ sites: Site[]; configured: boolean; profile_errors?: string[] }>({
     queryKey: ['deploy-web', 'sites'],
     queryFn: () => jget('/list'),
     refetchInterval: 30000,
   })
+  const sitesResp = sitesQ.data
   const sites = sitesResp?.sites || []
+  const profileErrors = sitesResp?.profile_errors || []
 
-  const { data: webappResp } = useQuery<{ artifacts: Artifact[] }>({
+  const webappQ = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['deploy-web', 'webapps'],
     queryFn: async () => {
       const r = await fetch('/api/artifacts?kind=webapp')
+      if (!r.ok) throw await toApiError(r)
       return (await r.json()) as { artifacts: Artifact[] }
     },
     refetchInterval: 30000,
   })
+  const webappResp = webappQ.data
   const webapps = (webappResp?.artifacts || []).filter((a) => a.webapp_metadata)
   const webappCost = (a: Artifact): number => {
     const est = a.webapp_metadata?.cost?.estimates || []
@@ -84,7 +187,12 @@ export default function ArtifactDeployPage() {
     (a) => !a.webapp_metadata?.deploy_target?.public_url && a.webapp_metadata?.lifecycle?.status !== 'expired')
   const navigate = useNavigate()
   const [draftProfiles, setDraftProfiles] = useState<Record<string, string>>({})
-  const deployDraft = (slug: string) => {
+  // The chat hand-off is now the FALLBACK, not the action. It is reached only
+  // when the backend says this app has no built static root for the direct path
+  // to publish (`webapp_root_unavailable`) — and the button that reaches it says
+  // "Deploy via agent", because a button labelled "Deploy" that opens a chat is
+  // the loop this page was reported for (#12816).
+  const launchDeployChat = (slug: string) => {
     const chosen = draftProfiles[slug] || defaultProfile
     ;(window as unknown as { __mc_chat_launch?: { message: string; ts: number } }).__mc_chat_launch = {
       message:
@@ -101,95 +209,114 @@ export default function ArtifactDeployPage() {
     qc.invalidateQueries({ queryKey: ['deploy-web', 'profiles'] })
     qc.invalidateQueries({ queryKey: ['deploy-web', 'sites'] })
   }
+  // jsend throws on any non-2xx reply, so every failure — a backend `{error}`
+  // body as much as a network rejection — arrives here and is shown through
+  // ErrorNotice; onSuccess only ever sees a 2xx.
   const addProfile = useMutation({
     mutationFn: (p: { name: string; region: string; create?: boolean; account?: string; role?: string; default?: boolean }) =>
       jsend<{ error?: string }>('/profiles', p),
-    onSuccess: ({ status, data }, p) => {
-      if (status >= 400) { setNotice(i18nT('pages.artifactDeployPage.error', { error: data?.error || i18nT('pages.artifactDeployPage.add_failed') })); return }
+    onSuccess: (_res, p) => {
+      setFailure(null)
       setNotice(p.create
         ? i18nT('pages.artifactDeployPage.created_and_registered_profile', { name: p.name })
         : i18nT('pages.artifactDeployPage.registered_profile', { name: p.name }))
       setShowNewProfile(false); setNpName(''); setNpAccount(''); setNpRole(''); setNpCreate(false)
       refreshProfiles()
     },
+    onError: (e) => setFailure((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
   })
   const setDefaultProfile = useMutation({
     mutationFn: (name: string) => jsend<{ error?: string }>(`/profiles/${encodeURIComponent(name)}`, { default: true }, 'PUT'),
-    onSuccess: ({ status, data }) => {
-      if (status >= 400) { setNotice(i18nT('pages.artifactDeployPage.error', { error: data?.error || i18nT('pages.artifactDeployPage.update_failed') })); return }
+    onSuccess: () => {
+      setFailure(null)
       refreshProfiles()
     },
+    onError: (e) => setFailure((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
   })
   const removeProfile = useMutation({
     mutationFn: (name: string) => jsend<{ error?: string }>(`/profiles/${encodeURIComponent(name)}`, {}, 'DELETE'),
-    onSuccess: ({ status, data }) => {
-      if (status >= 400) { setNotice(i18nT('pages.artifactDeployPage.error', { error: data?.error || i18nT('pages.artifactDeployPage.remove_failed') })); return }
+    onSuccess: () => {
+      setFailure(null)
       setNotice(i18nT('pages.artifactDeployPage.removed_from_registry_your_aws_config_is_untouche'))
       refreshProfiles()
     },
+    onError: (e) => setFailure((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
   })
   const verify = useMutation({
     mutationFn: (name: string) => jsend<Reach>('/verify', { profile: name }),
     onSuccess: ({ data }) => { setReach(data); refreshProfiles() },
+    // A rejected check (400 body or transport failure) is an unreachable
+    // verdict too — it renders through the same unreachable notice below.
+    onError: (e, name) => setReach({ reachable: false, profile: name, error: (errMessage(e) || i18nT('components.errorBoundary.something_went_wrong')) }),
   })
 
   const loadPolicyMut = useMutation({
     mutationFn: () => jget<{ policy: string; boundary_policy?: string; boundary_policy_name?: string; boundary_note?: string }>(`/iam-policy?tier=${policyTier}`),
     onSuccess: (data) => {
+      setFailure(null)
       setPolicy(data.policy)
       // Fullstack also requires the permissions-boundary policy —
       // iam:CreateRole is conditioned on it, so first deploy fails without it.
       setBoundaryPolicy(data.boundary_policy || '')
       setBoundaryNote(data.boundary_note ? `${data.boundary_note} (name: ${data.boundary_policy_name || ''})` : '')
     },
+    onError: (e) => setFailure((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
   })
 
   const recallMut = useMutation({
     // Two-call guard mirroring destroy — preview resolves the
     // LIVE resources, the dialog names them, and the confirmed call binds to
     // them so a recreated site is refused (409) instead of being emptied.
-    mutationFn: async (s: Site) => {
-      const prev = await jsend<any>('/recall', { site_id: s.site_id, profile: s.profile || '' })
-      if (prev.status !== 200) throw new Error(prev.data?.error || `Recall preview failed (${prev.status})`)
-      const r = prev.data.resources || {}
-      const ok = window.confirm(i18nT('pages.artifactDeployPage.recall_confirm', { name: s.site_id, bucket: r.bucket || '?' }))
+    // Either call failing throws out of jsend and lands in onError.
+    mutationFn: async (s: Site): Promise<{ status: number; data: SiteMutationResp }> => {
+      const prev = await jsend<SiteMutationResp>('/recall', { site_id: s.site_id, profile: s.profile || '' })
+      const r: SiteResources = prev.data.resources || {}
+      const ok = await confirm({
+        title: i18nT('pages.artifactDeployPage.recall_title'),
+        body: i18nT('pages.artifactDeployPage.recall_confirm', { name: s.site_id, bucket: r.bucket || '?' }),
+        confirmLabel: i18nT('pages.artifactDeployPage.recall_button'),
+      })
       if (!ok) return { status: 0, data: { cancelled: true } }
-      return jsend<any>('/recall', {
+      return jsend<SiteMutationResp>('/recall', {
         site_id: s.site_id, confirm: true, profile: s.profile || '',
         expected_bucket: r.bucket || '', expected_distribution_id: r.distribution_id || '',
       })
     },
-    onSuccess: ({ status, data }, s) => {
+    onSuccess: ({ status }, s) => {
       if (status === 0) return
-      setNotice(status === 200
-        ? i18nT('pages.artifactDeployPage.recalled', { name: s.site_id })
-        : i18nT('pages.artifactDeployPage.error', { error: data?.error ?? '' }))
+      setFailure(null)
+      setNotice(i18nT('pages.artifactDeployPage.recalled', { name: s.site_id }))
       qc.invalidateQueries({ queryKey: ['deploy-web', 'sites'] })
     },
+    onError: (e) => setFailure((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
   })
 
   const destroyMut = useMutation({
     // Two-call guard on the irreversible path. The preview call
     // resolves the LIVE resources; the dialog names those; the confirmed
     // call binds to them so a site recreated since preview is refused (409).
-    mutationFn: async (s: Site) => {
-      const prev = await jsend<any>('/destroy', { site_id: s.site_id, profile: s.profile || '' })
-      if (prev.status !== 200) throw new Error(prev.data?.error || `Destroy preview failed (${prev.status})`)
-      const r = prev.data.resources || {}
-      const ok = window.confirm(i18nT('pages.artifactDeployPage.destroy_confirm', { name: s.site_id, bucket: r.bucket || '?', distribution: r.distribution_id || '?' }))
+    // Either call failing throws out of jsend and lands in onError.
+    mutationFn: async (s: Site): Promise<{ status: number; data: SiteMutationResp }> => {
+      const prev = await jsend<SiteMutationResp>('/destroy', { site_id: s.site_id, profile: s.profile || '' })
+      const r: SiteResources = prev.data.resources || {}
+      const ok = await confirm({
+        title: i18nT('pages.artifactDeployPage.destroy_title'),
+        body: i18nT('pages.artifactDeployPage.destroy_confirm', { name: s.site_id, bucket: r.bucket || '?', distribution: r.distribution_id || '?' }),
+        confirmLabel: i18nT('pages.artifactDeployPage.destroy_button'),
+      })
       if (!ok) return { status: 0, data: { cancelled: true } }
-      return jsend<any>('/destroy', {
+      return jsend<SiteMutationResp>('/destroy', {
         site_id: s.site_id, confirm: true, profile: s.profile || '',
         expected_bucket: r.bucket || '', expected_distribution_id: r.distribution_id || '',
       })
     },
-    onSuccess: ({ status, data }, s) => {
+    onSuccess: ({ status }, s) => {
       if (status === 0) return
-      setNotice(status === 200
-        ? i18nT('pages.artifactDeployPage.destroying', { name: s.site_id })
-        : i18nT('pages.artifactDeployPage.error', { error: data?.error ?? '' }))
+      setFailure(null)
+      setNotice(i18nT('pages.artifactDeployPage.destroying', { name: s.site_id }))
       qc.invalidateQueries({ queryKey: ['deploy-web', 'sites'] })
     },
+    onError: (e) => setFailure((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
   })
 
   function loadPolicy() { loadPolicyMut.mutate() }
@@ -202,34 +329,47 @@ export default function ArtifactDeployPage() {
     destroyMut.mutate(s)
   }
 
-  const CmdRow = ({ text }: { text: string }) => (
-    <div style={cmd}>
-      <code style={{ overflow: 'auto', whiteSpace: 'nowrap' }}>{text}</code>
-      <Btn onClick={() => navigator.clipboard.writeText(text)}><Copy size={11} /> {i18nT('pages.artifactDeployPage.copy')}</Btn>
-    </div>
-  )
-
   // Computed stats for the StatCard row
   const totalDeployments = sites.length + deployedWebapps.length
   const estCost = totalWebappUsd
 
   return (
     <>
-      {/* Deploy is a sub-surface of Artifacts: always give the way
-          back to the gallery so the console never feels like a dead end. */}
-      <div className="px-6 pt-2">
-        <button
-          type="button"
+      <PageHeader title={i18nT('pages.artifactDeployPage.artifact_deploy')} subtitle={i18nT('pages.artifactDeployPage.one_console_for_deploying_artifacts_to_your_own')} />
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0" style={{ color: 'var(--text)' }}>
+
+      {/* Deploy is a sub-surface of Artifacts: always give the way back to the
+          gallery so the console never feels like a dead end. It sits inside the
+          standard content container rather than above PageHeader, because the
+          page shell requires the header to be the page's first element, and it
+          uses the shared `Btn` primitive with no className of its own: the
+          layout contract wants the primitive, and restyling one would add a site
+          to the restyle ratchet, so the spacing lives on the wrapper. */}
+      <div className="mb-4">
+        <Btn
           onClick={() => navigate('/artifacts')}
-          className="inline-flex items-center gap-1.5 text-[13px] text-muted hover:text-text transition-colors cursor-pointer bg-transparent border-none px-0"
           aria-label={i18nT('pages.artifactDeployPage.back_to_artifacts')}
         >
           <ArrowLeft size={14} aria-hidden="true" />
           {i18nT('pages.artifactDeployPage.back_to_artifacts')}
-        </button>
+        </Btn>
       </div>
-      <PageHeader title={i18nT('pages.artifactDeployPage.artifact_deploy')} subtitle={i18nT('pages.artifactDeployPage.one_console_for_deploying_artifacts_to_your_own')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0" style={{ color: 'var(--text)' }}>
+      {/* Cloud deployment withheld: the PROVISIONING half of this console is
+          hidden below, but the deployments table and its recall/destroy actions
+          stay — a policy that stops new deployments must not strand exposure
+          created while it was still permitted, which is the same reason those
+          routes are ungated on the backend. */}
+      {cloudDeploymentDisabled && (
+        <Card>
+          <CardTitle>
+            <Lock size={14} aria-hidden="true" />
+            {i18nT('pages.artifactDeployPage.cloud_deployment_disabled')}
+          </CardTitle>
+          <p style={{ fontSize: 13, color: 'var(--muted)', margin: 0 }}>
+            {i18nT('pages.artifactDeployPage.cloud_deployment_disabled_detail')}
+          </p>
+        </Card>
+      )}
 
       {/* StatCard row — mirrors AgentsPage/ArtifactsPage pattern */}
       <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6">
@@ -239,10 +379,34 @@ export default function ArtifactDeployPage() {
         <StatCard label={i18nT('pages.artifactDeployPage.est_cost_not_a_bill')} value={estCost > 0 ? `≤ ${formatCost(estCost)}` : formatCost(0)} delay={120} />
       </div>
 
+      {/* Read failures for the config + profiles queries. Sites/webapps report
+          inside the Deployments card, beside their own Refresh button. */}
+      {(cfgQ.isError || profilesQ.isError) && (
+        <div className="flex flex-col gap-2 mb-3">
+          {/* No hand-off while the new-profile form (npName/npAccount/npRole)
+              is open — it is unsaved and the hand-off unmounts this page.
+              With the form closed nothing on the page is at risk. */}
+          <ErrorNotice message={cfgQ.isError ? (errMessage(cfgQ.error) || i18nT('components.errorBoundary.something_went_wrong')) : null} askAgent={!showNewProfile} />
+          <ErrorNotice message={profilesQ.isError ? (errMessage(profilesQ.error) || i18nT('components.errorBoundary.something_went_wrong')) : null} askAgent={!showNewProfile} />
+          <div>
+            <Btn onClick={() => { if (cfgQ.isError) cfgQ.refetch(); if (profilesQ.isError) profilesQ.refetch() }}>
+              <RefreshCw size={12} /> {i18nT('pages.artifactDeployPage.retry')}
+            </Btn>
+          </div>
+        </div>
+      )}
+
+      {/* No hand-off while the new-profile form (npName/npAccount/npRole) is
+          open — a failed register/verify/remove leaves it filled and unsaved,
+          and the hand-off unmounts this page. With the form closed the inputs
+          of every action here are already persisted, so hand-off is safe. */}
+      <ErrorNotice message={failure} onDismiss={() => setFailure(null)} askAgent={!showNewProfile} className="mb-3" />
+
       {notice && (
         <Card style={{ whiteSpace: 'pre-wrap', borderColor: 'var(--accent)', fontSize: 12 }}>{notice}</Card>
       )}
 
+      {!cloudDeploymentDisabled && (<>
       {/* Getting started guide */}
       <Card>
         <Clickable style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: showGuide ? 12 : 0 }}
@@ -270,6 +434,24 @@ export default function ArtifactDeployPage() {
             <div>
               <b>{i18nT('pages.artifactDeployPage.3_apply_the_iam_policy')}</b> {i18nT('pages.artifactDeployPage.click')} <b>{i18nT('pages.artifactDeployPage.get_iam_policy')}</b>{i18nT('pages.artifactDeployPage.then_apply_it_yourself_to_a_dedicated_role_ident')} <code>{i18nT('pages.artifactDeployPage.aws_iam')}</code> {i18nT('pages.artifactDeployPage.command_kirocrew_never_edits_your_iam_the_first')}
             </div>
+            {/* Step 4 exists because its absence was a trap: the deploy TTL
+                defaults to a finite window, a finite window needs this stack, and
+                nothing above ever mentioned it — so a first deploy failed on a
+                precondition the setup guide had never named. Optional, and the
+                page now defaults new deploys to permanent, so skipping it costs
+                nothing but auto-expiry. */}
+            <div>
+              {/* The explainer is its own block rather than trailing the bold
+                  heading inline. Two catalog values in one inline run is a
+                  render-time fragment: a translator sees two stubs and the
+                  pseudolocale shows them colliding. On its own line it reads as
+                  the step's note, which is what it is. */}
+              <b>{i18nT('pages.artifactDeployPage.4_optional_install_auto_cleanup')}</b>
+              <div>{i18nT('pages.artifactDeployPage.auto_cleanup_explainer')}</div>
+              <div style={{ marginTop: 6 }}>
+                <CmdRow text={`${cleanupScriptPath} --profile ${defaultProfile || '<profile>'} --region ${npRegion || 'us-west-2'}`} />
+              </div>
+            </div>
             <span style={{ color: 'var(--accent)', fontSize: 12, cursor: 'default' }}>
               {i18nT('pages.artifactDeployPage.full_setup_guide_profile_aws_cli_v2_troubleshoot')}
             </span>
@@ -277,13 +459,17 @@ export default function ArtifactDeployPage() {
         )}
       </Card>
 
-      {/* Security model (collapsible) */}
+      {/* Security model (collapsible) — the public-by-link warning stays visible even when collapsed */}
       <Card>
-        <Clickable style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: showSecurity ? 12 : 0 }}
+        <Clickable style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: 8 }}
              onClick={() => setShowSecurity((v) => !v)}>
           {showSecurity ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           <CardTitle className="!mb-0"><Lock size={15} /> {i18nT('pages.artifactDeployPage.how_this_is_secured')}</CardTitle>
         </Clickable>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '8px 10px', borderRadius: 6, border: '1px solid color-mix(in srgb, var(--warn) 30%, transparent)', background: 'var(--warn-subtle)', color: 'var(--warn)', fontSize: 12.5, lineHeight: 1.5, marginBottom: showSecurity ? 12 : 0 }}>
+          <AlertTriangle className="lucide-inline" style={{ flexShrink: 0, marginTop: 2 }} />
+          <span style={{ fontWeight: 600 }}>{i18nT('pages.artifactDeployPage.public_by_link_warning')}</span>
+        </div>
         {showSecurity && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, fontSize: 12.5, lineHeight: 1.55 }}>
             <div>
@@ -294,10 +480,9 @@ export default function ArtifactDeployPage() {
               <code>{i18nT('pages.artifactDeployPage.bucketownerenforced')}</code> {i18nT('pages.artifactDeployPage.ownership_and_sse_aes256_with')} <b>{i18nT('pages.artifactDeployPage.no_public_bucket_policy')}</b>{i18nT('pages.artifactDeployPage.only_cloudfront_can_read_it_via_an_origin_access')}
               <code>{i18nT('pages.artifactDeployPage.aws_sourcearn')}</code> {i18nT('pages.artifactDeployPage.pins_your_specific_distribution_the_bucket_name')}
             </div>
-            <div>
-              <b>{i18nT('pages.artifactDeployPage.the_published_url_is_public_by_link')}</b> {i18nT('pages.artifactDeployPage.content_is_served_at_a_random')}
-              <code>{i18nT('pages.artifactDeployPage.cloudfront_net')}</code> {i18nT('pages.artifactDeployPage.domain')} <b>{i18nT('pages.artifactDeployPage.anyone_with_the_link_can_view_it')}</b> {i18nT('pages.artifactDeployPage.world_readable_no_auth_in_v1_don_t_publish_anyth')}
-            </div>
+            {/* The exposure claim itself lives in the always-visible banner above;
+                this line carries only the facts that banner does not state. */}
+            <div>{i18nT('pages.artifactDeployPage.random_domain_note')}</div>
             <div>
               <b>{i18nT('pages.artifactDeployPage.pre_publish_scan_sensitive_path_guard')}</b> {i18nT('pages.artifactDeployPage.content_is_scanned_for_secrets_and_internal_data')}<code>{i18nT('pages.artifactDeployPage.aws_2')}</code>, <code>{i18nT('pages.artifactDeployPage.ssh')}</code>{i18nT('pages.artifactDeployPage.before_any_upload')}
             </div>
@@ -371,7 +556,13 @@ export default function ArtifactDeployPage() {
                     <span style={{ display: 'flex', gap: 6 }}>
                       <Btn onClick={() => verify.mutate(p.name)}><ShieldCheck size={11} /> {i18nT('pages.artifactDeployPage.verify')}</Btn>
                       <Btn aria-label={i18nT('pages.artifactDeployPage.remove_from_registry', { name: p.name })}
-                        onClick={() => window.confirm(i18nT('pages.artifactDeployPage.remove_profile_confirm', { name: p.name })) && removeProfile.mutate(p.name)}>
+                        onClick={async () => {
+                          if (await confirm({
+                            title: i18nT('pages.artifactDeployPage.remove_profile_title'),
+                            body: i18nT('pages.artifactDeployPage.remove_profile_confirm', { name: p.name }),
+                            confirmLabel: i18nT('pages.artifactDeployPage.remove_profile_button'),
+                          })) removeProfile.mutate(p.name)
+                        }}>
                         <Trash2 size={11} /> {i18nT('pages.artifactDeployPage.remove')}
                       </Btn>
                     </span>
@@ -427,12 +618,18 @@ export default function ArtifactDeployPage() {
           </div>
         )}
         {reach && (
-          <div style={{ marginTop: 10, fontSize: 12, color: reach.reachable ? 'var(--ok)' : 'var(--danger)' }}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              {reach.reachable
-                ? <><CheckCircle size={12} /> {reach.profile}{i18nT('pages.artifactDeployPage.access_reachable')}{reach.account ? ` (account ${reach.account})` : ''}</>
-                : <><XCircle size={12} /> {reach.detail || reach.error || i18nT('pages.artifactDeployPage.not_reachable')}</>}
-            </span>
+          <div style={{ marginTop: 10, fontSize: 12 }}>
+            {reach.reachable
+              ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--ok)' }}>
+                  <CheckCircle size={12} /> {reach.profile}{i18nT('pages.artifactDeployPage.access_reachable')}{reach.account ? ` (account ${reach.account})` : ''}
+                </span>
+              : <>
+                  {/* No hand-off while the new-profile form (npName/npAccount/npRole)
+                      is open — it is unsaved and the hand-off unmounts this page.
+                      With the form closed the verified profile is already
+                      registered, so nothing is lost. */}
+                  <ErrorNotice variant="inline" message={reach.detail || reach.error || i18nT('pages.artifactDeployPage.not_reachable')} askAgent={!showNewProfile} />
+                </>}
             <div style={{ color: 'var(--muted)', fontSize: 11 }}>{reach.note}</div>
           </div>
         )}
@@ -443,14 +640,14 @@ export default function ArtifactDeployPage() {
               {policyTier === 'fullstack' && <span style={{ color: 'var(--accent)' }}> {i18nT('pages.artifactDeployPage.fullstack_tier_includes_lambda_api_gateway_dynam')}</span>}
             </div>
             <pre style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, fontSize: 11, maxHeight: 240, overflow: 'auto' }}>{policy}</pre>
-            <Btn onClick={() => navigator.clipboard.writeText(policy)}><Copy size={12} /> {i18nT('pages.artifactDeployPage.copy_policy')}</Btn>
+            <CopyBtn text={policy} size={12}>{i18nT('pages.artifactDeployPage.copy_policy')}</CopyBtn>
             {boundaryPolicy && (
               <div style={{ marginTop: 10 }}>
                 <div style={{ fontSize: 11, color: 'var(--warn)', marginBottom: 4 }}>
                   {boundaryNote || i18nT('pages.artifactDeployPage.fullstack_also_requires_the_permissions_boundary')}
                 </div>
                 <pre style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, fontSize: 11, maxHeight: 200, overflow: 'auto' }}>{boundaryPolicy}</pre>
-                <Btn onClick={() => navigator.clipboard.writeText(boundaryPolicy)}><Copy size={12} /> {i18nT('pages.artifactDeployPage.copy_boundary_policy')}</Btn>
+                <CopyBtn text={boundaryPolicy} size={12}>{i18nT('pages.artifactDeployPage.copy_boundary_policy')}</CopyBtn>
               </div>
             )}
           </div>
@@ -461,8 +658,11 @@ export default function ArtifactDeployPage() {
         </div>
       </Card>
 
-      {/* Pending confirmations — deploy previews awaiting human confirm */}
-      <PendingConfirmations qc={qc} />
+      {/* Pending confirmations — deploy previews awaiting human confirm.
+          No hand-off while the new-profile form (npName/npAccount/npRole) is
+          open on this page; otherwise the pending entries are server-persisted
+          and nothing is lost. */}
+      <PendingConfirmations qc={qc} askAgent={!showNewProfile} />
 
       {/* Ready to deploy — CardTitle + InfoTip */}
       {draftWebapps.length > 0 && (
@@ -470,58 +670,40 @@ export default function ArtifactDeployPage() {
           <CardTitle>
             {i18nT('pages.artifactDeployPage.ready_to_deploy_count', { count: draftWebapps.length })} <InfoTip text={i18nT('pages.artifactDeployPage.ready_to_deploy_tip')} />
           </CardTitle>
+          {/* Six columns with fixed-width controls overflow a 320px viewport, so
+              this table scrolls sideways rather than widening the whole page. */}
+          <div className="overflow-x-auto">
           <table className="w-full border-collapse table-striped">
             <thead>
               <tr>
-                {['Name', 'Status', 'Est. Cost', 'Profile', ''].map(h => (
-                  <th key={h} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{h}</th>
+                {READY_COLUMN_KEY.map((k, i) => (
+                  <th key={k ?? `col-${i}`} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{k ? i18nT(k) : ''}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {draftWebapps.map((a) => {
-                const cost = webappCost(a)
-                return (
-                  <tr key={a.slug} className="hover:bg-bg-hover transition-colors">
-                    <td className="px-2.5 py-2 border-b border-border text-sm font-semibold">
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                        <Rocket size={13} stroke={'var(--accent)'} /> {a.slug}
-                      </span>
-                    </td>
-                    <td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="warn">{i18nT('pages.artifactDeployPage.not_deployed')}</Badge></td>
-                    <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{cost > 0 ? `≤ $${cost.toFixed(4)}` : '~$0.00'}</td>
-                    <td className="px-2.5 py-2 border-b border-border text-sm">
-                      {profiles.length > 0 && (
-                        <SimpleSelect
-                          options={profiles.map((p) => p.name)}
-                          value={draftProfiles[a.slug] || defaultProfile || ''}
-                          onChange={(v) => setDraftProfiles((m) => ({ ...m, [a.slug]: v }))}
-                          clearLabel={defaultProfile ? `${defaultProfile} (default)` : i18nT('pages.artifactDeployPage.default')}
-                          aria-label={i18nT('pages.artifactDeployPage.deploy_profile_for_slug', { slug: a.slug })}
-                          style={{ minWidth: 100 }}
-                        />
-                      )}
-                    </td>
-                    <td className="px-2.5 py-2 border-b border-border text-sm text-right">
-                      <span style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                        <Btn primary onClick={() => deployDraft(a.slug)} aria-label={i18nT('pages.artifactDeployPage.deploy_artifact', { name: a.slug })}>
-                          <Rocket size={11} /> {i18nT('pages.artifactDeployPage.deploy')}
-                        </Btn>
-                        <Link to={`/artifacts/${encodeURIComponent(a.slug)}`} style={linkBtn}>
-                          <ExternalLink size={11} /> {i18nT('pages.artifactDeployPage.details')}
-                        </Link>
-                      </span>
-                    </td>
-                  </tr>
-                )
-              })}
+              {draftWebapps.map((a) => (
+                <DraftRow
+                  key={a.slug}
+                  artifact={a}
+                  cost={webappCost(a)}
+                  profiles={profiles.map((p) => p.name)}
+                  defaultProfile={defaultProfile}
+                  chosenProfile={draftProfiles[a.slug] || defaultProfile || ''}
+                  onProfileChange={(v) => setDraftProfiles((m) => ({ ...m, [a.slug]: v }))}
+                  onAgentDeploy={() => launchDeployChat(a.slug)}
+                />
+              ))}
             </tbody>
           </table>
+          </div>
           <div style={{ paddingTop: 10, fontSize: 11, color: 'var(--muted)' }}>
-            {i18nT('pages.artifactDeployPage.deploy_opens_a_new_chat_session_that_runs_the_ar')}
+            {i18nT('pages.artifactDeployPage.deploy_publishes_directly_from_this_page')}
           </div>
         </Card>
       )}
+
+      </>)}
 
       {/* Deployments — CardTitle + InfoTip + table-striped */}
       <Card>
@@ -531,9 +713,31 @@ export default function ArtifactDeployPage() {
           </CardTitle>
           <Btn onClick={() => { qc.invalidateQueries({ queryKey: ['deploy-web', 'sites'] }); qc.invalidateQueries({ queryKey: ['deploy-web', 'webapps'] }) }}><RefreshCw size={12} /> {i18nT('pages.artifactDeployPage.refresh')}</Btn>
         </div>
+        {/* Read failures sit beside the Refresh button above, which is their
+            retry. No hand-off while the new-profile form (npName/npAccount/
+            npRole) is open — it is unsaved and the hand-off unmounts this
+            page; otherwise the listing holds no draft. */}
+        {(sitesQ.isError || webappQ.isError || profileErrors.length > 0) && (
+          <div className="flex flex-col gap-2 mb-3">
+            <ErrorNotice message={sitesQ.isError ? (errMessage(sitesQ.error) || i18nT('components.errorBoundary.something_went_wrong')) : null} askAgent={!showNewProfile} />
+            <ErrorNotice message={webappQ.isError ? (errMessage(webappQ.error) || i18nT('components.errorBoundary.something_went_wrong')) : null} askAgent={!showNewProfile} />
+            <ErrorNotice
+              title={profileErrors.length > 0 ? i18nT('pages.artifactDeployPage.profile_errors_title') : undefined}
+              message={profileErrors.length > 0 ? profileErrors.join('\n') : null}
+              askAgent={!showNewProfile}
+            />
+          </div>
+        )}
         {sites.length + deployedWebapps.length === 0 && (
           <div style={{ fontSize: 13, color: 'var(--muted)' }}>
             {i18nT('pages.artifactDeployPage.no_deployments_yet_publish_an_artifact_from_its')} <b style={{ color: 'var(--text)' }}>{i18nT('pages.artifactDeployPage.deploy')}</b>.
+            {/* An empty list is not proof there is nothing deployed: this table is
+                a live read of AWS resource tags, and tagging is eventually
+                consistent, so a site that exists is invisible here for a minute
+                or two. Saying so stops a fresh deploy reading as a failure. */}
+            <div style={{ marginTop: 6, fontSize: 12 }}>
+              {i18nT('pages.artifactDeployPage.deployments_read_live_from_tags')}
+            </div>
           </div>
         )}
         {(sites.length + deployedWebapps.length > 0) && (
@@ -555,6 +759,7 @@ export default function ArtifactDeployPage() {
                   <td className="px-2.5 py-2 border-b border-border text-sm">{s.profile ? <span style={chip}>{s.profile}</span> : <span style={{ color: 'var(--muted)' }}>—</span>}</td>
                   <td className="px-2.5 py-2 border-b border-border text-sm" style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.url ? (safeHttpUrl(s.url) ? <a href={safeHttpUrl(s.url)!} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>{s.url}</a> : <span style={{ color: 'var(--muted)' }}>{s.url}</span>) : '—'}</td>
                   <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{i18nT('pages.artifactDeployPage.0_00_mo')}</td>
+                  {/* eslint-disable-next-line jsx-a11y/control-has-associated-label -- a cell of a plain data <table> has role `cell`, which is named by its contents and needs no name of its own (the rule reads every `td` as a grid's `gridcell` widget). Both controls inside carry their own visible text; the flex wrapper only pushes that text past the rule's 2-level scan. */}
                   <td className="px-2.5 py-2 border-b border-border text-sm">
                     <span style={{ display: 'flex', gap: 5 }}>
                       <Btn onClick={() => recall(s)}><Undo2 size={11} /> {i18nT('pages.artifactDeployPage.recall')}</Btn>
@@ -599,6 +804,135 @@ export default function ArtifactDeployPage() {
         )}
       </Card>
       </div>
+      {confirmDialog}
+    </>
+  )
+}
+
+// ── Ready-to-deploy row ─────────────────────────────────────────────────
+//
+// One row, one deploy state machine — which is why it is a component rather than
+// inline JSX in a `.map()`: `useDirectDeploy` is a hook and cannot be called in a
+// loop body.
+//
+// The primary button DEPLOYS, from here, behind the public-by-link
+// acknowledgment. It only becomes the agent hand-off once the backend has said
+// this app has no built static root to publish, and then it says so.
+function DraftRow({
+  artifact,
+  cost,
+  profiles,
+  defaultProfile,
+  chosenProfile,
+  onProfileChange,
+  onAgentDeploy,
+}: {
+  artifact: Artifact
+  cost: number
+  profiles: string[]
+  defaultProfile: string
+  chosenProfile: string
+  onProfileChange: (v: string) => void
+  onAgentDeploy: () => void
+}) {
+  const flow = useDirectDeploy(artifact.slug)
+  const { phase, ttlHours, setTtlHours, start, busy, needsAgent } = flow
+  const ttlLabel = (h: number) =>
+    h === 0
+      ? i18nT('components.directDeploy.ttl_permanent')
+      : i18nT('components.directDeploy.ttl_expires_in_hours', { hours: h })
+
+  return (
+    <>
+    <tr className="hover:bg-bg-hover transition-colors align-top">
+      <td className="px-2.5 py-2 border-b border-border text-sm font-semibold">
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <Rocket size={13} stroke={'var(--accent)'} /> {artifact.slug}
+        </span>
+      </td>
+      {/* The row's own status, not the artifact record's: the server back-fill
+          lands on a later refetch, so reading the record here shows "not
+          deployed" beside this row's own "Deployed!" and leaves a reader with two
+          contradictory answers. */}
+      <td className="px-2.5 py-2 border-b border-border text-sm">
+        {phase.kind === 'done' ? (
+          <Badge variant="ok">{i18nT('components.directDeploy.deployed')}</Badge>
+        ) : (
+          <Badge variant="warn">{i18nT('pages.artifactDeployPage.not_deployed')}</Badge>
+        )}
+      </td>
+      <td className="px-2.5 py-2 border-b border-border text-sm text-muted">
+        {cost > 0 ? `≤ $${cost.toFixed(4)}` : '~$0.00'}
+      </td>
+      <td className="px-2.5 py-2 border-b border-border text-sm">
+        {profiles.length > 0 && (
+          <SimpleSelect
+            options={profiles}
+            value={chosenProfile}
+            onChange={onProfileChange}
+            clearLabel={defaultProfile ? `${defaultProfile} (default)` : i18nT('pages.artifactDeployPage.default')}
+            aria-label={i18nT('pages.artifactDeployPage.deploy_profile_for_slug', { slug: artifact.slug })}
+            style={{ minWidth: 100 }}
+          />
+        )}
+      </td>
+      {/* Permanent leads deliberately: it is the only choice that needs no
+          auto-cleanup infrastructure, so it is the one that cannot fail on a
+          fresh account. Defaulting to 72 is what put every first deploy into the
+          reaper precondition. */}
+      <td className="px-2.5 py-2 border-b border-border text-sm">
+        <SimpleSelect
+          options={TTL_CHOICES.map(String)}
+          optionLabels={TTL_CHOICES.map(ttlLabel)}
+          value={String(ttlHours)}
+          onChange={(v) => setTtlHours(Number(v))}
+          aria-label={i18nT('components.publishHub.ttl_time_to_live')}
+          style={{ minWidth: 130 }}
+        />
+      </td>
+      <td className="px-2.5 py-2 border-b border-border text-sm">
+        <span style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+          {needsAgent ? (
+            <Btn onClick={onAgentDeploy} aria-label={i18nT('components.directDeploy.deploy_via_agent')}>
+              <Rocket size={11} /> {i18nT('components.directDeploy.deploy_via_agent')}
+            </Btn>
+          ) : (
+            <Btn
+              primary
+              /* A finished deploy and a standing scan block are both states
+                 where pressing Deploy again does nothing useful: the first is
+                 already published, the second refuses until the findings are
+                 dealt with. Leaving the primary bright there is what made a
+                 reader ask what a second press would do. */
+              disabled={busy || phase.kind === 'done' || phase.kind === 'scan-blocked'}
+              onClick={() => void start(chosenProfile)}
+              aria-label={i18nT('pages.artifactDeployPage.deploy_artifact', { name: artifact.slug })}
+            >
+              <Rocket size={11} />{' '}
+              {phase.kind === 'checking'
+                ? i18nT('components.publishHub.checking')
+                : phase.kind === 'deploying'
+                  ? i18nT('components.webAppArtifactCard.deploying')
+                  : i18nT('pages.artifactDeployPage.deploy')}
+            </Btn>
+          )}
+          <Link to={`/artifacts/${encodeURIComponent(artifact.slug)}`} style={linkBtn}>
+            <ExternalLink size={11} /> {i18nT('pages.artifactDeployPage.details')}
+          </Link>
+        </span>
+      </td>
+    </tr>
+    {/* A refusal banner is as wide as a sentence and the actions cell is the
+        table's narrowest column, so the flow spans its own full-width row.
+        Inside that cell it reaches past the viewport's right edge, which cuts
+        off the Details text and the buttons beside it. */}
+    {phase.kind !== 'idle' && (
+      <tr className="align-top">
+        <td className="px-2.5 pb-2 border-b border-border text-sm" colSpan={6}>
+          <DirectDeployFlow slug={artifact.slug} flow={flow} profile={chosenProfile} />
+        </td>
+      </tr>
+    )}
     </>
   )
 }
@@ -618,16 +952,23 @@ interface PendingEntry {
   created_at_epoch: number
 }
 
-function PendingConfirmations({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
-  const { data } = useQuery<{ pending: PendingEntry[] }>({
+// `askAgent` is decided by the page: the new-profile form lives on the same
+// page, and a hand-off from this card unmounts it along with everything else.
+function PendingConfirmations({ qc, askAgent }: { qc: ReturnType<typeof useQueryClient>; askAgent: boolean }) {
+  const pendingQ = useQuery<{ pending: PendingEntry[] }>({
     queryKey: ['deploy-web', 'pending'],
     queryFn: async () => {
       const r = await fetch(BASE + '/pending', { headers: { 'X-Session-Key': 'dashboard:ui' } })
+      if (!r.ok) throw await toApiError(r)
       return (await r.json()) as { pending: PendingEntry[] }
     },
     refetchInterval: 10000,
   })
-  const pending = data?.pending || []
+  const pending = pendingQ.data?.pending || []
+  // The pending entry awaiting the blocking public-exposure acknowledgment.
+  // Confirming a pending entry deploys immediately, so it goes through the same
+  // gate as a Publish-panel confirm rather than firing straight from the row.
+  const [ackEntry, setAckEntry] = useState<PendingEntry | null>(null)
 
   const confirmMut = useMutation({
     mutationFn: async ({ id, overrideScan }: { id: string; overrideScan?: boolean }) => {
@@ -636,10 +977,30 @@ function PendingConfirmations({ qc }: { qc: ReturnType<typeof useQueryClient> })
       // "Deploy anyway" sends override_scan so the backend clears them.
       const res = await fetch(BASE + `/pending/${id}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Session-Key': 'dashboard:ui' }, body: JSON.stringify(overrideScan ? { override_scan: true } : {}) })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error || `Confirm failed (${res.status})`)
+      if (!res.ok) {
+        // Carry the two technical fields alongside the message so the banner can
+        // stay the plain sentence and the stack names go behind Details. A
+        // confirm here is exactly where the reaper precondition lands.
+        const err = new Error(data.error || `Confirm failed (${res.status})`) as Error & {
+          details?: string; remediation?: string; code?: string
+        }
+        err.details = typeof data.details === 'string' ? data.details : undefined
+        err.remediation = typeof data.remediation === 'string' ? data.remediation : undefined
+        err.code = typeof data.code === 'string' ? data.code : undefined
+        throw err
+      }
       return data
     },
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['deploy-web', 'pending'] })
+      qc.invalidateQueries({ queryKey: ['deploy-web', 'sites'] })
+    },
+    // A failed confirm has already CLAIMED the entry (atomically, to stop a
+    // double deploy) and the handler re-adds it. Without this refetch the list
+    // keeps showing the claimed-and-gone state, so the row vanishes and the user
+    // is left with no entry to retry and no sign anything happened. Refetching
+    // brings the re-added row back beside the error.
+    onError: () => {
       qc.invalidateQueries({ queryKey: ['deploy-web', 'pending'] })
       qc.invalidateQueries({ queryKey: ['deploy-web', 'sites'] })
     },
@@ -657,13 +1018,19 @@ function PendingConfirmations({ qc }: { qc: ReturnType<typeof useQueryClient> })
     },
   })
 
-  if (!pending.length) return null
+  if (!pending.length && !pendingQ.isError) return null
 
   return (
     <Card>
       <CardTitle>
         <Rocket size={15} /> {i18nT('pages.artifactDeployPage.pending_confirmations_count', { count: pending.length })}
       </CardTitle>
+      {pendingQ.isError && (
+        <div className="flex items-start gap-2 mb-3">
+          <ErrorNotice message={(errMessage(pendingQ.error) || i18nT('components.errorBoundary.something_went_wrong'))} askAgent={askAgent} className="flex-1" />
+          <Btn onClick={() => pendingQ.refetch()}><RefreshCw size={12} /> {i18nT('pages.artifactDeployPage.retry')}</Btn>
+        </div>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10, fontSize: 13 }}>
         {pending.map((e) => {
           const age = Math.round((Date.now() / 1000 - e.created_at_epoch) / 60)
@@ -676,28 +1043,62 @@ function PendingConfirmations({ qc }: { qc: ReturnType<typeof useQueryClient> })
                   <div style={{ color: 'var(--muted)', fontSize: 11 }}>
                     {i18nT('pages.artifactDeployPage.source')} {source} {i18nT('pages.artifactDeployPage.profile_2')} {e.profile || i18nT('pages.artifactDeployPage.default')} {i18nT('pages.artifactDeployPage.ttl')} {e.ttl_hours}{i18nT('pages.artifactDeployPage.h_scan')} {e.scan_summary} &middot; {age}{i18nT('pages.artifactDeployPage.m_ago')}
                   </div>
+                  {/* Confirming commits a public publish — the warning sits inside
+                      each entry so it stays beside its own confirm button even
+                      when many entries make the list scroll. */}
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 5, color: 'var(--warn)', fontSize: 11, marginTop: 2 }}>
+                    <AlertTriangle size={12} style={{ flexShrink: 0, marginTop: 1 }} />
+                    <span>{i18nT('components.publishHub.public_exposure_warning')}</span>
+                  </div>
                   {e.override_scan_required && (
                     <div style={{ color: 'var(--warn)', fontSize: 11, marginTop: 2 }}>
                       {i18nT('pages.artifactDeployPage.blocked_by_non_credential_scan_findings_review_a')}
                     </div>
                   )}
                 </div>
-                <Btn danger onClick={() => confirmMut.mutate({ id: e.id, overrideScan: !!e.override_scan_required })} disabled={confirmMut.isPending}>
+                <Btn danger onClick={() => setAckEntry(e)} disabled={confirmMut.isPending}>
                   {e.override_scan_required ? i18nT('pages.artifactDeployPage.deploy_anyway') : i18nT('pages.artifactDeployPage.confirm_deploy')}
                 </Btn>
                 <Btn onClick={() => dismissMut.mutate(e.id)} disabled={dismissMut.isPending}>
                   {i18nT('pages.artifactDeployPage.dismiss')}
                 </Btn>
               </div>
-              {(confirmMut.isError || dismissMut.isError) && (
-                <div style={{ color: 'var(--error, #dc2626)', fontSize: 11, padding: '2px 10px' }}>
-                  {(confirmMut.error as Error)?.message || (dismissMut.error as Error)?.message}
-                </div>
-              )}
             </div>
           )
         })}
+        {/* Pending entries are server-persisted, so a failed confirm/dismiss
+            loses nothing here; the page decides `askAgent` for its own draft.
+            The banner holds the plain sentence and the stack/parameter names sit
+            behind Details — a confirm is exactly where the auto-cleanup
+            precondition lands, and that message used to be four product nouns. */}
+        <ErrorNotice
+          message={confirmMut.isError ? (errMessage(confirmMut.error) || i18nT('components.errorBoundary.something_went_wrong')) : dismissMut.isError ? (errMessage(dismissMut.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
+          onDismiss={() => { confirmMut.reset(); dismissMut.reset() }}
+          askAgent={askAgent}
+        />
+        {confirmMut.isError && (
+          <ErrorDetails
+            details={(confirmMut.error as { details?: string } | null)?.details}
+            remediation={(confirmMut.error as { remediation?: string } | null)?.remediation}
+          />
+        )}
       </div>
+      {/* Same blocking acknowledgment the Publish panel uses — confirming here
+          creates the public resource, so it cannot be a one-click row action. */}
+      <PublicPublishAckModal
+        open={!!ackEntry}
+        target={ackEntry?.site_id || ''}
+        ttlHours={ackEntry?.ttl_hours ?? 0}
+        busy={confirmMut.isPending}
+        onCancel={() => setAckEntry(null)}
+        onConfirm={() => {
+          const entry = ackEntry
+          setAckEntry(null)
+          if (entry) {
+            confirmMut.mutate({ id: entry.id, overrideScan: !!entry.override_scan_required })
+          }
+        }}
+      />
     </Card>
   )
 }

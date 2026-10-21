@@ -1,26 +1,39 @@
 ---
 title: Orchestrator Chat Sessions — an engineered pipeline with a decision-only agent
-status: in-progress
+status: superseded
 revision: v5
 author: kirocrew agent session, directed by zezhexu
 created: 2026-08-03
-last-audited: 2026-08-03
-audited-at: 0ab6ed48
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr: 1280
 implementation-prs: [1295]
 tracking-issues: []
 supersedes: []
-superseded-by: []
+superseded-by: [../system-specs/modules/crew-mode.md]
 ---
 # RFC: Orchestrator Chat Sessions — an engineered pipeline with a decision-only agent
 
-Status: in-progress — v5, post-second-council revision; accepted as design of record (PR #1280).
-Implementation lives entirely in **open PR #1295** (`feat/crew-mode`): `src/kiro_crew/crew_chat.py`
-does not exist on main, nor does `OrchestratorManager`, the `queue.json`/`topics.json` store, the
-`<<<SUMMARY` contract, `SubagentInfo.summary`, or any Crew Mode i18n key. Phase 0's routing-quality
-probe is zero-core by design and left no repo artifact, so it cannot be confirmed either way.
-Disambiguation: main's existing `orchestrator` symbols (`channel.py:121 is_orchestrator`,
-`config/prompt-orchestrator.md`) are a **pre-existing channel-level feature** that predates this RFC,
+> **Crew Mode is retired.** It shipped from this design (PR #1295) and was
+> removed in favour of the Crew Members page, where each crew is a standing
+> agent with its own thread. The record of what shipped, what diverged from the
+> design below (no snapshot-generation CAS, no `release` action, immediate
+> per-result delivery instead of burst coalescing) and how existing sessions
+> are treated is
+> [`../system-specs/modules/crew-mode.md`](../system-specs/modules/crew-mode.md)
+> § "Retired: Crew Mode". This document is kept as the intent behind it.
+
+Status: superseded — v5 was accepted as design of record in PR #1280, shipped as
+Crew Mode in PR #1295, and Crew Mode is retired (see the note above). Kept as
+history: the implementation deliberately diverged from this proposal: it had no snapshot-generation CAS,
+the decision action set omits `release`, and completed results are delivered
+individually instead of using the proposed burst-coalescing window. Phase 0's
+routing-quality probe was zero-core by design and left no repo artifact, so it
+cannot be confirmed either way.
+Disambiguation: main's existing `orchestrator` symbol (the `Channel.is_orchestrator`
+field in `channel.py`) is a **pre-existing channel-level feature** that predates this RFC
+(its companion prompt file `config/prompt-orchestrator.md` was removed by #15362; see
+`rfc-retire-chat-autopilot.md`),
 and "Crews" (agent templates, #1331/#1335) is not "Crew Mode". Neither counts as implementation.
 Councils: round 1 (v1 draft, 4-member cross-vendor, REVISE — every structural
 BLOCKER traced to simulating engineering in a prompt) → v4 architecture rewrite
@@ -98,7 +111,7 @@ user msg ──> ingress queue (durable, per-session, msg ids, entry state machi
   (`queue.json`, `topics.json`), atomic-write on every transition — the same
   durability pattern as subagent `state.json` and the #1114 registry rebuild.
   Explicitly: this durability is NEW Phase-1 work; the existing slot queue
-  (`state.py` `_ChatSlot._queue`) is in-memory and is not reused.
+  (`state_parts/chat_slot.py` `_ChatSlot._queue`) is in-memory and is not reused.
 - **Product shape**: an **orchestrator session type**, not a mode flag on
   `_ChatSlot`. The HTTP message handler routes messages for orchestrator
   sessions to `OrchestratorManager.enqueue()` before (instead of) turn

@@ -7,9 +7,11 @@ blocked in this environment, and the tests must stay hermetic anyway.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
+from kiro_crew import http_proxy
 from kiro_crew.mcp_providers import official as official_mod
 from kiro_crew.mcp_providers.base import (
     McpSearchResult,
@@ -384,6 +386,220 @@ class TestOfficialTransport:
 
 
 # ---------------------------------------------------------------------------
+# Response reading — _fetch_json streams the body to EOF
+# ---------------------------------------------------------------------------
+
+
+class _FakeContent:
+    """Stand-in for ``aiohttp.StreamReader`` that hands out queued chunks.
+
+    ``iter_chunked`` yields them in order, one per chunk. ``read(n)`` returns
+    at most one queued chunk (split when longer than *n*) and ``b""`` at EOF —
+    the documented "up to n bytes" contract a single read cannot satisfy for a
+    streamed body, kept so a single-read implementation is still exercised.
+    """
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.reads = 0
+
+    async def iter_chunked(self, n: int):
+        while self._chunks:
+            yield await self.read(n)
+
+    async def read(self, n: int = -1) -> bytes:
+        self.reads += 1
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        if n >= 0 and len(chunk) > n:
+            self._chunks.insert(0, chunk[n:])
+            chunk = chunk[:n]
+        return chunk
+
+    @property
+    def undelivered(self) -> int:
+        return sum(len(c) for c in self._chunks)
+
+
+class _FakeResponse:
+    def __init__(self, status: int, chunks):
+        self.status = status
+        self.content = _FakeContent(chunks)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self._response = response
+        self.get_kwargs: dict | None = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None, proxy=None):
+        self.get_kwargs = {"url": url, "headers": headers, "proxy": proxy}
+        return self._response
+
+
+def _serve(monkeypatch, *chunks, status: int = 200) -> _FakeResponse:
+    """Route ``_fetch_json``'s HTTP call at a response yielding *chunks*."""
+    response = _FakeResponse(status, chunks)
+    sessions: list[_FakeSession] = []
+
+    def _make(*a, **kw):
+        session = _FakeSession(response)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(official_mod.aiohttp, "ClientSession", _make)
+    response.sessions = sessions
+    return response
+
+
+class TestFetchJsonRead:
+    @pytest.mark.asyncio
+    async def test_multi_chunk_body_is_assembled(self, monkeypatch):
+        """A document split across chunks parses whole, not truncated."""
+        body = json.dumps({"servers": [{"name": f"io.github.a/s{i}"} for i in range(200)]})
+        raw = body.encode("utf-8")
+        third = len(raw) // 3
+        _serve(monkeypatch, raw[:third], raw[third : 2 * third], raw[2 * third :])
+
+        doc = await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+        assert doc == json.loads(body)
+
+    @pytest.mark.asyncio
+    async def test_heavily_fragmented_body_is_assembled(self, monkeypatch):
+        """Byte-at-a-time delivery still assembles — the loop has no read cap."""
+        raw = json.dumps({"servers": [{"name": "io.github.a/one"}]}).encode("utf-8")
+        _serve(monkeypatch, *[raw[i : i + 1] for i in range(len(raw))])
+
+        doc = await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+        assert doc == {"servers": [{"name": "io.github.a/one"}]}
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_rejected_mid_stream(self, monkeypatch):
+        """The cap applies to the accumulated total and stops the read early."""
+        monkeypatch.setattr(official_mod, "_MAX_RESPONSE_BYTES", 1024)
+        response = _serve(monkeypatch, *[b"x" * 512] * 20)
+
+        with pytest.raises(ProviderUnavailableError, match="too large"):
+            await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+        assert response.content.undelivered > 0, "read should abort, not drain the body"
+
+    @pytest.mark.asyncio
+    async def test_body_at_exact_cap_is_accepted(self, monkeypatch):
+        """A body exactly at the cap is not over it."""
+        raw = json.dumps({"servers": []}).encode("utf-8")
+        monkeypatch.setattr(official_mod, "_MAX_RESPONSE_BYTES", len(raw))
+        _serve(monkeypatch, raw[:2], raw[2:])
+
+        assert await official_mod._fetch_json("https://registry.example/v0.1/servers") == {
+            "servers": []
+        }
+
+    @pytest.mark.asyncio
+    async def test_404_returns_none_without_reading(self, monkeypatch):
+        """A missing entry is None, distinct from an unreachable registry."""
+        response = _serve(monkeypatch, b"not json", status=404)
+
+        assert await official_mod._fetch_json("https://registry.example/v0.1/servers") is None
+        assert response.content.reads == 0
+
+    @pytest.mark.asyncio
+    async def test_truncated_body_surfaces_as_provider_unavailable(self, monkeypatch):
+        """A genuinely malformed document is a provider failure, not a crash."""
+        _serve(monkeypatch, b'{"servers": [{"name": "io.git')
+
+        with pytest.raises(ProviderUnavailableError):
+            await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+    @pytest.mark.asyncio
+    async def test_env_proxy_is_passed_to_request(self, monkeypatch):
+        """Behind an HTTP(S) proxy, the request is sent through it.
+
+        aiohttp does not read HTTP(S)_PROXY unless trust_env=True (which also
+        enables the ~/.netrc Basic-auth path), so the provider resolves the
+        proxy from the environment itself and passes it as ``proxy=``.
+        """
+        raw = json.dumps({"servers": []}).encode("utf-8")
+        response = _serve(monkeypatch, raw)
+        monkeypatch.setattr(
+            http_proxy.urllib.request,
+            "getproxies",
+            lambda: {"https": "http://proxy.example:3128"},
+        )
+        # Pinned so a bypass list on the host running the test cannot decide it.
+        monkeypatch.setattr(http_proxy.urllib.request, "proxy_bypass", lambda _host: False)
+
+        await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+        assert response.sessions[0].get_kwargs["proxy"] == "http://proxy.example:3128"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("no_proxy", "expected"),
+        [
+            ("registry.example", None),
+            (".example", None),
+            ("*", None),
+            ("other.example", "http://proxy.example:3128"),
+        ],
+    )
+    async def test_no_proxy_host_is_fetched_directly(self, monkeypatch, no_proxy, expected):
+        """NO_PROXY keeps its meaning: a listed registry host goes direct.
+
+        Driven through the real environment, so ``getproxies`` and the bypass
+        check read the same variables; a host NO_PROXY does not list still
+        goes through the proxy.
+        """
+        for name in ("http_proxy", "https_proxy", "no_proxy", "all_proxy"):
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.upper(), raising=False)
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+        monkeypatch.setenv("NO_PROXY", no_proxy)
+        monkeypatch.setattr(
+            http_proxy.urllib.request,
+            "getproxies",
+            http_proxy.urllib.request.getproxies_environment,
+        )
+        monkeypatch.setattr(
+            http_proxy.urllib.request,
+            "proxy_bypass",
+            http_proxy.urllib.request.proxy_bypass_environment,
+        )
+        raw = json.dumps({"servers": []}).encode("utf-8")
+        response = _serve(monkeypatch, raw)
+
+        await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+        assert response.sessions[0].get_kwargs["proxy"] == expected
+
+    @pytest.mark.asyncio
+    async def test_no_env_proxy_passes_none(self, monkeypatch):
+        """With no proxy configured, nothing changes — a direct request."""
+        raw = json.dumps({"servers": []}).encode("utf-8")
+        response = _serve(monkeypatch, raw)
+        monkeypatch.setattr(http_proxy.urllib.request, "getproxies", lambda: {})
+
+        await official_mod._fetch_json("https://registry.example/v0.1/servers")
+
+        assert response.sessions[0].get_kwargs["proxy"] is None
+
+
+# ---------------------------------------------------------------------------
 # Registry fan-out
 # ---------------------------------------------------------------------------
 
@@ -432,6 +648,23 @@ class TestRegistryFanOut:
         assert [r.id for r in results] == ["f1"]
 
     @pytest.mark.asyncio
+    async def test_search_outcomes_report_timeout_without_dropping_results(self, monkeypatch):
+        from kiro_crew.mcp_providers import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_SEARCH_TIMEOUT_SECS", 0.05)
+        registry = ProviderRegistry()
+        registry.register(_StubProvider("slow", [_result("slow", "s1")], delay=1.0))
+        registry.register(_StubProvider("fast", [_result("fast", "f1")]))
+
+        response = await registry.search_with_outcomes("query")
+
+        assert [r.id for r in response.results] == ["f1"]
+        assert [(o.name, o.status) for o in response.provider_outcomes] == [
+            ("slow", "timeout"),
+            ("fast", "ok"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_unavailable_provider_skipped(self):
         registry = ProviderRegistry()
         registry.register(_StubProvider("off", [_result("off", "x")], available=False))
@@ -459,6 +692,24 @@ class TestRegistryFanOut:
         registry.register(_StubProvider("ok", [_result("ok", "k1")]))
         results = await registry.search("query")
         assert [r.id for r in results] == ["k1"]
+
+    @pytest.mark.asyncio
+    async def test_search_outcomes_report_provider_error(self):
+        class _Boom(_StubProvider):
+            async def search(self, query: str, *, limit: int = 20):
+                raise RuntimeError("kaput")
+
+        registry = ProviderRegistry()
+        registry.register(_Boom("boom"))
+        registry.register(_StubProvider("ok", [_result("ok", "k1")]))
+
+        response = await registry.search_with_outcomes("query")
+
+        assert [r.id for r in response.results] == ["k1"]
+        assert [(o.name, o.status) for o in response.provider_outcomes] == [
+            ("boom", "error"),
+            ("ok", "ok"),
+        ]
 
 
 # ---------------------------------------------------------------------------

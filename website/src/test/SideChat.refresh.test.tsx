@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
+import dashboardReducer from '../store/dashboardSlice'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import chatReducer from '../store/chatSlice'
 import SideChat from '../pages/chat/SideChat'
+import { ApiError } from '../api/apiError'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -48,8 +50,13 @@ function makeStore(parentMessages: Array<{ role: string; content: string }> = []
     },
   }
   return configureStore({
-    reducer: { chat: chatReducer },
-    preloadedState: preloaded as never,
+    // SideChat reads the gateway flag through useConnected (s.dashboard.connected),
+    // so the store needs the dashboard slice; preload it connected so sends work.
+    reducer: { chat: chatReducer, dashboard: dashboardReducer },
+    preloadedState: {
+      ...(preloaded as object),
+      dashboard: { ...dashboardReducer(undefined, { type: '@@INIT' }), connected: true },
+    } as never,
   })
 }
 
@@ -109,7 +116,12 @@ describe('SideChat stale-context banner', () => {
 
   it('rolls back optimistic user bubble when sendMutation rejects', async () => {
     const { api } = await import('../api/client')
-    vi.mocked(api.sideTurn).mockRejectedValueOnce(new Error('side turn already in flight'))
+    // A server refusal is an `ApiError` (non-2xx). A bare `Error` after
+    // `/side/turn` was dispatched is indeterminate under the transport contract
+    // (the request may have been taken and only the answer lost), so it keeps
+    // the bubble pending instead of inviting a duplicate -- that path is pinned
+    // by SideChat.sendReceipt.test.tsx.
+    vi.mocked(api.sideTurn).mockRejectedValueOnce(new ApiError(409, 'side turn already in flight', ''))
     const store = makeStore(
       [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }],
     )

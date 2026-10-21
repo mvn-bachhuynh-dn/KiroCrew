@@ -2,16 +2,14 @@
 """Local result-record store.
 
 One JSON file per reviewed change under ``data/results/``. This is the loop's
-output and the Focus Report's input — the durable source of truth. Writes are
+output and standalone report input; automatic runs retain accepted snapshots. Writes are
 atomic (temp + ``os.replace``) and mode ``0600`` (results may quote private
 diff snippets). Records follow the findings JSON contract in the skill.
 """
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 import threading
 from pathlib import Path
 
@@ -73,17 +71,7 @@ def write_reviewed(index: dict, root: Path | None = None) -> Path:
     store.ensure_layout(root)
     path = reviewed_path(root)
     data = json.dumps(index, indent=2).encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    store.atomic_write_locked(path, data)
     return path
 
 
@@ -142,9 +130,9 @@ def validate_result(record: dict) -> list[str]:
         # text (gate_verdict, design_risk, criticality, design_headline, problem,
         # why_it_matters, solution_assessment), and the readers consume them as
         # text: `.strip()` in classify, `html.escape()` in the renderer. Accepting
-        # a number here let both crash on a record this function had approved --
-        # and it also skipped the verdict-vocabulary check below, because that
-        # check used to be guarded by an isinstance() test that a number failed.
+        # a number here would let both crash on a record this function approved --
+        # and it would also skip the verdict-vocabulary check below, which is
+        # guarded by an isinstance() test that a number fails.
         # Refusing the record is the fail-closed direction: a numeric phase1 value
         # is malformed per the contract, and a rejected record is re-reviewed
         # rather than rendered half-broken.
@@ -158,16 +146,16 @@ def validate_result(record: dict) -> list[str]:
         # so execution reaches this line with the bad value still in hand, and
         # `not in VALID_VERDICTS` tests a SET — an unhashable list/dict would raise
         # TypeError inside the validator whose whole job is to report malformed
-        # records. It is no longer a hole the way it was under the "any scalar" rule:
-        # every non-string value now fails the string check above, so the guard only
-        # suppresses a duplicate complaint, never the only one.
+        # records. It is not a hole, because every non-string value fails the string
+        # check above, so the guard only suppresses a duplicate complaint, never the
+        # only one.
         if isinstance(p1.get("gate_verdict"), (str, type(None))) \
                 and p1.get("gate_verdict") not in VALID_VERDICTS:
             errs.append(f"phase1.gate_verdict must be one of {sorted(VALID_VERDICTS)}")
     findings = record.get("findings", [])
-    if findings and not isinstance(findings, list):
+    if not isinstance(findings, list):
         errs.append("findings must be a list")
-    elif isinstance(findings, list):
+    else:
         # Every entry is dereferenced as an object downstream (`_redact_finding`,
         # then `f.get("severity"/"file"/"line"/...)` when rendering), so a
         # non-object entry raises AttributeError mid-report rather than being
@@ -199,8 +187,8 @@ def validate_result(record: dict) -> list[str]:
             # `line` is checked in the loop above rather than here, so a missing key
             # and a wrong-typed one produce one message each, not two for the latter.
             # The renderer and every consumer treat it as a line number, and the
-            # report redactor no longer exempts it -- a credential written into it as
-            # a string used to ride that exemption to the dashboard.
+            # report redactor does not exempt it -- a credential written into it as a
+            # string would ride such an exemption to the dashboard.
     # `counts` and `blast_radius` are read with `.get()` in pipeline.py,
     # report.py and review_driver.py. A worker that wrote either as a list or a
     # scalar passed validation, was adopted, and then aborted the run with an
@@ -236,29 +224,43 @@ def validate_result(record: dict) -> list[str]:
     return errs
 
 
+def _encode_capped(record: dict) -> bytes:
+    """Serialize ``record`` exactly as ``json.dumps(record, indent=2)`` would,
+    but stop as soon as the output passes ``_RECORD_MAX_BYTES``. Raises ValueError.
+
+    Records carry worker-written fields (``extra``), and indentation multiplies
+    a deeply nested value many times over. Building the whole string before
+    checking its size let a ~1 MB worker response expand to tens of megabytes
+    first, so a memory-limited host raised MemoryError instead of this
+    ValueError. Streaming keeps peak memory near the cap.
+    """
+    parts: list[bytes] = []
+    size = 0
+    for chunk in json.JSONEncoder(indent=2).iterencode(record):
+        piece = chunk.encode("utf-8")
+        size += len(piece)
+        if size > _RECORD_MAX_BYTES:
+            raise ValueError(
+                f"serialized result record exceeds durable reader limit "
+                f"({_RECORD_MAX_BYTES} bytes)"
+            )
+        parts.append(piece)
+    return b"".join(parts)
+
+
 def write_result(record: dict, root: Path | None = None,
                  run_id: str | None = None) -> Path:
     """Validate then atomically write the record (mode 0600). Raises ValueError."""
     errs = validate_result(record)
     if errs:
         raise ValueError("invalid result record: " + "; ".join(errs))
+    data = _encode_capped(record)
     if run_id:
         store.ensure_run_layout(run_id, root)
     else:
         store.ensure_layout(root)
     path = result_path(record["change_id"], root, run_id)
-    data = json.dumps(record, indent=2).encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)  # always close the fd, even if os.write raised
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    store.atomic_write_locked(path, data)
     return path
 
 
@@ -326,62 +328,8 @@ def clear_results(root: Path | None = None, run_id: str | None = None) -> int:
     return removed
 
 
-# --- Bridging the worker's write path to the run's read path ------------------
-# The reviewing worker writes ``data/results/<change-id>.json`` — that path is
-# part of the prompt contract and of the `sage-review` skill, and the worker has
-# no notion of a run id. The DRIVER owns run scoping, so it moves each record
-# into the run's private dir once the turn ends.
-#
-# The shared dir is safe as a staging area despite concurrent runs: records are
-# keyed by change id, and the backend's in-flight claim registry guarantees two
-# live runs never hold the same change.
-
-def clear_staged(change_ids, root: Path | None = None) -> int:
-    """Remove the SHARED staging records for the given changes.
-
-    The shared dir is the worker's write path and the driver's adoption source, so
-    a record left there by a crashed run is indistinguishable from one the current
-    worker just wrote. Callers sweep their own keys before dispatch; only the keys
-    named here are touched, so a concurrent run's staging is left alone.
-
-    Takes change IDS (the caller owns the link -> id derivation; deriving it here
-    would import the driver and close an import cycle).
-    """
-    shared = results_dir(root, None)
-    removed = 0
-    for cid in change_ids or ():
-        p = shared / f"{safe_change_id(str(cid))}.json"
-        try:
-            p.unlink()
-            removed += 1
-        except OSError:
-            pass
-    return removed
-
-
-def stake_shared(change_id: str, root: Path | None = None) -> bool:
-    """Clear this change's shared slot. True == it is now empty and safe to adopt from.
-
-    Adoption cannot tell WHO wrote the file it adopts: the payload check only proves the
-    record names this change, and any reviewer worker can write any change's path in the
-    shared dir. So a record present before this change's own reviewer is dispatched has no
-    claim to be this change's findings -- it is a leftover from an earlier run or a plant
-    from another worker, and adopting it would attribute someone else's text to this pull
-    request.
-
-    Unlinked with ``os.unlink``, which removes a link without following it, so a symlink
-    planted at the path is discarded rather than dereferenced. Returning False (the slot
-    could not be cleared) tells the driver not to trust whatever turns up there.
-    """
-    path = result_path(change_id, root, None)
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass                      # already empty, which is the state we want
-    except OSError:
-        return False              # still occupied by something we cannot remove
-    return True
-
+# Posters use the shared path named in their prompt. Adoption transports their
+# delivery metadata; it does not authenticate review findings.
 
 def adopt_from_shared(change_id: str, root: Path | None = None,
                       run_id: str | None = None) -> bool:
@@ -429,12 +377,12 @@ def adopt_from_shared(change_id: str, root: Path | None = None,
             str(src), str(shared), max_bytes=_RECORD_MAX_BYTES)
     if raw is None:
         return False
-    # Validate BEFORE touching the destination. Round 13 replaced an atomic
-    # os.replace with an O_TRUNC write to close a symlink hole, and in doing so
-    # gave up all-or-nothing semantics: a malformed payload truncated whatever
-    # valid record was already there, and read_result then raised on the wreckage
-    # so no retry could recover it. Parse first, and only a record that is really
-    # for THIS change is allowed to land.
+    # Validate BEFORE touching the destination. The publish is an O_TRUNC write
+    # rather than an atomic os.replace, to close a symlink hole, so it has no
+    # all-or-nothing semantics: a malformed payload truncates whatever valid record
+    # is already there, and read_result then raises on the wreckage so no retry can
+    # recover it. Parse first, and only a record that is really for THIS change is
+    # allowed to land.
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -466,22 +414,10 @@ def adopt_from_shared(change_id: str, root: Path | None = None,
     # Write a private temp file in the destination directory, then rename over
     # the name: atomic, so a valid record is never destroyed by a failed write,
     # and the rename replaces the NAME without following a link planted there.
-    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(dir=str(dst.parent), prefix=".adopt-", suffix=".json")
-        with open(fd, "wb") as fh:
-            fh.write(raw)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, dst)
-        tmp = None
+        store.atomic_write_locked(dst, raw)
     except OSError:
         return False
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
     try:
         src.unlink()
     except OSError:
@@ -513,7 +449,6 @@ def publish_to_shared(change_id: str, root: Path | None = None,
     store.ensure_layout(root)
     shared = results_dir(root, None)
     dst = shared / f"{safe_change_id(change_id)}.json"
-    tmp = None
     try:
         # Read through the same no-follow guard the adoption direction uses. The
         # RUN results dir is worker-writable too, so a worker that replaced its
@@ -529,18 +464,7 @@ def publish_to_shared(change_id: str, root: Path | None = None,
                 max_bytes=_RECORD_MAX_BYTES)
         if raw is None:
             return False
-        fd, tmp = tempfile.mkstemp(dir=str(shared), prefix=".publish-", suffix=".json")
-        with open(fd, "wb") as fh:
-            fh.write(raw)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, dst)
-        tmp = None
+        store.atomic_write_locked(dst, raw)
     except OSError:
         return False
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
     return True

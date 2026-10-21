@@ -1,279 +1,76 @@
-"""Tests for speech-to-text transcription feature."""
+"""Tests for speech-to-text transcription of whole audio files.
+
+Three providers reach this module: the resident local recogniser (the default),
+Apple's on-device speech, and AWS Transcribe. Everything a test here needs about
+the recogniser is stubbed at the ``kiro_crew.stt`` seam, because the point of the
+batch path is what it does with an availability answer and a PCM buffer, not how
+whisper.cpp decodes one.
+
+This file holds availability, the local recogniser's language and WAV input,
+the Slack voice-memo adapter, ``SttConfig``, and the two provider-independent
+guards. The sibling ``test_transcribe_*.py`` files hold the rest:
+``transcribe_audio``'s providers (``test_transcribe_providers.py``), the ffmpeg
+decoder (``test_transcribe_ffmpeg.py``) and long recordings
+(``test_transcribe_segments.py``); ``transcribe_helpers.py`` holds the WAV
+builders the family shares.
+"""
 
 from __future__ import annotations
 
-import asyncio
+import importlib.machinery
+import importlib.util
 import os
-from pathlib import Path
-from types import SimpleNamespace
+import sys
+import types
+import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
-
-from kiro_crew import platform_compat as _pc
-from kiro_crew.config.loader import SttConfig
-from kiro_crew.transcribe import (
-    BREW_PATH_DIRS,
-    _find_mlx_whisper,
-    _find_whisper,
-    _is_openai_whisper,
-    _ProfileCredentialResolver,
-    find_brew,
-    is_available,
-    transcribe_audio,
+from transcribe_helpers import (
+    _ramp_int16,
+    _write_wav,
 )
 
-# ---------------------------------------------------------------------------
-# _find_whisper
-# ---------------------------------------------------------------------------
+from kiro_crew import stt, transcribe
+from kiro_crew.config.loader import SttConfig
+from kiro_crew.transcribe import availability_detail, find_brew, is_available, transcribe_audio
 
 
-def _no_own_venv(monkeypatch) -> None:
-    """Neutralize the running interpreter's own scripts dir.
+def _stub_recogniser_importable(monkeypatch) -> None:
+    """Make ``engine.probe()`` find a recogniser on a host without the extra.
 
-    ``_find_whisper`` probes it (that is what makes an install into the app's own
-    venv work), and on a dev machine that directory really does contain a
-    ``whisper`` — so a test isolating any LATER probe has to switch it off or it
-    never gets there. Same reason these tests already stub ``shutil.which`` and
-    ``_python3_bin_dir``.
+    ``probe`` asks two separate questions -- is it INSTALLED (`find_spec`) and does it
+    IMPORT -- so the stub has to satisfy both. A bare `types.ModuleType` has
+    ``__spec__ = None``, which makes `find_spec` raise ``ValueError`` rather than
+    report the module present, so each stub carries a real spec.
     """
-    monkeypatch.setattr("kiro_crew.transcribe._own_scripts_dir", lambda: "")
+    for name in ("pywhispercpp", "pywhispercpp.model"):
+        module = types.ModuleType(name)
+        module.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+        monkeypatch.setitem(sys.modules, name, module)
 
 
-class TestFindWhisper:
-    def test_configured_path_exists(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        assert _find_whisper(str(binary)) == str(binary)
+def _stub_recogniser_absent(monkeypatch) -> None:
+    """Make the recogniser look NOT INSTALLED, which is what `find_spec` answers.
 
-    def test_configured_path_missing(self):
-        assert _find_whisper("/nonexistent/whisper") is None
-
-    def test_configured_path_not_executable(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("data")
-        binary.chmod(0o644)
-        assert _find_whisper(str(binary)) is None
-
-    def test_empty_path_uses_which(self):
-        with patch("kiro_crew.transcribe.shutil.which", return_value="/usr/bin/whisper"):
-            assert _find_whisper("") == "/usr/bin/whisper"
-
-    def test_empty_path_which_none_checks_search_paths(self, tmp_path, monkeypatch):
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            _no_own_venv(monkeypatch)
-            monkeypatch.setattr("kiro_crew.transcribe._WHISPER_SEARCH_PATHS", [str(tmp_path / "w")])
-            assert _find_whisper("") is None
-
-    def test_finds_whisper_installed_into_our_own_venv(self, tmp_path, monkeypatch):
-        """``pip install openai-whisper`` inside the app's venv must be enough.
-
-        Nothing else in the search order looks there: ``shutil.which`` only sees
-        PATH (a venv is on PATH only after ``activate``, and the gateway runs as
-        ``<venv>/bin/kirocrew``), and ``_python3_bin_dir`` deliberately asks the
-        SYSTEM python3. So the obvious install left ``is_available()`` False, with
-        no fix but setting ``stt.whisper_path`` by hand.
-        """
-        venv_bin = tmp_path / "venv" / "bin"
-        venv_bin.mkdir(parents=True)
-        binary = venv_bin / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        monkeypatch.setattr("kiro_crew.transcribe.sys.executable", str(venv_bin / "python"))
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            monkeypatch.setattr("kiro_crew.transcribe._WHISPER_SEARCH_PATHS", [])
-            monkeypatch.setattr("kiro_crew.transcribe._python3_bin_dir", lambda: "")
-            assert _find_whisper("") == str(binary)
-
-    def test_our_venv_is_preferred_over_the_system_python(self, tmp_path, monkeypatch):
-        """Both present: the environment the caller installed into wins.
-
-        Picking the system one would run a DIFFERENT Whisper than the operator
-        just installed — a silently wrong version, or a missing model cache.
-        """
-        venv_bin = tmp_path / "venv" / "bin"
-        venv_bin.mkdir(parents=True)
-        ours = venv_bin / "whisper"
-        ours.write_text("#!/bin/sh\n")
-        ours.chmod(0o755)
-        sys_bin = tmp_path / "system" / "bin"
-        sys_bin.mkdir(parents=True)
-        theirs = sys_bin / "whisper"
-        theirs.write_text("#!/bin/sh\n")
-        theirs.chmod(0o755)
-
-        monkeypatch.setattr("kiro_crew.transcribe.sys.executable", str(venv_bin / "python"))
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            monkeypatch.setattr("kiro_crew.transcribe._WHISPER_SEARCH_PATHS", [])
-            monkeypatch.setattr("kiro_crew.transcribe._python3_bin_dir", lambda: str(sys_bin))
-            assert _find_whisper("") == str(ours)
-
-    def test_path_still_wins_over_the_venv(self, tmp_path, monkeypatch):
-        """A whisper already on PATH is what the operator chose; do not override it."""
-        venv_bin = tmp_path / "venv" / "bin"
-        venv_bin.mkdir(parents=True)
-        (venv_bin / "whisper").write_text("#!/bin/sh\n")
-        (venv_bin / "whisper").chmod(0o755)
-        monkeypatch.setattr("kiro_crew.transcribe.sys.executable", str(venv_bin / "python"))
-        with patch("kiro_crew.transcribe.shutil.which", return_value="/usr/bin/whisper"):
-            assert _find_whisper("") == "/usr/bin/whisper"
-
-    def test_empty_path_finds_in_search_paths(self, tmp_path, monkeypatch):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            _no_own_venv(monkeypatch)
-            monkeypatch.setattr("kiro_crew.transcribe._WHISPER_SEARCH_PATHS", [str(binary)])
-            assert _find_whisper("") == str(binary)
-
-    def test_tilde_expansion(self, tmp_path, monkeypatch):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        monkeypatch.setenv("HOME", str(tmp_path))
-        assert _find_whisper("~/whisper") == str(binary)
-
-    def test_scripts_dir_fallback_finds_dot_exe_on_windows(self, tmp_path, monkeypatch):
-        """Regression: a pip console script is ``whisper.exe`` in Scripts\\ on
-        Windows; the extensionless probe never found it. The suffix sweep must.
-        """
-        scripts = tmp_path / "Scripts"
-        scripts.mkdir()
-        exe = scripts / "whisper.exe"
-        exe.write_text("")  # no execute bit on Windows
-        monkeypatch.setattr("kiro_crew.transcribe.platform_compat.IS_WINDOWS", True)
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            _no_own_venv(monkeypatch)
-            monkeypatch.setattr("kiro_crew.transcribe._python3_bin_dir", lambda: str(scripts))
-            monkeypatch.setattr("kiro_crew.transcribe._WHISPER_SEARCH_PATHS", [])
-            assert _find_whisper("") == str(exe)
-
-
-# ---------------------------------------------------------------------------
-# _is_openai_whisper — the --fp16 gate (issue #1896)
-# ---------------------------------------------------------------------------
-
-
-class TestIsOpenaiWhisper:
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "whisper",
-            "/usr/bin/whisper",
-            "/opt/homebrew/bin/whisper",
-            "whisper.exe",  # Windows console script — .stem drops the suffix
-            "/usr/bin/WHISPER",  # case-insensitive
-        ],
-    )
-    def test_reference_binary_is_openai(self, path):
-        assert _is_openai_whisper(path) is True
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "whisper-ctranslate2",
-            "/usr/local/bin/whisper-ctranslate2",
-            "/home/u/.local/bin/faster-whisper",
-            "/usr/bin/whisperx",
-            "/opt/whisper-cpp/main",
-        ],
-    )
-    def test_dropin_engines_are_not_openai(self, path):
-        assert _is_openai_whisper(path) is False
-
-
-# ---------------------------------------------------------------------------
-# _transcribe_native --fp16 gating end-to-end (issue #1896)
-# ---------------------------------------------------------------------------
-
-
-class TestNativeFp16Gating:
-    """``--fp16 False`` must reach openai-whisper but never a drop-in engine.
-
-    Passing it to whisper-ctranslate2 makes the CLI exit rc=2 and the user sees
-    a silent empty transcript, so the flag is gated on the resolved binary name.
+    Absence has to be simulated at the finder rather than by making the import raise.
+    Those are different states with different next actions, and conflating them
+    reported an installed-but-unloadable wheel (missing system library, too-old
+    glibc) as "install the voice extra" to someone who already had.
     """
+    from kiro_crew.stt import engine as engine_mod
 
-    async def _run_native(self, tmp_path, whisper_bin: str) -> list:
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, provider="whisper", timeout_secs=10)
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-        captured: dict = {}
-
-        async def fake_exec(*args, **kwargs):
-            captured["args"] = list(args)
-            out_dir = args[args.index("--output_dir") + 1]
-            Path(out_dir).joinpath("test.txt").write_text("hello world")
-            return mock_proc
-
-        with patch("kiro_crew.transcribe._find_whisper", return_value=whisper_bin):
-            with patch(
-                "kiro_crew.transcribe.asyncio.create_subprocess_exec", side_effect=fake_exec
-            ):
-                result = await transcribe_audio(str(audio), cfg)
-        assert result == "hello world"
-        return captured["args"]
-
-    @pytest.mark.asyncio
-    async def test_openai_whisper_gets_fp16(self, tmp_path):
-        args = await self._run_native(tmp_path, "/usr/bin/whisper")
-        assert "--fp16" in args
-        assert args[args.index("--fp16") + 1] == "False"
-
-    @pytest.mark.asyncio
-    async def test_dropin_engine_omits_fp16(self, tmp_path):
-        args = await self._run_native(tmp_path, "/usr/local/bin/whisper-ctranslate2")
-        assert "--fp16" not in args
-        # The rest of the invocation is unchanged — the engine still gets its model/output flags.
-        assert "--model" in args and "--output_format" in args
+    monkeypatch.setattr(engine_mod.importlib.util, "find_spec", lambda name: None)
 
 
-# ---------------------------------------------------------------------------
-# _find_mlx_whisper
-# ---------------------------------------------------------------------------
-
-
-class TestFindMlxWhisper:
-    def test_found_on_path(self):
-        with patch("kiro_crew.transcribe.shutil.which", return_value="/usr/local/bin/mlx_whisper"):
-            assert _find_mlx_whisper() == "/usr/local/bin/mlx_whisper"
-
-    def test_not_found(self, monkeypatch):
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            monkeypatch.setattr("kiro_crew.transcribe._python3_bin_dir", lambda: "")
-            monkeypatch.setattr("kiro_crew.transcribe._MLX_WHISPER_SEARCH_PATHS", ["/nonexistent"])
-            assert _find_mlx_whisper() is None
-
-    def test_found_in_search_paths(self, tmp_path, monkeypatch):
-        binary = tmp_path / "mlx_whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            monkeypatch.setattr("kiro_crew.transcribe._python3_bin_dir", lambda: "")
-            monkeypatch.setattr(
-                "kiro_crew.transcribe._MLX_WHISPER_SEARCH_PATHS", [str(binary)]
-            )
-            assert _find_mlx_whisper() == str(binary)
-
-
-# ---------------------------------------------------------------------------
-# find_brew
-# ---------------------------------------------------------------------------
 class TestFindBrew:
     """A GUI-launched gateway inherits PATH=/usr/bin:/bin:/usr/sbin:/sbin, so
     ``shutil.which("brew")`` reports Homebrew MISSING on a machine that has it.
     ``find_brew`` falls back to the fixed install prefixes."""
 
     def test_found_on_path(self):
-        with patch(
-            "kiro_crew.transcribe.shutil.which", return_value="/opt/homebrew/bin/brew"
-        ):
+        with patch("kiro_crew.transcribe.shutil.which", return_value="/opt/homebrew/bin/brew"):
             assert find_brew() == "/opt/homebrew/bin/brew"
 
     def test_found_off_path_via_prefix(self, tmp_path, monkeypatch):
@@ -281,46 +78,22 @@ class TestFindBrew:
         brew.write_text("#!/bin/sh\n")
         brew.chmod(0o755)
         with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            monkeypatch.setattr(
-                "kiro_crew.transcribe._BREW_CANDIDATE_PATHS", [str(brew)]
-            )
+            monkeypatch.setattr("kiro_crew.transcribe._BREW_CANDIDATE_PATHS", [str(brew)])
             assert find_brew() == str(brew)
 
     def test_not_installed(self, monkeypatch):
         with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            monkeypatch.setattr(
-                "kiro_crew.transcribe._BREW_CANDIDATE_PATHS", ["/nonexistent/brew"]
-            )
+            monkeypatch.setattr("kiro_crew.transcribe._BREW_CANDIDATE_PATHS", ["/nonexistent/brew"])
             assert find_brew() is None
-
-    def test_path_dirs_cover_both_mac_prefixes_and_pipx_bin(self):
-        """The shell-side list must cover Intel + Apple Silicon brew and the
-        ``~/.local/bin`` dir pipx installs ``mlx_whisper`` into."""
-        assert "/opt/homebrew/bin" in BREW_PATH_DIRS
-        assert "/usr/local/bin" in BREW_PATH_DIRS
-        assert os.path.expanduser("~/.local/bin") in BREW_PATH_DIRS
-        # Expanded, not left as a shell variable — the script quotes each entry.
-        assert not any(d.startswith("$") or d.startswith("~") for d in BREW_PATH_DIRS)
 
 
 # ---------------------------------------------------------------------------
-# is_available
+# availability_detail / is_available
 # ---------------------------------------------------------------------------
 class TestIsAvailable:
     def test_disabled(self):
         cfg = SttConfig(enabled=False)
         assert is_available(cfg) is False
-
-    def test_enabled_no_binary(self):
-        cfg = SttConfig(enabled=True, whisper_path="/nonexistent")
-        assert is_available(cfg) is False
-
-    def test_enabled_with_binary(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        cfg = SttConfig(enabled=True, whisper_path=str(binary))
-        assert is_available(cfg) is True
 
     def test_loads_config_when_none(self):
         mock_cfg = MagicMock()
@@ -328,345 +101,387 @@ class TestIsAvailable:
         with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=mock_cfg):
             assert is_available(None) is False
 
-    def test_mlx_available_when_binary_found(self):
-        cfg = SttConfig(enabled=True, provider="mlx")
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value="/usr/bin/mlx_whisper"):
-            assert is_available(cfg) is True
 
-    def test_mlx_unavailable_when_binary_missing(self):
-        cfg = SttConfig(enabled=True, provider="mlx")
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value=None):
-            assert is_available(cfg) is False
+class TestAvailabilityDetail:
+    """One shape for all three providers, and one code per distinct next action.
+
+    "Install an extra", "your platform has no prebuilt wheel" and "this needs a
+    newer macOS" lead the user somewhere different, so each is pinned separately:
+    collapsing them into a boolean is what makes voice input feel broken rather
+    than unconfigured. The codes themselves travel to the browser in JSON and
+    select the message the dashboard renders, so they are pinned as literals via
+    the constants that own them.
+    """
+
+    @staticmethod
+    def _detail(cfg) -> stt.Availability:
+        """The detailed answer, having checked the boolean view agrees with it.
+
+        ``is_available`` is derived from ``availability_detail`` rather than
+        implemented beside it, and the pair that disagrees hands a caller a 503
+        for a provider the settings panel is showing as ready. Asserted on every
+        case below, so a re-implementation of either cannot pass.
+        """
+        detail = availability_detail(cfg)
+        assert is_available(cfg) is detail.ok
+        return detail
+
+    def test_disabled_is_a_choice_not_a_fault(self):
+        """Its own code, because "you turned this off" and "this cannot run here"
+        are not the same report and only one of them is worth a fix hint."""
+        detail = self._detail(SttConfig(enabled=False))
+        assert detail.ok is False
+        assert detail.code == transcribe.CODE_DISABLED
+        assert detail.detail
+
+    def test_local_missing_extra(self, monkeypatch):
+        """The recogniser wheel is absent on a default install."""
+        _stub_recogniser_absent(monkeypatch)
+        detail = self._detail(SttConfig(enabled=True, provider="local"))
+        assert detail.ok is False
+        assert detail.code == stt.CODE_EXTRA_MISSING
+        # The recogniser distribution, not the extra name: `kirocrew[voice]` is
+        # not installable from any index.
+        assert "pywhispercpp" in detail.detail
+        assert "kirocrew[" not in detail.detail
+
+    def test_local_no_wheel_for_platform(self, monkeypatch):
+        """A platform with no published wheel means "install a C++ toolchain",
+        not "install the extra"."""
+        from kiro_crew.stt import engine as engine_mod
+
+        _stub_recogniser_absent(monkeypatch)
+        monkeypatch.setattr(engine_mod, "_has_prebuilt_wheel", lambda: False)
+        detail = self._detail(SttConfig(enabled=True, provider="local"))
+        assert detail.ok is False
+        assert detail.code == stt.CODE_NO_WHEEL
+
+    def test_local_import_failed(self, monkeypatch):
+        """An installed wheel that will not load (missing system library,
+        incompatible CPU baseline) is a third state: nothing to install, and the
+        loader's own message is the only useful thing to show."""
+
+        class _ExplodingFinder:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".")[0] == "pywhispercpp":
+                    raise RuntimeError("dlopen failed: libwhisper")
+                return None
+
+        monkeypatch.delitem(sys.modules, "pywhispercpp", raising=False)
+        monkeypatch.delitem(sys.modules, "pywhispercpp.model", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [_ExplodingFinder(), *sys.meta_path])
+        detail = self._detail(SttConfig(enabled=True, provider="local"))
+        assert detail.ok is False
+        assert detail.code == stt.CODE_IMPORT_FAILED
+        assert "dlopen failed: libwhisper" in detail.detail
+
+    def test_local_ok_ignores_a_model_that_is_not_downloaded(self, monkeypatch):
+        """A missing model is deliberately NOT part of the answer.
+
+        It resolves itself on first use, so reporting it as unavailable would hide
+        a working install behind a condition that fixes itself. ``models_dir`` is
+        under the per-test data home and holds nothing, so the configured model is
+        genuinely absent here.
+        """
+        from kiro_crew.stt import models
+
+        _stub_recogniser_importable(monkeypatch)
+        cfg = SttConfig(enabled=True, provider="local", model="base")
+        assert models.is_present(models.resolve(cfg.model)) is False
+        detail = self._detail(cfg)
+        assert detail.ok is True
+        assert detail.code == stt.CODE_OK
+
+    def test_transcribe_without_boto3(self, monkeypatch):
+        monkeypatch.setattr(transcribe, "boto3", None)
+        detail = self._detail(SttConfig(enabled=True, provider="transcribe"))
+        assert detail.ok is False
+        assert detail.code == stt.CODE_EXTRA_MISSING
+        # The cloud half by name, and never the unresolvable extras form.
+        assert "amazon-transcribe" in detail.detail
+        assert "kirocrew[" not in detail.detail
+
+    def test_transcribe_without_the_streaming_client(self, monkeypatch):
+        """boto3 alone is not enough: the streaming client is a separate package
+        in the same extra, and its absence must report the same fix."""
+        monkeypatch.setattr(transcribe, "boto3", object())
+        monkeypatch.setitem(sys.modules, "amazon_transcribe", None)
+        detail = self._detail(SttConfig(enabled=True, provider="transcribe"))
+        assert detail.ok is False
+        assert detail.code == stt.CODE_EXTRA_MISSING
+
+    def test_transcribe_ok_does_not_consult_consent(self, monkeypatch):
+        """Consent is checked where audio would leave the host, not here.
+
+        This predicate is polled (once per inbound Slack message, on every
+        settings read) and a refusal writes an audit entry, so asking here would
+        fill the audit log with refusals nobody requested.
+        """
+        from kiro_crew import aws_consent
+
+        monkeypatch.setattr(transcribe, "boto3", object())
+        monkeypatch.setitem(sys.modules, "amazon_transcribe", types.ModuleType("amazon_transcribe"))
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("availability must not touch the consent gate")
+
+        monkeypatch.setattr(aws_consent, "refuse_and_log", _refuse)
+        detail = self._detail(SttConfig(enabled=True, provider="transcribe"))
+        assert detail.ok is True
+        assert detail.code == stt.CODE_OK
+
+    def test_apple_needs_toolchain(self, monkeypatch):
+        """Separate from unsupported because this one has a one-line fix."""
+        from kiro_crew import apple_speech
+
+        monkeypatch.setattr(
+            apple_speech,
+            "availability",
+            lambda: apple_speech.Availability(
+                False, "run: xcode-select --install", needs_toolchain=True
+            ),
+        )
+        detail = self._detail(SttConfig(enabled=True, provider="apple"))
+        assert detail.ok is False
+        assert detail.code == transcribe.CODE_APPLE_NEEDS_TOOLCHAIN
+        assert detail.detail == "run: xcode-select --install"
+
+    def test_apple_unsupported_host(self, monkeypatch):
+        """Not macOS, or too old a macOS for the SpeechAnalyzer API. No install
+        fixes it, so it must not be reported as something to install."""
+        from kiro_crew import apple_speech
+
+        monkeypatch.setattr(
+            apple_speech,
+            "availability",
+            lambda: apple_speech.Availability(False, "Apple speech is macOS only"),
+        )
+        detail = self._detail(SttConfig(enabled=True, provider="apple"))
+        assert detail.ok is False
+        assert detail.code == transcribe.CODE_APPLE_UNSUPPORTED
+
+    def test_apple_available_never_builds_the_helper(self, monkeypatch):
+        """Availability runs on the event loop (the settings read, the transcribe
+        endpoint, the Slack voice path), and compiling the Swift helper there
+        would freeze the gateway for as long as swiftc takes."""
+        from kiro_crew import apple_speech
+
+        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
+
+        def _no_build(*args, **kwargs):
+            raise AssertionError("availability must not build the Swift helper")
+
+        monkeypatch.setattr(apple_speech, "_build_helper", _no_build)
+        detail = self._detail(SttConfig(enabled=True, provider="apple"))
+        assert detail.ok is True
+        assert detail.code == stt.CODE_OK
+
+    def test_retired_provider_answers_on_the_local_floor(self, monkeypatch):
+        """A hand-edited config naming a retired provider must not report a fault.
+
+        ``local`` is the floor every other value degrades to, so the answer is the
+        local recogniser's own, not "unknown provider".
+        """
+        _stub_recogniser_absent(monkeypatch)
+        detail = self._detail(SttConfig(enabled=True, provider="mlx"))
+        assert detail.ok is False
+        assert detail.code == stt.CODE_EXTRA_MISSING
 
 
 # ---------------------------------------------------------------------------
-# transcribe_audio
+# _whisper_language
 # ---------------------------------------------------------------------------
 
 
-class TestTranscribeAudio:
-    @pytest.mark.asyncio
-    async def test_disabled_returns_none(self):
-        cfg = SttConfig(enabled=False)
-        result = await transcribe_audio("/tmp/test.webm", cfg)
-        assert result is None
+class TestWhisperLanguage:
+    """Whisper names its languages by bare ISO 639 code, never a region, so a
+    configured locale has to be cut down to its primary subtag."""
 
-    @pytest.mark.asyncio
-    async def test_no_binary_returns_none(self):
-        cfg = SttConfig(enabled=True, whisper_path="/nonexistent")
-        result = await transcribe_audio("/tmp/test.webm", cfg)
-        assert result is None
+    @pytest.mark.parametrize(
+        "configured, expected",
+        [
+            ("en-US", "en"),
+            ("zh-CN", "zh"),
+            ("pt-BR", "pt"),
+            # A POSIX locale spells the separator with an underscore.
+            ("en_GB", "en"),
+            ("fr_FR", "fr"),
+            ("FR-fr", "fr"),
+            # Whitespace survives a hand-edited config.json.
+            ("  de-DE  ", "de"),
+            ("fr", "fr"),
+            # Three letters is a valid ISO 639-3 code.
+            ("haw", "haw"),
+        ],
+    )
+    def test_locale_reduces_to_its_primary_subtag(self, configured, expected):
+        assert transcribe._whisper_language(configured) == expected
 
-    @pytest.mark.asyncio
-    async def test_whisper_discovery_runs_off_event_loop(self, tmp_path, monkeypatch):
-        from threading import get_ident
+    @pytest.mark.parametrize("configured", ["auto", "", None])
+    def test_unset_means_auto_detect(self, configured):
+        """The empty string is what the recogniser reads as auto-detect, so an
+        unset or explicitly automatic setting resolves to it rather than to a
+        guessed language."""
+        assert transcribe._whisper_language(configured) == ""
 
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True)
-        loop_thread = get_ident()
-        discovery_threads = []
+    def test_non_string_means_auto_detect(self):
+        """A hand-edited config.json can hold a number or an object here. ``or ""``
+        alone would let a truthy non-string through, because it only substitutes
+        on a falsy value."""
+        assert transcribe._whisper_language(0) == ""
+        assert transcribe._whisper_language(1234) == ""
+        assert transcribe._whisper_language(["en-US"]) == ""
 
-        def discover_python_bin_dir():
-            discovery_threads.append(get_ident())
-            return ""
-
-        monkeypatch.setattr(
-            "kiro_crew.transcribe._python3_bin_dir", discover_python_bin_dir
-        )
-        # This test observes the thread `_python3_bin_dir` runs on, so the probe
-        # BEFORE it must miss — otherwise discovery short-circuits and never
-        # reaches the call being watched.
-        _no_own_venv(monkeypatch)
-        monkeypatch.setattr("kiro_crew.transcribe._WHISPER_SEARCH_PATHS", [])
-        with patch("kiro_crew.transcribe.shutil.which", return_value=None):
-            result = await transcribe_audio(str(audio), cfg)
-
-        assert result is None
-        assert discovery_threads
-        assert discovery_threads[0] != loop_thread
-
-    @pytest.mark.asyncio
-    async def test_aws_audio_read_runs_off_event_loop(self, tmp_path, monkeypatch):
-        from threading import get_ident
-
-        from kiro_crew import transcribe as tr
-
-        audio = tmp_path / "test.ogg"
-        audio.write_bytes(b"fake audio")
-        cfg = SttConfig(enabled=True, provider="transcribe", timeout_secs=10)
-        loop_thread = get_ident()
-        read_threads = []
-
-        def read_audio(path):
-            assert path == str(audio)
-            read_threads.append(get_ident())
-            return b"fake audio"
-
-        input_stream = SimpleNamespace(
-            send_audio_event=AsyncMock(),
-            end_stream=AsyncMock(),
-        )
-        stream = SimpleNamespace(input_stream=input_stream, output_stream=object())
-
-        class FakeClient:
-            def __init__(self, **kwargs):
-                pass
-
-            async def start_stream_transcription(self, **kwargs):
-                return stream
-
-        class FakeHandler:
-            def __init__(self, output_stream, transcript_parts):
-                pass
-
-            async def handle_events(self):
-                pass
-
-        monkeypatch.setattr(tr, "boto3", object())
-        monkeypatch.setattr(tr, "_read_audio_bytes", read_audio)
-        monkeypatch.setattr(
-            tr,
-            "_load_aws_transcribe_components",
-            lambda: (FakeClient, FakeHandler),
-        )
-
-        result = await tr._transcribe_aws(str(audio), cfg)
-
-        assert result is None
-        assert read_threads
-        assert read_threads[0] != loop_thread
-
-    @pytest.mark.asyncio
-    async def test_whisper_output_file_io_runs_off_event_loop(
-        self, tmp_path, monkeypatch
-    ):
-        from threading import get_ident
-
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-        cfg = SttConfig(enabled=True, whisper_path=str(binary), timeout_secs=10)
-        loop_thread = get_ident()
-        io_threads = []
-
-        def make_output_dir():
-            io_threads.append(get_ident())
-            return str(output_dir)
-
-        def collect_output(*args, **kwargs):
-            io_threads.append(get_ident())
-            return "Hello world"
-
-        def remove_output_dir(*args, **kwargs):
-            io_threads.append(get_ident())
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-
-        monkeypatch.setattr("kiro_crew.transcribe.tempfile.mkdtemp", make_output_dir)
-        monkeypatch.setattr(
-            "kiro_crew.transcribe._collect_whisper_output", collect_output
-        )
-        monkeypatch.setattr("kiro_crew.transcribe.shutil.rmtree", remove_output_dir)
-        with patch(
-            "kiro_crew.transcribe.asyncio.create_subprocess_exec",
-            return_value=mock_proc,
-        ):
-            result = await transcribe_audio(str(audio), cfg)
-
-        assert result == "Hello world"
-        assert len(io_threads) == 3
-        assert all(thread != loop_thread for thread in io_threads)
-
-    @pytest.mark.asyncio
-    async def test_successful_transcription(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, whisper_path=str(binary), timeout_secs=10)
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-
-        async def fake_exec(*args, **kwargs):
-            out_dir = args[args.index("--output_dir") + 1]
-            Path(out_dir).joinpath("test.txt").write_text("Hello world")
-            return mock_proc
-
-        with patch(
-            "kiro_crew.transcribe.asyncio.create_subprocess_exec", side_effect=fake_exec
-        ):
-            result = await transcribe_audio(str(audio), cfg)
-        assert result == "Hello world"
-
-    @pytest.mark.asyncio
-    async def test_whisper_failure_returns_none(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, whisper_path=str(binary), timeout_secs=10)
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 1
-        mock_proc.communicate = AsyncMock(return_value=(b"", b"error"))
-
-        with patch(
-            "kiro_crew.transcribe.asyncio.create_subprocess_exec", return_value=mock_proc
-        ):
-            result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_timeout_returns_none(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, whisper_path=str(binary), timeout_secs=1)
-
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
-
-        with patch(
-            "kiro_crew.transcribe.asyncio.create_subprocess_exec", return_value=mock_proc
-        ):
-            with patch(
-                "kiro_crew.transcribe.asyncio.wait_for", side_effect=asyncio.TimeoutError
-            ):
-                result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_no_output_file_returns_none(self, tmp_path):
-        binary = tmp_path / "whisper"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, whisper_path=str(binary), timeout_secs=10)
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-
-        with patch(
-            "kiro_crew.transcribe.asyncio.create_subprocess_exec", return_value=mock_proc
-        ):
-            result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_loads_config_when_none(self):
-        mock_cfg = MagicMock()
-        mock_cfg.stt = SttConfig(enabled=False)
-        with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=mock_cfg):
-            result = await transcribe_audio("/tmp/test.webm", None)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_mlx_no_binary_returns_none(self, tmp_path):
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, provider="mlx")
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value=None):
-            result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_mlx_invalid_model_rejected_before_subprocess(self, tmp_path):
-        """A malformed mlx_model (e.g. from a hand-edited config) must be
-        rejected before it is ever passed to the subprocess."""
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(
-            enabled=True, provider="mlx", mlx_model="; rm -rf ~", timeout_secs=10
-        )
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value="/usr/bin/mlx_whisper"):
-            with patch("kiro_crew.transcribe.asyncio.create_subprocess_exec") as spawn:
-                result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-        spawn.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_mlx_successful_transcription(self, tmp_path):
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(
-            enabled=True, provider="mlx", mlx_model="mlx-community/whisper-large-v3-turbo",
-            timeout_secs=10,
-        )
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-        captured: dict = {}
-
-        async def fake_exec(*args, **kwargs):
-            captured["args"] = args
-            out_dir = args[args.index("--output-dir") + 1]
-            Path(out_dir).joinpath("test.txt").write_text("Hola mundo")
-            return mock_proc
-
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value="/usr/bin/mlx_whisper"):
-            with patch(
-                "kiro_crew.transcribe.asyncio.create_subprocess_exec", side_effect=fake_exec
-            ):
-                result = await transcribe_audio(str(audio), cfg)
-        assert result == "Hola mundo"
-        # The configured HF repo must be passed via --model.
-        assert "mlx-community/whisper-large-v3-turbo" in captured["args"]
-
-    @pytest.mark.asyncio
-    async def test_mlx_failure_returns_none(self, tmp_path):
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, provider="mlx", timeout_secs=10)
-
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 1
-        mock_proc.communicate = AsyncMock(return_value=(b"", b"boom"))
-
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value="/usr/bin/mlx_whisper"):
-            with patch(
-                "kiro_crew.transcribe.asyncio.create_subprocess_exec", return_value=mock_proc
-            ):
-                result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_mlx_timeout_returns_none(self, tmp_path):
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, provider="mlx", timeout_secs=1)
-
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
-
-        with patch("kiro_crew.transcribe._find_mlx_whisper", return_value="/usr/bin/mlx_whisper"):
-            with patch(
-                "kiro_crew.transcribe.asyncio.create_subprocess_exec", return_value=mock_proc
-            ):
-                with patch(
-                    "kiro_crew.transcribe.asyncio.wait_for", side_effect=asyncio.TimeoutError
-                ):
-                    result = await transcribe_audio(str(audio), cfg)
-        assert result is None
+    @pytest.mark.parametrize("configured", ["e", "english", "12", "x-klingon", "!!", "-"])
+    def test_garbage_tag_auto_detects_rather_than_raising(self, configured):
+        """A mistyped setting must cost the user a detection pass, never a failed
+        transcription."""
+        assert transcribe._whisper_language(configured) == ""
 
 
 # ---------------------------------------------------------------------------
-# events.py: _transcribe_files
+# _pcm_from_wav
+# ---------------------------------------------------------------------------
+
+
+class TestPcmFromWav:
+    """The dashboard's audio worklet and the recogniser already agree on 16 kHz
+    mono int16, so audio in that form needs no external tool. Anything else
+    returns None so the caller hands it to ffmpeg, because resampling correctly
+    is ffmpeg's job and a naive stride would change the pitch the model hears.
+    """
+
+    def test_mono_16k_decodes_to_scaled_float32(self, tmp_path):
+        samples = _ramp_int16(800)
+        audio = tmp_path / "mono.wav"
+        _write_wav(audio, samples)
+
+        pcm = transcribe._pcm_from_wav(str(audio))
+
+        assert pcm is not None
+        assert pcm.dtype == np.float32
+        np.testing.assert_allclose(pcm, samples.astype(np.float32) / 32768.0)
+
+    def test_stereo_is_downmixed_and_stays_float32(self, tmp_path):
+        """Folding channels rather than refusing them: a two-channel 16 kHz
+        recording needs no resampling, so spending an ffmpeg spawn on it would be
+        pure latency."""
+        frames = 400
+        interleaved = np.empty(frames * 2, dtype=np.int16)
+        interleaved[0::2] = 10_000  # left
+        interleaved[1::2] = -6_000  # right
+        audio = tmp_path / "stereo.wav"
+        _write_wav(audio, interleaved, channels=2)
+
+        pcm = transcribe._pcm_from_wav(str(audio))
+
+        assert pcm is not None
+        assert pcm.dtype == np.float32
+        assert pcm.size == frames
+        np.testing.assert_allclose(pcm, np.full(frames, 2_000 / 32768.0, dtype=np.float32))
+
+    def test_multichannel_folding_is_sliced_and_exact_across_the_slice_boundary(self, tmp_path):
+        """A whole-file multichannel read holds the interleaved int16 buffer
+        AND its float32 conversion at once — ~1.5 GiB for a four-channel hour,
+        an OOM on an input the import byte cap admits (GPT review r23). The
+        fold therefore runs in byte-bounded slices (8 MiB of raw int16 per
+        slice — GPT review r34: bounding by SECONDS let the channel count
+        scale the transient without limit); this file spans the slice boundary
+        and must fold to exactly the same per-frame mean as a whole-file fold."""
+        channels = 4
+        # One slice is (8 MiB // (channels * 2)) frames; cross it by a second.
+        frames = (8 * 1024 * 1024) // (channels * 2) + transcribe.stt.SAMPLE_RATE_HZ
+        rng = np.random.default_rng(23)
+        interleaved = rng.integers(-30_000, 30_000, frames * channels, dtype=np.int16)
+        audio = tmp_path / "quad.wav"
+        _write_wav(audio, interleaved, channels=channels)
+
+        pcm = transcribe._pcm_from_wav(str(audio))
+
+        assert pcm is not None and pcm.size == frames
+        expected = (interleaved.astype(np.float32) / 32768.0).reshape(-1, channels).mean(axis=1)
+        np.testing.assert_allclose(pcm, expected, rtol=0, atol=1e-7)
+
+    def test_slice_byte_budget_is_channel_count_independent(self, tmp_path):
+        """GPT review r34: a valid 256-channel WAV under the import size cap
+        must not make one slice allocate hundreds of MiB. The slice frame
+        count shrinks with the channel count, so the raw bytes read per
+        ``readframes`` call stay bounded — pinned here by folding a
+        256-channel file whose whole-file read would be ~50 MiB while each
+        slice stays at 8 MiB, and checking exactness end to end."""
+        channels = 256
+        # One slice for 256 channels is (8 MiB // 512) = 16384 frames; span
+        # three slices so the loop and the boundary are both exercised.
+        frames = 16384 * 2 + 1000
+        rng = np.random.default_rng(34)
+        interleaved = rng.integers(-30_000, 30_000, frames * channels, dtype=np.int16)
+        audio = tmp_path / "many.wav"
+        _write_wav(audio, interleaved, channels=channels)
+
+        pcm = transcribe._pcm_from_wav(str(audio))
+
+        assert pcm is not None and pcm.size == frames
+        expected = (interleaved.astype(np.float32) / 32768.0).reshape(-1, channels).mean(axis=1)
+        np.testing.assert_allclose(pcm, expected, rtol=0, atol=1e-7)
+
+    @pytest.mark.parametrize("rate", [8_000, 44_100, 48_000])
+    def test_other_sample_rates_defer_to_ffmpeg(self, tmp_path, rate):
+        audio = tmp_path / "rate.wav"
+        _write_wav(audio, _ramp_int16(400), rate=rate)
+        assert transcribe._pcm_from_wav(str(audio)) is None
+
+    @pytest.mark.parametrize("sampwidth", [1, 4])
+    def test_other_sample_widths_defer_to_ffmpeg(self, tmp_path, sampwidth):
+        """Only int16 is read here. A different width is a conversion, and the
+        conversion belongs to the tool that also resamples."""
+        audio = tmp_path / "width.wav"
+        with wave.open(str(audio), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(sampwidth)
+            wav.setframerate(16_000)
+            wav.writeframes(b"\x00" * (400 * sampwidth))
+        assert transcribe._pcm_from_wav(str(audio)) is None
+
+    @pytest.mark.parametrize("header_bytes", [0, 4, 20, 40])
+    def test_truncated_header_returns_none_rather_than_raising(self, tmp_path, header_bytes):
+        """A transfer cut off before the format chunk is unreadable, and the
+        reader says so by raising. ffmpeg reads far more than the stdlib does, so
+        that is a "try the other route" rather than a failure to report."""
+        audio = tmp_path / "cut.wav"
+        _write_wav(audio, _ramp_int16(800))
+        audio.write_bytes(audio.read_bytes()[:header_bytes])
+        assert transcribe._pcm_from_wav(str(audio)) is None
+
+    def test_truncated_data_keeps_the_frames_that_arrived(self, tmp_path):
+        """A recording cut off mid-stream has a header promising more frames than
+        the file holds. What is there is still speech, so it decodes rather than
+        costing the user the whole memo."""
+        audio = tmp_path / "short.wav"
+        _write_wav(audio, _ramp_int16(800))
+        whole = audio.read_bytes()
+        audio.write_bytes(whole[: len(whole) - 600])
+
+        pcm = transcribe._pcm_from_wav(str(audio))
+
+        assert pcm is not None
+        assert pcm.dtype == np.float32
+        # 600 bytes short of the promised 800 int16 frames.
+        assert pcm.size == 800 - 300
+
+    def test_non_wav_payload_returns_none(self, tmp_path):
+        """A ``.wav`` suffix is only trusted to decide whether to TRY: a Slack
+        voice memo saved under the wrong name must fall through to the transcode.
+        """
+        audio = tmp_path / "actually-ogg.wav"
+        audio.write_bytes(b"OggS\x00\x02" + b"\x00" * 200)
+        assert transcribe._pcm_from_wav(str(audio)) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert transcribe._pcm_from_wav(str(tmp_path / "absent.wav")) is None
+
+
+# ---------------------------------------------------------------------------
+# Slack voice-memo adapter
 # ---------------------------------------------------------------------------
 
 
@@ -689,8 +504,13 @@ class TestTranscribeFiles:
             },
         ]
 
-        with patch(
-            "kiro_crew.slack.events.transcribe_audio", new_callable=AsyncMock, return_value="Hello"
+        with (
+            patch("kiro_crew.slack.events.batch_duration_cap_secs", return_value=None),
+            patch(
+                "kiro_crew.slack.events.transcribe_audio",
+                new_callable=AsyncMock,
+                return_value="Hello",
+            ),
         ):
             result = await _transcribe_files(mock_orch, files)
         assert result == ["Hello"]
@@ -743,8 +563,13 @@ class TestTranscribeFiles:
         # module global. Patching the definition left the REAL transcriber running --
         # the assertion passed for the wrong reason and the test was the 3rd slowest in
         # the suite. Matches the sibling test above.
-        with patch(
-            "kiro_crew.slack.events.transcribe_audio", new_callable=AsyncMock, return_value=None
+        with (
+            patch("kiro_crew.slack.events.batch_duration_cap_secs", return_value=None),
+            patch(
+                "kiro_crew.slack.events.transcribe_audio",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
             result = await _transcribe_files(mock_orch, files)
         assert result == []
@@ -829,34 +654,99 @@ class TestSlackClientDownloadFile:
 
 class TestSttConfig:
     def test_defaults(self):
+        """The shipped defaults, stated as the values a user gets.
+
+        Two of these are the whole point of the resident local recogniser and are
+        pinned here rather than left implicit: ``provider`` is ``local``, which
+        needs no account and no out-of-band install, and ``streaming`` is ON,
+        because every provider produces partials and the panel that shows words
+        while you speak is the default experience rather than an opt-in.
+        """
         cfg = SttConfig()
         assert cfg.enabled is True
-        assert cfg.whisper_path == ""
-        assert cfg.model == "turbo"
-        assert cfg.mlx_model == "mlx-community/whisper-large-v3-turbo"
-        assert cfg.device == "cpu"
+        assert cfg.provider == "local"
+        assert cfg.model == "base"
+        assert cfg.language_code == "auto"
+        assert cfg.streaming is True
+        assert cfg.silence_ms == 700
+        assert cfg.partial_interval_ms == 400
+        assert cfg.idle_evict_secs == 600
+        assert cfg.endpointing is False
+        assert cfg.dictation_panel is True
         assert cfg.timeout_secs == 300
+
+    def test_default_model_is_a_real_catalog_entry(self):
+        """The default names a model the downloader can actually fetch. The
+        advertised menu offering a model with no sha256 pin is how a first
+        dictation fails on a fresh install."""
+        from kiro_crew.stt import models
+
+        assert SttConfig().model in {m.name for m in models.CATALOG}
+
+    @pytest.mark.parametrize("provider", ["local", "apple", "transcribe"])
+    @pytest.mark.parametrize("language", ["auto", "AUTO", "", None, 42])
+    def test_language_default_matches_provider_capabilities(self, provider, language):
+        cfg = SttConfig(provider=provider, language_code=language)
+        assert cfg.language_code == "auto"
+        assert cfg.effective_language_code == ("auto" if provider == "local" else "en-US")
+
+    @pytest.mark.parametrize("provider", ["local", "apple", "transcribe"])
+    @pytest.mark.parametrize("language", ["en-US", "zh-CN"])
+    def test_explicit_language_is_preserved(self, provider, language):
+        cfg = SttConfig(provider=provider, language_code=language)
+        assert cfg.language_code == language
+        assert cfg.effective_language_code == language
 
     def test_custom_values(self):
         cfg = SttConfig(
-            enabled=True, whisper_path="/opt/whisper", model="small", device="cuda", timeout_secs=60
+            enabled=True,
+            provider="transcribe",
+            model="small",
+            streaming=False,
+            timeout_secs=60,
         )
         assert cfg.enabled is True
+        assert cfg.provider == "transcribe"
         assert cfg.model == "small"
+        assert cfg.streaming is False
+        assert cfg.timeout_secs == 60
+
+    @pytest.mark.parametrize(
+        "retired_field", ["whisper_path", "mlx_model", "parakeet_model", "device"]
+    )
+    def test_fields_of_retired_providers_are_gone(self, retired_field):
+        """Each names an out-of-band install or a device selector belonging to a
+        provider that does not exist. Re-adding one would put a setting back in
+        the panel that nothing reads."""
+        assert not hasattr(SttConfig(), retired_field)
 
 
 # ---------------------------------------------------------------------------
-# Sensitive path guard (Fix #2)
+# The two provider-independent guards
 # ---------------------------------------------------------------------------
 
 
 class TestSensitivePathGuard:
+    """Both guards run outside every provider branch, deliberately: a per-branch
+    copy is a copy that will be missing from the next branch someone adds."""
+
     @pytest.mark.asyncio
-    async def test_sensitive_path_blocked_for_whisper(self, tmp_path):
-        """is_sensitive_path check covers whisper path, not just AWS."""
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake")
-        cfg = SttConfig(enabled=True, provider="whisper")
+    async def test_sensitive_path_blocked_before_any_local_decode(self, tmp_path, monkeypatch):
+        """The refusal lands before dispatch, so the local recogniser is never
+        even asked whether it could run: reading the file at all is the thing
+        being refused."""
+        audio = tmp_path / "voice.wav"
+        _write_wav(audio, _ramp_int16(1600))
+        cfg = SttConfig(enabled=True, provider="local")
+
+        def _never_probed():
+            raise AssertionError("the guard must refuse before the provider is reached")
+
+        def _never_decoded(path):
+            raise AssertionError("a refused path must not be read")
+
+        monkeypatch.setattr(stt, "availability", _never_probed)
+        monkeypatch.setattr(transcribe, "_pcm_from_wav", _never_decoded)
         with patch("kiro_crew.security.is_sensitive_path", return_value=True):
             result = await transcribe_audio(str(audio), cfg)
         assert result is None
@@ -870,171 +760,65 @@ class TestSensitivePathGuard:
             result = await transcribe_audio(str(audio), cfg)
         assert result is None
 
+    def test_the_gateways_own_voice_runtime_snapshot_is_not_refused(self, tmp_path, monkeypatch):
+        """GPT review r30: the crew ``run/`` dir is a sensitive leaf, and the
+        import snapshots are staged under ``run/voice-runtime`` precisely
+        because agents cannot reach it — so without the exemption every import
+        would be refused by the gateway's own guard and the feature would
+        always fail."""
+        root = tmp_path / "voice-root"
+        root.mkdir()
+        snap = root / "kc-meetings-x-import" / "recording.wav"
+        snap.parent.mkdir()
+        snap.write_bytes(b"bytes")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox.prime_voice_runtime_sandbox_paths", lambda: str(root)
+        )
+        with patch("kiro_crew.security.is_sensitive_path", return_value=True):
+            assert transcribe._is_sensitive_audio_path(str(snap)) is False
 
-# ---------------------------------------------------------------------------
-# ensure_ffmpeg_in_path for whisper (Fix #3)
-# ---------------------------------------------------------------------------
+    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform has no symlinks")
+    def test_a_link_planted_under_the_runtime_root_is_still_judged(self, tmp_path, monkeypatch):
+        """The exemption is by REAL path: a link under the root resolves to its
+        target outside it and is judged as whatever it points at."""
+        root = tmp_path / "voice-root"
+        root.mkdir()
+        outside = tmp_path / "outside.wav"
+        outside.write_bytes(b"bytes")
+        link = root / "recording.wav"
+        link.symlink_to(outside)
+        monkeypatch.setattr(
+            "kiro_crew.sandbox.prime_voice_runtime_sandbox_paths", lambda: str(root)
+        )
+        with patch("kiro_crew.security.is_sensitive_path", return_value=True):
+            assert transcribe._is_sensitive_audio_path(str(link)) is True
 
 
-class TestFfmpegEnsuredForWhisper:
+class TestTranscriptRedaction:
     @pytest.mark.asyncio
-    async def test_ensure_ffmpeg_called_for_whisper(self, tmp_path):
-        audio = tmp_path / "test.webm"
-        audio.write_text("fake")
-        cfg = SttConfig(enabled=True, provider="whisper", whisper_path="/nonexistent")
-        with patch("kiro_crew.security.is_sensitive_path", return_value=False), \
-             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path") as mock_ensure:
-            await transcribe_audio(str(audio), cfg)
-        mock_ensure.assert_called_once()
+    async def test_local_transcript_is_redacted(self, tmp_path, monkeypatch):
+        """Spoken credentials are redacted on the way out of the local provider
+        too, not only the cloud one.
 
-    @pytest.mark.asyncio
-    async def test_ensure_ffmpeg_not_called_for_transcribe(self, tmp_path):
-        audio = tmp_path / "test.ogg"
-        audio.write_text("fake")
-        cfg = SttConfig(enabled=True, provider="transcribe")
-        with patch("kiro_crew.security.is_sensitive_path", return_value=False), \
-             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path") as mock_ensure, \
-             patch("kiro_crew.transcribe._transcribe_aws", new_callable=AsyncMock, return_value="hi"):
-            await transcribe_audio(str(audio), cfg)
-        mock_ensure.assert_not_called()
-
-
-class TestFfmpegCandidateDirsWindows:
-    """Regression guards for the Windows ffmpeg discovery fix.
-
-    Runs on POSIX CI by monkeypatching ``platform_compat.IS_WINDOWS`` (same
-    pattern as ``TestTaskkillErrorMapping`` in ``test_platform_compat.py``) —
-    the branch construction is platform-independent code.
-    """
-
-    def test_windows_dirs_appended(self, monkeypatch):
-        from kiro_crew import platform_compat as pc
-        from kiro_crew import transcribe as tr
-
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        pf = r"C:\Program Files"
-        la = r"C:\Users\user\AppData\Local"
-        monkeypatch.setenv("ProgramFiles", pf)
-        monkeypatch.setenv("LOCALAPPDATA", la)
-
-        dirs = tr._ffmpeg_candidate_dirs()
-        assert os.path.join(pf, "ffmpeg", "bin") in dirs
-        assert os.path.join(la, "Programs", "ffmpeg", "bin") in dirs
-        assert "/usr/local/bin" in dirs
-
-    def test_non_windows_omits_windows_dirs(self, monkeypatch):
-        from kiro_crew import platform_compat as pc
-        from kiro_crew import transcribe as tr
-
-        monkeypatch.setattr(pc, "IS_WINDOWS", False)
-        dirs = tr._ffmpeg_candidate_dirs()
-        for d in dirs:
-            assert "Program Files" not in d
-            assert "AppData" not in d
-
-    def test_ensure_ffmpeg_probes_with_which(self, tmp_path, monkeypatch):
-        """``ensure_ffmpeg_in_path`` must use ``shutil.which(name, path=d)`` so it
-        catches ``ffmpeg.exe`` on Windows in addition to plain ``ffmpeg`` on POSIX.
-        Regression: the prior implementation called ``os.path.isfile(<d>/ffmpeg)``
-        which is blind to the ``.exe`` suffix.
+        The transcript becomes a turn in a session and a line in the history, so a
+        key read aloud must not survive the trip even though this recogniser never
+        sent the audio anywhere.
         """
-        from kiro_crew import transcribe as tr
+        audio = tmp_path / "voice.wav"
+        _write_wav(audio, _ramp_int16(1600))
+        cfg = SttConfig(enabled=True, provider="local", timeout_secs=10)
+        monkeypatch.setattr(stt, "availability", lambda: stt.Availability(True))
 
-        target_dir = tmp_path / "ffbin"
-        target_dir.mkdir()
+        async def fake_transcribe_pcm(pcm, **kwargs):
+            return "the key is AKIAIOSFODNN7EXAMPLE ok", stt.Availability(True)
 
-        monkeypatch.setattr(tr, "_FFMPEG_CANDIDATE_DIRS", [str(target_dir)])
-        monkeypatch.setenv("PATH", "/nowhere")
+        monkeypatch.setattr(stt, "transcribe_pcm", fake_transcribe_pcm)
 
-        calls: list[tuple[str, str]] = []
+        result = await transcribe_audio(str(audio), cfg)
 
-        def fake_which(name, path=None):
-            calls.append((name, path or ""))
-            return f"{path}/ffmpeg" if path == str(target_dir) else None
-
-        monkeypatch.setattr(tr.shutil, "which", fake_which)
-        tr.ensure_ffmpeg_in_path()
-
-        assert calls and calls[0][0] == "ffmpeg"
-        assert calls[0][1] == str(target_dir)
-        assert os.environ["PATH"].startswith(str(target_dir))
-
-    def test_ensure_ffmpeg_skips_dirs_already_on_path(self, tmp_path, monkeypatch):
-        from kiro_crew import transcribe as tr
-
-        target_dir = tmp_path / "ffbin"
-        target_dir.mkdir()
-        monkeypatch.setattr(tr, "_FFMPEG_CANDIDATE_DIRS", [str(target_dir)])
-        monkeypatch.setenv("PATH", f"{target_dir}{os.pathsep}/nowhere")
-
-        called: list[str] = []
-
-        def fake_which(name, path=None):
-            called.append(name)
-            return None
-
-        monkeypatch.setattr(tr.shutil, "which", fake_which)
-        tr.ensure_ffmpeg_in_path()
-
-        assert called == []
-        assert os.environ["PATH"].startswith(str(target_dir))
-
-
-class TestFfmpegDiscoveryWindowsOnly:
-    """Real, unmocked Windows behaviour — mkdir a fake install dir, drop an
-    ``ffmpeg.exe`` inside, point ``_FFMPEG_CANDIDATE_DIRS`` at it, verify
-    ``ensure_ffmpeg_in_path`` picks it up. Skipped on POSIX.
-    """
-
-    @pytest.mark.skipif(
-        not _pc.IS_WINDOWS,
-        reason="Windows-only: exercises PATHEXT-driven .exe suffix resolution.",
-    )
-    def test_ffmpeg_exe_discovered(self, tmp_path, monkeypatch):
-        from kiro_crew import transcribe as tr
-
-        ffbin = tmp_path / "ffbin"
-        ffbin.mkdir()
-        exe = ffbin / "ffmpeg.exe"
-        exe.write_bytes(b"MZ")
-
-        monkeypatch.setattr(tr, "_FFMPEG_CANDIDATE_DIRS", [str(ffbin)])
-        monkeypatch.setenv("PATH", r"C:\\Windows\\System32")
-
-        tr.ensure_ffmpeg_in_path()
-        assert os.environ["PATH"].startswith(str(ffbin))
-
-
-# ---------------------------------------------------------------------------
-# Unsupported format rejection for Transcribe
-# ---------------------------------------------------------------------------
-
-
-class TestTranscribeFormatValidation:
-    @pytest.mark.asyncio
-    async def test_rejects_unsupported_format(self, tmp_path):
-        audio = tmp_path / "test.mp3"
-        audio.write_text("fake")
-        cfg = SttConfig(enabled=True, provider="transcribe")
-        with patch("kiro_crew.security.is_sensitive_path", return_value=False):
-            result = await transcribe_audio(str(audio), cfg)
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _ProfileCredentialResolver null check (Fix #4)
-# ---------------------------------------------------------------------------
-
-
-class TestProfileCredentialResolver:
-    @pytest.mark.asyncio
-    async def test_none_credentials_raises(self):
-        resolver = _ProfileCredentialResolver.__new__(_ProfileCredentialResolver)
-        mock_session = MagicMock()
-        mock_session.get_credentials.return_value = None
-        mock_session.profile_name = "test-profile"
-        resolver._session = mock_session
-        mock_creds_module = MagicMock()
-        with patch.dict("sys.modules", {"amazon_transcribe": MagicMock(), "amazon_transcribe.auth": mock_creds_module}):
-            with pytest.raises(RuntimeError, match="No AWS credentials found"):
-                await resolver.get_credentials()
+        assert result is not None
+        assert "AKIAIOSFODNN7EXAMPLE" not in result
+        assert "[REDACTED: credential]" in result
+        # The surrounding speech survives: redaction replaces the secret, it does
+        # not discard the utterance.
+        assert result.startswith("the key is ")

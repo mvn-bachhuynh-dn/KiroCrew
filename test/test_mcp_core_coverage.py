@@ -1,10 +1,7 @@
 """Coverage tests for ``kiro_crew.mcp_core`` helpers and thin tool bodies.
 
-Focus areas (the largest previously-uncovered blocks):
+Focus areas (the largest coverage gaps):
 
-* the browser-snapshot compressors (``_compress_snapshot_to_outline`` /
-  ``_search_snapshot``) and the ``browse_outline`` / ``browse_search`` tools
-  that wrap them,
 * the loopback HTTP verb helpers (``_get`` / ``_patch`` / ``_put`` /
   ``_delete``) plus ``_http_error_body`` error decoding + redaction,
 * the chat-history snippet helpers and ``_format_anchor``,
@@ -27,24 +24,25 @@ import urllib.error
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from kiro_crew import mcp_core
+from kiro_crew.history import INCOGNITO_MEMORY_MODES
 from kiro_crew.mcp_core import (
     _call_tool,
     _casefold_match_span,
-    _compress_snapshot_to_outline,
     _do_select_crew,
     _extract_history_snippet,
     _format_anchor,
     _history_is_incognito,
     _http_error_body,
     _parse_iso_date_epoch,
-    _search_snapshot,
     _validate_args,
     _ws_bucket,
 )
+from kiro_crew.skill_runtime.search import SkillSearchReport
 
 
 class _FakeResponse:
@@ -81,93 +79,8 @@ def _no_session_key(monkeypatch: pytest.MonkeyPatch) -> None:
     care whether it returns something header-safe, so freeze it.
     """
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat-1")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
     monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s3cr3t")
-
-
-# ── snapshot compression helpers ──────────────────────────────────────────
-
-
-class TestCompressSnapshotToOutline:
-    def test_empty_snapshot_is_reported_not_crashed(self):
-        assert "Empty snapshot" in _compress_snapshot_to_outline("")
-
-    def test_keeps_interactive_lines_and_drops_noise(self):
-        snapshot = "\n".join(
-            [
-                "- generic",
-                "",
-                "-",
-                '    - button "Save" [ref=e7]',
-                '  - heading "Title"',
-                "  - decorative-thing",
-            ]
-        )
-        out = _compress_snapshot_to_outline(snapshot)
-        assert "Page outline (2 elements)" in out
-        assert 'button "Save" [ref=e7]' in out
-        assert "decorative-thing" not in out
-
-    def test_indent_is_compacted_and_capped(self):
-        deep = " " * 40 + '- button "Deep" [ref=e1]'
-        out = _compress_snapshot_to_outline(deep)
-        body = out.split("\n")[1]
-        # min(indent // 2, 4) levels of two spaces → 8 leading spaces max.
-        assert body.startswith(" " * 8)
-        assert not body.startswith(" " * 10)
-
-    def test_truncates_at_max_lines(self):
-        snapshot = "\n".join(f'- button "b{i}" [ref=e{i}]' for i in range(20))
-        out = _compress_snapshot_to_outline(snapshot, max_lines=5)
-        assert "... (truncated at 5 lines)" in out
-        assert 'button "b19"' not in out
-
-    def test_no_interactive_elements_reports_total_lines(self):
-        out = _compress_snapshot_to_outline("- plain\n- text\n\n- words")
-        assert "No interactive elements found in snapshot (3 total lines)" in out
-
-
-class TestSearchSnapshot:
-    def test_empty_snapshot_and_empty_query_are_distinct_errors(self):
-        assert _search_snapshot("", "x") == "Empty snapshot."
-        assert _search_snapshot("some page", "") == "Error: query is required"
-
-    def test_matches_are_numbered_from_one(self):
-        out = _search_snapshot("alpha\nbeta\nBETA again", "beta")
-        assert "Found 2 matches" in out
-        assert "L2: beta" in out
-        assert "L3: BETA again" in out
-
-    def test_invalid_regex_falls_back_to_literal_search(self):
-        out = _search_snapshot("cost is 5 (approx)", "(approx")
-        assert "L1: cost is 5 (approx)" in out
-
-    def test_no_match_reports_line_count(self):
-        out = _search_snapshot("a\nb", "zzz")
-        assert "No matches for 'zzz' in snapshot (2 lines)." == out
-
-    def test_max_results_caps_output(self):
-        out = _search_snapshot("\n".join(["hit"] * 10), "hit", max_results=3)
-        assert "Found 3 matches" in out
-
-
-class TestBrowseTools:
-    def test_browse_outline_tool_returns_compressed_outline(self):
-        result = _call_tool(
-            "browse_outline", {"snapshot": '- button "Go" [ref=e1]', "max_lines": 10}
-        )
-        assert "Page outline (1 elements)" in result
-        assert "[ref=e1]" in result
-
-    def test_browse_search_tool_returns_matches(self):
-        result = _call_tool("browse_search", {"snapshot": "alpha\nbeta", "query": "beta"})
-        assert "Found 1 matches" in result
-
-    def test_browse_search_tool_reports_missing_query(self):
-        result = _call_tool("browse_search", {"snapshot": "alpha"})
-        assert result == "Error: query is required"
-
-
-# ── loopback HTTP verb helpers ────────────────────────────────────────────
 
 
 class TestHttpErrorBody:
@@ -202,6 +115,31 @@ class TestHttpErrorBody:
         err = _http_error(400, json.dumps({"error": f"bad key {secret}"}).encode())
         assert secret not in _http_error_body(err)["error"]
 
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            ("caller_record_missing", "cron or subagent record no longer exists"),
+            ("unix_peer_unverified", "could not verify this Unix-socket caller"),
+            ("peer_session_mismatch", "bound to a different session"),
+        ],
+    )
+    def test_internal_auth_denial_codes_are_actionable(self, code: str, expected: str):
+        err = _http_error(403, json.dumps({"error": "Forbidden", "code": code}).encode())
+        out = _http_error_body(err)
+        assert expected in out["error"]
+        assert out["error"] != "Forbidden"
+        assert out["code"] == code
+
+    def test_unrelated_error_code_keeps_the_backend_message(self):
+        err = _http_error(
+            403,
+            b'{"error": "Forbidden", "code": "unrelated_auth_denial"}',
+        )
+        assert _http_error_body(err) == {
+            "error": "Forbidden",
+            "code": "unrelated_auth_denial",
+        }
+
 
 @pytest.mark.parametrize("verb", ["_get", "_patch", "_put", "_delete"])
 class TestVerbHelpers:
@@ -226,7 +164,9 @@ class TestVerbHelpers:
     ):
         fn = getattr(mcp_core, verb)
         monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat—1")
-        with patch("kiro_crew.mcp_core.loopback_urlopen", side_effect=AssertionError("must not be called")):
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", side_effect=AssertionError("must not be called")
+        ):
             out = fn("/api/thing")
         assert "invalid in HTTP headers" in out["error"]
 
@@ -245,14 +185,18 @@ class TestVerbHelperBodies:
             assert req.headers["Content-type"] == "application/json"
 
     def test_delete_without_body_sends_no_content_type(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})) as m:
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})
+        ) as m:
             mcp_core._delete("/api/thing")
         req = m.call_args[0][0]
         assert req.data is None
         assert "Content-type" not in req.headers
 
     def test_delete_with_body_sends_json(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})) as m:
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})
+        ) as m:
             mcp_core._delete("/api/thing", {"rule": "x"})
         req = m.call_args[0][0]
         assert json.loads(req.data.decode()) == {"rule": "x"}
@@ -278,7 +222,10 @@ class TestPostTransportClassification:
         assert out == {"error": "read timeout", "transport_error": True}
 
     def test_http_error_is_not_flagged_transport_error(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", side_effect=_http_error(400, b'{"error": "nope"}')):
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen",
+            side_effect=_http_error(400, b'{"error": "nope"}'),
+        ):
             out = mcp_core._post("/api/spawn", {})
         assert out == {"error": "nope"}
 
@@ -288,7 +235,7 @@ class TestPostTransportClassification:
 
 class TestHistoryScalarHelpers:
     def test_incognito_detection_is_case_insensitive(self):
-        mode = sorted(mcp_core._HISTORY_INCOGNITO_MODES)[0]
+        mode = sorted(INCOGNITO_MEMORY_MODES)[0]
         assert _history_is_incognito({"memory_mode": mode.upper()}) is True
         assert _history_is_incognito({"memory_mode": "persistent"}) is False
         assert _history_is_incognito({}) is False
@@ -427,9 +374,7 @@ class TestDoSelectCrew:
         assert [c["name"] for c in out["crews"]] == ["docs"]
         assert "high confidence" in out["guidance"]
 
-    def test_unknown_crew_returns_error_with_available_names(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_unknown_crew_returns_error_with_available_names(self, monkeypatch: pytest.MonkeyPatch):
         cfg = _crew_config({"main": SimpleNamespace(triggers="", model="auto")}, "main")
         self._patch_cfg(monkeypatch, cfg)
         out = json.loads(_do_select_crew("ghost"))
@@ -440,17 +385,21 @@ class TestDoSelectCrew:
         self._patch_cfg(monkeypatch, _crew_config({}, ""))
         assert json.loads(_do_select_crew("ghost"))["available"] == "(none)"
 
-    def test_named_crew_returns_resolved_bindings(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ):
+    def test_named_crew_returns_resolved_bindings(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
         cfg = _crew_config({"docs": SimpleNamespace(triggers="d", model="opus")}, "main")
         self._patch_cfg(monkeypatch, cfg)
+
+        def resolve(_cfg, _name, *, validate_memory_files=True):
+            assert _cfg is cfg and _name == "docs"
+            assert validate_memory_files is False
+            return SimpleNamespace(
+                kiro_agent="ka", workspace_dir=tmp_path / "ws", memory_store_name="ms"
+            )
+
         monkeypatch.setattr(
             mcp_core,
             "resolve_agent_bindings",
-            lambda _cfg, _name: SimpleNamespace(
-                kiro_agent="ka", workspace_dir=tmp_path / "ws", memory_store_name="ms"
-            ),
+            resolve,
         )
         out = json.loads(_do_select_crew("docs"))
         assert out["crew"] == "docs"
@@ -461,9 +410,7 @@ class TestDoSelectCrew:
             "model": "opus",
         }
 
-    def test_select_crew_tool_routes_through_do_select_crew(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_select_crew_tool_routes_through_do_select_crew(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(mcp_core, "_do_select_crew", lambda crew: f"crew={crew!r}")
         assert _call_tool("select_crew", {"crew": "docs"}) == "crew='docs'"
 
@@ -509,14 +456,14 @@ class TestSpawnRunArgumentHandling:
 
     def test_keep_spawn_advertises_continuability(self):
         with patch.object(mcp_core, "_post", return_value={"id": "ag1"}):
-            out = _call_tool("spawn_run", {"task": "one", "keep": True})
+            out = _call_tool("spawn_run", {"task": "one", "keep": True, "solo_reason": "bulk_data"})
         assert "GUARANTEED continuability" in out
         assert "spawn_release" in out
 
     def test_transport_error_is_reported_as_unknown_acceptance(self):
         err = {"error": "read timeout", "transport_error": True}
         with patch.object(mcp_core, "_post", return_value=err) as m:
-            out = _call_tool("spawn_run", {"task": "one"})
+            out = _call_tool("spawn_run", {"task": "one", "solo_reason": "bulk_data"})
         assert "acceptance status is unknown" in out
         assert "Do not retry automatically" in out
         # A transport failure must NOT be reconciled as a lost wave member.
@@ -557,7 +504,7 @@ class TestSpawnRunArgumentHandling:
         assert "Spawned 1 subagent(s)" in out
         assert "1 task(s) failed to start" in out
         assert "1 task(s) have unknown acceptance status" in out
-        assert "END YOUR TURN NOW" in out
+        assert "END YOUR TURN NOW" in out.upper()
 
     def test_orphaned_spawn_warns_and_switches_to_polling_guidance(
         self, monkeypatch: pytest.MonkeyPatch
@@ -582,7 +529,7 @@ class TestSpawnRunArgumentHandling:
     def test_approval_mode_env_is_forwarded(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("KIROCREW_APPROVAL_MODE", "auto")
         with patch.object(mcp_core, "_post", return_value={"id": "ag1"}) as m:
-            _call_tool("spawn_run", {"task": "one"})
+            _call_tool("spawn_run", {"task": "one", "solo_reason": "bulk_data"})
         assert m.call_args[0][1]["approval_mode"] == "auto"
 
 
@@ -677,6 +624,64 @@ class TestWorkflowAuthor:
 
 
 class TestWorkflowRun:
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"workflow": "debug-project"},
+            {"source": "ctx.agent('x')"},
+            {"intent": "debug the project"},
+        ],
+    )
+    def test_refuses_to_start_without_strict_session_identity(self, args):
+        with (
+            patch.object(mcp_core, "_resolve_session_key_strict", return_value=""),
+            patch.object(mcp_core, "_post") as mocked,
+        ):
+            # The fixture still offers a lenient identity; it cannot authorize a run.
+            out = _call_tool("workflow_run", args)
+
+        assert "Cannot verify the current workflow caller" in out
+        assert "No workflow action was performed" in out
+        mocked.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "args, endpoint",
+        [
+            ({"source": "ctx.agent('x')"}, "/api/workflows/run"),
+            ({"intent": "debug the project"}, "/api/workflows/run_intent"),
+        ],
+    )
+    def test_ad_hoc_run_passes_only_the_verified_identity(self, args, endpoint):
+        with (
+            patch.object(
+                mcp_core, "_resolve_session_key_strict", return_value="dashboard:verified"
+            ),
+            patch.object(mcp_core, "_post", return_value={"run_id": "r-ad-hoc"}) as mocked,
+        ):
+            out = _call_tool("workflow_run", args)
+
+        mocked.assert_called_once_with(endpoint, args, session_key="dashboard:verified")
+        assert "r-ad-hoc" in out
+
+    def test_saved_workflow_reference_runs_exact_definition(self):
+        response = {"run_id": "r-saved", "workflow_id": "wfd_1", "revision": 2}
+        with (
+            patch.object(
+                mcp_core, "_resolve_session_key_strict", return_value="dashboard:verified"
+            ),
+            patch.object(mcp_core, "_post", return_value=response) as mocked,
+        ):
+            out = _call_tool(
+                "workflow_run",
+                {"workflow": "debug-project", "input": "login failure", "args": {"depth": 2}},
+            )
+        assert mocked.call_args[0] == (
+            "/api/workflows/definitions/debug-project/run",
+            {"input": "login failure", "args": {"depth": 2}},
+        )
+        assert mocked.call_args.kwargs == {"session_key": "dashboard:verified"}
+        assert "r-saved" in out and "revision 2" in out
+
     def test_neither_source_nor_intent_is_rejected(self):
         out = _call_tool("workflow_run", {})
         assert out == "Error: provide either 'source' or 'intent'"
@@ -725,6 +730,69 @@ class TestWorkflowRun:
     def test_non_int_budget_total_is_rejected_by_the_schema(self):
         out = _call_tool("workflow_run", {"source": "ctx.agent('x')", "budget_total": "lots"})
         assert "budget_total" in out
+
+
+class TestWorkflowDefinitionLibrary:
+    def test_list_saved_definitions(self):
+        response = {
+            "definitions": [
+                {"id": "wfd_1", "slug": "debug-project", "revision": 2, "name": "Debug"}
+            ]
+        }
+        with patch.object(mcp_core, "_get", return_value=response) as mocked:
+            out = _call_tool("workflow_library_list", {"search": "debugging"})
+        assert mocked.call_args[0][0] == "/api/workflows/definitions?q=debugging"
+        assert "/workflow debug-project" in out
+
+
+class TestWorkflowReadIdentity:
+    @pytest.mark.parametrize("tool", ["workflow_status", "workflow_result", "workflow_list"])
+    def test_reads_refuse_inherited_identity_without_http(self, tool):
+        with (
+            patch.object(mcp_core, "_resolve_session_key_strict", return_value="") as strict,
+            patch.object(mcp_core, "strict_identity_diagnosis", return_value=""),
+            patch.object(mcp_core, "_get") as get,
+        ):
+            out = _call_tool(tool, {} if tool == "workflow_list" else {"run_id": "r1"})
+        assert "Cannot verify the current workflow caller" in out
+        assert "No workflow action was performed" in out
+        strict.assert_called_once_with()
+        get.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["workflow_status", "workflow_result", "workflow_list"])
+    @pytest.mark.parametrize("refused", [False, True])
+    def test_reads_forward_exact_verified_identity(self, tool, refused):
+        from kiro_crew.mcp_tools.workflows import HANDLERS
+
+        response = (
+            {"error": "foreign run refused"}
+            if refused
+            else {
+                "run_id": "r1",
+                "status": "finished",
+                "result": "owned result",
+                "runs": [{"run_id": "r1", "status": "finished"}],
+            }
+        )
+        with (
+            patch.object(
+                mcp_core, "_resolve_session_key_strict", return_value="dashboard:verified"
+            ) as strict,
+            patch.object(
+                mcp_core, "_resolve_session_key", side_effect=AssertionError("identity re-resolved")
+            ),
+            patch.object(mcp_core, "_get", return_value=response) as get,
+            patch.object(mcp_core, "sel") as audit,
+        ):
+            out = HANDLERS[tool](tool, {} if tool == "workflow_list" else {"run_id": "r1"})
+        strict.assert_called_once_with()
+        endpoint = "/api/workflows/runs" + ("" if tool == "workflow_list" else "/r1")
+        get.assert_called_once_with(endpoint, session_key="dashboard:verified")
+        assert (
+            audit.return_value.log_tool_invocation.call_args.kwargs["session_key"]
+            == "dashboard:verified"
+        )
+        assert ("foreign run refused" in out) if refused else ("r1" in out)
 
 
 class TestWorkflowStatusAndResult:
@@ -790,7 +858,12 @@ class TestWorkflowStatusAndResult:
         assert secret not in out
 
     def test_result_leaves_non_str_scalars_untouched(self):
-        snap = {"run_id": "r1", "status": "finished", "result": {"n": 3, "flag": True}, "events": []}
+        snap = {
+            "run_id": "r1",
+            "status": "finished",
+            "result": {"n": 3, "flag": True},
+            "events": [],
+        }
         with patch.object(mcp_core, "_get", return_value=snap):
             payload = json.loads(_call_tool("workflow_result", {"run_id": "r1"}))
         assert payload["result"] == {"n": 3, "flag": True}
@@ -856,6 +929,68 @@ class TestWorkflowListCancelRerun:
 
 
 class TestSkillSearch:
+    """A session-bound call searches through the gateway (project scope); a
+    session-less CLI call falls back to the local loader."""
+
+    def test_exact_read_uses_json_and_retains_signed_session(self, monkeypatch):
+        from kiro_crew.validation import MAX_SKILL_KEY_CHARS
+
+        key = "nested/" + "x" * (MAX_SKILL_KEY_CHARS - len("nested/"))
+        seen = []
+        monkeypatch.setattr(
+            mcp_core, "require_strict_session_key", lambda *args: ("dashboard:signed", None)
+        )
+        monkeypatch.setattr(
+            mcp_core, "_get", lambda *args, **kwargs: pytest.fail("exact read used URL")
+        )
+        monkeypatch.setattr(
+            mcp_core, "SkillsLoader", lambda **kwargs: pytest.fail("signed read fell back")
+        )
+
+        def post(path, body, *, session_key):
+            seen.append((path, body, session_key))
+            return {"matches": [{"key": key, "name": key, "content": "read marker"}]}
+
+        monkeypatch.setattr(mcp_core, "_post", post)
+        result = _call_tool("skill_search", {"action": "read", "key": key})
+        assert "read marker" in result
+        assert len(seen) == 1
+        assert seen[0][0] == "/api/skills/-/discover"
+        assert seen[0][1]["key"] == key
+        assert seen[0][1]["scope"] == "installed"
+        assert seen[0][2] == "dashboard:signed"
+
+    @staticmethod
+    def _gateway(
+        monkeypatch: pytest.MonkeyPatch, matches: list[dict], **extra: object
+    ) -> list[str]:
+        seen: list[str] = []
+
+        def _get(path: str, **_kw: object) -> dict:
+            seen.append(path)
+            return {"matches": matches, **extra}
+
+        monkeypatch.setattr(mcp_core, "_get", _get)
+        monkeypatch.setattr(
+            mcp_core,
+            "SkillsLoader",
+            lambda **_kw: pytest.fail("session-bound skill_search must not use the local loader"),
+        )
+        return seen
+
+    @staticmethod
+    def _assert_gateway_query(seen: list[str], *, query: str, limit: int) -> None:
+        assert len(seen) == 1
+        parsed = urlsplit(seen[0])
+        assert parsed.path == "/api/skills/-/discover"
+        assert parse_qs(parsed.query) == {
+            "scope": ["installed"],
+            "q": [query],
+            "limit": [str(limit)],
+            "action": ["search"],
+            "offset": ["0"],
+        }
+
     def test_matches_are_rendered_with_load_hints(self, monkeypatch: pytest.MonkeyPatch):
         matches = [
             {
@@ -865,68 +1000,117 @@ class TestSkillSearch:
                 "path": "/skills/kirocrew-dev/babysit/SKILL.md",
             }
         ]
-        monkeypatch.setattr(
-            mcp_core,
-            "SkillsLoader",
-            lambda **_kw: SimpleNamespace(search_skills=lambda _q, limit: matches),
-        )
+        seen = self._gateway(monkeypatch, matches)
         out = _call_tool("skill_search", {"query": "babysit"})
-        assert "Skills matching 'babysit' (top 1)" in out
+        assert "Available skills (search, offset 0, 1 results)" in out
         # Whitespace in the description is collapsed.
         assert "Monitor a PR" in out
-        assert "cat /skills/kirocrew-dev/babysit/SKILL.md" in out
-        assert "$babysit" in out
+        assert "key='kirocrew-dev/babysit'" in out
+        assert "$kirocrew-dev/babysit" in out
+        self._assert_gateway_query(seen, query="babysit", limit=20)
+
+    def test_confined_match_renders_its_body_instead_of_a_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        matches = [{"name": "p", "key": "p", "description": "d", "content": "BODY_TEXT"}]
+        self._gateway(monkeypatch, matches)
+        out = _call_tool("skill_search", {"query": "p"})
+        assert "[Skill instructions — reference data]\nBODY_TEXT" in out
+        assert "cat " not in out
 
     def test_long_description_is_truncated(self, monkeypatch: pytest.MonkeyPatch):
         matches = [{"name": "s", "key": "s", "description": "d" * 500, "path": "/p"}]
-        monkeypatch.setattr(
-            mcp_core,
-            "SkillsLoader",
-            lambda **_kw: SimpleNamespace(search_skills=lambda _q, limit: matches),
-        )
+        self._gateway(monkeypatch, matches)
         out = _call_tool("skill_search", {"query": "s"})
         assert "d" * 300 + "..." in out
         assert "d" * 301 not in out
 
     def test_no_matches_suggests_broader_keywords(self, monkeypatch: pytest.MonkeyPatch):
+        self._gateway(monkeypatch, [])
+        out = _call_tool("skill_search", {"query": "zzz"})
+        assert "No skills matched 'zzz'" in out
+
+    def test_no_matches_in_a_mapped_scope_names_the_scope(self, monkeypatch: pytest.MonkeyPatch):
+        self._gateway(monkeypatch, [], scoped=True)
+        out = _call_tool("skill_search", {"query": "babysit"})
+        assert "No skills matched 'babysit'. Search covers only this agent's skill://" in out
+        assert "not found" in out
+
+    def test_pid_walked_identity_never_selects_a_project(self, monkeypatch: pytest.MonkeyPatch):
+        """A tokenless spawn child resolves leniently to its PARENT slot. The
+        gateway route returns that project's confined skill bodies, so only a
+        signed identity may reach it; the walk falls back to the global loader."""
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:parent")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        monkeypatch.setattr(
+            mcp_core,
+            "_get",
+            lambda *_a, **_kw: pytest.fail("unsigned identity reached the gateway"),
+        )
+        closed: list[bool] = []
         monkeypatch.setattr(
             mcp_core,
             "SkillsLoader",
-            lambda **_kw: SimpleNamespace(search_skills=lambda _q, limit: []),
+            lambda **_kw: SimpleNamespace(
+                search_skills_report=lambda q, limit, **kwargs: SkillSearchReport(
+                    [
+                        {
+                            "name": "global-only",
+                            "key": "g/global-only",
+                            "description": q,
+                            "path": "/g",
+                        }
+                    ],
+                    False,
+                ),
+                close=lambda: closed.append(True),
+            ),
         )
-        out = _call_tool("skill_search", {"query": "zzz"})
-        assert "No skills matched 'zzz'" in out
+        out = _call_tool("skill_search", {"query": "x"})
+        assert "global-only" in out
+        assert closed == [True]
+
+    def test_gateway_error_is_reported_not_swallowed(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(mcp_core, "_get", lambda *_a, **_kw: {"error": "project not trusted"})
+        out = _call_tool("skill_search", {"query": "x"})
+        assert out.startswith("Error: skill_search failed: RuntimeError: project not trusted")
 
     @pytest.mark.parametrize("raw,expected", [(0, 20), (999, 50), (5, 5)])
     def test_limit_is_defaulted_and_clamped(
         self, monkeypatch: pytest.MonkeyPatch, raw: int, expected: int
     ):
-        seen: list[int] = []
-
-        def _loader(**_kw: object) -> SimpleNamespace:
-            def _search(_q: str, limit: int) -> list[dict]:
-                seen.append(limit)
-                return []
-
-            return SimpleNamespace(search_skills=_search)
-
-        monkeypatch.setattr(mcp_core, "SkillsLoader", _loader)
+        seen = self._gateway(monkeypatch, [])
         _call_tool("skill_search", {"query": "x", "limit": raw})
-        assert seen == [expected]
+        self._assert_gateway_query(seen, query="x", limit=expected)
 
     def test_limit_defaults_when_omitted(self, monkeypatch: pytest.MonkeyPatch):
+        seen = self._gateway(monkeypatch, [])
+        _call_tool("skill_search", {"query": "x"})
+        self._assert_gateway_query(seen, query="x", limit=20)
+
+    def test_without_a_session_the_local_loader_answers(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        monkeypatch.setattr(
+            mcp_core, "_get", lambda *_a, **_kw: pytest.fail("no session: no gateway call")
+        )
         seen: list[int] = []
+        closed: list[bool] = []
 
         def _loader(**_kw: object) -> SimpleNamespace:
-            def _search(_q: str, limit: int) -> list[dict]:
+            def _search(_q: str, limit: int, **kwargs) -> SkillSearchReport:
                 seen.append(limit)
-                return []
+                return SkillSearchReport(
+                    [{"name": "s", "key": "s", "description": "d", "path": "/p"}], False
+                )
 
-            return SimpleNamespace(search_skills=_search)
+            return SimpleNamespace(search_skills_report=_search, close=lambda: closed.append(True))
 
         monkeypatch.setattr(mcp_core, "SkillsLoader", _loader)
-        _call_tool("skill_search", {"query": "x"})
-        assert seen == [20]
+        out = _call_tool("skill_search", {"query": "x", "limit": 7})
+        assert seen == [8]
+        assert closed == [True]
+        assert "Available skills (search, offset 0, 1 results)" in out
 
     def test_loader_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch):
         def _boom(**_kw: object) -> SimpleNamespace:
@@ -934,7 +1118,7 @@ class TestSkillSearch:
 
         monkeypatch.setattr(mcp_core, "SkillsLoader", _boom)
         out = _call_tool("skill_search", {"query": "x"})
-        assert out.startswith("skill_search failed: RuntimeError")
+        assert out.startswith("Error: skill_search failed: RuntimeError")
 
 
 class TestRegisterHook:
@@ -963,6 +1147,43 @@ class TestRegisterHook:
         out = _call_tool("register_hook", {"hook_id": "h", "context_summary": "c"})
         assert "hooks.json is corrupted" in out
         assert hook_file.read_text() == "{not json"
+
+    def test_acquiring_the_lock_does_not_truncate_the_lock_file(self):
+        """The lock-file open must be WRITABLE but MUST NOT truncate.
+
+        ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+        ``"r"``; but ``"w"`` truncates at open, and on Windows a truncating
+        open of a lock file whose first byte another holder already locked
+        raises a sharing violation instead of waiting — the contending acquirer
+        crashes before it reaches ``flock_exclusive`` and the serialisation the
+        lock exists to provide never happens. POSIX ``flock`` tolerates the
+        truncate, which is why the defect is invisible on Linux.
+
+        The lock file's bytes must survive acquisition. ``hooks.json.lock`` is the SAME file
+        ``webhooks.locked`` guards from another module, so cross-process
+        contention on it is the store's normal state — which is why truncation
+        (the platform-independent observable those PRs pinned) is asserted
+        here: seed the lock file, register a hook, require the bytes survived.
+        """
+        seed = b"lock-file-content-that-must-survive"
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(seed)
+
+        out = _call_tool("register_hook", {"hook_id": "review-bot", "context_summary": "c"})
+
+        assert "Hook registered: review-bot" in out
+        assert lock_path.read_bytes() == seed
+
+    def test_registration_works_when_the_lock_file_is_absent(self):
+        """First registration must create the lock file rather than raise."""
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        assert not lock_path.exists()
+
+        out = _call_tool("register_hook", {"hook_id": "first-run", "context_summary": "c"})
+
+        assert "Hook registered: first-run" in out
+        assert lock_path.exists()
 
 
 class TestReadSlackProfile:
@@ -1062,7 +1283,7 @@ class TestFileSend:
         src.write_text("all green")
         with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
             out = _call_tool("file_send", {"path": str(src), "description": "CI report"})
-        assert out == "File sent: report.txt (CI report)"
+        assert out == "File sent: report.txt (CI report) (delivered to Slack)"
         dest = mcp_core.outbox_dir() / "report.txt"
         assert dest.read_text() == "all green"
         notify = next(c for c in m.call_args_list if c[0][0] == "/api/outbox/notify")
@@ -1077,7 +1298,7 @@ class TestFileSend:
         with patch.object(mcp_core, "_post", return_value={"ok": True}):
             out = _call_tool("file_send", {"path": str(src)})
         assert out.startswith("File sent: report_")
-        assert out.endswith(".txt")
+        assert out.endswith(".txt (delivered to Slack)")
         assert (mcp_core.outbox_dir() / "report.txt").read_text() == "older"
 
     def test_missing_file_is_refused(self, tmp_path):
@@ -1088,7 +1309,13 @@ class TestFileSend:
         src = tmp_path / "creds.txt"
         src.write_text("AKIA" + "P" * 16)
         out = _call_tool("file_send", {"path": str(src)})
-        assert out == "Error: file content contains sensitive data; send aborted"
+        assert out.startswith("Error: file content contains sensitive data; send aborted")
+        # The refusal now names the remedy. A wall that does not say a consented
+        # path exists is the reported complaint, so this
+        # asserts MORE than the previous exact-equality pin, not less -- and it
+        # asserts the never-grantable legs are named as such.
+        assert "/api/file-delivery/consent" in out
+        assert "can never be granted" in out
 
     def test_disallowed_binary_mime_is_refused(self, tmp_path):
         src = tmp_path / "payload.bin"
@@ -1101,7 +1328,7 @@ class TestFileSend:
         src.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
         with patch.object(mcp_core, "_post", return_value={"ok": True}):
             out = _call_tool("file_send", {"path": str(src)})
-        assert out == "File sent: shot.png"
+        assert out == "File sent: shot.png (delivered to Slack)"
 
     def test_notify_error_is_propagated(self, tmp_path):
         src = tmp_path / "report.txt"
@@ -1134,8 +1361,120 @@ class TestFileSend:
             out = _call_tool("file_send", {"path": str(src)})
         assert out == "File sent: report.txt (Slack upload failed: not in channel)"
 
+    def test_channel_delivery_takes_precedence_over_slack(self, tmp_path, monkeypatch):
+        # A caller linked to a Telegram chat or Discord DM gets the file THERE;
+        # the Slack owner-DM leg is the fallback, not a second copy.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": True, "channel_type": "telegram"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (delivered to telegram)"
+        assert all(c[0][0] != "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_channel_skip_leaves_the_slack_leg_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": False, "skipped": "no_channel_destination"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        # The invariant this test owns: a channel SKIP does not disturb the
+        # Slack leg, which still runs as the fallback.
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        # The skip is also REPORTED. It must not read a bare "File sent:
+        # report.txt", which is indistinguishable from a delivery for a file
+        # that only reached the dashboard (see test_file_send_skip_reason.py).
+        assert out.startswith("File sent: report.txt")
+        assert "no_channel_destination" in out
+
+    def test_channel_failure_warns_and_falls_back_to_slack(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"error": "telegram api 400"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == (
+            "File sent: report.txt (channel upload failed: telegram api 400)"
+            " (delivered to Slack)"
+        )
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_an_explicit_slack_channel_beats_native_delivery(self, tmp_path, monkeypatch):
+        # channel="C…" names a DESTINATION the caller chose; the native leg's
+        # session-link inference must not silently reroute the file to the
+        # linked Telegram chat instead of the named Slack channel.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": True, "channel_type": "telegram"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src), "channel": "C0TRACKED123"})
+        assert all(
+            c[0][0] != "/api/channel/upload-file" for c in m.call_args_list
+        ), "native delivery must not run for an explicitly named channel"
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        assert out == "File sent: report.txt (delivered to Slack)"
+
+    def test_an_unidentified_caller_gets_no_native_delivery(self, tmp_path, monkeypatch):
+        # The lenient session resolver includes a /proc ancestor walk, under
+        # which an unidentified subagent resolves to its PARENT slot — and the
+        # file would deliver into the parent's conversation. No strict
+        # identity, no native delivery; the Slack leg keeps its own classifier.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+        with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        # The native leg is refused (no strict identity), but the Slack leg's
+        # own classifier still resolves this caller, so its delivery reports.
+        assert out == "File sent: report.txt (delivered to Slack)"
+        assert all(c[0][0] != "/api/channel/upload-file" for c in m.call_args_list)
+
+    def test_native_delivery_pins_the_strict_identity_on_the_wire(self, tmp_path, monkeypatch):
+        # The endpoint resolves the destination from the caller's session map
+        # entry, so the request must carry the VERIFIED key — not whatever the
+        # default resolution would re-derive server-side.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-9")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                assert kw.get("session_key") == "dashboard:chat-9"
+                return {"ok": True, "delivered": True, "channel_type": "discord"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (delivered to discord)"
+        assert any(c[0][0] == "/api/channel/upload-file" for c in m.call_args_list)
+
 
 # ── argument validation seam ──────────────────────────────────────────────
+
 
 class TestValidateArgs:
     def test_schema_backed_tool_is_validated_and_cleaned(self):
@@ -1149,8 +1488,10 @@ class TestValidateArgs:
             _validate_args("workflow_status", {"run_id": "r1", "junk": "x"})
 
     def test_schemaless_tool_passes_through_untouched(self):
+        # ``memory_recall`` validates its own ``query`` in the handler and has no
+        # entry in MCP_CORE_SCHEMAS, so it exercises the pass-through branch.
         raw = {"anything": 1}
-        assert _validate_args("learn_list", raw) == raw
+        assert _validate_args("memory_recall", raw) == raw
 
     def test_invalid_run_id_pattern_is_rejected(self):
         from kiro_crew.validation import ValidationError

@@ -31,7 +31,10 @@
 
 import { describe, it, expect, afterEach } from 'vitest'
 
-import { i18next } from './index'
+// `./all` for the non-English catalogs: `./index` registers English only, and
+// `activeLocale()` reads i18next's RESOLVED language — an unregistered language
+// resolves to `en`, so every locale case below would format in English.
+import { i18next } from './all'
 import { SUPPORTED_LANGUAGES } from './languages'
 import {
   activeLocale,
@@ -47,6 +50,8 @@ import {
   fmtDateTimeNumeric,
   fmtTimeNumeric,
   fmtDuration,
+  fmtElapsed,
+  fmtLanguageName,
   fmtList,
   fmtNumber,
   fmtPercent,
@@ -161,8 +166,14 @@ describe('fmtUnit', () => {
 
   it('translates the unit itself', async () => {
     await withLanguage('de', () => {
+      // Byte-identical to Intl except for one documented deviation: a plain
+      // U+0020 inside the quantity is promoted to U+00A0 so a line can never
+      // break between the number and its unit. Which unit name and which
+      // separator STYLE still come entirely from CLDR — nothing is hardcoded,
+      // which is what this test exists to protect.
       expect(fmtUnit(90, 'minute')).toBe(
-        new Intl.NumberFormat('de', { style: 'unit', unit: 'minute', unitDisplay: 'narrow' }).format(90),
+        new Intl.NumberFormat('de', { style: 'unit', unit: 'minute', unitDisplay: 'narrow' })
+          .format(90).replace(/ /g, '\u00A0'),
       )
     })
   })
@@ -399,6 +410,80 @@ describe('fmtDuration', () => {
   })
 })
 
+describe('fmtElapsed', () => {
+  it('shows a tenth under ten seconds and drops it above', () => {
+    // Golden (en). The bands exist because useful precision changes with
+    // magnitude: a tenth matters on a 4-second step and is noise on a 37-second
+    // one.
+    expect(fmtElapsed(4_200)).toBe('4.2s')
+    expect(fmtElapsed(9_990)).toBe('10.0s')
+    expect(fmtElapsed(37_400)).toBe('37s')
+  })
+
+  it('rounds the tenth up at the midpoint', () => {
+    // 4.25s has no exact tenth, and Intl rounds half away from zero. Pinned
+    // because a reader comparing two adjacent rows should know the last digit
+    // can move by one rather than truncating.
+    expect(fmtElapsed(4_250)).toBe('4.3s')
+  })
+
+  it('keeps a trailing zero under ten seconds, so the width does not jump', () => {
+    expect(fmtElapsed(3_000)).toBe('3.0s')
+    expect(fmtElapsed(0)).toBe('0.0s')
+  })
+
+  it('rounds to whole seconds before splitting, so 119.6s is never 1m 60s', () => {
+    // The invalid form is reachable by flooring minutes before rounding the
+    // remainder, which is the bug this ordering exists to prevent.
+    expect(fmtElapsed(119_600)).toBe('2m 0s')
+    expect(fmtElapsed(398_000)).toBe('6m 38s')
+  })
+
+  it('keeps the seconds place above a minute rather than collapsing to 2m', () => {
+    // A series must step 2m 1s -> 2m 0s -> 59s. A bare `2m` for one tick reads
+    // as a different magnitude.
+    expect(fmtElapsed(121_000)).toBe('2m 1s')
+    expect(fmtElapsed(59_000)).toBe('59s')
+  })
+
+  it('adds an hours band past an hour, so a long run never reads 67m 11s', () => {
+    // #19930: a subagent run of 4031s read `4031s` on the chip and `67m 11s`
+    // in the sidebar. The boundary steps 59m 59s -> 1h 0m 0s.
+    expect(fmtElapsed(4_031_000)).toBe('1h 7m 11s')
+    expect(fmtElapsed(3_599_000)).toBe('59m 59s')
+    expect(fmtElapsed(3_600_000)).toBe('1h 0m 0s')
+    expect(fmtElapsed(3_599_600)).toBe('1h 0m 0s')
+  })
+
+  it('drops the tenths band for a whole-second live counter', () => {
+    // A 1 Hz counter's input is already whole seconds; `4.0s` there is noise.
+    expect(fmtElapsed(4_000, { wholeSeconds: true })).toBe('4s')
+    expect(fmtElapsed(0, { wholeSeconds: true })).toBe('0s')
+    expect(fmtElapsed(37_000, { wholeSeconds: true })).toBe('37s')
+    expect(fmtElapsed(4_031_000, { wholeSeconds: true })).toBe('1h 7m 11s')
+  })
+
+  it('formats in the app language, not the host default', async () => {
+    // Derived, not golden: proves the wiring rather than pinning a zh literal.
+    // zh joins unit lists with nothing, so a hardcoded space would leave a gap.
+    await withLanguage('zh-CN', () => {
+      expect(fmtElapsed(398_000)).toBe(
+        new Intl.ListFormat('zh-CN', { type: 'unit', style: 'narrow' }).format([
+          new Intl.NumberFormat('zh-CN', { style: 'unit', unit: 'minute', unitDisplay: 'narrow' }).format(6),
+          new Intl.NumberFormat('zh-CN', { style: 'unit', unit: 'second', unitDisplay: 'narrow' }).format(38),
+        ]),
+      )
+    })
+  })
+
+  it('renders an em dash for a span that cannot be measured', () => {
+    // Same sentinel fmtDuration uses, so a caller can hand over an unmeasurable
+    // span without branching.
+    expect(fmtElapsed(NaN)).toBe('—')
+    expect(fmtElapsed(Infinity)).toBe('—')
+  })
+})
+
 describe('fmtCompact', () => {
   it('abbreviates per the language, not with a hardcoded K', async () => {
     expect(fmtCompact(1234)).toBe('1.2K') // golden (en)
@@ -432,10 +517,14 @@ describe('fmtBytes', () => {
 
   it('localizes the unit and the separator', async () => {
     await withLanguage('ru', () => {
+      // ru's separator is CLDR's, not ours. The one deviation is that a plain
+      // U+0020 is promoted to U+00A0 — see `fmtUnit`. ru already uses U+00A0
+      // here, so this locale is unchanged by that; the normalization is applied
+      // to both sides so the test states the rule rather than the locale's luck.
       expect(fmtBytes(1500)).toBe(
         new Intl.NumberFormat('ru', {
           style: 'unit', unit: 'kilobyte', unitDisplay: 'narrow', maximumFractionDigits: 1,
-        }).format(1.5),
+        }).format(1.5).replace(/ /g, '\u00A0'),
       )
     })
   })
@@ -488,5 +577,23 @@ describe('collator / compareText', () => {
 
   it('exposes the raw collator for callers needing other options', () => {
     expect(collator({ sensitivity: 'variant' }).compare('apple', 'Apple')).not.toBe(0)
+  })
+})
+
+describe('fmtLanguageName', () => {
+  it('names a language in the active language', async () => {
+    expect(fmtLanguageName('vi')).toBe(
+      new Intl.DisplayNames('en', { type: 'language' }).of('vi'),
+    )
+    await withLanguage('de', () => {
+      // Derived from the language's own Intl data, so ICU updates cannot break it.
+      expect(fmtLanguageName('vi')).toBe(new Intl.DisplayNames('de', { type: 'language' }).of('vi'))
+      expect(fmtLanguageName('vi')).not.toBe(new Intl.DisplayNames('en', { type: 'language' }).of('vi'))
+    })
+  })
+
+  it('shows the code itself when Intl cannot name it', () => {
+    expect(fmtLanguageName('not a code')).toBe('not a code')
+    expect(fmtLanguageName('')).toBe('')
   })
 })

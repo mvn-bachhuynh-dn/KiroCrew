@@ -16,13 +16,13 @@ from kiro_crew.dashboard.handlers import mcp as mcp_mod
 
 
 class TestBgMcpProbeBoundedFanout:
-    """Regression guard.
+    """``_bg_mcp_probe`` must respect the probe concurrency bound.
 
-    ``_bg_mcp_probe`` previously ran its own unbounded ``asyncio.gather`` over
-    every configured server, bypassing the ``_PROBE_MAX_CONCURRENCY`` semaphore
-    that ``probe_all()`` carries (the fix). Under a network blip that
-    floods the loop's default executor and can starve the heartbeat into a
-    watchdog ``_exit`` (full gateway restart). It MUST route through the bounded
+    Its own unbounded ``asyncio.gather`` over every configured server would
+    bypass the ``PROBE_MAX_CONCURRENCY`` semaphore that ``probe_all()`` carries.
+    Under a network blip that floods the loop's default executor and can starve
+    the heartbeat into a watchdog ``_exit`` (full gateway restart). It MUST route
+    through the bounded
     ``probe_all()`` path.
     """
 
@@ -44,7 +44,7 @@ class TestBgMcpProbeBoundedFanout:
         monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
         monkeypatch.setattr(mcp_mod, "_mcp_probe_in_progress", True)
 
-        await mcp_mod._bg_mcp_probe()
+        await mcp_mod._bg_mcp_probe(None)
 
         # The bounded path was used exactly once. Fails if an unbounded gather
         # over probe_server is ever reintroduced in _bg_mcp_probe.

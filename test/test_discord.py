@@ -5,6 +5,16 @@ button components (renderer.py), deny-by-default auth + DM-only guard +
 capabilities + inbound normalization (transport.py), streaming render +
 finalization (renderer.py), the interactive approval decider, and the dispatch
 turn + interaction routing (transport_dispatch.py). Mirrors test_telegram.py.
+
+The family is split by the module under test. This file holds the command
+parsing, the renderer's chunking and option helpers, the gateway client and the
+transport. The streaming render, finalization and the approval decider are in
+``test_discord_renderer.py``; the dispatch turn is in
+``test_discord_dispatcher.py`` and ``test_discord_mirroring.py`` (the
+conversation as its own mirror, and its crew log); interaction routing and the
+command surfaces are in ``test_discord_interactions.py``. The shared fakes are
+in ``discord_helpers.py``; this module re-exports the ones other suites import
+from it.
 """
 
 from __future__ import annotations
@@ -15,34 +25,39 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
+import discord_helpers
 import pytest
-
-from kiro_crew.acp.types import (
-    EVENT_COMPACTION_STATUS,
-    EVENT_COMPLETE,
-    EVENT_TEXT_CHUNK,
+from discord_helpers import (  # noqa: F401
+    _PNG,
+    FakeClient,
+    FakeCtx,
+    FakeProvider,
+    FakeSessions,
+    MultipartFake,
+    _dispatcher,
+    _drop_live_config_snapshot,
+    _Ev,
+    _inbound,
+    _prime_live,
 )
+
+from conftest import assert_rejected_without_backtracking
+from kiro_crew.discord import renderer as discord_renderer
 from kiro_crew.discord.attachments import process_discord_attachments
 from kiro_crew.discord.client import (
     _INTENT_DIRECT_MESSAGES,
     _INTENT_GUILD_MESSAGES,
     _INTENT_MESSAGE_CONTENT,
     DISCORD_CHUNK_LIMIT,
+    DISCORD_MAX_TEXT,
     DiscordClient,
     DiscordInbound,
-    DiscordInteraction,
     _find_button_label,
 )
-from kiro_crew.discord.commands import (
-    parse_command,
-    parse_mid_turn_override,
-)
+from kiro_crew.discord.commands import parse_command, parse_mid_turn_override
 from kiro_crew.discord.renderer import (
-    DiscordApprovalDecider,
     DiscordRenderer,
     _extract_options,
-    _split_markdown,
-    _split_text,
     _strip_steering,
     build_option_components,
 )
@@ -51,325 +66,12 @@ from kiro_crew.discord.transport import (
     DiscordInboundMessage,
     DiscordTransport,
 )
-from kiro_crew.discord.transport_dispatch import (
-    _STEER_ACK_EMOJI,
-    DiscordDispatcher,
-    _receipt_text,
-)
+from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
-from kiro_crew.messaging.link import ChannelLink, legacy_dashboard_mirror_key
+from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.session_map import ConversationOwnershipConflict
 
-_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
-
-# ── Fakes ──────────────────────────────────────────────────────────────────
-
-
-class FakeClient:
-    """Captures outbound Discord REST calls."""
-
-    def __init__(self) -> None:
-        self.sent: list[tuple[str, Any]] = []
-        self.edits: list[tuple[str, str, Any]] = []
-        self.component_edits: list[tuple[str, Any]] = []
-        self.acked: list[str] = []
-        self.reactions: list[tuple[str, str]] = []
-        self.thread_channels: set[str] = set()
-        self.attachment_bodies: dict[str, bytes] = {}
-        self.attachment_downloads: list[str] = []
-        self._mid = 100
-
-    async def is_thread_channel(self, channel_id: str) -> bool:
-        return channel_id in self.thread_channels
-
-    async def send_typing(self, channel_id: str) -> None:
-        return None
-
-    async def send_message(
-        self,
-        channel_id: str,
-        text: str,
-        *,
-        components: Any = None,
-        reply_to_message_id: Any = None,
-    ) -> str:
-        await asyncio.sleep(0)  # yield like a real network await (exposes races)
-        self._mid += 1
-        self.sent.append((text, components))
-        return str(self._mid)
-
-    async def edit_message(
-        self,
-        channel_id: str,
-        message_id: str,
-        text: str,
-        *,
-        components: Any = None,
-    ) -> bool:
-        self.edits.append((message_id, text, components))
-        return True
-
-    async def edit_message_components(
-        self, channel_id: str, message_id: str, components: Any
-    ) -> bool:
-        self.component_edits.append((message_id, components))
-        return True
-
-    async def ack_component_interaction(self, interaction_id: str, interaction_token: str) -> None:
-        self.acked.append(interaction_id)
-
-    async def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
-        self.reactions.append((message_id, emoji))
-
-    async def create_dm_channel(self, user_id: str) -> str:
-        return f"dm-{user_id}"
-
-    async def download_attachment(self, url: str, dest: str) -> None:
-        self.attachment_downloads.append(url)
-        with open(dest, "wb") as fh:
-            fh.write(self.attachment_bodies[url])
-
-    def final_text(self) -> Any:
-        """Text the user ultimately sees on the live message: the last edit if
-        it was edited (edit-streaming), else the last send."""
-        if self.edits:
-            return self.edits[-1][1]
-        return self.sent[-1][0] if self.sent else None
-
-    def final_components(self) -> Any:
-        if self.edits:
-            return self.edits[-1][2]
-        return self.sent[-1][1] if self.sent else None
-
-
-class _Ev:
-    def __init__(self, kind: str, text: str = "", stop_reason: str = "", title: str = "") -> None:
-        self.kind = kind
-        self.text = text
-        self.stop_reason = stop_reason
-        self.tool_call_id = ""
-        self.title = title
-        self.context_usage_pct = 0.0
-
-
-class FakeProvider:
-    supports_steer = True
-
-    def __init__(self, reply: str = "Answer") -> None:
-        self._reply = reply
-        self.steered: list = []
-        self.cancelled = 0
-        self.active_turn = True
-
-    def has_active_turn(self) -> bool:
-        return self.active_turn
-
-    async def steer(self, text: str) -> bool:
-        self.steered.append(text)
-        return True
-
-    async def cancel(self, *, wait_ack_timeout: float = 0.0) -> str:
-        self.cancelled += 1
-        return "acked"
-
-    async def stream(self, message: str) -> Any:
-        yield _Ev(EVENT_TEXT_CHUNK, text=f"{self._reply}: {message[:16]}")
-        yield _Ev(EVENT_COMPLETE, stop_reason="end_turn")
-
-    async def stream_command(self, command: str) -> Any:
-        yield _Ev(EVENT_COMPACTION_STATUS, text="completed", title="ok")
-        yield _Ev(EVENT_COMPLETE, stop_reason="end_turn")
-
-    async def compact(self, context: str = "") -> None:
-        return None
-
-    async def wait_for_compaction(self, timeout: float = 0.0) -> dict:
-        return {"type": "completed", "summary": "ok"}
-
-    async def approve_tool(self, request_id: Any) -> None:
-        return None
-
-    async def reject_tool(self, request_id: Any) -> None:
-        return None
-
-
-class FakeSessions:
-    def __init__(self, raise_on_get: bool = False) -> None:
-        self.released: list[str] = []
-        self.acquired: list[str] = []
-        self.destroyed: list[str] = []
-        self.successes: list[str] = []
-        self.failures: list[str] = []
-        self.last_agent: Any = None
-        self.raise_on_get = raise_on_get
-        self._busy = False
-        self._has = True
-        self.queued: list = []
-        self._gp = FakeProvider()
-        self.mirror_links: dict[str, Any] = {}
-        self.origin_links: dict[str, Any] = {}
-        self.inbound_mirror_keys: set[str] = set()
-
-    async def get_or_create(self, key: str, *, agent: Any = None, channel_id: Any = None) -> Any:
-        self.last_agent = agent
-        if self.raise_on_get:
-            raise RuntimeError("cold-start failed")
-        return FakeProvider(), True, False
-
-    async def set_channel(self, key: str, channel: str) -> None:
-        return None
-
-    def record_success(self, key: str) -> None:
-        self.successes.append(key)
-
-    async def record_failure(self, key: str) -> None:
-        self.failures.append(key)
-
-    def check_context_usage(self, key: str, provider: Any) -> float:
-        return 10.0
-
-    def release(self, key: str) -> None:
-        self.released.append(key)
-
-    def get_provider(self, key: str) -> Any:
-        return self._gp
-
-    def is_busy(self, key: str) -> bool:
-        return self._busy
-
-    def max_generation(self, bucket: str) -> int:
-        return -1
-
-    def set_mirror_link(
-        self,
-        key: str,
-        link: Any,
-        *,
-        accepts_inbound: bool = False,
-    ) -> None:
-        # Interface parity with the real SessionMap: a conversation is exclusive
-        # once it is inbound-committed — this claim is inbound-capable, or an
-        # occupant already is. Two outbound-only mirrors stay allowed. A fake that
-        # accepts what production refuses lets a test go green against a state the
-        # product cannot reach.
-        rivals = [
-            other for other, held in self.mirror_links.items() if other != key and held == link
-        ]
-        if rivals and (
-            accepts_inbound or any(other in self.inbound_mirror_keys for other in rivals)
-        ):
-            raise ConversationOwnershipConflict(
-                f"{getattr(link, 'channel_type', '?')} conversation is already held"
-            )
-        self.mirror_links[key] = link
-        if accepts_inbound:
-            self.inbound_mirror_keys.add(key)
-        else:
-            self.inbound_mirror_keys.discard(key)
-
-    def get_mirror_link(self, key: str) -> Any:
-        return self.mirror_links.get(key)
-
-    def set_origin_link(self, key: str, link: Any) -> None:
-        self.origin_links[key] = link
-
-    def get_origin_link(self, key: str) -> Any:
-        return self.origin_links.get(key)
-
-    def find_mirror_sessions(self, link: Any, *, inbound_only: bool = False) -> list[str]:
-        return [
-            key
-            for key, candidate in self.mirror_links.items()
-            if candidate == link and (not inbound_only or key in self.inbound_mirror_keys)
-        ]
-
-    def clear_mirror_link(self, key: str) -> bool:
-        self.inbound_mirror_keys.discard(key)
-        return self.mirror_links.pop(key, None) is not None
-
-    def clear_mirror_links_at(self, link: Any) -> list[str]:
-        cleared = self.find_mirror_sessions(link)
-        for key in cleared:
-            self.inbound_mirror_keys.discard(key)
-            self.mirror_links.pop(key, None)
-        return cleared
-
-    def enqueue(self, key: str, ts: str, text: str, *, force: bool = False, **kw: Any) -> bool:
-        if force or self._busy:
-            self.queued.append((ts, text, kw))
-            return True
-        return False
-
-    def dequeue(self, key: str) -> Any:
-        return self.queued.pop(0) if self.queued else None
-
-    def clear_queue(self, key: str) -> None:
-        self.queued.clear()
-
-    def has_session(self, key: str) -> bool:
-        return self._has
-
-    async def try_acquire(self, key: str) -> bool:
-        if self._busy or not self._has:
-            return False
-        self.acquired.append(key)
-        return True
-
-    async def destroy(self, key: str) -> None:
-        self.destroyed.append(key)
-
-
-class _FakeHooks:
-    auto_approve_subagent_spawn = False
-
-    def on_tool_call(self, *a: Any, **k: Any) -> Any:
-        return SimpleNamespace(action="allow")
-
-
-class FakeCtx:
-    def __init__(self) -> None:
-        self.hooks = _FakeHooks()
-        self.messages: list[str] = []
-
-    def build_message(self, text: str, is_new: bool, key: str, **kw: Any) -> Any:
-        self.messages.append(text)
-        return text, None
-
-
-def _cfg(soft: int = 80, default_agent: str = "") -> Any:
-    return SimpleNamespace(
-        discord=SimpleNamespace(soft_threshold_pct=soft),
-        agent=SimpleNamespace(default_agent=default_agent),
-        messaging=SimpleNamespace(
-            dm_scope="per-channel-peer",
-            idle_reset_minutes=0,
-            daily_reset_hour=-1,
-            queue_mode="steer",
-        ),
-    )
-
-
-def _dispatcher(
-    allowed: set[str],
-    *,
-    allowed_threads: set[str] | None = None,
-    raise_on_get: bool = False,
-    default_agent: str = "",
-) -> tuple[DiscordDispatcher, FakeClient, FakeSessions]:
-    sess = FakeSessions(raise_on_get=raise_on_get)
-    d = DiscordDispatcher(
-        sessions=sess,  # type: ignore[arg-type]
-        ctx_builder=FakeCtx(),  # type: ignore[arg-type]
-        cfg=_cfg(default_agent=default_agent),
-        allowed_user_ids=allowed,
-        allowed_thread_ids=allowed_threads,
-        agent=None,
-        conv_log=None,
-    )
-    cli = FakeClient()
-    d.client = cli  # type: ignore[assignment]
-    return d, cli, sess
+_cfg = discord_helpers._cfg  # assigned, not imported: a parameter here shadows it
 
 
 # ── commands.py ──────────────────────────────────────────────────────────
@@ -431,26 +133,687 @@ class TestMidTurnOverride:
 
 # ── renderer.py helpers ──────────────────────────────────────────────────
 
+_ORACLE_CODE = "x = 1\n"
+_ORACLE_PROSE = "Ordinary prose about how chat surfaces render markdown.\n"
 
-class TestSplitText:
-    def test_short_text_single_chunk(self) -> None:
-        assert _split_text("hello", 100) == ["hello"]
+#: Fence shapes swept by BOTH renderer oracles -- the strip/append symmetry one
+#: and the whitespace-fidelity one. Shared so neither can drift onto a corpus the
+#: other never sees. They cover the information a per-chunk fence walk cannot
+#: recover from the source: 3/4/5-backtick openers, authored inner bare ``` lines,
+#: literal backticks in prose, 4-space-indented lookalikes, info strings, and a
+#: run of blank lines at the tail.
+_FENCE_SHAPES = [
+    "```py\n" + _ORACLE_CODE * 40,  # open 3-backtick fence
+    "```py\n" + _ORACLE_CODE * 40 + "```\n",  # closed 3-backtick fence
+    "````md\n" + _ORACLE_CODE * 40,  # open 4-backtick fence
+    "````md\n" + ("```py\n" + _ORACLE_CODE + "```\n") * 25,  # inner bare closers
+    "````md\n" + ("```py\n" + _ORACLE_CODE + "```\n") * 25 + "````\n",  # …then closed
+    "`````\n" + ("```\n" + _ORACLE_CODE + "```\n") * 25,  # 5-backtick outer
+    _ORACLE_PROSE * 12,  # no fence at all
+    "You type ``` to open a block.\n" + _ORACLE_PROSE * 12,  # literal in prose
+    "You type ``` inline.\n\n```py\n" + _ORACLE_CODE * 30,  # literal, then open
+    _ORACLE_PROSE * 6 + "    ```\n" + _ORACLE_CODE * 20,  # indented lookalike
+    "   ```py\n" + _ORACLE_CODE * 40,  # 3-space indent still opens
+    "```a`b\n" + _ORACLE_CODE * 40,  # backtick in info string == inline code
+    "```py\n" + _ORACLE_CODE * 20 + "```\n\n```sh\nls\n" + _ORACLE_CODE * 20,  # two fences
+    "````md\n" + _ORACLE_CODE * 20 + "```\n" + _ORACLE_CODE * 20 + "\n\n\n",  # ws tail
+    # Blank code lines INSIDE a fence with more code after them -- the shape the
+    # remainder would delete, swept at every limit so the cut lands on each
+    # newline of the run in turn.
+    "```py\n" + _ORACLE_CODE * 20 + "\n\n" + _ORACLE_CODE * 20,
+    "```py\n" + (_ORACLE_CODE + "\n\n\n") * 12,  # 4-newline runs throughout
+]
 
-    def test_empty_text(self) -> None:
-        assert _split_text("", 100) == []
 
-    def test_splits_at_paragraph_boundary(self) -> None:
-        text = "para one\n\npara two\n\npara three"
-        chunks = _split_text(text, 20)
-        assert all(len(c) <= 20 for c in chunks)
-        assert "".join(c.replace("\n", "") for c in chunks)  # nothing lost
+class TestRotationSplitting:
+    """The regression corpus, repointed onto the shared splitter.
 
-    def test_split_markdown_balances_fences(self) -> None:
-        code = "```py\n" + ("x = 1\n" * 50) + "```"
-        chunks = _split_markdown(code, 120)
-        assert len(chunks) > 1
-        for ch in chunks:
-            assert ch.count("```") % 2 == 0  # every chunk self-contained
+    Discord owns no splitter: ``_rotate_on_length`` consumes
+    ``split_markdown_safe``, so every shape below is that module's behavior as a
+    Discord user reads it. The module's own contracts -- fence grammar, budget,
+    prefix stability, lossless reassembly -- are pinned in
+    ``test_messaging_split.py`` and are deliberately not restated here. These
+    tests pin the INTEGRATION: which chunks the renderer seals, which one it
+    keeps live, and that it adds and removes nothing on the way.
+    """
+
+    def _renderer(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: limit)
+        # A live frame is throttled and re-rendered by design, so it carries no
+        # stability promise and would interleave with the sealed frames. Holding
+        # it back leaves ``cli.sent`` as exactly the sealed chunks, in order,
+        # which is the channel every assertion below reads.
+        monkeypatch.setattr("kiro_crew.discord.renderer._EDIT_THROTTLE_S", 1e9)
+        return r, cli
+
+    async def _rotate(
+        self, monkeypatch: pytest.MonkeyPatch, src: str, limit: int
+    ) -> tuple[list[str], str]:
+        """The sealed frames and the retained live buffer for *src* at *limit*."""
+        r, cli = self._renderer(monkeypatch, limit)
+        r._buf = [src]
+        await r._rotate_on_length()
+        return [t for t, _ in cli.sent], "".join(r._buf)
+
+    @pytest.mark.asyncio
+    async def test_pathological_rotation_work_is_offloaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.discord import renderer as renderer_module
+
+        r, _ = self._renderer(monkeypatch, 100)
+        source = "`" * 5_000
+        r._buf = [source]
+        offloads: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+        def _capture(text: str, limit: int) -> tuple[list[str], bool]:
+            return [text], False
+
+        async def _offload(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+            offloads.append((func, args, kwargs))
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(renderer_module, "split_markdown_safe_with_tier", _capture)
+        monkeypatch.setattr(renderer_module.asyncio, "to_thread", _offload)
+
+        await r._rotate_on_length()
+
+        assert offloads == [
+            (renderer_module.protected_ref_spans, (source,), {}),
+            (_capture, (source, 100), {}),
+            # The rotation grades the pair the splitter never sees -- the sealed
+            # chunks plus the tail it retains -- and that read is over
+            # attacker-influenced text, so it is offloaded like the two above it.
+            (
+                renderer_module.severs_a_credential,
+                ([source], renderer_module._redact_all, renderer_module._delivered_form),
+                {},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_segment_under_the_cap_is_not_rotated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert await self._rotate(monkeypatch, "hello", 100) == ([], "hello")
+        assert await self._rotate(monkeypatch, "", 100) == ([], "")
+
+    @pytest.mark.asyncio
+    async def test_a_lone_chunk_is_handed_back_untouched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Nothing appended and nothing to undo, including for the shapes the
+        # deleted tail-closer strip would have to reason about.
+        for text in ["```py\nx = 1\n", "type ``` here", "plain prose"]:
+            assert await self._rotate(monkeypatch, text, 1900) == ([], text)
+
+    @pytest.mark.asyncio
+    async def test_a_paragraph_boundary_is_preferred(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sealed, tail = await self._rotate(monkeypatch, "para one\n\npara two\n\npara three", 20)
+        assert sealed == ["para one"]  # cut at the paragraph break, blank line trimmed
+        assert tail == "para two\n\npara three"
+
+    @pytest.mark.asyncio
+    async def test_every_sealed_frame_closes_its_own_fence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sealed, tail = await self._rotate(monkeypatch, "```py\n" + "x = 1\n" * 50 + "```", 120)
+        assert len(sealed) > 1
+        for frame in sealed:
+            # Self-contained: the language tag is carried into every
+            # continuation and a matching closer ends it.
+            assert frame.startswith("```py\n"), frame[:12]
+            assert frame.endswith("\n```"), frame[-8:]
+            assert frame.count("```") % 2 == 0
+        assert tail.endswith("```")  # the source's own closer, not an invented one
+
+    @pytest.mark.asyncio
+    async def test_the_retained_tail_is_left_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The final chunk keeps a still-arriving fence OPEN, by contract.
+
+        This is what replaced a whole append-then-strip protocol. The private
+        splitter sealed every chunk including the last and reported, through a
+        returned flag, that it had done so; the rotation then undid it on the
+        retained tail. The shared splitter never seals the final chunk, so there
+        is no flag to read and nothing to strip -- and no way for an append and
+        a strip to disagree, which is what every defect in that cluster was.
+        """
+        src = "```py\n" + "x = 1\n" * 50  # the model's closing ``` has not arrived
+        sealed, tail = await self._rotate(monkeypatch, src, 120)
+        assert len(sealed) > 1
+        for frame in sealed:
+            assert frame.endswith("\n```")
+        assert tail.startswith("```py\n")  # the authored opener, not a bare ```
+        assert not tail.rstrip().endswith("```")
+        assert src.endswith(tail[len("```py\n") :])  # the tail IS the source's own tail
+
+    @pytest.mark.asyncio
+    async def test_a_seal_ending_in_escape_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Escape opener UNMATCHED across the seam: the sealed prefix ends in an
+        odd backslash run, so a marker on the live tail's first line is escaped
+        (literal) in the full text but real when the tail is scanned alone.
+
+        The seam-aware classifier asks the extraction reader at the tail's own
+        resume point: the two readings disagree, so the rotation fails closed.
+        Left un-degraded, the semantic seal would upload a source-literal file.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        # Cut lands right after a lone backslash; the tail opens with markup the
+        # backslash escapes in the full text.
+        r._buf = ["y" * 59 + "\\" + "![c](/tmp/c.png) tail"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_escaped_trailing_space_is_not_escape_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Escape opener MATCHED (spent) at the seam: a backslash escaping a real
+        trailing space straddles nothing the tail resumes.
+
+        The extraction reader judges both readings the same, so the classifier
+        sees no flip and uploads stay eligible. A whole-head escape count on the
+        rstripped sealed chunk would have faked debt here; consulting the reader
+        at the tail's resume point does not.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["x" * 58 + "\\ short tail here"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_clean_seal_keeps_uploads_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A seam with no open literalness context of any kind is neutral: both
+        readings agree, so uploads stay eligible."""
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["x" * 58 + " short tail here"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_backtick_balanced_within_the_seam_block_is_not_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A backtick BALANCED within the seam's own blank-line block is not
+        debt: the block closes its inline-code span before the seam, so the
+        prefix opens nothing the tail inherits.
+
+        Check 1 masks the seam's own block with the reader's segmentation. A
+        block whose backticks pair leaves no surviving opener, so uploads stay
+        eligible -- degrading here would only cost a genuinely-real image later.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # An earlier paragraph carries a lone backtick, but the seam's OWN block
+        # closes its inline-code span (`code`) before the over-limit filler is
+        # cut, so nothing is left open at the seam.
+        r._buf = ["a ` char here\n\nthen `code` and " + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_an_open_inline_code_opener_in_the_seam_block_degrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An inline-code opener still OPEN in the seam's own block degrades,
+        fail-closed.
+
+        The seam's block ends inside an unclosed inline-code span. Whether a
+        closing backtick arrives later on the tail is unknown at rotation, and if
+        it does the tail-alone read promotes a marker the full text keeps
+        literal -- so the classifier fails closed on the open opener in the
+        seam's own block rather than gambling on the closer never arriving.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # The seam's own block opens an inline-code span and does not close it
+        # before the over-limit line is cut.
+        r._buf = ["intro\n\nopen `code span " + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_two_unmatched_backticks_in_separate_paragraphs_degrade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two unmatched backticks in SEPARATE paragraphs, then a literal local
+        image across the seam, must degrade (GPT finding on the whole-region
+        mask).
+
+        A whole-prefix mask pairs the two lone backticks across the blank line
+        and sees no debt, so a later ``![b](...)`` that the full text keeps
+        literal -- because the second paragraph's inline-code span still covers
+        it -- is uploaded once the tail is scanned alone. Block-bounding the mask
+        to the seam's own block (the reader's own segmentation) sees the second
+        paragraph's opener still open and degrades. Fail closed.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Para 1 opens a lone backtick; blank line; para 2 opens another and its
+        # over-limit line is cut with the span still open -- a later
+        # ``![b](/tmp/b.png)`` on the tail, closed by a trailing backtick, is
+        # literal in the full text but real in the tail alone.
+        r._buf = [
+            "first `para with a lone tick\n\n"
+            "second `para " + "y" * 70 + " and ![b](/tmp/b.png) done`\n"
+        ]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_a_matched_inline_code_pair_across_the_seam_stays_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inline-code opener MATCHED before the seam: a balanced pair leaves no
+        open context for the tail to resume, so uploads stay eligible."""
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["a `code` here " + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_an_open_fence_across_the_seam_does_not_disable_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fence opener across the seam via a REOPENER tail: the splitter builds
+        ``tail = reopener + remainder`` with a synthetic ``"```lang\\n"`` the
+        source never had, so ``split_source.endswith(tail)`` is False.
+
+        The seam then sits inside an open fence -- literal in both readings and
+        already owned by the fence-aware per-chunk span scan -- so the classifier
+        is skipped and uploads stay eligible. A naive concatenation check would
+        have fabricated a closing-then-reopening fence and faked debt.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # A long code fence, still open, over the limit -- no orphaned ref.
+        r._buf = ["```py\n" + "x = 1\n" * 40]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_an_over_limit_indented_fenced_block_stays_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fenced block whose lines are themselves indented, crossing the
+        limit, must not disable uploads.
+
+        The reopener tail makes ``split_source.endswith(tail)`` False, so the
+        seam classifier is skipped: every seam is inside the open fence, literal
+        in both readings. Otherwise the reopened fence's indent would have faked
+        indentation debt and disabled uploads for the whole segment.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["```py\n" + "    indented_code = 1\n" * 6]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_in_indented_code_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Indentation opener UNMATCHED across the seam (head indented, tail
+        not): a four-space indented logical line dirty-cut MID-LINE leaves the
+        tail continuing that literal-code context WITHOUT its indent.
+
+        The full text reads a marker on that line literal (indented code); the
+        de-indented tail reads it real. The classifications differ -- the seam
+        classifier sees the flip and fails closed. This is the original
+        local-path leak repro: left un-degraded, the semantic seal would upload
+        a source-literal file.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # One over-limit indented-code line, no ref yet; it is cut mid-line and
+        # the tail resumes the same logical line without the four-space indent.
+        r._buf = ["    " + "y" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_without_indent_keeps_uploads_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Indentation MATCHED (absent in both): a non-indented logical line cut
+        mid-line opens no literal-code context.
+
+        A marker on its tail is genuinely real in the full text too, so both
+        readings agree and there is no degrade.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["z" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_before_a_tab_led_tail_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Indentation opener UNMATCHED the OTHER way (head not indented, tail
+        tab-led): the mirror flip.
+
+        ``_safe_cut`` admits a mid-line boundary right before a leading ``\\t``
+        (a tab is not a delimiter lead), so the retained tail BEGINS tab-led and
+        reads as indented code at offset 0 -- while the source line's own start
+        is not indented. The full text reads a marker on that line REAL, the
+        tail-alone reading reads it LITERAL: the seal drops the image and ships
+        the raw local path to Discord as display text. The seam classifier fails
+        closed on the mismatch.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Over-limit single logical line; the mid-line cut lands so the tail
+        # begins with a tab (>= four expanded columns) while the source line
+        # itself is not indented -- a literalness flip.
+        r._buf = ["z" * 59 + "\t  more code on the same over-limit logical line\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_over_limit_fenced_block_does_not_fake_seam_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fenced block crossing the limit must not disable uploads: the
+        reopener tail makes the seam classifier skip (seam inside an open
+        fence, owned by the fence-aware per-chunk span scan)."""
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # An indented fenced code block, over the limit, carrying no orphaned
+        # reference -- every seam is inside the open fence.
+        r._buf = ["```py\n" + "    indented_code = 1\n" * 6]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_the_original_local_path_leak_is_not_uploaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: the indentation-seam leak (the class all three review
+        blocks descended from) does not surface a workspace path as an upload.
+
+        A four-space indented over-limit line is cut mid-line; a later image
+        marker arrives on the de-indented tail. The full text keeps it literal
+        (indented code), so the file must NOT be extracted -- degrading routes
+        the seal to redacted display text, where the marker stays literal, and
+        no OutboundFile is produced.
+        """
+        r, cli = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Rotate on the indented over-limit line -> degrade.
+        r._buf = ["    " + "y" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+        # The later marker arrives on the tail; the segment stays degraded, so
+        # the seal extracts nothing (no local file uploaded).
+        r._buf.append("![c](/tmp/c.png)\n")
+        await r._seal_current(extract_uploads=True)
+        assert cli.uploaded_files == []
+
+    @pytest.mark.asyncio
+    async def test_an_inline_code_span_opened_before_the_seam_degrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `` ``code `` inline-code span opened in the sealed prefix, whose
+        closer sits DEEP in the live tail, degrades the segment.
+
+        The rotation seals a prefix that opens a two-backtick inline span; the
+        tail is later sealed WITHOUT that opener, so a marker the full text kept
+        literal because the span covered it reads as real once the tail is
+        scanned alone. The ref-set at the rotation seam cannot see it -- the tail
+        still carries the closing delimiter at that instant -- so the classifier
+        catches it as an inline-code opener with no closer before the seam. Fail
+        closed: the whole segment degrades.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # `` ``code `` opens a two-backtick inline span; the over-limit filler
+        # forces a rotation whose sealed prefix ends inside that open span,
+        # while the closer only arrives far down the live tail.
+        r._buf = ["``code\n" + "x" * 80 + "\n" + "y" * 80 + "\ntail and ![b](/tmp/b.png)\n``"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_fence_grammar_seams_survive_a_rotation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a real fence line opens a block, and its run length is kept.
+
+        A ``` counted as a substring reads prose about fencing as code and
+        inverts every later decision; a closer shorter than its opener closes
+        nothing. Each row is (opener line, the tail's reopener, the closer a
+        sealed frame carries) -- an empty reopener means the source opened no
+        fence at all, so no frame may carry a closer either.
+        """
+        code = "x = 1\n" * 60
+        for opener, reopen, closer in [
+            ("```py\n", "```py\n", "\n```"),
+            ("````md\n", "````md\n", "\n````"),
+            ("`````\n", "`````\n", "\n`````"),
+            ("   ```py\n", "   ```py\n", "\n```"),  # <=3 spaces of indent still opens
+            ("    ```py\n", "", ""),  # 4+ is an indented code line
+            ("```a`b\n", "", ""),  # a backtick in the info string is inline code
+            ("You type ``` inline.\n", "", ""),  # mid-line, so it opens nothing
+        ]:
+            sealed, tail = await self._rotate(monkeypatch, opener + code, 120)
+            where = repr(opener)
+            assert len(sealed) > 1, where
+            assert tail.startswith(reopen), (where, tail[:14])
+            for frame in sealed:
+                assert frame.endswith(closer or "x = 1"), (where, frame[-10:])
+
+    @pytest.mark.asyncio
+    async def test_an_authored_inner_fence_line_survives_a_rotation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 4-backtick block documenting 3-backtick ones keeps its own ``` lines.
+
+        Per CommonMark the inner bare ``` closes nothing, so the source fence is
+        still open at the cut and every continuation reopens the 4-backtick one.
+        A per-chunk walk run after a BARE ``` reopen loses the opener's run
+        length, reads the authored inner closer as closing the block, and the
+        strip that followed then deleted the author's own line.
+        """
+        src = "````markdown\n" + "Nest a block:\n\n```py\nx = 1\n```\n\n" * 90
+        sealed, tail = await self._rotate(monkeypatch, src, 1800)
+        assert len(sealed) >= 1
+        assert tail.startswith("````markdown\n")
+        assert src.endswith(tail[len("````markdown\n") :])  # a suffix, not a shortened copy
+        authored = src.count("\n```\n")
+        assert sum(f.count("\n```\n") for f in sealed) + tail.count("\n```\n") >= authored
+
+    @pytest.mark.asyncio
+    async def test_indentation_inside_a_fence_reaches_the_user_verbatim(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Stripping leading whitespace silently re-indents split code. Inside a
+        # fence the reopener heads every continuation, so an indented code line
+        # never starts a frame and survives the renderer's own strip too.
+        src = "```py\n" + "    indented = 1\n" * 40
+        sealed, tail = await self._rotate(monkeypatch, src, 200)
+        assert len(sealed) > 1
+        for frame in sealed + [tail]:
+            for line in frame.split("\n"):
+                if "indented" in line:
+                    assert line == "    indented = 1", repr(line)
+
+    @pytest.mark.asyncio
+    async def test_blank_code_lines_survive_a_rotation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Blank lines are CONTENT inside a fence, and no cut absorbs a run.
+
+        ``lstrip("\\n")`` on a boundary remainder deleted whole runs of them and
+        pulled the next code line up a row. The shared splitter absorbs no line
+        separator at all, so the run reaches the retained tail intact.
+        """
+        # A remainder of nothing but newlines.
+        _, tail = await self._rotate(monkeypatch, "```py\n" + "x = 1\n" * 299 + "\n\n", 1800)
+        assert tail.endswith("\n\n\n")
+        # The same run straddling the cut, with more code AFTER it.
+        src = "```py\n" + "x = 1\n" * 6 + "\n\n" + "y = 2\n" * 6
+        sealed, tail = await self._rotate(monkeypatch, src, 60)
+        assert len(sealed) >= 1
+        joined = "".join(sealed) + tail
+        assert "x = 1y = 2" not in joined  # no code line shifted up onto another
+        assert "\n\n" in joined  # the blank code lines are still there
+
+    @pytest.mark.asyncio
+    async def test_a_continuation_gains_no_leading_blank_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The opposite failure mode of preserving a run: where the source had a
+        # single separator and no blank line, the continuation must start with
+        # content and no invented gap.
+        sealed, tail = await self._rotate(monkeypatch, "a" * 30 + "\n" + "b" * 30, 40)
+        assert sealed == ["a" * 30]
+        assert tail == "b" * 30
+
+    @pytest.mark.timeout(30)
+    @pytest.mark.asyncio
+    async def test_a_rotation_terminates_on_pathological_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Input no cut fits cleanly must finish rather than spin.
+
+        An all-newline tail, a bare backtick run, and a budget too small to hold
+        a fence's own scaffolding are the three shapes with no clean cut
+        anywhere. Chunks legitimately go over budget in the last of them; what
+        matters is that the call returns and makes progress.
+
+        The run is five times the limit: termination does not depend on its
+        length, but the cost does. Every cut of a bare run is two characters
+        wide, and the sever grade reads each boundary against the whole text,
+        so the work grows with the square of the run -- 5000 backticks took
+        about 4 s alone and timed out on a loaded coverage shard.
+        """
+        for src, limit in [
+            ("\n\n", 1),
+            ("`" * 500, 100),
+            ("```a-very-long-info-string-indeed\n" + "code\n" * 20, 12),
+        ]:
+            sealed, tail = await self._rotate(monkeypatch, src, limit)
+            assert sealed or tail, repr(src[:14])
+
+    @pytest.mark.asyncio
+    async def test_an_overlimit_chunk_never_reaches_the_api_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The splitter's one documented budget exception, bounded again here.
+
+        A logical line that admits no cut clean on both sides is placed WHOLE
+        and its chunk carries the fence scaffolding on top of the limit. The 100
+        characters ``_limit`` holds back absorb ordinary scaffolding, but an
+        opener this long does not fit in them, so the chunk passes Discord's
+        hard cap -- where ``send_message`` truncates and drops the tail
+        INCLUDING the synthetic closer, leaving an unterminated code block
+        missing content and no signal that anything went.
+        """
+        opener = "`" * 260  # scaffolding wider than _limit's headroom
+        line = "x" + "`" * 1699  # content: not a bare run, and no cut is clean
+        src = opener + "\n" + line + "\n" + "tail\n" * 40
+        limit = 1800  # DISCORD_CAPABILITIES' own _limit()
+        assert any(len(c) > DISCORD_MAX_TEXT for c in split_markdown_safe(src, limit))
+
+        sealed, tail = await self._rotate(monkeypatch, src, limit)
+        assert sealed
+        for frame in sealed:
+            assert len(frame) <= DISCORD_MAX_TEXT, len(frame)
+        # Sliced, not truncated: every authored character still reaches the user.
+        it = iter("".join(("".join(sealed) + tail).split()))
+        assert all(c in it for c in "".join(src.split()))
+
+        # The same guard covers the final seal, which is the other payload the
+        # API sees whole.
+        r, cli = self._renderer(monkeypatch, limit)
+        await r.on_text_chunk(src)
+        await r.on_done()
+        for text, _ in cli.sent:
+            assert len(text) <= DISCORD_MAX_TEXT, len(text)
+        for _mid, text, _components in cli.edits:
+            assert len(text) <= DISCORD_MAX_TEXT, len(text)
+
+    @pytest.mark.asyncio
+    async def test_streaming_a_source_seals_what_splitting_it_whole_would(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Prefix stability, end to end: incremental == one-shot.
+
+        Splitting is greedy left-to-right, so re-splitting a longer prefix of
+        the same stream reproduces every chunk but the last byte-for-byte. That
+        is what lets this renderer POST a sealed chunk and keep only the final
+        one live -- Discord has no affordance for un-posting a message, so a cut
+        that moved once more text arrived would be unrecoverable. Streaming the
+        source in slices must therefore land exactly the messages one shot does.
+        """
+        src = _FENCE_SHAPES[3]  # a 4-backtick block full of inner 3-backtick ones
+        limit = 200
+        r, cli = self._renderer(monkeypatch, limit)
+        posted: list[str] = []
+        for start in range(0, len(src), 37):
+            await r.on_text_chunk(src[start : start + 37])
+            grown = [t for t, _ in cli.sent]
+            assert grown[: len(posted)] == posted, "a message already posted moved"
+            posted = grown
+        whole = split_markdown_safe(src, limit)
+        assert posted == [_strip_steering(c) for c in whole[:-1]]
+        assert "".join(r._buf) == whole[-1]
+
+    @pytest.mark.asyncio
+    async def test_the_renderer_seals_the_splitter_chunks_unmodified(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Swept oracle: a rotation IS the splitter's output, verbatim.
+
+        The renderer must not carry its own splitter and then undo part of it, since
+        every defect in that cluster was the append and the strip disagreeing on
+        one shape. There is nothing left to disagree about, and this pins that:
+        each chunk but the last is sealed exactly once, in order, and the last is
+        retained as the live buffer byte-for-byte. The only transform in the
+        identity is ``_strip_steering``, the renderer's pre-existing normalizer
+        (which also collapses runs of 3+ newlines, so THAT is the visible
+        blank-line cap, not the splitter's) -- any re-added append or strip fails
+        it, whatever shape motivated it.
+
+        Shapes cover what a per-chunk fence walk cannot recover from the source:
+        3/4/5-backtick openers, authored inner bare ``` lines, literal backticks
+        in prose, 4-space-indented lookalikes, info strings, and blank-line runs.
+        """
+        rotated = frames = 0
+        for src in _FENCE_SHAPES:
+            assert src and "[OPTIONS" not in src and "[STEERING" not in src  # no detach
+            for limit in list(range(40, 201, 7)) + [1900]:
+                chunks = split_markdown_safe(src, limit)
+                sealed, tail = await self._rotate(monkeypatch, src, limit)
+                where = f"shape={src[:14]!r} limit={limit}"
+                rotated += len(chunks) > 1
+                frames += len(sealed)
+                assert tail == chunks[-1], f"live buffer is not the final chunk: {where}"
+                assert sealed == [
+                    _strip_steering(c) for c in chunks[:-1]
+                ], f"sealed frames are not the splitter's own chunks: {where}"
+                # Nothing authored is dropped: every non-whitespace source
+                # character still appears, in order, across the frames plus the
+                # tail. Synthetic backticks only ever ADD.
+                it = iter("".join(("".join(sealed) + tail).split()))
+                assert all(
+                    c in it for c in "".join(src.split())
+                ), f"authored characters deleted: {where}"
+        # The sweep must not go vacuous.
+        assert rotated > 300 and frames > 1000, (rotated, frames)
 
 
 class TestOptionComponents:
@@ -476,6 +839,17 @@ class TestOptionComponents:
         total = sum(len(r["components"]) for r in comps)
         assert total == 25
 
+    def test_origin_tag_suffixes_every_custom_id(self) -> None:
+        """The provenance tag rides the custom_id; bare ids are the legacy shape.
+
+        ``opt:<i>:<tag>`` is what the press-side gate parses back out, so the
+        two halves meet exactly here.
+        """
+        comps = build_option_components(["a", "b"], "deadbeefcafe")
+        assert comps is not None
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        assert ids == ["opt:0:deadbeefcafe", "opt:1:deadbeefcafe"]
+
 
 class TestExtractOptions:
     def test_no_options(self) -> None:
@@ -498,19 +872,16 @@ class TestExtractOptions:
         # each position — polynomial. The tempered body
         # (?:[^[]|\[(?!OPTIONS:))* forbids only a re-occurring "[OPTIONS:", so
         # the body is unambiguous (linear). A whitespace-padded unterminated tag
-        # and many repeated "[OPTIONS:" prefixes (the real pump) must both return
-        # promptly.
-        import time
-
-        for evil in (
-            "[OPTIONS:" + ("\t" * 200_000) + "x",
-            "[OPTIONS:" * 100_000 + "x",
-        ):
-            start = time.perf_counter()
-            body, opts = _extract_options(evil)
-            elapsed = time.perf_counter() - start
-            assert elapsed < 1.0, f"_extract_options took {elapsed:.2f}s (possible ReDoS)"
+        # and many repeated "[OPTIONS:" prefixes (the real pump) must both be
+        # rejected in CPU time linear in the pump -- see
+        # conftest.assert_rejected_without_backtracking for why this is not a
+        # 1.0 s wall-clock bound.
+        def reject(text: str) -> None:
+            body, opts = _extract_options(text)
             assert opts == []
+
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" + ("\t" * n) + "x")
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" * n + "x")
 
 
 class TestStripSteering:
@@ -523,6 +894,82 @@ class TestStripSteering:
         out = _strip_steering("body text [STEERING steer-ab12: still stream")
         assert "STEERING" not in out
         assert out.startswith("body text")
+
+    def test_an_unclosed_marker_cannot_span_table_rows(self) -> None:
+        text = "[STEERING steer-deadbeef |\n| --- | --- |"
+        assert _strip_steering(text) == text
+
+    def test_removes_a_marker_whose_summary_wrapped(self) -> None:
+        """kiro-cli's rephrase is free to wrap, and the frame is still a frame.
+
+        Every other reader of this frame says so: ``messaging.driver`` matches it
+        with ``re.DOTALL``, ``constants._STEERING_TAIL_PREFIX_RE`` closes the same
+        grammar's prefix with ``re.DOTALL``, and the dashboard's parser spells the
+        summary ``[\\s\\S]*?``. A class that stopped at the first line end left the
+        marker in the delivered Discord message.
+        """
+        text = "before [STEERING steer-ab12: switching to the job id\nand re-running it] after"
+        out = _strip_steering(text)
+        assert "STEERING" not in out
+        assert out.startswith("before") and out.endswith("after")
+
+    def test_the_chip_summary_survives_a_wrapped_marker(self) -> None:
+        """``_rotate_at_markers`` reads the summary at the offset the marker
+        pattern chose, so the two must agree on the same frame: a summary the
+        marker matched but this one did not leaves the steer chip blank."""
+        text = "[STEERING steer-ab12: switching to the job id\nand re-running it]"
+        marker = discord_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = discord_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None
+        assert summary.group(1) == "switching to the job id\nand re-running it"
+
+    def test_a_dashed_steer_id_is_one_frame_to_both_patterns(self) -> None:
+        """``messaging.driver`` accepts ``[0-9a-f-]+`` for the id, so a dashed id
+        is a real frame; the two patterns here have to agree about it."""
+        text = "[STEERING steer-a180-ae7f: checked] tail"
+        marker = discord_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = discord_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None and summary.group(1) == "checked"
+        assert _strip_steering(text).strip() == "tail"
+
+    def test_prose_that_merely_opens_with_the_sentinel_stays(self) -> None:
+        """The counterpart to allowing newlines, and the reason it is safe.
+
+        ``messaging.driver`` already rules that opening with the sentinel is not
+        being a marker. Without the id requirement, a class that spans lines would
+        swallow from ``[STEERING`` to any later ``]`` -- here a Markdown link two
+        lines down.
+        """
+        text = "[STEERING is the feature I mean\n\nsee the [docs](x) for it"
+        assert _strip_steering(text) == text
+
+    def test_the_grammar_agrees_with_the_messaging_driver(self) -> None:
+        """One frame, two readers: a corpus both must classify the same way.
+
+        This renderer is defence for callers that bypass ``TurnDriver``, so the
+        two spellings answer the same question about the same bytes; a divergence
+        is how one surface starts delivering what the other removes.
+        """
+        frames = [
+            "[STEERING steer-ab12: checked]",
+            "[STEERING steer-a180ae7f: 已并行查询悉尼天气,一并答复。]",
+            "[STEERING steer-a180-ae7f: checked]",
+            "[STEERING steer-ab12: line one\nline two]",
+            "[STEERING steer-ab12]",
+        ]
+        not_frames = [
+            "[STEERING is the feature I mean]",
+            "[STEERING steer-: empty id]",
+            "[STEERING steer-zzzz: not hex]",
+        ]
+        for text in frames:
+            assert discord_renderer._STEER_MARKER_RE.fullmatch(text), text
+            assert messaging_driver._STEER_MARKER_RE.match(text), text
+        for text in not_frames:
+            assert discord_renderer._STEER_MARKER_RE.fullmatch(text) is None, text
+            assert messaging_driver._STEER_MARKER_RE.match(text) is None, text
 
 
 class TestFindButtonLabel:
@@ -642,9 +1089,7 @@ class TestGatewayAttachmentNormalization:
         assert dest.read_bytes() == b"firstsecond"
         assert all(operation_threads.values())
         assert all(
-            thread != loop_thread
-            for threads in operation_threads.values()
-            for thread in threads
+            thread != loop_thread for threads in operation_threads.values() for thread in threads
         )
 
     @pytest.mark.asyncio
@@ -657,9 +1102,7 @@ class TestGatewayAttachmentNormalization:
             "https://media.discordapp.net:444/file.png",
         ],
     )
-    async def test_download_refuses_non_discord_origin(
-        self, tmp_path: Any, url: str
-    ) -> None:
+    async def test_download_refuses_non_discord_origin(self, tmp_path: Any, url: str) -> None:
         client = DiscordClient(token="test")
         with pytest.raises(ValueError, match="Discord attachment URL"):
             await client.download_attachment(url, str(tmp_path / "out"))
@@ -676,17 +1119,14 @@ class TestDiscordAttachmentAdapter:
         client.attachment_bodies[url] = b"OggS" + b"\x00" * 32
         transcribed: list[str] = []
 
-        async def _transcribe(path: str) -> str:
+        async def _transcribe(path: str, _cfg: object) -> str:
             assert os.path.exists(path)
             transcribed.append(path)
             return "spoken words"
 
-        monkeypatch.setattr(
-            "kiro_crew.transcribe.is_available", lambda: True
-        )
-        monkeypatch.setattr(
-            "kiro_crew.transcribe.transcribe_audio", _transcribe
-        )
+        monkeypatch.setattr("kiro_crew.transcribe.is_available", lambda: True)
+        monkeypatch.setattr("kiro_crew.transcribe.batch_duration_cap_secs", lambda _cfg: None)
+        monkeypatch.setattr("kiro_crew.transcribe.transcribe_audio", _transcribe)
 
         result = await process_discord_attachments(
             client,  # type: ignore[arg-type]
@@ -718,9 +1158,7 @@ class TestDiscordAttachmentAdapter:
             observed.append(threading.get_ident())
             return False
 
-        monkeypatch.setattr(
-            "kiro_crew.transcribe.is_available", _available
-        )
+        monkeypatch.setattr("kiro_crew.transcribe.is_available", _available)
         result = await process_discord_attachments(
             client,  # type: ignore[arg-type]
             [
@@ -734,9 +1172,7 @@ class TestDiscordAttachmentAdapter:
         )
 
         assert observed and loop_thread not in observed
-        assert result.rejections == [
-            "[Audio attachment — transcription is unavailable]"
-        ]
+        assert result.rejections == ["[Audio attachment — transcription is unavailable]"]
         cleanup(result.temp_paths)
 
 
@@ -797,7 +1233,7 @@ class TestTransportAuth:
         assert DISCORD_CAPABILITIES.edit is True
         assert DISCORD_CAPABILITIES.reactions is True
         assert DISCORD_CAPABILITIES.files_inbound is True
-        assert DISCORD_CAPABILITIES.files_outbound is False  # no upload path exists
+        assert DISCORD_CAPABILITIES.files_outbound is True  # seal-time upload path
         assert DISCORD_CAPABILITIES.threads is True
 
 
@@ -864,7 +1300,10 @@ class TestConfiguredTargets:
 
 class TestTransportReceive:
     def _transport(
-        self, allowed: list[str], allowed_threads: list[str] | None = None
+        self,
+        allowed: list[str],
+        allowed_threads: list[str] | None = None,
+        allowed_channels: list[str] | None = None,
     ) -> tuple[DiscordTransport, list[InboundMessage], FakeClient]:
         dispatched: list[InboundMessage] = []
 
@@ -877,6 +1316,7 @@ class TestTransportReceive:
             client,  # type: ignore[arg-type]
             allowed_user_ids=allowed,
             allowed_thread_ids=allowed_threads or [],
+            allowed_channel_ids=allowed_channels or [],
             dispatch=_dispatch,
         )
         return t, dispatched, client
@@ -927,6 +1367,99 @@ class TestTransportReceive:
         await t.receive(DiscordInbound(channel_id="t1", user_id="u1", text="hello", guild_id="g1"))
         assert len(dispatched) == 1
         assert dispatched[0].thread_id == "t1"
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_channel_creates_thread_before_dispatch(self) -> None:
+        t, dispatched, client = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="Plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+
+        assert client.created_threads == [("c1", "m1", "Plan the release")]
+        assert len(dispatched) == 1
+        assert dispatched[0].conversation_id == "thread-m1"
+        assert dispatched[0].thread_id == "thread-m1"
+
+    @pytest.mark.asyncio
+    async def test_followup_message_in_auto_created_thread_dispatches(self) -> None:
+        """The thread the transport just created must be immediately valid for
+        the same user's next message, not just for button interactions -- a
+        frozen ``_allowed_threads`` would silently strand every reply."""
+        t, dispatched, _ = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="Plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+        assert len(dispatched) == 1
+        created_thread_id = dispatched[0].conversation_id
+
+        await t.receive(
+            DiscordInbound(
+                channel_id=created_thread_id,
+                user_id="u1",
+                text="Here's a follow-up",
+                message_id="m2",
+                guild_id="g1",
+            )
+        )
+
+        assert len(dispatched) == 2
+        assert dispatched[1].conversation_id == created_thread_id
+        assert dispatched[1].thread_id == created_thread_id
+        assert dispatched[1].text == "Here's a follow-up"
+
+    @pytest.mark.asyncio
+    async def test_channels_governance_denial_blocks_thread_creation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A runtime channels-governance deny must stop the REST thread-create
+        call itself -- not just the turn that would have followed it -- since
+        creating the thread is a visible, irreversible side effect."""
+
+        async def _denied(_channel_type: str) -> bool:
+            return False
+
+        monkeypatch.setattr("kiro_crew.discord.transport.channel_inbound_permitted", _denied)
+        t, dispatched, client = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="Plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+
+        assert client.created_threads == []
+        assert dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_channel_rejects_unapproved_user_without_thread(self) -> None:
+        t, dispatched, client = self._transport(["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u2",
+                text="hello",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+
+        assert client.created_threads == []
+        assert dispatched == []
 
     @pytest.mark.asyncio
     async def test_normal_channel_denied_even_if_id_is_allowlisted(self) -> None:
@@ -984,915 +1517,3 @@ class TestTransportReceive:
     async def test_resolve_conversation_creates_dm_channel(self) -> None:
         t, _, _ = self._transport(["u1"])
         assert await t.resolve_conversation("u1") == "dm-u1"
-
-
-# ── renderer.py streaming/finalization ───────────────────────────────────
-
-
-class TestRenderer:
-    def _renderer(self) -> tuple[DiscordRenderer, FakeClient]:
-        cli = FakeClient()
-        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
-        return r, cli
-
-    @pytest.mark.asyncio
-    async def test_stream_and_finalize(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_text_chunk("Hello ")
-        await r.on_text_chunk("world")
-        await r.on_done()
-        assert cli.final_text() == "Hello world"
-
-    @pytest.mark.asyncio
-    async def test_options_become_buttons_and_never_stream(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_text_chunk("Pick\n[OPTIONS: A | B]")
-        # Live frames must never show the raw directive.
-        for text, _ in cli.sent:
-            assert "[OPTIONS" not in text
-        await r.on_done()
-        comps = cli.final_components()
-        assert comps is not None
-        labels = [b["label"] for row in comps for b in row["components"]]
-        assert labels == ["A", "B"]
-        assert "[OPTIONS" not in cli.final_text()
-
-    @pytest.mark.asyncio
-    async def test_long_options_before_streamed_steer_ack_become_buttons(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        # The assistant's final line is a valid OPTIONS trailer. The provider's
-        # internal steer acknowledgment follows it and arrives across chunks,
-        # with the combined buffer well past Discord's message cap.
-        await r.on_text_chunk(
-            ("x" * 3800)
-            + "\n\n[OPTIONS: Alpha | Bravo | Charlie]"
-            + "\n\n[STEERING steer-7e6a4a0d"
-        )
-        await r.on_text_chunk("94314d2db: acknowledged]")
-        await r.on_done()
-
-        components = [c for _, c in cli.sent if c] + [c for _, _, c in cli.edits if c]
-        labels = [b["label"] for row in components[0] for b in row["components"]]
-        assert labels == ["Alpha", "Bravo", "Charlie"]
-        visible = "\n".join([t for t, _ in cli.sent] + [t for _, t, _ in cli.edits])
-        assert "[OPTIONS" not in visible
-        assert "[STEERING" not in visible
-        assert "steer-7e6a4a0d" not in visible
-        assert "94314d2db" not in visible
-
-    @pytest.mark.asyncio
-    async def test_long_output_rotates_messages(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_text_chunk("A" * 5000)
-        await r.on_done()
-        # More than one message posted, none over the API cap.
-        assert len(cli.sent) >= 2
-        for text, _ in cli.sent:
-            assert len(text) <= 2000
-        for _, text, _c in cli.edits:
-            assert len(text) <= 2000
-
-    @pytest.mark.asyncio
-    async def test_tool_footer_transient(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_tool_call("t1", "grep")
-        assert any("grep" in text for text, _ in cli.sent)
-        await r.on_text_chunk("Result body")
-        await r.on_done()
-        assert "grep" not in cli.final_text()
-
-    @pytest.mark.asyncio
-    async def test_error_placeholder_when_no_output(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_done(stop_reason="error")
-        assert "⚠️" in cli.final_text()
-
-    @pytest.mark.asyncio
-    async def test_prompt_choice_sends_separate_approval_message(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_prompt_choice([], request_id="req9")
-        text, comps = cli.sent[-1]
-        assert "Approve" in text
-        ids = [b["custom_id"] for row in comps for b in row["components"]]
-        # a:<rid>:<nonce>:<flag> — nonce guards against reused request IDs.
-        assert len(ids) == 2
-        assert ids[0].startswith("a:req9:") and ids[0].endswith(":1")
-        assert ids[1].startswith("a:req9:") and ids[1].endswith(":0")
-        nonce = ids[0].split(":")[2]
-        assert len(nonce) == 16  # 8 random bytes hex
-        DiscordApprovalDecider._NONCES.pop(DiscordApprovalDecider.key("sk", "req9"), None)
-
-    @pytest.mark.asyncio
-    async def test_steer_marker_rotates_message_with_chip(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_text_chunk("first part [STEERING steer-ab12: focus on Y] second part")
-        await r.on_done()
-        all_texts = [t for t, _ in cli.sent] + [t for _, t, _ in cli.edits]
-        # Marker never shown raw; chip carries the summary.
-        assert all("[STEERING" not in t for t in all_texts)
-        assert any("focus on Y" in t for t in all_texts)
-
-    @pytest.mark.asyncio
-    async def test_close_finalizes_unfinished_turn(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        await r.on_text_chunk("partial")
-        await r.close()
-        assert cli.final_text() == "partial"
-
-    @pytest.mark.asyncio
-    async def test_no_rotation_steer_summary_chip(self) -> None:
-        r, cli = self._renderer()
-        await r.on_turn_start()
-        r.note_steer("my steer words")
-        await r.on_text_chunk("answer body")
-        await r.on_done()
-        assert "my steer words" in cli.final_text()
-        assert "answer body" in cli.final_text()
-
-
-# ── DiscordApprovalDecider ───────────────────────────────────────────────
-
-
-class TestApprovalDecider:
-    @pytest.mark.asyncio
-    async def test_resolve_approves_with_valid_nonce(self) -> None:
-        decider = DiscordApprovalDecider(session_key="sk")
-        ev = SimpleNamespace(request_id="r1")
-        task = asyncio.ensure_future(decider(ev))
-        await asyncio.sleep(0)  # let the Future register
-        key = DiscordApprovalDecider.key("sk", "r1")
-        nonce = DiscordApprovalDecider.register_nonce(key)
-        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce)
-        assert await task is True
-
-    @pytest.mark.asyncio
-    async def test_stale_nonce_fails_closed(self) -> None:
-        """A button from an earlier prompt (reused request ID) cannot resolve
-        a new pending request — the nonce must match the CURRENT prompt's."""
-        decider = DiscordApprovalDecider(session_key="sk")
-        ev = SimpleNamespace(request_id="r1")
-        task = asyncio.ensure_future(decider(ev))
-        await asyncio.sleep(0)
-        key = DiscordApprovalDecider.key("sk", "r1")
-        DiscordApprovalDecider.register_nonce(key)  # current prompt's nonce
-        # Press carries an OLD nonce (from a prompt before a restart).
-        assert not DiscordApprovalDecider.resolve_global(key, True, nonce="deadbeefdeadbeef")
-        assert not task.done()  # still pending — stale press had no effect
-        # A missing nonce also fails closed.
-        assert not DiscordApprovalDecider.resolve_global(key, True)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        DiscordApprovalDecider._NONCES.pop(key, None)
-
-    @pytest.mark.asyncio
-    async def test_resolve_unknown_key_returns_false(self) -> None:
-        assert not DiscordApprovalDecider.resolve_global("sk:none", True, nonce="x")
-
-
-# ── transport_dispatch.py ────────────────────────────────────────────────
-
-
-class TestDispatcher:
-    def _msg(self, text: str, user: str = "u1", chan: str = "c1") -> InboundMessage:
-        return InboundMessage(channel_type="discord", user_id=user, conversation_id=chan, text=text)
-
-    @pytest.mark.asyncio
-    async def test_new_command_bumps_generation(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        k1 = d._session_key("u1")
-        await d.handle_message(self._msg("!new"))
-        assert d._session_key("u1") != k1
-        assert "New conversation" in cli.sent[-1][0]
-
-    @pytest.mark.asyncio
-    async def test_help_command(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        await d.handle_message(self._msg("!help"))
-        assert "Kiro Crew" in cli.sent[-1][0]
-        assert "!sessions [query]" in cli.sent[-1][0]
-
-    @pytest.mark.asyncio
-    async def test_typing_indicator_starts_before_the_session_cold_start(
-        self, monkeypatch
-    ) -> None:
-        """TTFT guard: the typing loop must be STARTED before the ACP cold start.
-
-        ``sessions.get_or_create`` can spend seconds spawning and handshaking an
-        ACP session. ``on_turn_start`` does not send the indicator inline -- it
-        spawns a refresh task -- so it must be called BEFORE the cold start, or
-        the task is not even created until the cold start has finished and the
-        user sees several seconds of dead air. That regressed when attachment
-        ingestion was inserted ahead of ``on_turn_start`` (#1053). The shared
-        skeleton in messaging/dispatch.py documents this order as "typing
-        indicator before cold start"; telegram/transport_dispatch.py follows it.
-
-        Asserting the ORDER of the two calls, not merely that both happened:
-        both happen either way, so order is the entire bug. Deliberately spying
-        on ``on_turn_start`` rather than ``send_typing`` -- the latter runs on a
-        spawned task and cannot fire until the loop next yields, which makes it
-        useless for pinning this ordering.
-        """
-        d, cli, sess = _dispatcher({"u1"})
-        order: list[str] = []
-
-        real_get_or_create = sess.get_or_create
-        real_on_turn_start = DiscordRenderer.on_turn_start
-
-        async def _spy_get_or_create(*args: Any, **kwargs: Any) -> Any:
-            order.append("cold_start")
-            return await real_get_or_create(*args, **kwargs)
-
-        async def _spy_on_turn_start(self_: Any) -> None:
-            order.append("typing_started")
-            await real_on_turn_start(self_)
-
-        monkeypatch.setattr(sess, "get_or_create", _spy_get_or_create)
-        monkeypatch.setattr(DiscordRenderer, "on_turn_start", _spy_on_turn_start)
-
-        await d.handle_message(self._msg("hello world"))
-
-        assert "typing_started" in order, "typing was never started"
-        assert "cold_start" in order, "session was never acquired"
-        assert order.index("typing_started") < order.index("cold_start"), (
-            f"typing must start before the cold start, got {order}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_normal_turn_streams_and_releases(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        await d.handle_message(self._msg("hello world"))
-        assert "Answer: hello world" in (cli.final_text() or "")
-        assert sess.successes and sess.released
-
-    @pytest.mark.asyncio
-    async def test_cold_start_failure_releases_nothing_but_closes_renderer(
-        self,
-    ) -> None:
-        d, cli, sess = _dispatcher({"u1"}, raise_on_get=True)
-        await d.handle_message(self._msg("hello"))
-        # No semaphore was acquired -> no release/record_failure of a held slot.
-        assert sess.released == []
-        assert sess.failures == []
-
-    @pytest.mark.asyncio
-    async def test_session_released_even_when_renderer_close_raises(self, monkeypatch) -> None:
-        """A rendering-finalization failure (e.g. Discord returning a
-        malformed body) must never leave the session permanently busy."""
-        from kiro_crew.discord.renderer import DiscordRenderer
-
-        async def _boom(self) -> None:
-            raise RuntimeError("finalization failed")
-
-        monkeypatch.setattr(DiscordRenderer, "close", _boom)
-        d, _, sess = _dispatcher({"u1"})
-        await d.handle_message(self._msg("hello"))
-        assert sess.released  # release still happened
-        assert d._active_renderers == {}  # renderer entry cleaned up
-
-    @pytest.mark.asyncio
-    async def test_text_and_image_reach_prompt_then_temp_is_cleaned(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        loop_thread = threading.get_ident()
-        cleanup_threads: list[int] = []
-
-        def _cleanup(paths: list[str]) -> None:
-            cleanup_threads.append(threading.get_ident())
-            cleanup(paths)
-
-        monkeypatch.setattr(
-            "kiro_crew.discord.transport_dispatch.cleanup_attachments",
-            _cleanup,
-        )
-        d, cli, _ = _dispatcher({"u1"})
-        url = "https://cdn.discordapp.com/attachments/c/m/photo.png"
-        cli.attachment_bodies[url] = _PNG
-        await d.handle_message(
-            InboundMessage(
-                channel_type="discord",
-                user_id="u1",
-                conversation_id="c1",
-                text="look at this",
-                attachments=[
-                    {
-                        "filename": "photo.png",
-                        "content_type": "image/png",
-                        "size": len(_PNG),
-                        "url": url,
-                    }
-                ],
-            )
-        )
-        await asyncio.sleep(0)
-
-        prompt = d.ctx_builder.messages[-1]
-        lines = prompt.splitlines()
-        assert lines[0] == "look at this"
-        assert lines[1].endswith(".png")
-        assert cli.attachment_downloads == [url]
-        assert not os.path.exists(lines[1])
-        assert cleanup_threads and loop_thread not in cleanup_threads
-
-    @pytest.mark.asyncio
-    async def test_attachment_turn_acquires_before_download_yields(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        d.cfg.messaging.queue_mode = "queue"
-        download_started = asyncio.Event()
-        finish_download = asyncio.Event()
-        url = "https://cdn.discordapp.com/attachments/c/m/slow.png"
-
-        real_get_or_create = sess.get_or_create
-        real_release = sess.release
-
-        async def _get_or_create(*args: Any, **kwargs: Any) -> Any:
-            result = await real_get_or_create(*args, **kwargs)
-            sess._busy = True
-            return result
-
-        def _release(key: str) -> None:
-            sess._busy = False
-            real_release(key)
-
-        async def _slow_download(download_url: str, dest: str) -> None:
-            cli.attachment_downloads.append(download_url)
-            download_started.set()
-            await finish_download.wait()
-            with open(dest, "wb") as fh:
-                fh.write(_PNG)
-
-        monkeypatch.setattr(sess, "get_or_create", _get_or_create)
-        monkeypatch.setattr(sess, "release", _release)
-        monkeypatch.setattr(cli, "download_attachment", _slow_download)
-
-        first = asyncio.create_task(
-            d.handle_message(
-                InboundMessage(
-                    channel_type="discord",
-                    user_id="u1",
-                    conversation_id="c1",
-                    text="first",
-                    attachments=[
-                        {
-                            "filename": "slow.png",
-                            "content_type": "image/png",
-                            "size": len(_PNG),
-                            "url": url,
-                        }
-                    ],
-                )
-            )
-        )
-        await asyncio.wait_for(download_started.wait(), timeout=1)
-
-        assert sess._busy, "session must be acquired before attachment download"
-        await d.handle_message(self._msg("second"))
-        assert [queued[1] for queued in sess.queued] == ["second"]
-
-        finish_download.set()
-        await first
-
-        assert d.ctx_builder.messages[0].splitlines()[0] == "first"
-        assert d.ctx_builder.messages[1] == "second"
-        assert sess.queued == []
-
-    @pytest.mark.asyncio
-    async def test_command_like_caption_does_not_discard_attachment(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        url = "https://cdn.discordapp.com/attachments/c/m/command.png"
-        cli.attachment_bodies[url] = _PNG
-        await d.handle_message(
-            InboundMessage(
-                channel_type="discord",
-                user_id="u1",
-                conversation_id="c1",
-                text="!help",
-                attachments=[
-                    {
-                        "filename": "command.png",
-                        "content_type": "image/png",
-                        "size": len(_PNG),
-                        "url": url,
-                    }
-                ],
-            )
-        )
-        await asyncio.sleep(0)
-
-        prompt = d.ctx_builder.messages[-1]
-        assert prompt.splitlines()[0] == "!help"
-        assert prompt.splitlines()[1].endswith(".png")
-        assert "Kiro Crew — Discord" not in "\n".join(text for text, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_attachment_rejection_is_not_silent(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        await d.handle_message(
-            InboundMessage(
-                channel_type="discord",
-                user_id="u1",
-                conversation_id="c1",
-                text="",
-                attachments=[
-                    {
-                        "filename": "archive.bin",
-                        "content_type": "application/octet-stream",
-                        "size": 10,
-                        "url": "https://cdn.discordapp.com/a.bin",
-                    }
-                ],
-            )
-        )
-        await asyncio.sleep(0)
-
-        assert "unsupported type" in d.ctx_builder.messages[-1]
-        assert cli.attachment_downloads == []
-
-    @pytest.mark.asyncio
-    async def test_busy_attachment_waits_for_queued_turn_before_cleanup(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        url = "https://media.discordapp.net/attachments/c/m/queued.png"
-        attachment = {
-            "filename": "queued.png",
-            "content_type": "image/png",
-            "size": len(_PNG),
-            "url": url,
-        }
-        cli.attachment_bodies[url] = _PNG
-        sess._busy = True
-        await d.handle_message(
-            InboundMessage(
-                channel_type="discord",
-                user_id="u1",
-                conversation_id="c1",
-                text="",
-                attachments=[attachment],
-            )
-        )
-
-        assert cli.attachment_downloads == []
-        assert sess.queued[0][2]["attachments"] == [attachment]
-        sess._busy = False
-        await d._drain_queue(d._session_key("u1"), "u1", "c1")
-        await asyncio.sleep(0)
-
-        prompt_path = d.ctx_builder.messages[-1].splitlines()[0]
-        assert cli.attachment_downloads == [url]
-        assert prompt_path.endswith(".png")
-        assert not os.path.exists(prompt_path)
-
-    @pytest.mark.asyncio
-    async def test_drain_defers_messages_that_exceed_attachment_cap(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-
-        def _batch(prefix: str) -> list[dict[str, Any]]:
-            batch: list[dict[str, Any]] = []
-            for i in range(10):
-                url = (
-                    "https://cdn.discordapp.com/attachments/c/m/"
-                    f"{prefix}-{i}.png"
-                )
-                cli.attachment_bodies[url] = _PNG
-                batch.append(
-                    {
-                        "filename": f"{prefix}-{i}.png",
-                        "content_type": "image/png",
-                        "size": len(_PNG),
-                        "url": url,
-                    }
-                )
-            return batch
-
-        first = _batch("first")
-        second = _batch("second")
-        sess.queued = [
-            ("t1", "first batch", {"attachments": first}),
-            ("t2", "second batch", {"attachments": second}),
-            ("t3", "after second", {"attachments": []}),
-        ]
-
-        await d._drain_queue(d._session_key("u1"), "u1", "c1")
-
-        assert cli.attachment_downloads == [
-            item["url"] for item in [*first, *second]
-        ]
-        assert sess.queued == []
-        assert len(d.ctx_builder.messages) == 2
-        assert d.ctx_builder.messages[0].splitlines()[0] == "first batch"
-        assert d.ctx_builder.messages[1].splitlines()[0] == "second batch"
-        assert "after second" in d.ctx_builder.messages[1]
-
-    @pytest.mark.asyncio
-    async def test_busy_steers_and_acks_with_reaction(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        sess._busy = True
-        msg = DiscordInboundMessage(
-            channel_type="discord",
-            user_id="u1",
-            conversation_id="c1",
-            text="steer text",
-            message_id="m42",
-        )
-        await d.handle_message(msg)
-        assert sess._gp.steered == ["steer text"]
-        assert cli.reactions == [("m42", _STEER_ACK_EMOJI)]
-
-    @pytest.mark.asyncio
-    async def test_busy_queue_override_enqueues_with_receipt(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        sess._busy = True
-        await d.handle_message(self._msg("!queue later please"))
-        assert [t for _, t, _ in sess.queued] == ["later please"]
-        assert any("Queued" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_stop_cancels_and_clears_queue(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        sess._busy = True
-        sess.queued.append(("ts", "queued msg", {}))
-        await d.handle_message(self._msg("!stop"))
-        assert sess._gp.cancelled == 1
-        assert sess.queued == []
-        assert "Stopped" in cli.sent[-1][0]
-
-    @pytest.mark.asyncio
-    async def test_compact_uses_try_acquire_and_releases(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        await d.handle_message(self._msg("!compact"))
-        assert sess.acquired and sess.released
-        visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
-        assert "Context compacted" in visible
-
-    @pytest.mark.asyncio
-    async def test_compact_summary_body_is_not_sent(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-
-        async def _completed(timeout: float = 0.0) -> dict:
-            return {"type": "completed", "summary": "## OBJECTIVE\ninternal guidance"}
-
-        sess._gp.wait_for_compaction = _completed
-        await d.handle_message(self._msg("!compact"))
-        visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
-        assert "Context compacted" in visible
-        assert "OBJECTIVE" not in visible and "internal guidance" not in visible
-
-    @pytest.mark.asyncio
-    async def test_compact_timeout_reports_gracefully(self) -> None:
-        # Regression: nested 120s timeouts made the graceful-timeout branch
-        # unreachable and destroyed a healthy session. A compaction that yields
-        # no terminal status must report a timeout and KEEP the session.
-        d, cli, sess = _dispatcher({"u1"})
-
-        async def _timeout(timeout: float = 0.0) -> dict:
-            return {"type": "timeout"}
-
-        sess._gp.wait_for_compaction = _timeout
-        await d.handle_message(self._msg("!compact"))
-        assert any("timed out" in t for _, t, _ in cli.edits) or any(
-            "timed out" in t for t, _ in cli.sent
-        )
-        assert sess.destroyed == []  # healthy session preserved
-
-    @pytest.mark.asyncio
-    async def test_link_and_unlink(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        await d.handle_message(self._msg("!link"))
-        key = d._session_key("u1")
-        assert key in sess.mirror_links
-        assert legacy_dashboard_mirror_key(key) not in sess.mirror_links
-        assert sess.mirror_links[key].channel_id == "c1"
-        await d.handle_message(self._msg("!unlink"))
-        assert key not in sess.mirror_links
-
-    @pytest.mark.asyncio
-    async def test_unlink_clears_binding_stranded_by_generation_rotation(self) -> None:
-        # THE stale-mirror regression: a binding written at one DM generation,
-        # then the conversation rotates (!new / idle / daily reset). The row's
-        # key spelling no longer derives from the current session key, so the
-        # key-addressed clears cannot reach it — yet it still occupies the
-        # location and blocks `!session` resume. Unlink must free it by value.
-        d, cli, sess = _dispatcher({"u1"})
-        await d.handle_message(self._msg("!link"))
-        stale_key = d._session_key("u1")
-        await d.handle_message(self._msg("!new"))  # rotate the generation
-        key = d._session_key("u1")
-        assert stale_key != key  # binding is now stranded under the old spelling
-        assert stale_key not in (key, legacy_dashboard_mirror_key(key))
-        await d.handle_message(self._msg("!unlink"))
-        assert sess.mirror_links == {}
-        assert any("Unlinked" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_unlink_clears_dashboard_mirror_into_this_channel(self) -> None:
-        # A dashboard session mirroring outbound into this conversation is the
-        # exact occupant `!session`'s conflict check refuses on ("attached to
-        # another session") — `!unlink` in the conversation must clear it.
-        d, cli, sess = _dispatcher({"u1"})
-        sess.mirror_links["dashboard:chat-9"] = ChannelLink("discord", channel_id="c1")
-        await d.handle_message(self._msg("!unlink"))
-        assert sess.mirror_links == {}
-        assert any("Unlinked" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_unlink_leaves_other_locations_alone(self) -> None:
-        # The value sweep is exact-match: a mirror into a DIFFERENT Discord
-        # channel must survive an unlink here, and with nothing pointing at
-        # this conversation the reply stays truthful ("wasn't linked").
-        d, cli, sess = _dispatcher({"u1"})
-        other = ChannelLink("discord", channel_id="c2")
-        sess.mirror_links["dashboard:chat-9"] = other
-        await d.handle_message(self._msg("!unlink"))
-        assert sess.mirror_links == {"dashboard:chat-9": other}
-        assert any("wasn't linked" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_unlink_frees_location_in_one_shot_with_resumed_session(self) -> None:
-        # A resumed session AND an outbound dashboard mirror can co-occupy a
-        # location: a session map can hold co-located bindings written before
-        # conversations became exclusive. The resumed-session early path must
-        # still free the WHOLE location — one `!unlink`, not two. The rows go in
-        # directly because `set_mirror_link` refuses to create this state.
-        d, cli, sess = _dispatcher({"u1"})
-        loc = ChannelLink("discord", channel_id="c1")
-        sess.mirror_links["dashboard:resumed"] = loc
-        sess.inbound_mirror_keys.add("dashboard:resumed")
-        sess.mirror_links["dashboard:chat-9"] = loc
-        await d.handle_message(self._msg("!unlink"))
-        assert sess.mirror_links == {}
-        assert any("Left the resumed session" in t for t, _ in cli.sent)
-        await d.handle_message(self._msg("!unlink"))
-        assert any("wasn't linked" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_unlink_repairs_duplicate_inbound_bindings(self) -> None:
-        # Duplicate inbound bindings make the resume resolver fail closed
-        # (routing denied), so the resumed-session path cannot release them —
-        # the dispatcher sweep is the repair, and the reply says how much it
-        # cleared instead of a bare ✅ that reads as "just yours". The rows go in
-        # directly because `set_mirror_link` refuses to create this state.
-        d, cli, sess = _dispatcher({"u1"})
-        loc = ChannelLink("discord", channel_id="c1")
-        for wedged in ("dashboard:wedged-a", "dashboard:wedged-b"):
-            sess.mirror_links[wedged] = loc
-            sess.inbound_mirror_keys.add(wedged)
-        await d.handle_message(self._msg("!unlink"))
-        assert sess.mirror_links == {}
-        assert any("Unlinked (2 bindings)" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_new_frees_whole_location_when_leaving_resumed_session(self) -> None:
-        # `!new` releases a resumed session through the same whole-location
-        # sweep as `!unlink`: a co-located outbound mirror must not leak into
-        # the fresh conversation the command starts. The rows go in directly
-        # because `set_mirror_link` refuses to create this state.
-        d, cli, sess = _dispatcher({"u1"})
-        loc = ChannelLink("discord", channel_id="c1")
-        sess.mirror_links["dashboard:resumed"] = loc
-        sess.inbound_mirror_keys.add("dashboard:resumed")
-        sess.mirror_links["dashboard:bystander"] = loc
-        await d.handle_message(self._msg("!new"))
-        assert sess.mirror_links == {}
-        assert any("left the resumed session" in t for t, _ in cli.sent)
-
-    @pytest.mark.asyncio
-    async def test_default_agent_fallback(self) -> None:
-        d, _, sess = _dispatcher({"u1"})
-        await d.handle_message(self._msg("hi"))
-        assert sess.last_agent == "kirocrew"
-
-    @pytest.mark.asyncio
-    async def test_configured_default_agent_wins(self) -> None:
-        d, _, sess = _dispatcher({"u1"}, default_agent="custom")
-        await d.handle_message(self._msg("hi"))
-        assert sess.last_agent == "custom"
-
-    def test_thread_session_is_shared_but_dms_remain_per_user(self) -> None:
-        d, _, _ = _dispatcher({"u1", "u2"}, allowed_threads={"t1"})
-        assert d._session_key("u1", "t1") == d._session_key("u2", "t1")
-        assert d._session_key("u1") != d._session_key("u2")
-
-
-class TestInteractions:
-    def _itx(self, custom_id: str, label: str = "", guild: str = "") -> DiscordInteraction:
-        return DiscordInteraction(
-            interaction_id="i1",
-            interaction_token="tok",
-            channel_id="c1",
-            user_id="u1",
-            message_id="m1",
-            custom_id=custom_id,
-            label=label,
-            guild_id=guild,
-        )
-
-    @pytest.mark.asyncio
-    async def test_unauthorized_interaction_not_acked(self) -> None:
-        d, cli, _ = _dispatcher({"other"})
-        await d.on_interaction(self._itx("a:r1:aabbccdd:1"))
-        assert cli.acked == []
-
-    @pytest.mark.asyncio
-    async def test_guild_interaction_denied(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("a:r1:aabbccdd:1", guild="g1"))
-        assert cli.acked == []
-
-    @pytest.mark.asyncio
-    async def test_allowlisted_thread_interaction_is_acked(self) -> None:
-        d, cli, _ = _dispatcher({"u1"}, allowed_threads={"c1"})
-        cli.thread_channels.add("c1")
-        await d.on_interaction(self._itx("a:r9:aabbccdd:1", guild="g1"))
-        assert cli.acked == ["i1"]
-        assert any("expired" in text for _, text, _ in cli.edits)
-
-    @pytest.mark.asyncio
-    async def test_approval_resolves_pending_future(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
-        DiscordApprovalDecider._REGISTRY[key] = fut
-        nonce = DiscordApprovalDecider.register_nonce(key)
-        try:
-            await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
-            assert fut.result() is True
-            assert cli.acked == ["i1"]
-            assert any("Approved" in t for _, t, _ in cli.edits)
-        finally:
-            DiscordApprovalDecider._REGISTRY.pop(key, None)
-            DiscordApprovalDecider._NONCES.pop(key, None)
-
-    @pytest.mark.asyncio
-    async def test_channels_deny_drops_approval_interaction(self, tmp_path, monkeypatch) -> None:
-        # HIGH (GPT pass 1 #1 + #4): a channels-governance DENY must stop a button
-        # press from resolving a pending tool approval — otherwise a policy denial
-        # applied after connect could still execute a governed tool via a stale
-        # approval button. This regression-locks the on_interaction chokepoint
-        # (removing the gate makes the pending future resolve → test fails).
-        import json
-
-        from kiro_crew.platform import governance_profiles as gp
-
-        pdir = tmp_path / "profiles"
-        pdir.mkdir()
-        monkeypatch.setattr(gp, "_PROFILES_DIR", pdir)
-        gp.reset_store()
-        (pdir / "host.json").write_text(
-            json.dumps(
-                {
-                    "name": "host",
-                    "bind": {"type": "surface", "id": "host"},
-                    "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
-                }
-            )
-        )
-        d, cli, _ = _dispatcher({"u1"})
-        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
-        DiscordApprovalDecider._REGISTRY[key] = fut
-        nonce = DiscordApprovalDecider.register_nonce(key)
-        try:
-            await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
-            # The interaction IS acked (ack happens after auth, before the gate, to
-            # meet Discord's ~3s deadline — acking is a no-op UI dismissal), but the
-            # approval is DROPPED before resolution: the pending future stays
-            # unresolved, so the governed tool never executes.
-            assert not fut.done(), "denied channel must not resolve the tool approval"
-            assert cli.acked == ["i1"]
-            # No verdict edit (Approved/Denied) — resolution never happened.
-            assert not any("Approved" in t or "Denied" in t for _, t, _ in cli.edits)
-        finally:
-            DiscordApprovalDecider._REGISTRY.pop(key, None)
-            DiscordApprovalDecider._NONCES.pop(key, None)
-            gp.reset_store()
-
-    @pytest.mark.asyncio
-    async def test_channels_deny_still_resolves_reject_interaction(self, tmp_path, monkeypatch):
-        # MEDIUM (GPT round-13 #3): a REJECT press ("a:...:0") on a denied channel
-        # must STILL resolve the pending approval as refused (False) — a reject is a
-        # denial, exactly what a channels-deny wants, and silently dropping it would
-        # strand the pending future until timeout (~300s). Only APPROVE is gated out.
-        import json
-
-        from kiro_crew.platform import governance_profiles as gp
-
-        pdir = tmp_path / "profiles"
-        pdir.mkdir()
-        monkeypatch.setattr(gp, "_PROFILES_DIR", pdir)
-        gp.reset_store()
-        (pdir / "host.json").write_text(
-            json.dumps(
-                {
-                    "name": "host",
-                    "bind": {"type": "surface", "id": "host"},
-                    "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
-                }
-            )
-        )
-        d, cli, _ = _dispatcher({"u1"})
-        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
-        DiscordApprovalDecider._REGISTRY[key] = fut
-        nonce = DiscordApprovalDecider.register_nonce(key)
-        try:
-            await d.on_interaction(self._itx(f"a:r1:{nonce}:0"))  # reject (flag 0)
-            assert fut.done() and fut.result() is False, (
-                "a reject on a denied channel must resolve the approval as refused, "
-                "not strand it"
-            )
-            assert any("Denied" in t for _, t, _ in cli.edits)
-        finally:
-            DiscordApprovalDecider._REGISTRY.pop(key, None)
-            DiscordApprovalDecider._NONCES.pop(key, None)
-            gp.reset_store()
-
-    @pytest.mark.asyncio
-    async def test_channels_deny_drops_inbound_message(self, tmp_path, monkeypatch) -> None:
-        # HIGH (GPT pass 1 #4): a channels DENY must stop handle_message from
-        # driving a turn. Regression-locks the dispatcher's inbound chokepoint.
-        import json
-
-        from kiro_crew.platform import governance_profiles as gp
-
-        pdir = tmp_path / "profiles"
-        pdir.mkdir()
-        monkeypatch.setattr(gp, "_PROFILES_DIR", pdir)
-        gp.reset_store()
-        (pdir / "host.json").write_text(
-            json.dumps(
-                {
-                    "name": "host",
-                    "bind": {"type": "surface", "id": "host"},
-                    "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
-                }
-            )
-        )
-        d, cli, sess = _dispatcher({"u1"})
-        try:
-            await d.handle_message(
-                InboundMessage(
-                    channel_type="discord", user_id="u1", conversation_id="c1", text="hello"
-                )
-            )
-            # No turn ran: nothing sent, no session success recorded.
-            assert cli.final_text() in (None, "")
-            assert sess.successes == []
-        finally:
-            gp.reset_store()
-
-    @pytest.mark.asyncio
-    async def test_wrong_nonce_reports_expiry_not_approval(self) -> None:
-        """A stale button press (nonce mismatch) must not display 'Approved'."""
-        d, cli, _ = _dispatcher({"u1"})
-        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
-        DiscordApprovalDecider._REGISTRY[key] = fut
-        DiscordApprovalDecider.register_nonce(key)
-        try:
-            await d.on_interaction(self._itx("a:r1:0000000000000000:1"))
-            assert not fut.done()
-            assert any("expired" in t for _, t, _ in cli.edits)
-        finally:
-            DiscordApprovalDecider._REGISTRY.pop(key, None)
-            DiscordApprovalDecider._NONCES.pop(key, None)
-
-    @pytest.mark.asyncio
-    async def test_expired_approval_reports_expiry(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("a:r9:aabbccdd:1"))
-        assert any("expired" in t for _, t, _ in cli.edits)
-
-    @pytest.mark.asyncio
-    async def test_option_choice_reinjects_as_turn(self) -> None:
-        d, cli, sess = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("opt:0", label="Choice A"))
-        # Buttons retired without clobbering the answer text.
-        assert cli.component_edits == [("m1", [])]
-        # Choice echoed as a quote, then answered as a fresh turn.
-        assert any(t.startswith("> Choice A") for t, _ in cli.sent)
-        assert any(
-            "Answer: Choice A" in t for t in [t for t, _ in cli.sent] + [t for _, t, _ in cli.edits]
-        )
-
-    @pytest.mark.asyncio
-    async def test_option_without_label_asks_to_type(self) -> None:
-        d, cli, _ = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("opt:0", label=""))
-        assert any("type it instead" in t for t, _ in cli.sent)
-
-
-def test_receipt_text_caps_displayed_items() -> None:
-    texts = [f"message {i}" for i in range(8)]
-    out = _receipt_text(texts)
-    assert out.startswith("⏳ Queued (8):")
-    assert "…and 3 more" in out

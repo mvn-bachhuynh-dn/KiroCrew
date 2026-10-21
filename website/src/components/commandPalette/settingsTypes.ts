@@ -16,8 +16,33 @@ export interface SettingEntry {
   id: string
   /** Human-readable label from the JSX prop. */
   label: string
-  /** Optional description from the JSX prop. */
+  /**
+   * Catalog key for a translated label. The registry keeps the English label
+   * for search, while deep-link highlighting resolves this key at runtime so
+   * it can match the label rendered in the active locale.
+   */
+  labelKey?: string
+  /**
+   * Fan-out disambiguator (e.g. 'Discord') for entries a multi-target panel
+   * emits once per channel. `label` already carries it in English as
+   * `<label> (<labelSuffix>)`; a localized display re-appends it to the
+   * resolved `labelKey` string, which is un-suffixed by design so highlight
+   * DOM lookup still matches the rendered text.
+   */
+  labelSuffix?: string
+  /**
+   * The row's always-visible help, from the JSX `description` prop. Only text
+   * the row shows on screen lands here, so a consumer may quote it as on-row
+   * copy.
+   */
   description?: string
+  /**
+   * The row's tip prose, from the JSX `hint` prop: shown only behind the row's
+   * info tip, never on the row itself. Kept apart from `description` so no
+   * consumer quotes tip text as if the row displayed it. Search and the palette
+   * subtitle read both (see `settingHelpText`).
+   */
+  hint?: string
   /** Which settings tab this belongs to (matches SettingsPage TABS key). */
   tab: string
   /** Which primitive renders this setting. */
@@ -37,9 +62,38 @@ export interface SettingEntry {
    */
   params?: Record<string, string>
   /**
-   * Backend config key this setting writes (e.g. 'telemetry.beacon_enabled').
+   * Schema-backed config key this setting writes (e.g. 'telemetry.beacon_enabled').
    * Used by SettingRef to resolve a config key to its UI deep-link.
-   * Undefined for settings that don't map to a single config path.
+   * Undefined outside the typed schema or without a single config path.
    */
   configKey?: string
+  /**
+   * Explicit DOM row identity, independent of any backend config path.
+   * When present, highlighting waits for this exact data-setting-id target
+   * rather than substituting another control with the same translated label.
+   */
+  settingId?: string
+}
+
+/**
+ * A hand-curated entry in settingsManual.ts. Key-only by construction: the
+ * i18n gate forbids English prose literals in hand-written source, so manual
+ * entries carry catalog KEYS and generation (`mergeManualEntries`) resolves
+ * `label`/`description` from the English catalogs — the same strings the
+ * panel renders, which keeps `data-setting-label` highlighting exact.
+ */
+export type ManualSettingEntry = Omit<SettingEntry, 'label' | 'labelKey' | 'description' | 'hint'> & {
+  labelKey: string
+  descriptionKey?: string
+}
+
+/**
+ * All of a row's help text, tip first, for readers that want every word the
+ * row explains itself with (search corpus, palette subtitle) and do not care
+ * where it renders. The tip states what the row is and the visible description
+ * states the consequence, so tip-then-description reads as prose.
+ */
+export function settingHelpText(entry: { description?: string; hint?: string }): string | undefined {
+  const text = [entry.hint, entry.description].filter((s): s is string => !!s).join(' ')
+  return text || undefined
 }

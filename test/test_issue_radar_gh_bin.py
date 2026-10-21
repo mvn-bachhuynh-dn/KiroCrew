@@ -10,14 +10,45 @@ These tests pin that wiring — a regression here either locks out every stock
 ``brew install gh`` (the bug this replaced) or silently accepts an
 agent-plantable shim.
 """
+import os
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only gh resolution")
+pytestmark = [
+    pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only gh resolution"),
+    pytest.mark.skipif(
+        sys.platform != "win32"
+        and os.stat(tempfile.gettempdir()).st_uid not in (0, os.geteuid()),
+        reason="temp dir owned by another user; provider ownership checks reject it",
+    ),
+]
 
 from kiro_crew import github_runner  # noqa: E402
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh  # noqa: E402
+
+
+def _trust_ancestors_above(monkeypatch, base):
+    """Pin ancestor owners without changing fixture files or permission bits."""
+    ancestors = set(base.resolve().parents)
+    real_stat = Path.stat
+
+    def fake_stat(self, **kwargs):
+        info = real_stat(self, **kwargs)
+        if self not in ancestors:
+            return info
+
+        class AncestorStat:
+            st_uid = 0
+
+            def __getattr__(self, name):
+                return getattr(info, name)
+
+        return AncestorStat()
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +79,7 @@ def test_gh_bin_accepts_a_user_owned_install_from_path(monkeypatch, tmp_path) ->
         {"gh": ("/nonexistent-kirocrew/gh",), "glab": ("/nonexistent-kirocrew/glab",)},
     )
     monkeypatch.setenv("PATH", str(tmp_path / "user-bin"))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert gh._gh_bin() == binary
 
@@ -118,6 +150,7 @@ def test_gh_bin_caches_the_resolved_path(monkeypatch, tmp_path) -> None:
         "PROVIDER_EXECUTABLE_CANDIDATES",
         {"gh": (binary,), "glab": ("/nonexistent-kirocrew/glab",)},
     )
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert gh._gh_bin() == binary
     # Second call must not re-validate: point the candidates at nothing and

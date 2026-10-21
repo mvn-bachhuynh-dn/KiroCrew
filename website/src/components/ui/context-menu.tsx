@@ -1,49 +1,161 @@
 import * as React from 'react'
+import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as ContextMenuPrimitive from '@radix-ui/react-context-menu'
 import { cn } from '../../lib/utils'
+import { useCloseOnFileDrag } from '../../hooks/useCloseOnFileDrag'
+import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
+import { PhoneSubContentDiv, PhoneSubTriggerDiv, usePhoneSubState } from './phoneSubmenu'
+import { MountAfterCommit, useCloseWhenCrewHidden, useOverlayRoot } from '../overlayRoot'
 
-const ContextMenu = ContextMenuPrimitive.Root
+/**
+ * A context menu opens on a right-click, so no caller drives it: `open` is
+ * deliberately not accepted (a future controlled caller gets a type error
+ * here instead of a silently ignored prop). Radix's Root does take `open`,
+ * which is what lets this wrapper close it.
+ */
+type ContextMenuProps = Omit<React.ComponentProps<typeof ContextMenuPrimitive.Root>, 'open'>
+
+/**
+ * Radix `ContextMenu.Root`, plus the same rule as `DropdownMenu`: an open
+ * modal menu closes when a file drag from outside the page enters the window,
+ * so the chat composer's drop zone can receive the drop. See
+ * `useCloseOnFileDrag` for the mechanism.
+ */
+function ContextMenu({ onOpenChange, modal = true, ...rest }: ContextMenuProps) {
+  const [open, setOpen] = React.useState(false)
+
+  const handleOpenChange = React.useCallback((next: boolean) => {
+    setOpen(next)
+    onOpenChange?.(next)
+  }, [onOpenChange])
+  const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
+
+  useCloseOnFileDrag(open && modal, close)
+  useCloseWhenCrewHidden(open, close)
+
+  return <ContextMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
+}
 const ContextMenuTrigger = ContextMenuPrimitive.Trigger
 const ContextMenuGroup = ContextMenuPrimitive.Group
-const ContextMenuPortal = ContextMenuPrimitive.Portal
-const ContextMenuSub = ContextMenuPrimitive.Sub
+// Portals into the owning pane's overlay root, so content opened in the local
+// dashboard hides with it behind a remote Crew (see components/overlayRoot).
+function ContextMenuPortal(props: React.ComponentProps<typeof ContextMenuPrimitive.Portal>) {
+  return (
+    <MountAfterCommit>
+      <ContextMenuPrimitive.Portal container={useOverlayRoot()} {...props} />
+    </MountAfterCommit>
+  )
+}
 const ContextMenuRadioGroup = ContextMenuPrimitive.RadioGroup
+
+type ContextSubPhoneContextValue = { isPhone: boolean; expanded: boolean; toggle: () => void }
+const ContextSubPhoneContext = React.createContext<ContextSubPhoneContextValue | null>(null)
+
+const ContextMenuSub = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Sub>
+>(function ContextMenuSub({ children, open, defaultOpen, onOpenChange, ...rest }, ref) {
+  const isPhone = useIsTouchDevice()
+  const { expanded, toggle } = usePhoneSubState(open, defaultOpen, onOpenChange)
+  if (isPhone) {
+    return (
+      <ContextSubPhoneContext.Provider value={{ isPhone: true, expanded, toggle }}>
+        <div ref={ref} className="w-full" {...(rest as React.HTMLAttributes<HTMLDivElement>)}>
+          {children}
+        </div>
+      </ContextSubPhoneContext.Provider>
+    )
+  }
+  return <ContextMenuPrimitive.Sub open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange} {...rest}>{children}</ContextMenuPrimitive.Sub>
+})
 
 const ContextMenuContent = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Content>
->(({ className, ...props }, ref) => (
-  <ContextMenuPrimitive.Portal>
+>(({ className, ...props }, ref) => {
+  const trustRoot = useGuideTrustRootAttrs()
+  return (
+  <ContextMenuPortal>
     <ContextMenuPrimitive.Content
       ref={ref}
+      {...trustRoot}
       className={cn(
-        'z-[9999] min-w-[8rem] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95',
+        // Cap the height to the space Radix measured between the anchor and the
+        // viewport edge (its own collision var) and scroll the overflow, so a
+        // menu taller than the room below stays fully reachable on a short
+        // viewport (mobile) instead of clipping its bottom items off-screen with
+        // `overflow-hidden`. Radix already flips the menu above the anchor when
+        // that side has more room; this handles the case where neither side is
+        // tall enough.
+        'z-[9999] min-w-[8rem] max-h-[var(--radix-context-menu-content-available-height)] overflow-y-auto overscroll-contain rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
+        // Entry animation only. Radix suspends unmount until an exit animation
+        // finishes, and the still-mounted dismissable layer consumes the next
+        // pointer-down — so an exit animation makes an immediate re-open (here,
+        // a right-click elsewhere) a no-op for the animation's whole duration.
+        'animate-in fade-in-0 zoom-in-95',
         'data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2',
         className
       )}
       {...props}
     />
-  </ContextMenuPrimitive.Portal>
-))
+  </ContextMenuPortal>
+  )
+})
 ContextMenuContent.displayName = ContextMenuPrimitive.Content.displayName
 
+/**
+ * `offline` dims a row whose action needs a live gateway — the same prop, the
+ * same weight and the same composition order as `DropdownMenuItem`, which
+ * documents the reasoning in full.
+ *
+ * It exists on BOTH families because one caller renders one list of rows through
+ * either of them: `renderFolderMenuItems` picks the family from its `variant`, so
+ * the folder ⋯-menu and the right-click menu are the same rows. A dim on only the
+ * dropdown would leave the context menu presenting the identical gateway writes at
+ * full weight.
+ *
+ * Composed AFTER `className` on purpose: `cn` is tailwind-merge, so the last class
+ * in a conflicting group wins, and with `className` last the `text-danger` delete
+ * row would keep full-saturation red at 40% opacity while its siblings went muted.
+ */
 const ContextMenuItem = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Item> & { inset?: boolean }
->(({ className, inset, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Item> & { inset?: boolean; offline?: boolean }
+>(({ className, inset, offline, ...props }, ref) => (
   <ContextMenuPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
+      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       inset && 'pl-8',
-      className
+      className,
+      offline && 'text-muted opacity-40'
     )}
     {...props}
   />
 ))
 ContextMenuItem.displayName = ContextMenuPrimitive.Item.displayName
+
+/**
+ * A menu row that reports WHICH option is currently in effect, the context-menu
+ * twin of `DropdownMenuRadioItem`: screen readers announce a `menuitemradio` as
+ * checked or unchecked, which a plain item cannot convey.
+ */
+const ContextMenuRadioItem = React.forwardRef<
+  React.ComponentRef<typeof ContextMenuPrimitive.RadioItem>,
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.RadioItem>
+>(({ className, ...props }, ref) => (
+  <ContextMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
+      'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+      className
+    )}
+    {...props}
+  />
+))
+ContextMenuRadioItem.displayName = ContextMenuPrimitive.RadioItem.displayName
 
 const ContextMenuSeparator = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.Separator>,
@@ -57,41 +169,93 @@ const ContextMenuSeparator = React.forwardRef<
 ))
 ContextMenuSeparator.displayName = ContextMenuPrimitive.Separator.displayName
 
+const ContextMenuLabel = React.forwardRef<
+  React.ComponentRef<typeof ContextMenuPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Label>
+>(({ className, ...props }, ref) => (
+  <ContextMenuPrimitive.Label
+    ref={ref}
+    className={cn('px-3 py-1.5 text-[12px] font-semibold text-muted', className)}
+    {...props}
+  />
+))
+ContextMenuLabel.displayName = ContextMenuPrimitive.Label.displayName
+
 const ContextMenuSubTrigger = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.SubTrigger>,
   React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.SubTrigger> & { inset?: boolean }
->(({ className, inset, children, ...props }, ref) => (
-  <ContextMenuPrimitive.SubTrigger
-    ref={ref}
-    className={cn(
-      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
-      'focus:bg-bg-hover data-[state=open]:bg-bg-hover',
-      inset && 'pl-8',
-      className
-    )}
-    {...props}
-  >
-    {children}
-  </ContextMenuPrimitive.SubTrigger>
-))
+>(({ className, inset, children, onClick, onKeyDown, ...props }, ref) => {
+  const ctx = React.useContext(ContextSubPhoneContext)
+  if (ctx?.isPhone) {
+    return (
+      <PhoneSubTriggerDiv
+        ref={ref as React.Ref<HTMLDivElement>}
+        inset={inset}
+        expanded={ctx.expanded}
+        onToggle={ctx.toggle}
+        className={className}
+        onClick={onClick as unknown as React.MouseEventHandler<HTMLDivElement> | undefined}
+        onKeyDown={onKeyDown as unknown as React.KeyboardEventHandler<HTMLDivElement> | undefined}
+        {...(props as React.HTMLAttributes<HTMLDivElement>)}
+      >
+        {children}
+      </PhoneSubTriggerDiv>
+    )
+  }
+  return (
+    <ContextMenuPrimitive.SubTrigger
+      ref={ref}
+      className={cn(
+        'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
+        'focus:bg-bg-hover data-[state=open]:bg-bg-hover',
+        inset && 'pl-8',
+        className
+      )}
+      onClick={onClick as unknown as React.MouseEventHandler<HTMLDivElement> | undefined}
+      onKeyDown={onKeyDown as unknown as React.KeyboardEventHandler<HTMLDivElement> | undefined}
+      {...props}
+    >
+      {children}
+    </ContextMenuPrimitive.SubTrigger>
+  )
+})
 ContextMenuSubTrigger.displayName = ContextMenuPrimitive.SubTrigger.displayName
 
 const ContextMenuSubContent = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.SubContent>,
   React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.SubContent>
->(({ className, ...props }, ref) => (
-  <ContextMenuPrimitive.Portal>
-    <ContextMenuPrimitive.SubContent
-      ref={ref}
-      className={cn(
-        'z-[9999] min-w-[8rem] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
-        className
-      )}
-      {...props}
-    />
-  </ContextMenuPrimitive.Portal>
-))
+>(({ className, children, ...props }, ref) => {
+  const ctx = React.useContext(ContextSubPhoneContext)
+  const trustRoot = useGuideTrustRootAttrs()
+  if (ctx?.isPhone) {
+    if (!ctx.expanded) return null
+    return (
+      <PhoneSubContentDiv
+        ref={ref as React.Ref<HTMLDivElement>}
+        className={className}
+        {...(props as React.HTMLAttributes<HTMLDivElement>)}
+      >
+        {children}
+      </PhoneSubContentDiv>
+    )
+  }
+  return (
+    <ContextMenuPortal>
+      <ContextMenuPrimitive.SubContent
+        ref={ref}
+        {...trustRoot}
+        className={cn(
+          'z-[9999] min-w-[8rem] max-h-[var(--radix-context-menu-content-available-height)] overflow-y-auto overscroll-contain rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
+          'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
+          className
+        )}
+        {...props}
+      >
+        {children}
+      </ContextMenuPrimitive.SubContent>
+    </ContextMenuPortal>
+  )
+})
 ContextMenuSubContent.displayName = ContextMenuPrimitive.SubContent.displayName
 
 export {
@@ -99,6 +263,7 @@ export {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuLabel,
   ContextMenuSeparator,
   ContextMenuGroup,
   ContextMenuPortal,
@@ -106,4 +271,5 @@ export {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
   ContextMenuRadioGroup,
+  ContextMenuRadioItem,
 }

@@ -1,5 +1,5 @@
-"""Build gate + tests: the Slack persist path stays off the event loop (#1699),
-and a slot orders its rows against foreign on-disk rows (#1689).
+"""Build gate + tests: the Slack persist path stays off the event loop,
+and a slot orders its rows against foreign on-disk rows.
 
 ## Why a gate and not just tests
 
@@ -17,7 +17,7 @@ active — and most of these call sites swallow that in a best-effort ``except``
 Off the loop there is no running loop in the worker thread, so ``_locked`` takes
 the patient poll-to-deadline path instead.
 
-``history.py`` already warns (with ``stack_info``) when append runs on the loop,
+``history_offload.py`` already warns (with ``stack_info``) when append runs on the loop,
 but a warning is only as good as someone reading logs. This gate is the
 deterministic form: a NEW Slack call site cannot persist a turn on the loop
 without failing the build.
@@ -40,6 +40,7 @@ from datetime import datetime
 from unittest.mock import patch
 
 import pytest
+from source_corpus import parsed_candidates
 
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts, transcript_sort_key
 
@@ -149,20 +150,27 @@ def find_violations(source: str, path: str = "<source>") -> list[tuple[str, int]
 
 def collect_repo_violations() -> list[tuple[str, int]]:
     """Scan every ``kiro_crew/**/*.py`` for an on-loop turn persist."""
-    root = _src_root()
-    base = root.parent
+    base = _src_root().parent
     out: list[tuple[str, int]] = []
-    for py in sorted(root.rglob("*.py")):
-        try:
-            src = py.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):  # pragma: no cover - defensive
-            continue
+    # ``find_violations`` cannot report a hit unless ``_bound_names`` bound
+    # something, and every binding it recognises -- the ``from ... import
+    # save_conversation_turn`` alias, or the ``<module>.save_conversation_turn``
+    # attribute call itself -- puts the literal in the file's TEXT. So narrowing
+    # to files holding it drops non-matches only, and the shared corpus parses
+    # just those (a handful) instead of ast.parse-ing all ~1550 modules -- ~3.5 s
+    # per run, because find_violations' early return happens AFTER the parse.
+    # Filtering through ``parsed_candidates`` rather than a raw ``in`` test is
+    # deliberate: it matches on NFKC-normalised text, so an identifier spelled
+    # with a Unicode compatibility homoglyph -- which CPython folds at parse time,
+    # making it a real AST match -- cannot slip past the filter and quietly
+    # un-gate itself.
+    for py, text, _tree in parsed_candidates(require_all=(_BANNED_FUNC,)):
         try:
             rel = str(py.relative_to(base))
         except ValueError:  # pragma: no cover - defensive
             rel = str(py)
         try:
-            out.extend(find_violations(src, rel))
+            out.extend(find_violations(text, rel))
         except SyntaxError:  # pragma: no cover - defensive
             continue
     return out
@@ -300,8 +308,15 @@ def test_every_slack_persist_site_goes_through_the_choke_point() -> None:
     """
     root = _src_root()
     sites = 0
-    for name in ("handler.py", "gateway.py", "transport_dispatch.py"):
-        tree = ast.parse((root / "slack" / name).read_text(encoding="utf-8"))
+    paths = [
+        root / "slack" / name for name in ("handler.py", "gateway.py", "transport_dispatch.py")
+    ]
+    # The gateway facade's composed owners hold part of its persist sites.
+    paths += sorted((root / "slack" / "gateway_runtime").glob("*.py"))
+    # So do the handler facade's.
+    paths += sorted((root / "slack" / "handler_runtime").glob("*.py"))
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -338,7 +353,7 @@ async def test_two_concurrent_turns_do_not_interleave(tmp_path) -> None:
     ``save_conversation_turn`` never yields between its two appends, so the pair
     was effectively atomic. Dispatching it to worker threads makes two concurrent
     turns for the same session genuinely interleavable into
-    ``user_A, user_B, assistant_A, assistant_B`` -- turns that no longer pair up,
+    ``user_A, user_B, assistant_A, assistant_B`` -- turns that do not pair up,
     which no timestamp ordering can repair because every row's ``ts`` is
     individually correct.
 
@@ -414,7 +429,7 @@ class TestLatestTranscriptTs:
         )
 
 
-# ── #1689: a slot orders against a foreign on-disk row ───────────────────────
+# ── A slot orders against a foreign on-disk row ─────────────────────────────
 #
 # The behavioural coverage for that lives in test_transcript_row_ordering.py,
 # which owns transcript ordering and already carries the colliding-clock
@@ -451,3 +466,171 @@ def test_a_corrupt_ts_is_skipped_not_ranked(bad: str) -> None:
 def test_all_candidates_corrupt_yields_no_floor(bad: str) -> None:
     """No usable floor means None -- never a bogus value the stamper will drop."""
     assert latest_transcript_ts(bad, bad) is None
+
+
+# ── Restore-read tier: no startup restore read is INLINED on the loop ────────
+#
+# Same failure family as the persist gate above, opposite direction: a READ this
+# time, and the cost is not a dropped write but a stalled event loop. The startup
+# restore drivers call list_sessions() (a glob + stat + first-line read of EVERY
+# session file) and, per session, a metadata read plus a chained transcript walk.
+# On a real home that measured ~13.6s for 76 sessions — and because
+# _loop_heartbeat pets the LoopStallWatchdog FROM A COROUTINE, a blocked loop
+# cannot pet it: the 25s exit_after timer fires, dumps thread stacks and _exit()s
+# the gateway before it ever finishes booting.
+#
+# SCOPE, stated plainly: this gate is SHAPE cover, not the proof. It flags a read
+# spelled directly inside an `async def` body in the scanned files. It would
+# NOT have caught #895's original form, where the async driver drove a synchronous
+# GENERATOR and the reads sat one hop away inside it — and it deliberately does not
+# chase that hop, because following module-local calls transitively lands in
+# _rehydrate_slot_from_history's read fallback (dead when a caller prefetches) and
+# buys false positives that would get suppressed rather than obeyed.
+#
+# What actually pins the property is behavioural, in
+# test_open_slots_persistence_async_restore.py::test_restore_open_slots_async_reads_off_the_loop
+# and test_session_restore.py's off-loop class: they record the thread each half
+# ran on and fail on the base shape. This gate is the cheap companion that stops
+# a future edit from re-inlining a read straight into a driver.
+#
+# The offloaded shape passes for free — `asyncio.to_thread(_prefetch_recent_session, …)`
+# passes the function as a bare Name, which is not a call at that point.
+#
+# Scoped to an explicit allow-list of bulk-restore drivers (chat_persistence.py and
+# the handlers/sessions family), not repo-wide. Repo-wide, these three methods have many legitimate
+# on-loop callers reading one small metadata line; the invariant being pinned is
+# about the BULK restore path, and a gate that fires everywhere would be turned
+# off rather than obeyed.
+
+_RESTORE_READS = frozenset({"list_sessions", "read_messages_chained", "get_metadata_status"})
+
+
+def find_restore_read_violations(source: str, path: str = "<source>") -> list[tuple[str, int]]:
+    """Return ``(path, lineno)`` for on-loop bulk-restore reads.
+
+    Matches the ATTRIBUTE form only (``conv_log.read_messages_chained(key)``),
+    which is how every real call site spells it — the methods live on
+    ``ConversationLog``, so there is no bare-name form to evade through. A
+    trailing ``# loop-ok: <reason>`` comment suppresses a line that is genuinely
+    safe, and every suppression must state its reason.
+    """
+    tree = ast.parse(source)
+    suppressed = _suppressed_lines(source)
+    out: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for call in _scope_calls(node):
+            func = call.func
+            if not (isinstance(func, ast.Attribute) and func.attr in _RESTORE_READS):
+                continue
+            span = range(call.lineno, (call.end_lineno or call.lineno) + 1)
+            if any(ln in suppressed for ln in span):
+                continue
+            out.append((path, call.lineno))
+    return out
+
+
+def test_no_startup_restore_read_runs_on_the_event_loop() -> None:
+    """Async handlers must offload bulk-reads, never call inline.
+
+    **Limitation:** This gate is lexical — it flags only calls syntactically
+    inside an ``async def`` body. A one-level sync-helper extraction defeats it
+    (e.g. ``def _helper(): return log.list_sessions()`` called from an async def).
+    Zero-violation does NOT prove the code is safe; it proves the gate cannot see
+    a violation.
+    """
+    targets = [
+        _src_root() / "dashboard" / "chat_persistence.py",
+        _src_root() / "dashboard" / "chat_persistence_parts" / "member_store.py",
+        _src_root() / "dashboard" / "chat_persistence_parts" / "restore_drivers.py",
+        _src_root() / "dashboard" / "chat_persistence_parts" / "save_transaction.py",
+        _src_root() / "dashboard" / "chat_persistence_parts" / "slot_builders.py",
+        _src_root() / "dashboard" / "handlers" / "sessions.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "usage_scrape.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "app_scope.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "history_reads.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "summaries.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "delete_claim.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "slot_teardown.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "delete_routes.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "live_turn.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "tool_policy.py",
+        _src_root() / "dashboard" / "handlers" / "sessions_parts" / "restart.py",
+    ]
+    all_violations: list[tuple[str, int]] = []
+    for target in targets:
+        assert target.exists(), f"{target.name} not found at {target}"
+        all_violations.extend(
+            find_restore_read_violations(target.read_text(encoding="utf-8"), str(target))
+        )
+    if all_violations:
+        detail = "\n".join(f"  {path}:{lineno}" for path, lineno in all_violations)
+        raise AssertionError(
+            "a bulk-restore disk read is called directly inside an `async def` "
+            "body.\n\n"
+            "list_sessions() scans every session file; read_messages_chained() "
+            "walks a whole transcript across forks. On the event loop that "
+            "starves the LoopStallWatchdog heartbeat, whose exit_after timer "
+            "then kills the gateway mid-boot (#895). Hoist the read:\n"
+            "    sessions = await asyncio.to_thread(log.list_sessions)\n"
+            "and keep only the slot mutation on the loop (slot creation "
+            "broadcasts through asyncio.Queue.put_nowait / Event.set, neither "
+            "thread-safe).\n"
+            "If an on-loop read is genuinely correct, add a trailing "
+            "'# loop-ok: <reason>' comment.\n\n"
+            f"{detail}"
+        )
+
+
+def test_restore_read_detector_flags_an_inline_walk() -> None:
+    src = (
+        "async def f(log, key):\n"
+        "    msgs = log.read_messages_chained(key)\n"
+        "    return msgs\n"
+    )
+    assert [v[1] for v in find_restore_read_violations(src)] == [2]
+
+
+def test_restore_read_detector_flags_an_inline_session_scan() -> None:
+    src = "async def f(log):\n    return log.list_sessions()\n"
+    assert [v[1] for v in find_restore_read_violations(src)] == [2]
+
+
+def test_restore_read_detector_accepts_the_offloaded_form() -> None:
+    """``to_thread`` passes the callable as a bare Name — not a call yet."""
+    src = (
+        "import asyncio\n"
+        "async def f(log):\n"
+        "    return await asyncio.to_thread(log.list_sessions)\n"
+    )
+    assert find_restore_read_violations(src) == []
+
+
+def test_restore_read_detector_ignores_a_sync_helper() -> None:
+    """The prefetch helpers themselves are sync — that is the whole point."""
+    src = (
+        "def _prefetch(log, key):\n"
+        "    return log.get_metadata_status(key), log.read_messages_chained(key)\n"
+    )
+    assert find_restore_read_violations(src) == []
+
+
+def test_restore_read_detector_ignores_a_nested_sync_scope() -> None:
+    """A closure handed to a worker thread is a different execution frame."""
+    src = (
+        "import asyncio\n"
+        "async def f(log, key):\n"
+        "    def _read():\n"
+        "        return log.read_messages_chained(key)\n"
+        "    return await asyncio.to_thread(_read)\n"
+    )
+    assert find_restore_read_violations(src) == []
+
+
+def test_restore_read_detector_honors_a_loop_ok_suppression() -> None:
+    src = (
+        "async def f(log, key):\n"
+        "    return log.list_sessions()  # loop-ok: two entries, fixture only\n"
+    )
+    assert find_restore_read_violations(src) == []

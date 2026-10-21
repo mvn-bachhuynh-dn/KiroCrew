@@ -410,6 +410,115 @@ class TestScreenshotSpoolNamesAreUnique:
         assert result.image_jpeg == b""
 
 
+class TestSpoolFailureLeavesNoOrphanFrame:
+    """A post-allocation spool failure must not orphan the ``mkstemp`` frame.
+
+    ``mkstemp`` allocates the name AND creates the file, so every raiser after
+    it — the write, the permission tighten, the ring trim — can leave a
+    zero-owner frame behind in the spool when the blanket fail-soft handler
+    discards the path without unlinking. The degraded return value alone
+    passes on the unfixed code; the no-new-file assertion is the point.
+    """
+
+    def _service(self, tmp_path, monkeypatch):
+        from kiro_crew.computer_use import service as service_mod
+
+        monkeypatch.setattr(service_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+        return service_mod
+
+    def _snap(self, service_mod, payload: bytes):
+        from kiro_crew.computer_use.types import AppRef, Snapshot
+
+        return Snapshot(
+            app=AppRef(name="A", pid=1, bundle_id="com.acme.a", window_id=7),
+            elements=(),
+            captured_at=time.monotonic(),
+            image_jpeg=payload,
+            image_width=10,
+            image_height=10,
+        )
+
+    def _spool_files(self, service_mod, tmp_path):
+        import os
+
+        shot_dir = os.path.join(str(tmp_path), service_mod.SCREENSHOT_DIR_NAME)
+        if not os.path.isdir(shot_dir):
+            return []
+        return os.listdir(shot_dir)
+
+    def _assert_degraded_and_clean(self, service_mod, tmp_path, result):
+        assert result.image_path == ""
+        assert result.image_jpeg == b""
+        assert result.image_width == 0 and result.image_height == 0
+        # THE assertion: the allocated frame was unlinked, not orphaned.
+        assert self._spool_files(service_mod, tmp_path) == []
+
+    def test_a_failing_write_leaves_no_file_behind(self, tmp_path, monkeypatch):
+        import os
+
+        service_mod = self._service(tmp_path, monkeypatch)
+        real_fdopen = os.fdopen
+
+        class _BoomHandle:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                self._inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._inner.__exit__(*exc)
+
+            def write(self, _data):
+                raise OSError("no space left on device")
+
+        monkeypatch.setattr(
+            service_mod.os, "fdopen", lambda fd, mode: _BoomHandle(real_fdopen(fd, mode))
+        )
+        svc = service_mod.ComputerUseService()
+        result = svc._persist_image(self._snap(service_mod, b"AAAA"))
+        self._assert_degraded_and_clean(service_mod, tmp_path, result)
+
+    def test_a_failing_permission_tighten_leaves_no_file_behind(self, tmp_path, monkeypatch):
+        service_mod = self._service(tmp_path, monkeypatch)
+
+        def boom(_path):
+            raise OSError("chmod refused")
+
+        monkeypatch.setattr(service_mod.platform_compat, "restrict_to_owner", boom)
+        svc = service_mod.ComputerUseService()
+        result = svc._persist_image(self._snap(service_mod, b"AAAA"))
+        self._assert_degraded_and_clean(service_mod, tmp_path, result)
+
+    def test_a_failing_ring_trim_leaves_no_file_behind(self, tmp_path, monkeypatch):
+        service_mod = self._service(tmp_path, monkeypatch)
+
+        def boom(_shot_dir):
+            raise RuntimeError("trim exploded")
+
+        monkeypatch.setattr(service_mod, "_trim_ring", boom)
+        svc = service_mod.ComputerUseService()
+        result = svc._persist_image(self._snap(service_mod, b"AAAA"))
+        self._assert_degraded_and_clean(service_mod, tmp_path, result)
+
+    def test_the_happy_path_still_spools_an_owner_only_frame(self, tmp_path, monkeypatch):
+        """The cleanup must never fire on success: the frame survives, 0o600."""
+        import os
+        import stat
+
+        service_mod = self._service(tmp_path, monkeypatch)
+        svc = service_mod.ComputerUseService()
+        result = svc._persist_image(self._snap(service_mod, b"AAAA"))
+        assert result.image_path
+        assert os.path.isfile(result.image_path)
+        with open(result.image_path, "rb") as handle:
+            assert handle.read() == b"AAAA"
+        if os.name == "posix":
+            assert stat.S_IMODE(os.stat(result.image_path).st_mode) == 0o600
+        assert self._spool_files(service_mod, tmp_path) == [os.path.basename(result.image_path)]
+
+
 class TestSnapshotIndex:
     # Every entry is namespaced by session, so the tests name one explicitly
     # rather than relying on a default the API deliberately does not provide.
@@ -1050,3 +1159,66 @@ class TestASuppressedScreenshotAlwaysSaysSoWhy:
             cu_backend.reset_shared_backend()
             cu_service.reset_shared_service()
             cu_index.reset_shared_index()
+
+
+class TestScreenshotNoteStaysOutsideRedaction:
+    """Why ``render_tree`` appends the screenshot note AFTER ``policy.redact_result``.
+
+    The redactor keeps this host's default macOS temp dir intact, but that does not
+    make the order removable: it exempts only the per-user directory id ``confstr``
+    reports, and the spool follows ``$TMPDIR``.
+    Each case below is a real spool root whose path redaction still breaks, so
+    moving the note inside the redacted body would hand the model a mangled path.
+
+    The first assertion of each case pins that premise. If it ever fails, the
+    redactor has learned the shape and the order may be revisited.
+    """
+
+    # Real shape: two-char bucket, 30 lowercase alphanumerics, no vowels, ``0000gn``.
+    _HOST_ID = "6r/9f82r1996wq9g2scz0v53nph0000gn"
+    _LEAF = "kirocrew-computer-shots/shot-1700000000000-ab12cd34.jpeg"
+
+    @staticmethod
+    def _as_host(monkeypatch, host_id):
+        from kiro_crew.security import redaction as redaction_mod
+
+        monkeypatch.setattr(redaction_mod, "_host_darwin_user_dir_id", lambda: host_id)
+
+    @staticmethod
+    def _snap(image_path: str) -> Snapshot:
+        app = AppRef(bundle_id="com.acme.files", name="Files", pid=42, window_id=7)
+        return Snapshot(
+            app=app,
+            window_title="Docs",
+            elements=(ElementRec(index=0, role="AXTextField", value=FAKE_CREDENTIAL_FIXTURE),),
+            captured_at=time.monotonic(),
+            image_path=image_path,
+            image_jpeg=b"\xff\xd8\xff\xd9",
+            image_width=1280,
+            image_height=800,
+        )
+
+    @pytest.mark.parametrize(
+        ("root", "host_id"),
+        [
+            pytest.param(f"/var/folders/{_HOST_ID}/T", None, id="no-confstr-answer"),
+            pytest.param(
+                f"/var/folders/{_HOST_ID}/T/tmpk3x9q2zw", _HOST_ID, id="nested-random-tmpdir"
+            ),
+        ],
+    )
+    def test_spool_path_reaches_the_model_byte_exact(self, monkeypatch, root, host_id):
+        from kiro_crew.computer_use import policy
+
+        self._as_host(monkeypatch, host_id)
+        path = f"{root}/{self._LEAF}"
+        assert policy.redact_result(f"Screenshot: {path}") != f"Screenshot: {path}", (
+            "redaction now keeps this spool path intact; the append-after-redaction "
+            "order in render_tree may be retirable"
+        )
+
+        text = render.render_tree(self._snap(path), text_limit=DEFAULT_TEXT_LIMIT)
+        assert f"Screenshot: {path}\n" in text
+        # The order only spares our own note: the tree body is still redacted.
+        assert FAKE_CREDENTIAL_FIXTURE not in text
+        assert "REDACTED" in text

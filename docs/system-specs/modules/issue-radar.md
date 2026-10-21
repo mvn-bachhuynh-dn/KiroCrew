@@ -2,11 +2,13 @@
 
 ## Overview
 
-Issue Radar is an opt-in (`defaultEnabled: false`) built-in app for GitHub
-issue and pull-request triage. It connects one or more repos via the user's own
-`gh` CLI session (no GitHub App, no PAT management) and provides a 3-column
-workbench: browse/filter issues, view AI-summarized detail + timeline, apply
-triage actions (label, close/reopen), and record per-issue investigation findings
+Issue Radar is an opt-in (`defaultEnabled: false`) built-in app for tracked-item
+and change-request triage across THREE providers — GitHub, GitLab and Azure
+DevOps (see [Providers](#providers)). It connects one or more repos via the
+user's own vendor CLI session (`gh`, `glab` or `az` — no OAuth app, no PAT held
+by Kiro Crew) and provides a 3-column workbench: browse/filter issues (work
+items on Azure DevOps), view AI-summarized detail + timeline, apply triage
+actions (label, close/reopen), and record per-issue investigation findings
 in a local ledger. A parallel PULL REQUESTS section reuses the same shape —
 filter by lifecycle (open / merged / closed-unmerged), person, draft and label;
 read an AI summary of the description plus the whole review conversation; see
@@ -16,11 +18,263 @@ reopen, merge or arm the provider's own auto-merge, and cancel or re-run CI, per
 or in bulk across a selection (see Pull-Request Actions). A background watcher
 optionally notifies on new issues.
 
+## Providers
+
+Three providers are supported, and each is a plain MODULE that mirrors the others
+function-for-function (`github_client`, `gitlab_client`, `azure_client`).
+`provider.py` owns the identity type (`RepoKey`), the dispatch table and the
+display vocabulary; `ProviderClient` is the protocol the routes require, and
+because a module cannot be statically checked against a Protocol, conformance is
+enforced by `TestClientParity`, which compares every member's signature against
+GitHub's — GitHub is the REFERENCE rather than one peer among three, since the
+routes, caches and components were all written to its names, so a disagreement is
+always the other client drifting and the failure names which one. That class also
+asserts its own table covers every entry in `provider.PROVIDERS`, so a fourth
+provider cannot be registered while the gate silently keeps comparing three.
+
+**Each client module is the stable composition façade for its provider.** The
+routes and tests continue to import `github_client`, `gitlab_client` and
+`azure_client`; those modules carry the protocol surface, exception aliases,
+the constants something actually binds, and patchable I/O chokepoints (`github_client`
+and `azure_client` serve them from their owners, below). A mirror
+NOTHING binds is not part of that surface: the sibling that owns the value reads
+its own module global, so a façade copy is never the seam it resembles and
+patching it changes nothing. Binding means the façade's own code, a test that
+asserts on the façade attribute, or a documented cross-surface pointer such as
+`_MEMBER_ASSOC_RANK`, which `website/src/apps/issue-radar/context.tsx` names as
+the anchor the frontend ranking tracks. Provider-specific sibling modules keep
+the implementation boundaries explicit: `*_transport.py` owns URL, environment,
+request and pagination mechanics; `*_normalization.py` converts provider payloads
+into the shared GitHub-shaped records; and `github_queries.py` owns GitHub's
+GraphQL, dependency and search query plans. The façades inject their current
+bindings into those helpers so established monkeypatch seams remain authoritative
+(for `github_client` and `azure_client`, their owners inject them, and the mirror
+keeps them patchable through the façade).
+The reviewed real `glab` and `az` process spawns remain in
+`gitlab_client._glab_run` and `azure_client_cli._az_run` (served as
+`azure_client._az_run`), respectively, which keeps the spawn-audit allowlist tied
+to the same security chokepoints.
+
+**`github_client` is a mirror façade over six owners.** Its code lives in the
+`github_client_*.py` siblings, one responsibility each, and the façade serves every
+name from the owner that binds it (`kiro_crew._facade_mirror`), so a patch of
+`github_client.<name>` reaches every owner holding that name, as it reached the one
+module. `github_client_cli` holds the exception aliases, the timeouts, the hardened
+`gh` spawn `_gh_run` and the REST runner `_run_gh_api`; `github_client_repo_reads`
+the repo access check, the issue lists and their change probe, the viewer's login
+and contributed repos, labels and members; `github_client_detail` issue detail,
+reference summaries, the issue and PR timeline, the dependency graph and the crew
+claim; `github_client_writes` the triage writes, the permission read that gates
+them, and every pull-request action, with the PR's workflow-run read that its CI
+actions and the failure watch use; `github_client_pulls` the PR lists, detail,
+checks, list-card enrichment and search; and `github_client_ci` the viewer's open-PR
+heads and each repo's recent workflow runs. New GitHub code goes to the owner of its
+responsibility, and an owner never imports the façade.
+
+**`azure_client` is a mirror façade over seven owners**, the same way. Its code lives in
+the `azure_client_*.py` siblings: `azure_client_cli` holds the exception aliases, the
+timeouts, the per-endpoint API versions and paging limits, the hardened `az` spawn
+`_az_run` and the `az devops invoke` runner `_az_invoke` with its paging;
+`azure_client_work_items` the project's GUID, the template's own state names, the
+signed-in identity, WIQL and the batched hydrate; `azure_client_repo_reads` the repo
+access check and permission read, the work-item lists and their change probe, tags as
+labels, members, the login and its default organization, and contributed repos;
+`azure_client_detail` work-item detail, reference summaries and the work-item and PR
+timelines; `azure_client_writes` the work-item triage writes and the issue and PR
+comments, whose bodies `_comment_text` redacts; `azure_client_pulls` the PR lists,
+detail with its mergeability and merge-strategy vocabulary, policy evaluations and
+builds read as checks, list-card enrichment and search; and `azure_client_pr_actions`
+close or reopen, review, merge, auto-complete and a PR's builds. New Azure DevOps code
+goes to the owner of its responsibility, and an owner never imports the façade.
+
+| | GitHub | GitLab | Azure DevOps |
+|---|---|---|---|
+| Provider id | `github` | `gitlab` | `azure` |
+| CLI that owns the credential | `gh api` | `glab api` | `az devops invoke` |
+| Host | `github.com` (pinned) | `gitlab.com`, or an allowlisted self-managed `host[:port]` | `dev.azure.com` (pinned) |
+| `RepoKey.owner` carries | owner | group path (`group/subgroup`) | `{organization}/{project}` |
+| Tracked item | issue | issue | work item (**project-scoped**) |
+| Change request | pull request, `#` | merge request, `!` | pull request, `!` |
+| Review verbs | approve / request changes / comment | approve / comment (request changes REFUSED) | comment only (**both verdicts REFUSED** — see below) |
+| Merge methods | `MERGE` / `SQUASH` / `REBASE` | `MERGE` / `SQUASH` (`REBASE` refused) | `MERGE` / `SQUASH` / `REBASE` |
+| Auto-merge | `enablePullRequestAutoMerge` | REFUSED (see below) | `autoCompleteSetBy` |
+| Assignees | a set, capped at 10 | a set (Free keeps only the first) | exactly ONE (`System.AssignedTo`); more than one is REFUSED |
+
+**Every provider is reached by shelling out to its vendor CLI as a raw REST
+passthrough, and Kiro Crew stores NO credential of its own.** `gh api`, `glab api`
+and `az devops invoke` are each the vendor's own generic REST verb, so the client
+modules speak the provider's REST API directly while the CLI owns the token — an
+authenticated `gh`/`glab` session, an `az login` session, or `AZURE_DEVOPS_EXT_PAT`.
+This is a deliberate security posture rather than an implementation shortcut: there
+is no OAuth app, no hosted backend, no PAT in `config.json`, and no token in the
+gateway process, so the app's blast radius is whatever the user's own terminal
+already had. Each client runs its CLI with a list argv (never `shell=True`) and a
+minimal environment, so there is no shell-injection surface either. The cost of the
+posture is that a provider install the vendor CLI cannot reach is not supported at
+all — see "On-premises is out of scope" below.
+
+**Identity is three-level on Azure DevOps, using the overloading GitLab already
+needs.** A GitHub repo is `(owner, repo)`; the other two add `provider` and `host`,
+and `RepoKey.owner` carries the whole namespace ABOVE the repository, at any depth the
+provider allows. On GitLab that is the group path, capped where GitLab caps it: a
+namespace deeper than `gitlab_transport.MAX_NAMESPACE_SEGMENTS` (21 group levels) or
+a segment longer than 255 characters is refused at connect. On Azure DevOps it is
+`{organization}/{project}`, with `repo` the git repository inside that project. The
+field is not split further because both providers treat the whole path as the
+project's address, so one field keeps the storage layout, the connected-repo gate
+and all ~38 route signatures unchanged. Azure's web address inserts a literal
+`_git` between project and repository (`RepoKey.web_url`), because a project holds
+repositories alongside boards, pipelines and artifacts and that segment is what
+disambiguates them.
+
+**The Azure host is PINNED and the legacy URL form is canonicalized.**
+`normalize_host` replaces whatever a client sent with `dev.azure.com` for Azure
+(and `github.com` for GitHub), because the host becomes part of a cache path and
+part of the identity a repo is looked up by, so it must not be request-influenced.
+The legacy `{organization}.visualstudio.com` form is still accepted when PARSING a
+pasted URL — matched as a host SUFFIX on the parsed hostname, never as a substring
+of the URL — and canonicalized to `dev.azure.com` there, so one organization cannot
+acquire two identities and two cache trees by being connected from two URL shapes.
+
+**The significant semantic limitation: Azure work items are PROJECT-scoped and
+carry no repository dimension at all.** There is no "issues in this repository"
+question to ask Azure DevOps, so `list_open_issues` ignores `repo` and returns the
+PROJECT's work items — which means two repositories connected from one project
+legitimately show the same tracked-item list. That is not a bug and not a cache
+collision; it is the shape of the platform, and the UI says so rather than implying
+a per-repo list. Pull requests have no such problem: they are repository-scoped
+like everywhere else. Two consequences follow:
+
+- **Listing is always two calls.** Azure has no filtered work-item list endpoint,
+  so every listing is a WIQL query that returns ids (`_WIQL_TOP`) followed by a
+  batched hydrate of those ids (`_BATCH_MAX_IDS` per call, chunked and stitched).
+  Both legs run under the paginating timeout budget and the result is cached, so
+  the cost is paid per refresh rather than per view.
+- **No state vocabulary is assumed.** A work item's `System.State` values belong to
+  the project's PROCESS TEMPLATE (Agile, Basic, Scrum, CMMI), where "Closed",
+  "Done", "Completed" and "Resolved" are all real closing states. Nothing
+  hard-codes a state name: the closing states are read from the work item type's
+  own state definitions and the open filter is built from that.
+
+**Azure DevOps is READ-ONLY through this app's own controls.** `get_repo_permissions`
+reports `push`/`triage` as false, and `routes._repo_can_write` consults that before
+admitting any mutation, so labelling, commenting, state changes, merging and
+auto-merge all refuse for an Azure repo even though the client implements them.
+
+This is not an oversight, and the reason is worth recording. The only authorization
+signal reachable through the `az devops invoke` passthrough is project TEAM
+MEMBERSHIP, and membership does not imply repository write: Azure's permissions are
+per-repository ACLs a project can override, so a team member can have Git
+"Contribute" denied while still editing work items, or the reverse. Inferring
+`push` from membership therefore over-grants — it offers controls the repository
+will refuse — and it does so through a gate whose answer is cached. Azure exposes no
+effective-permission read this transport can address (only namespace ACL bitmasks).
+A user who holds the rights still acts in Azure DevOps directly, where the
+permission is evaluated against their real identity.
+
+The write implementations are kept, tested and refused at the gate rather than
+deleted, so restoring them needs only an authorization source worth trusting.
+
+**Azure DevOps reaches GitHub's parity on merging, but NOT on review verdicts.**
+It expresses all three merge strategies
+(`noFastForward` / `squash` / `rebase` — `REBASE` maps to the linear `rebase`, never
+to `rebaseMerge`, because the caller asking for a rebase means the linear history),
+and a genuine reversible auto-merge: patching `autoCompleteSetBy` to an identity
+arms the PR and patching it to the empty GUID disarms it, which is a real armed
+STATE rather than a modifier on the merge call.
+
+Review verdicts are the exception, and the reason is worth recording because it is
+not a gap in the API surface but in what the API can *promise*. Azure's reviewer
+vote attaches to the PULL REQUEST, not to a commit: there is no revision parameter
+to send. So between the route's head-moved check and the vote, a push can land and
+the verdict then records against code nobody read. Azure resetting votes on push
+does not close that ordering — the reset fires with the push, before the vote
+arrives — and no compensating fix works either, since withdrawing a vote after
+re-reading the head is itself a write whose failure would leave an approval
+standing on unreviewed code. `PR_REVIEW_EVENTS` is therefore `("COMMENT",)` and
+`APPROVE` / `REQUEST_CHANGES` are refused with an explanation, which is the same
+choice GitLab makes for the verdict it cannot express. A human can still vote in
+Azure DevOps' own UI, where they see the head they are voting on.
+
+Azure's
+`mergeable_state` resolves to `mergeable` (the value `_MERGE_ALLOWED_STATES`
+admits) only when every BLOCKING policy evaluation is approved, so unlike GitLab's
+legacy `can_be_merged` it is a real "protections satisfied" reading rather than
+"no conflicts"; a policy read that fails returns `unknown`, because a gate that
+cannot read the policies must not claim they are satisfied.
+
+**Labels are TWO unrelated systems on Azure DevOps.** A pull request's labels are
+tag definitions attached to the PR. A work item's are `System.Tags`, a single
+delimited STRING field on the item — so every mutation is a read-modify-write of
+the whole field (Azure has no add-one-tag operation), tag names are case
+SENSITIVE, and a name containing `,` or `;` is rejected because the delimiter
+cannot survive the round trip. Azure tags carry neither colour nor description, so
+the colour every tag renders in is SYNTHETIC (`_SYNTHETIC_LABEL_COLOR`, the same
+neutral fallback the other two clients use for an uncoloured label) and
+`create_label` returns that synthetic colour rather than the caller's — the caller
+is not told a colour was saved when none was.
+
+**On-premises is out of scope, for both providers that have such an edition, and
+for the same reason.** GitHub Enterprise Server and Azure DevOps Server are both
+unsupported because neither has a credential path this app's transport can use. For
+Azure the reason is concrete: the `azure-devops` CLI extension does not support
+Azure DevOps Server at all, so a CLI-passthrough client cannot serve it. Supporting
+it would mean raw REST plus a credential Kiro Crew stores itself, which is exactly
+the posture stated above. Both providers are therefore listed in
+`_PINNED_HOSTS`, and `azure_client._resolve_host` refuses every host but
+`dev.azure.com` — including an EMPTY one, rather than defaulting, so a call site
+that forgot the host fails loudly instead of silently targeting a host the caller
+never named.
+
+**No provider's CLI is a hard dependency.** `app.json` lists `gh`, `glab` and `az`
+under `dependencies.optionalCommands`, so a shop that uses one provider installs
+the app without the other two CLIs on the host. A missing CLI surfaces as a setup
+error on the first call to THAT provider, not as an install-time refusal.
+
 ## Routes
 
 All routes live under `/api/apps/issue-radar/` and are registered by
 `apps/builtins/issue_radar/backend/routes.py:register_routes`. Every handler is
 wrapped in `_require_enabled` (returns 403 when the app is disabled).
+
+**`backend/routes.py` is the route layer's facade, and the handlers live in
+`backend/http_routes/`.** The facade owns what every handler runs first: request
+identity (`_key_from_request`, `_key_from_body`, `_account_key`), the enabled,
+connected-repo and write-permission gates (`_require_enabled`, `_connected`,
+`_repo_can_write`), per-repo store scoping (`_scope`, `_st`), the SEL audit
+(`_audit`) and the provider-neutral error aliases. It also keeps `/connect`, whose
+off-loop URL parse `tests/test_gitlab.py` pins to that file, the probe-gated
+list-poll decision (see Client-Side List Polling) and `register_routes`. Each
+private `http_routes` module owns one responsibility:
+
+| Module | Owns |
+|---|---|
+| `http_routes/repositories.py` | `/repos` (GET, DELETE), `/me`, `/recent-repos`, `/settings`, `/settings/role`, `/labels`, `/members`, and the cache-first label loader `_load_labels_for_ai` |
+| `http_routes/items.py` | `/issues`, `/issue`, `/pulls`, `/pulls/search`, `/pull`, `/ref`, both first-page fast paths, and the open-issue loader `_load_open_issues_for_reco` |
+| `http_routes/deps.py` | `/deps` and its per-app refresh-task and rebuild-lock registries |
+| `http_routes/ai.py` | `/issue-ai`, `/pull-ai`, the one-shot model adapter `_run_oneshot_model`, and the output-language resolution every AI surface shares |
+| `http_routes/recommendations.py` | `/recommendations` (GET, POST) and `/labels/create` |
+| `http_routes/tagging.py` | `/tagging` (GET, POST) and `/labels/apply-bulk` |
+| `http_routes/issue_writes.py` | `/labels/apply`, `/issue/state`, `/issue/assignees` |
+| `http_routes/investigation.py` | `/investigation` (GET, PUT) |
+| `http_routes/pr_actions.py` | every `/pull/*` action, `/pull/runs`, `/pulls/bulk`, and the shared `_pr_action_preamble` / `_run_pr_action` |
+| `http_routes/gitlab_groups.py` | `/gitlab-groups` (GET, POST, DELETE) and `/gitlab-groups/review-requests` |
+
+The facade re-exports every name those modules define, so `routes.<name>` keeps
+resolving for the tests, for `crew_routes`' gate chain and for other modules' docs.
+**A patch on `backend.routes` of a gate or a seam intercepts the call wherever it
+is made.** An owner module reaches everything the facade owns, and every seam the
+suites patch (the cache-first loaders, the model calls, `_run_pr_action`,
+`_refuse_if_head_moved`, the locked write helpers, `_ui_language`,
+`_TAG_BATCH_MAX`), through a function-local `from .. import routes` and a
+call-time `routes.<name>` read. Any other name an owner calls within its own
+module, such as `_pr_action_preamble` from the PR handlers, is bound there, so
+patching it on the facade reaches only the callers that read it through the
+facade. `test/test_issue_radar_http_routes_surface.py` fails an owner module that
+binds a gate or a seam itself. The import is function-local because the facade
+imports the owners, so a module-scope import back would be a cycle.
+`tests/test_gitlab.py` holds the facade and every `http_routes` module to the
+per-repo store-scoping rule.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -28,10 +282,11 @@ wrapped in `_require_enabled` (returns 403 when the app is disabled).
 | GET | `/issues` | List open/closed issues (cached, paginated). `poll=1` takes the probe-gated path — see Client-Side List Polling. `first_page=1` (open only) takes the progressive first-paint fast path — see First Paint |
 | GET | `/issue` | Full issue detail + timeline |
 | GET | `/ref` | Compact summary of one referenced issue/PR (hover preview + issue-vs-PR resolution). One `gh` call, no timeline, short-TTL cache |
+| GET | `/deps` | The repo's dependency graph `{edges, nodes}` (edge = `{blocked, blocker, source: native\|inferred}`), scoped to the open issues. Serve-stale-revalidate-behind: a cache younger than `DEPS_CACHE_TTL_SEC` is served as-is, an older one is served immediately while ONE coalesced background rebuild per repo refreshes it (cancelled on app cleanup); only a never-synced repo or `refresh=1` rebuilds inline. Non-GitHub providers answer an empty graph, not an error. Inline rebuild failures are 502 `deps_issue_scope_unavailable` (open-issue scope unreadable) or `deps_fetch_failed` |
 | GET | `/labels` | Repo label set (cached with a **10-min TTL**; see "The label cache expires") |
 | GET | `/members` | Repo collaborators (authoritative API or fallback) |
 | GET | `/repos` | Connected repos list. Rows missing a cached `permissions` object (connected before permissions were tracked) are self-healed with a live `verify_repo_access`, run CONCURRENTLY under a bounded semaphore (`_REPO_HEAL_CONCURRENCY`) rather than one-at-a-time, since this gates app open; a single unreadable repo is skipped, not fatal |
-| GET | `/recent-repos` | Repos the `gh` user contributed to recently (connect-dialog picker) |
+| GET | `/recent-repos` | Repos the authenticated user contributed to recently, for the connect-dialog picker; provider-neutral (`?provider=&host=`), so GitHub, GitLab and Azure DevOps all populate it, not only `gh` |
 | DELETE | `/repos` | Disconnect a repo (drops config + cache) |
 | GET | `/me` | Current `gh` login |
 | GET/PUT | `/settings` | Per-repo triage settings. The PUT replaces the whole document, so it carries the `revision` it read and is refused with **409** if the stored revision has moved — otherwise a stale tab would erase a label appended meanwhile |
@@ -40,23 +295,129 @@ wrapped in `_require_enabled` (returns 403 when the app is disabled).
 | GET | `/pulls` | List open/closed PRs (cached, `poll=1` probe-gated as for `/issues`; `first_page=1` (open only) takes the progressive first-paint fast path — see First Paint; rows enriched with diff size + check tally via one GraphQL call and merge readiness via a second, lean one run CONCURRENTLY, each topped up by number for rows outside its `first:100` window). Rows whose enrichment failed carry `null` (unknown, not zero) and are deliberately NOT written to the cache, so the next read retries |
 | GET | `/pulls/search` | PRs matching a per-person filter, resolved server-side by GitHub search (escapes the list's page cap). Paginates only as far as its own cap and reports `truncated` so the UI says "newest N" rather than implying completeness |
 | GET | `/pull` | Full PR detail + conversation (issue timeline merged with inline review comments) + automated checks on the head commit. Cache-first with a short server-side TTL (`PR_DETAIL_CACHE_TTL_SEC`), so a plain GET self-refreshes and no caller has to pass `refresh=1` to stay current |
-| GET | `/pull-ai` | AI summary of a PR (description + whole conversation + check state), cached against a fingerprint that hashes the conversation's CONTENT — so an edited comment invalidates it, not just a new one |
+| GET | `/pull-ai` | AI summary of a PR (description + whole conversation + check state), cached against a fingerprint that hashes the conversation's CONTENT — so an edited comment invalidates it, not just a new one. The configured dashboard language (when set) is folded into the fingerprint too, so switching languages earns a fresh summary instead of serving the cached one in the old language |
 | POST | `/labels/apply` | Apply label changes (add/remove) |
 | POST | `/issue/state` | Close/reopen an issue |
-| GET/PUT | `/investigation` | Per-issue investigation record. The PUT is the ONE app route also reachable with the gateway internal secret (`_MIXED_INTERNAL_API_PATHS`), because it is the write behind the `issue_radar_record_investigation` MCP tool — see [Recording findings](#recording-findings) |
+| POST | `/issue/assignees` | REPLACE an issue's assignees with the given final set. Carries `expected`, the set the client last read; the write lands only if the forge still holds it, otherwise a 409 carries the current set. A login the forge will not assign is a 400 `invalid_assignees` |
+| POST | `/issue/comment` | Post a comment on an issue (a forge write, gated like the mutating PR routes) |
+| GET/PUT | `/investigation` | Per-issue investigation record. The PUT is reachable with the gateway internal secret (`_MIXED_INTERNAL_API_PATHS`), because it is the write behind the `issue_radar_record_investigation` MCP tool. The only other internal-secret paths are `/crew` and `/crew/work`, for the crew ledger tools — see [Recording findings](#recording-findings) |
 | GET/POST | `/recommendations` | AI label taxonomy recommendations |
 | POST | `/labels/create` | Create a new repo label |
 | GET | `/tagging` | The untagged queue (also serves `bulk_max`, the bulk-apply cap, so the client chunks on the server's real limit; and `titles` bounded to the slice a recommendation's examples can cite) (open issues with ZERO labels) plus any cached per-issue label suggestions for it. Never runs the model, so opening the Tagging dashboard costs nothing; suggestions for issues that have since been labelled elsewhere are filtered out |
 | POST | `/tagging` | Generate per-issue label suggestions with ONE batched model call (`_TAG_BATCH_MAX` = 50 issues). Without `numbers` it takes the next un-analysed slice, so repeated calls walk a long backlog without re-paying; with `numbers` it re-analyses specific issues. Proposals are intersected with the repo's real label set AND with the batch that was shown, so injected issue text can neither invent a label nor reach an issue outside the batch |
 | POST | `/labels/apply-bulk` | Apply label ADDITIONS to many issues at once (add-only — removal stays a per-issue action). Unknown labels are rejected before any write, so a typo cannot half-apply the batch; per-issue failures are reported rather than swallowed, and only the issues that actually got labelled leave the queue |
 | POST | `/pull/state` | Close or reopen a PR. Routed through the provider's PULL endpoint, not the issue endpoint — a merged PR's un-reopenability then comes from the provider instead of silently succeeding against the issue shadow |
-| POST | `/pull/review` | Submit a review (`approve` / `request_changes` / `comment`). Requires `head_sha` — a review is a verdict on a REVISION, so it rides as GitHub's `commit_id` / GitLab's `sha` and a force-push between render and click is refused rather than recorded. A body is required for the latter two (the provider rejects them bodyless). GitLab has no "request changes" verb and the client REFUSES rather than degrading it to a comment |
+| POST | `/pull/review` | Submit a review (`approve` / `request_changes` / `comment`). Requires `head_sha` — a review is a verdict on a REVISION, so it rides as GitHub's `commit_id` / GitLab's `sha` and a force-push between render and click is refused rather than recorded. A body is required for the latter two (the provider rejects them bodyless). GitLab has no "request changes" verb, and Azure DevOps can bind NEITHER verdict to a revision, so each client REFUSES rather than degrading a verdict to a comment |
 | POST | `/pull/comment` | Post a conversation comment on a PR |
-| POST | `/pull/merge` | Merge a PR now. Per-PR only — never bulk. Requires `head_sha`, sent as the provider's `sha` precondition so the merge is pinned to the reviewed commit. Cannot bypass a gate: the provider enforces branch protection on its own endpoint, and a 405 refusal is mapped to a readable message |
-| POST | `/pull/auto-merge` | Arm or disarm the PROVIDER's own auto-merge, for a PR that is not mergeable yet. **GitHub only** — REFUSED on GitLab, where `merge_when_pipeline_succeeds` is a deferral modifier on the merge endpoint rather than an arm verb (see "GitLab auto-merge is REFUSED outright" below); the UI hides both controls there. Callers must send only rows that are not landable yet — the provider refuses an already-clean or already-merged PR, and the list row carries `mergeable_state` so the bulk bar can tell (see "Merge readiness is on the LIST row") |
+| POST | `/pull/merge` | Merge a PR now. Per-PR only — never bulk. Requires `head_sha`, sent as the provider's `sha` precondition so the merge is pinned to the reviewed commit. Cannot bypass a gate: the provider enforces branch protection on its own endpoint, and a refusal is mapped to a readable `merge_not_allowed` message. On GitHub it goes through the asynchronous merge API and answers only once the merge has landed; a merge still running after the wait is a 409 `merge_pending` |
+| POST | `/pull/auto-merge` | Arm or disarm the PROVIDER's own auto-merge, for a PR that is not mergeable yet. **GitHub and Azure DevOps only** — REFUSED on GitLab, where `merge_when_pipeline_succeeds` is a deferral modifier on the merge endpoint rather than an arm verb (see "GitLab auto-merge is REFUSED outright" below); the UI hides both controls there. Callers must send only rows that are not landable yet — the provider refuses an already-clean or already-merged PR, and the list row carries `mergeable_state` so the bulk bar can tell (see "Merge readiness is on the LIST row") |
 | GET | `/pull/runs` | The CI runs on a PR's head commit, each with its id plus server-computed `cancellable`/`rerunnable`, so the UI never offers an action the provider will refuse |
 | POST | `/pull/run` | Cancel or re-run one CI run (`failed_only` re-runs just the failed jobs) |
 | POST | `/pulls/bulk` | Apply ONE action to many PRs (`_BULK_PR_ACTIONS`: close, reopen, approve, comment, auto_merge, cancel_auto_merge; max `_BULK_PR_MAX` = 50). `approve` additionally requires a `head_shas` map keyed by PR number, covering EVERY number in the request (see rule 2). Sequential, because the PRs share one provider rate limit. Partial failure is reported per PR rather than failing the batch |
+| GET | `/gitlab-groups` | The followed GitLab groups as `[{host, path}]`. A local config read, no `glab` call — see "GitLab groups" |
+| POST | `/gitlab-groups` | Follow a GitLab group (owner only). Body `{group}`: a bare path (a gitlab.com group) or a pasted group link, whose host must be gitlab.com or in `dashboard.gitlab_hosts`. The path is validated, then one read-only `GET groups/:id` confirms it exists before it is stored; a malformed path is 400 `invalid_group` and an unknown group 404 `group_not_found`, and neither is stored. Answers `{host, path}` |
+| DELETE | `/gitlab-groups` | Stop following a group (owner only, `?host=&path=`). Local only |
+| GET | `/gitlab-groups/review-requests` | Open merge requests across a followed group and all its subgroups where the signed-in `glab` user is a requested reviewer: ONE paginated `groups/:id/merge_requests?…&reviewer_username=<me>&include_subgroups=true` search through the same query builder, username check and `PR_SEARCH_MAX` cap as `/pulls/search`, walking at most `GROUP_SEARCH_MAX_PAGES` pages, with `truncated` reported. Rows are bounded per field (see "GitLab groups"). A group that was never followed is 404 before any `glab` call. Every error carries a `code` (`group_not_found`, `group_forbidden`, `setup_required`, `no_login`, `provider_error`) |
+| GET/POST | `/crews` | List a repo's crews with their settings and on-duty/working/paused counts; POST creates a crew |
+| GET | `/crews/names` | Suggested names for a new crew |
+| GET/PUT | `/crews/settings` | Per-repo crew settings |
+| GET/PUT/DELETE | `/crew` | Read one crew with its open items, events and the repo's shared skip index; PUT updates it; DELETE retires it (the record survives) |
+| GET | `/crew/fabric` | The crews pipeline view's whole payload (phases and items). Non-GitHub providers answer `items: []` |
+| PUT | `/crew/work` | Record one work-item step and its progress event (the write behind `issue_radar_crew_record`) |
+| POST | `/crew/pause` | Pause or resume a crew |
+
+**`website/src/apps/issue-radar/api.ts` holds the dashboard's calls to these
+routes** (`issueRadarApi`), plus the base path and the AI-language hint that
+`/issue-ai`, `/pull-ai` and `/recommendations` take. The crews pipeline view
+reads `/crew/fabric` through its own client,
+`website/src/apps/issue-radar/pipeline/api.ts`. `api.ts` is also the one import
+path the app's modules use for these calls and their shapes, and the one module
+id their specs mock. The shapes live in two owners that `api.ts` re-exports, and
+a new shape goes to the owner for its routes:
+`website/src/apps/issue-radar/apiTypes.ts` for the repo, issue and pull-request
+routes (with the error classes the calls throw and the `RepoRef` query and body
+helpers), and `website/src/apps/issue-radar/apiCrewTypes.ts` for the crew routes
+(the records, the phase classifications and the event kinds that mirror the
+backend crew store). Neither owner imports `api.ts`, and no other module of the
+app imports an owner, so a spec's mock of `api.ts` replaces every call
+`issueRadarApi` makes for every importer.
+`website/src/apps/issue-radar/api.owners.test.tsx` pins that shape.
+
+## GitLab groups
+
+A user who reviews across a large GitLab group follows the GROUP instead of
+connecting each project. **A followed group is a path, never a project list.**
+`config.json` gains a `gitlab_groups` array of `{host, path}` only. The key is
+absent until the first group is added, and removing the last group removes it
+again, so an install that never follows a group keeps its config byte for byte.
+There is no token and no per-group setting.
+
+The group's review requests are one group-scoped search, so new projects and
+subgroups appear without any reconnect. Each refresh is one paginated
+`groups/:id/merge_requests` read with `include_subgroups=true`, `scope=all`,
+`state=opened` and `reviewer_username` set to the signed-in `glab` user.
+`build_group_pr_search_query` adds `include_subgroups` to
+`build_pr_search_query`'s own parameters, so the state mapping and the username
+charset check are the per-project search's own. The walk stops at
+`GROUP_SEARCH_MAX_PAGES` (the pages `PR_SEARCH_MAX` plus its sentinel row need),
+not at the generic `_MAX_PAGES`.
+
+**A group row bounds every field it keeps**, because the rows come from every
+project in the tree:
+
+- A row carries only `number`, `title`, `url`, `project`, `author`, `updated_at`
+  and `truncated_fields`. There is no description, label list or reviewer list.
+- Each string has its own `GROUP_ROW_*_MAX` bound, and a field cut to its bound
+  is named in `truncated_fields`.
+- An over-long `url` is dropped to `''` rather than cut, since a shortened link
+  points somewhere else.
+- `project` is read from GitLab's `references.full`, falling back to `web_url`.
+
+**A group read answers 404 only for GitLab's 404.** It uses
+`_raise_if_group_missing` in place of the auth check, and that raises
+`ProviderNotFoundError` only when the stderr tail carries both `404` and "not
+found". A group path or username can contain `404` but never a space, so an
+outage on group `team404` stays a 502.
+
+The path is validated before it reaches a request:
+
+- It has 1 to `MAX_NAMESPACE_SEGMENTS` segments.
+- Each segment passes the same shape check as a project URL's segments.
+- `.`, `..` and GitLab's system paths (`groups`, `api`, `-`, …) are refused.
+- It is percent-encoded as GitLab's single `:id` parameter.
+
+A malformed path is refused before any call, so it can never widen into a broader
+query. The host must be gitlab.com or allowlisted in `dashboard.gitlab_hosts`, the
+same rule as connecting a project, and `_resolve_host` re-checks it at spawn.
+Following and unfollowing are owner only. The read route serves only a followed
+`host` + `path`, compared exactly: that comparison is its authorization gate, the
+counterpart of `is_repo_connected`.
+
+The UI has three parts, sharing one react-query entry (`lib/gitlabGroups.ts`):
+
+- The "GitLab groups" section of General settings follows and unfollows groups.
+  Each followed group gets a labelled Unfollow button, and the Settings rail
+  lists the section under General.
+- The "Review requests" dashboard lists each group's merge requests. A group's
+  count reads "more than N" when the list is capped, with a "See all on GitLab"
+  link to the same search in GitLab's own merge-request list (built from the
+  response's `login`). Every group has its own `ErrorNotice`, and each error code
+  maps to a sentence that says what to do. The list refreshes on the list
+  cadence, but never faster than `GROUP_REVIEWS_MIN_POLL_MS`, because one refresh
+  walks up to four pages.
+- `DashboardsSection` lists that dashboard only while at least one group is
+  followed, or while it is the page on screen.
+
+With no group followed, the only new request is the local list read: there is no
+review-request call, and the dashboards rail is unchanged.
+
+This covers review requests, the issue's primary use case. It does not
+materialise every project as a connected repo: a scheduled recursive subgroup
+walk would hit rate limits and pagination on 100+ projects, flood the repo list,
+and need a policy for per-repo settings as projects join and leave. Nor is it a
+host-wide reviewer search: the unit the issue asks to connect is a group, and on
+gitlab.com one account reviews across unrelated groups that a group view keeps
+apart.
 
 ## Recording findings
 
@@ -65,19 +426,41 @@ triage prompt. When the agent concludes it writes its verdict back into the
 item's investigation record — that is what puts a verdict + summary on the
 issue's card instead of leaving it in chat scrollback.
 
+The session opens in the repo's configured **`workspace_path`** (a per-repo,
+local-only triage setting stored in `config.json`, alongside `triage_labels` and
+`notify_on_new_issue`, and normalized by `store._normalize_settings`) so the agent
+sees the repo's real source instead of the gateway's default cwd. The frontend forwards it as the new slot's
+`project` on `createSlot`, which sets the working directory via `chatSlotProject`
+after create. An empty setting passes `null`, leaving the slot on the default cwd. It is applied only when a FRESH session is opened;
+a resumed slot keeps the working directory it was born with, so changing the
+setting never moves the cwd of a conversation already running — which is why the
+Repo Settings readout says "New Investigate sessions will run in …", not that the
+next click will. The path is stored verbatim and never validated against the
+filesystem — the path resolves on the machine running the gateway (which may be a
+different host than the operator's), and a not-yet-checked-out path is a
+legitimate empty state. Because it is unvalidated, `chatSlotProject` can still
+reject it at slot-create time (missing dir on the gateway host, or a sensitive
+path); `createSlot` then deletes the just-made slot and throws, which reaches
+`openSession`'s `catch` and surfaces in the hook's `error` state — the same
+contract the chat sidebar uses ("Not a directory"). A bad path is deliberately
+NOT swallowed into a default-cwd session: doing so would silently pin the whole
+investigation thread in the wrong directory, recreating the wrong-cwd failure
+this feature removes.
+
 That write goes through the **`issue_radar_record_investigation` MCP tool**, not
 a raw HTTP call. An agent session holds no dashboard credential:
 
 - the access cookie is `httpOnly`, so the frontend cannot hand it to the agent;
-- `KIROCREW_INTERNAL_SECRET` is stripped from agent env by
-  `sandbox._AGENT_DENIED_ENV_KEYS`;
 - `.local_secret` — needed for the `GET /api/token/local` bootstrap — is on the
-  `security.py` sensitive-path denylist, for tool reads and for the shell forms.
+  sensitive-path list in `security/paths_lists.py`, so the tool gate refuses an agent's
+  reads of it. The OS sandbox does not hide it
+  (`sandbox._CREW_SANDBOX_VISIBLE_LEAVES`), because in-sandbox MCP servers
+  authenticate back to the dashboard with it; the tool gate is the only fence.
 
 So a direct `PUT /api/apps/issue-radar/investigation` from the agent is refused
-with `403 {"error": "Token required"}`. It used to be exactly what the seed
-prompt asked for, which meant no investigation ever recorded findings and the
-card's verdict/summary render path was unreachable. The tool runs in the
+with `403 {"error": "Token required"}`. A seed prompt that asked for that raw
+call would leave every investigation unrecorded and the card's verdict/summary
+render path unreachable. The tool runs in the
 `kirocrew-core` MCP server, which holds the internal secret legitimately, so the
 route is listed in `_MIXED_INTERNAL_API_PATHS` — the full path only, never the
 `/api/apps/issue-radar` prefix, which would also admit the forge-write routes
@@ -94,6 +477,23 @@ findings object (the UI's clear path); there is deliberately no per-field clear.
 `provider`/`host`/`kind` are always sent explicitly — the record is keyed on them,
 and defaulting them records a GitLab item into a same-slug GitHub repo's ledger.
 
+Per-key merging is the contract WITHIN one run and the wrong one ACROSS runs. A
+re-run ("Start over", or any path that opens a replacement session) recording a
+`verdict` and `summary` but no `root_cause` would inherit the previous run's
+`root_cause`, leaving the record — the only copy — holding a verdict assembled
+from two investigations with nothing marking which parts came from which. The
+store therefore owns the run boundary, because only there is it atomic with the
+write: the record remembers the session its findings were written under
+(`findings_slot_key`), and the FIRST findings write under a different session
+REPLACES rather than merges, while later writes from that same session keep
+merging. The prior verdict survives until a new one exists and never blends with
+it — which is why the replacement is not done by clearing at session open
+(`agentSession.ts` says so at the save site): the record is the only copy, so an
+abandoned re-run would lose the prior verdict permanently. A boundary needs BOTH
+sessions known and different; an unknown owner (findings recorded for an item
+with no session linked) or a cleared link falls back to merging, which is the
+non-destructive reading.
+
 **In the MCP tool**, every finding string and label goes through the platform
 redaction shim (`platform.redact_via_context` → exfil URLs + credentials) before the
 PUT: findings are LLM prose about an untrusted issue body, they are stored verbatim,
@@ -108,7 +508,7 @@ output.
 All data under `app_data_dir("issue-radar")` (typically `~/.kiro/crew/apps/issue-radar/data/`):
 
 ```
-config.json                         # Connected repos, per-repo settings
+config.json                         # Connected repos, per-repo settings, followed GitLab groups
 repos/<owner>/<repo>/
   issues-cache.json                 # Open issues (schema-versioned, + poll probe)
   issues-closed-cache.json          # Closed issues (capped at 100)
@@ -126,6 +526,21 @@ repos/<owner>/<repo>/
   watch-state.json                  # Watcher high-water mark
 ```
 
+That tree is PUBLIC GITHUB's, and it keeps the original layout so an install that
+has been triaging GitHub issues keeps every cache, setting and investigation note
+exactly where it already is. Every other provider+host pair is rooted under a
+reserved segment first — `@providers/<provider>/<host>/repos/<owner>/<repo>/`, via
+`store.provider_root` passed as the `root=` argument the ~40 per-repo store
+functions already accept, so none of their bodies change. The segment is reserved
+rather than merely conventional: a GitHub owner is constrained to
+`[A-Za-z0-9._-]+`, so no real owner can produce `@providers` and collide with the
+subtree. The host is part of the path because `group/project` on gitlab.com is a
+different project from the same path on a private instance; for Azure DevOps the
+host is pinned and the legacy `visualstudio.com` form is canonicalized before it
+gets here, which is what keeps one organization from occupying two of these trees.
+`<owner>` is the whole namespace, so an Azure repo's data lands under
+`@providers/azure/dev.azure.com/repos/<organization>/<project>/<repo>/`.
+
 `config.json` RMW operations are serialized via a cross-process file lock
 (`platform_compat.file_lock` on `config.json.lock`). `tagging-cache.json` holds
 the same lock discipline on its own `.lock` sidecar: every mutation is a merge
@@ -134,16 +549,65 @@ would otherwise lose an update. An analysed issue the model declined to label is
 stored as an EMPTY list, not omitted — otherwise "the next un-analysed slice"
 would return the same unlabelable issues forever.
 
+The connected-repo reader treats a non-object `config.json` as an empty config,
+and filters non-object rows from its `repos` list. A malformed row cannot stop
+the app from listing or updating other connected repositories.
+
+Every cache parser applies the same rule to its own file: a JSON root that parses
+but is not an object is unusable. Readers return a MISS so the route refetches and
+the next write heals the file; write-through patchers skip that individual file
+and continue patching the other caches. Without that, a hand-edited or restored
+cache fails its route or aborts the remaining post-write cache repairs. The
+investigation record is deliberately excluded — it is the only copy of a user's
+findings, so reading a malformed root as "absent" would let the next write replace
+it.
+
+**Where the store's code lives.** `store.py` is a mirror façade
+(`kiro_crew._facade_mirror`): routes, tests and sibling modules still reach
+`store.<name>`, and a patch through it reaches every owner binding the name. The
+code is in six owners: `store_repos` (the data root, `config.json` and its lock, the
+provider-scoped directories, the connected repos with their name matching,
+permissions and settings, the watchers' per-repo state, and GitLab groups),
+`store_labels` (the label and member caches), `store_ai` (the AI triage and PR
+summary caches, label recommendations, the tagging queue, investigation records
+and the `now_iso` clock that stamps them), `store_deps` (the dependency-edge cache),
+`store_issues` (the issue list,
+detail and reference caches, and the write-through patches a triage write applies)
+and `store_pulls` (the PR list and detail caches). New storage goes to the owner of
+its responsibility. The crew store, `crew_store.py`, is a mirror façade over its own
+`crew_store_*` owners the same way; `crew_ledger_spec.md` beside the backend names them.
+
 ## Permissions
 
 Write routes (`/labels/apply`, `/labels/apply-bulk`, `/issue/state`,
-`/labels/create`, and every MUTATING `/pull/*` + `/pulls/bulk` action) are gated on
+`/issue/assignees`, `/issue/comment`, `/labels/create`, and every MUTATING `/pull/*` + `/pulls/bulk` action) are gated on
 confirmed `triage` or `push` access (`_repo_can_write` returns `True` — unknown
 permission is denied, not allowed). Read-only repos degrade to suggest-only. Every PR
 *mutation* goes through one `_pr_action_preamble` helper for the
 JSON/owner/connected/permission checks, so the gate is not re-implemented per handler.
 `GET /pull/runs` is a READ and is gated on the connected-repo check only, like the
 other reads — it returns run metadata the PR's own `checks` already imply.
+
+A second layer sits in front of the first: the **owner gate**. Every write route
+calls `require_owner_dashboard_request` before it reads its body, and a caller that
+is not the dashboard owner gets 403 `owner_only`. That refuses a non-owner dashboard
+subject and every app token, this app's own included. The gate covers the forge
+writes above and the local-state writes too:
+
+| Route | Owner gate in |
+|---|---|
+| `POST /crews`, `PUT /crew`, `DELETE /crew`, `POST /crew/pause`, `PUT /crews/settings` | `crew_routes._body_preamble` |
+| `PUT /crew/work` (dashboard caller) | `crew_routes._body_preamble` |
+| `POST /connect` | `routes._handle_connect` |
+| `DELETE /repos`, `PUT /settings`, `POST /settings/role` | their handlers in `http_routes/repositories.py` |
+| `PUT /investigation` (dashboard caller) | `http_routes/investigation.py` |
+| `POST /tagging`, `POST /recommendations` | their handlers in `http_routes/tagging.py` and `http_routes/recommendations.py` |
+
+Two internal-secret callers pass without the owner gate, each by its exact path in
+the server's internal allowlist: the agent leg of `PUT /crew/work`
+(`issue_radar_crew_record`) and `PUT /investigation`
+(`issue_radar_record_investigation`). A crew route other than `GET /crew` and
+`PUT /crew/work` refuses an internal-secret caller outright (`_agent_gate`).
 
 ## Pull-Request Actions
 
@@ -156,9 +620,8 @@ deliberate narrowing:
 1. **Merging is offered in two forms, and the app refuses an unsatisfied PR itself
    rather than relying on the provider to.** `/pull/merge` lands a PR that is ready
    now; `/pull/auto-merge` hands one that is not yet ready to the provider to land once
-   its checks pass. An earlier revision shipped only the second, reasoning that a direct
-   merge could land unreviewed code — which left a repository with **no branch rule**
-   (where auto-merge is unavailable) with no merge path at all.
+   its checks pass. Both are needed: auto-merge alone would leave a repository with
+   **no branch rule** (where auto-merge is unavailable) with no merge path at all.
    **Why the app has to do the checking.** It is tempting to say "the provider
    adjudicates": branch protection is enforced on its merge endpoint, and an unsatisfied
    PR comes back 405. That is true for an ordinary user and false for the account that
@@ -168,7 +631,7 @@ deliberate narrowing:
    `mergeable: true` with `mergeable_state: "blocked"`. Gating on it therefore offered
    the most privileged account a one-click way to land a PR its own rules had rejected.
    So the route re-reads the PR and refuses anything outside `_MERGE_ALLOWED_STATES`
-   (`clean` / `has_hooks` on GitHub, `mergeable` on GitLab) with a
+   (`clean` / `has_hooks` on GitHub, `mergeable` on GitLab and on Azure DevOps) with a
    **409 `merge_not_ready`**, and the UI mirrors the same set so the button never appears
    where it would only be refused. Two exclusions are load-bearing:
    - `unstable` is often described as "only non-required checks are failing", but the
@@ -185,32 +648,49 @@ deliberate narrowing:
      one GitLab value in the set. Note the read side still reports `can_be_merged` as
      `mergeable: true` — "no conflicts" is a true, useful signal for the pane's warning;
      the merge *gate* keys off the raw status instead, which is why
-     `gitlab_client._MERGEABLE_STATUSES` and `routes._MERGE_ALLOWED_STATES` deliberately
-     differ.
+     `gitlab_client._MERGEABLE_STATUSES` and `http_routes/pr_actions.py`'s
+     `_MERGE_ALLOWED_STATES` deliberately differ.
 
    A gate that cannot tell must refuse — and such a PR is still one click from
    `auto_merge`, which lets the provider decide once the checks finish. A provider 405 is
    still mapped to a readable refusal, since *Method Not Allowed* on a merge button reads
    like an app bug.
+   **On GitHub the merge is asynchronous.** `github_client.merge_pull_request` calls
+   `PUT .../pulls/{n}/merge-async` with `merge_action: direct_merge` and
+   `bypass_rules: false`, then polls `GET .../merge-async/{uuid}` for up to
+   `MERGE_ASYNC_WAIT_SEC`. GitHub recommends this endpoint over the synchronous one: its
+   background job retries transient errors on a busy repository. `bypass_rules: false`
+   means even an account allowed to bypass rules does not do so from here. A `failed`
+   result or an immediate 400 raises `GhMergeRefusedError`, which the route maps to
+   `merge_not_allowed`, carrying GitHub's reason when the background job reports one. A request still running when the wait
+   ends, or one already pending (409, which GitHub uses only for "a merge request already
+   exists"; a stale pinned sha is a 400), is a **409 `merge_pending`**, never a success:
+   the sequential merge stops on it rather than merging the next PR onto a base this one
+   has not reached. `direct_merge` keeps "Merge" meaning "merge now"; a branch that
+   requires a merge queue is reached through auto-merge.
    **The merge is PINNED to the reviewed head commit.** `head_sha` is required by the
    route (400 `head_sha_required`) and by both clients, and rides as the provider's own
    `sha` precondition — so a push landing between the read and the click answers 409
-   instead of merging. The route also refuses when the live head has moved since its own
+   instead of merging. On GitHub a stale pinned sha is an HTTP 400, surfaced as 409
+   `merge_not_allowed`; a provider 409 (GitLab, Azure DevOps) is 409 `merge_conflict`.
+   The route also refuses when the live head has moved since its own
    state read: that state describes the commit it was read for, not a newer one. The UI
    does not offer the button until it knows the sha.
    **The merge METHOD is per-provider, and the tuples deliberately differ.**
    `_pr_merge_method_field` reads `PR_MERGE_METHODS` off the *key's own* client rather
-   than `github_client`'s copy — which an earlier revision did, and which worked only
-   because the two happened to match. They no longer do: GitHub's `/merge` accepts
+   than `github_client`'s copy, because the tuples differ: GitHub's `/merge` accepts
    `MERGE` / `SQUASH` / `REBASE`, but GitLab's has **no rebase option at all** —
    merge-commit vs. semi-linear vs. fast-forward is the *project's* `merge_method`
-   setting, and the only per-request lever is `squash`. Accepting `REBASE` there
-   translated it to `squash: false`, so GitLab produced a **merge commit**: the caller
-   named one history shape and silently got another, on the one operation that cannot
-   be undone. `REBASE` is therefore absent from `gitlab_client.PR_MERGE_METHODS` and a
+   setting, and the only per-request lever is `squash`. Accepting `REBASE` there would
+   translate it to `squash: false`, so GitLab would produce a **merge commit**: the
+   caller would name one history shape and silently get another, on the one operation
+   that cannot be undone. `REBASE` is therefore absent from `gitlab_client.PR_MERGE_METHODS` and a
    request for it is a 400 `invalid_merge_method` — the same refuse-rather-than-
    approximate rule the client follows for "request changes" and a full CI re-run.
    (GitLab's separate `/rebase` endpoint does not merge, so it is not a substitute.)
+   Azure DevOps sits with GitHub rather than GitLab here: all three shapes are a
+   per-request `completionOptions.mergeStrategy`, so `azure_client.PR_MERGE_METHODS`
+   is the full tuple and nothing has to be refused.
    There is deliberately **no "override and merge"**: an override is a governance
    decision recorded ON the provider (this repo does it with a reviewed
    `/ai-review override` comment), and shedding a
@@ -324,8 +804,11 @@ deliberate narrowing:
 verb (the closest thing, unapproving, is not a verdict on a revision) and its
 `/retry` only retries failed and canceled jobs — so `submit_pr_review` raises for
 `REQUEST_CHANGES` and `rerun_workflow_run` reports `failed_only: true` regardless of
-what was asked. Reporting a verdict the platform never recorded, or a full re-run
-that did not happen, would be worse than the error.
+what was asked. Azure DevOps refuses BOTH verdicts, for the ordering reason under
+[Providers](#providers): its vote cannot be bound to the revision it was formed on.
+Reporting a verdict the platform never recorded, or a full re-run that did not
+happen, would be worse than the error. GitHub is the only provider that expresses
+this whole surface natively.
 
 **The sharpest instance, because it is a security property rather than a cosmetic
 one: GitLab auto-merge is REFUSED outright.** GitLab has no independent "arm" verb —
@@ -344,6 +827,10 @@ case. An MR armed on GitLab still *displays* as armed, since the read-side
 On GitHub, where `enablePullRequestAutoMerge` is a real, separate mutation, arming is
 offered normally — and `auto_merge` is derived from the returned `autoMergeRequest`
 rather than asserted, because a hardcoded `True` is a claim rather than an observation.
+Azure DevOps is in the same position for the same reason: `autoCompleteSetBy` is an
+armed STATE on the pull request, set to an identity to arm and to the empty GUID to
+disarm, so arming there is genuinely reversible and is read back off the returned
+field rather than assumed.
 
 **Merge readiness is on the LIST row, because a BULK action is what needs it.**
 `enablePullRequestAutoMerge` is only valid for a PR that is *not landable yet*: GitHub
@@ -396,7 +883,7 @@ Three further properties are load-bearing:
 
 - **Normalized into REST's vocabulary at the parse boundary.** GraphQL SHOUTS its enums
   (`CLEAN`, `MERGEABLE`, `OPEN`) where REST is lowercase, so `_parse_summary_rows`
-  lowers them; `routes._MERGE_ALLOWED_STATES` and the frontend's `MERGE_READY_STATES`
+  lowers them; `pr_actions._MERGE_ALLOWED_STATES` and the frontend's `MERGE_READY_STATES`
   both compare lowercase, and an un-lowered `CLEAN` would match neither and read as
   "not ready" — silently keeping the broken arm on offer.
 - **`UNKNOWN` stays unknown, and it is the COMMON case.** GitHub computes mergeability
@@ -544,10 +1031,10 @@ Two safeguards, both deliberate:
   whole reason it is 30s.** The binding constraint is NOT the 5,000/hr core budget — a
   poll is probe-gated, so its steady-state cost is one search call, not a paginated
   refetch — it is GitHub's **30/min search quota**, which the probe spends and the user's
-  own `gh search` shares. `_PROBE_COALESCE_SEC` (15s) shares one reading per (repo, kind)
+  own `gh search` shares. `_PROBE_COALESCE_SEC` (15s) shares one reading per (provider, host, owner, repo, kind)
   across every open tab, so a 30s interval costs at most 2 probes/min/kind however many
   tabs are open. Halve the floor and that stops holding. Nothing enforces the
-  relationship across the language boundary, so `issueRadarPolling.test.ts` asserts
+  relationship across the language boundary, so `issueRadarPolling.test.tsx` asserts
   `min(choices) == 2 × 15s`: if the backend constant moves, that test is what says this
   floor must move with it.
 - **`/pulls/search` opts out of BOTH new knobs.** Prefetch does not reach it, and
@@ -567,14 +1054,18 @@ react-query's **5 minutes**, which is shorter than an ordinary triage session. L
 Tagging dashboard for six minutes, come back, and its queue has been evicted: a loading
 line, then a full refetch. Once per tab click.
 
-`IssueRadarPage` therefore sets ONE query default for the whole `['issue-radar', ...]` key
-space: `gcTime = CACHE_RETENTION_MS` (**30 min**). Four properties:
+The host therefore registers ONE query default for the whole `['issue-radar', ...]` key
+space: `BuiltinAppRoute` does it for every builtin app, against the `[appId]` prefix, with
+`gcTime = APP_CACHE_RETENTION_MS` (**30 min**) from `website/src/apps/appCacheRetention.ts`,
+the only place that number lives. `IssueRadarPage` registers nothing itself: a second
+`setQueryDefaults` on the same key would write the same entry, and chunk evaluation order
+would decide which value wins. Four properties:
 
 - **Set once, for the key space** rather than repeated across the ~30 query sites, because
   a per-site option is one a newly added query silently forgets. Every key in the app
   already starts with the `issue-radar` segment, which is what makes one default reach all
   of them.
-- **Scoped to this app.** Raising the global default would retain every other page's
+- **Scoped per app.** Raising the global default would retain every other page's
   queries too, which is memory spent on data nothing asked to keep.
 - **Retention is not freshness.** `staleTime` and the poll intervals still decide when a
   refetch happens, so a longer `gcTime` only changes whether there is something to paint
@@ -584,8 +1075,9 @@ space: `gcTime = CACHE_RETENTION_MS` (**30 min**). Four properties:
 
 That is sufficient on its own because the surfaces gate their loading copy on `isLoading`,
 which is false whenever data is present: a remount inside the retention window paints the
-retained rows immediately and any refetch runs behind them. `issueRadarPolling.test.ts`
-pins the retention, its scoping, and the not-pending property.
+retained rows immediately and any refetch runs behind them. `issueRadarPolling.test.tsx`
+pins the retention, its scoping, and the not-pending property; `appCacheRetention.test.ts`
+pins the host-side value and prefix.
 
 The lists additionally keep their previous rows on screen while a new key loads, so
 changing a filter repaints instantly instead of blanking to a spinner. That costs no
@@ -601,24 +1093,24 @@ a same-slug repo on another host is correctly a different repo) and returns `und
 across a switch, which renders the honest loading state. The ticked selection is already
 cleared on `scopeKey`, but that effect runs *after* the paint — it closes the window one
 render late rather than never opening it, which is why the placeholder itself is scoped.
-`issueRadarPolling.test.ts` pins both halves.
+`issueRadarPolling.test.tsx` pins both halves.
 
 `add_pr_comment` is a separate function from `add_issue_comment` even though the two
 coincide on GitHub (one number sequence per repo): GitLab numbers issues and merge
-requests INDEPENDENTLY, so a single shared entry point would be a silent way to
-comment on an unrelated item. The `ProviderClient` protocol and the
+requests INDEPENDENTLY, and on Azure DevOps a work item and a pull request are
+allocated by different services entirely, so a single shared entry point would be a
+silent way to comment on an unrelated item. The `ProviderClient` protocol and the
 `TestClientParity` surface list both.
 
 The UI reads the PR detail's `auto_merge` field to decide whether it offers "enable"
 or "cancel", which is why `PR_DETAIL_CACHE_SCHEMA` is at **v5** — a v4 entry has no
 such key, and defaulting it to absent would show "enable" on an already-armed PR.
-`PULLS_CACHE_SCHEMA` moved to **v6** for the same reason: the list row now carries
-`head_sha`, and a v5 row served as-is would silently disable bulk approve for every
-already-cached repo until its TTL expired — a broken-looking button rather than a
-visibly stale list. It moved again to **v7** when the row gained `mergeable_state` /
-`mergeable` (see "Merge readiness is on the LIST row" below): a v6 row has neither
-field, and an absent value is indistinguishable from "not ready", so serving one would
-keep offering exactly the arm that fails.
+`PULLS_CACHE_SCHEMA` is at **v7** for the same reason: the list row carries
+`head_sha`, `mergeable_state` and `mergeable` (see "Merge readiness is on the LIST row"
+below). A row without `head_sha` served as-is would silently disable bulk approve for
+every already-cached repo until its TTL expired — a broken-looking button rather than a
+visibly stale list. A row without the readiness fields reads as "not ready", so serving
+one would keep offering exactly the arm that fails.
 CI runs are fetched separately from `/pull`'s `checks`, because a check is a per-job
 RESULT (and may come from a service with no runs at all) while cancel/re-run acts on
 the parent RUN and needs its id.
@@ -627,7 +1119,7 @@ the parent RUN and needs its id.
 
 - **Spawn hardening**: All `gh` calls funnel through `_gh_run`, a thin wrapper
   over the shared hardened runner (`kiro_crew.github_runner.run_gh`), which
-  resolves a canonical `gh` via `github_runner.resolve_gh`
+  resolves a validated `gh` via `github_runner.resolve_gh`
   (`KIROCREW_ISSUE_RADAR_GH` override, then `KIROCREW_GH_BIN`, then the
   well-known install dirs, then the ambient `PATH`) and validates it (and every
   parent) with `github_runner.validate_provider_executable`. The default policy
@@ -640,19 +1132,50 @@ the parent RUN and needs its id.
   historical root-owned, symlink-free requirement. The runner passes a minimal
   env (`github_runner.gh_env` — the safe-key base plus gh-scoped
   auth/network/TLS vars, with ambient ssh-agent/git-ssh identity stripped; no
-  unrelated gateway secrets) and pins `GH_HOST=github.com`, because Issue
-  Radar is github.com-only by design and its bare API paths never pass
+  unrelated gateway secrets) and pins `GH_HOST=github.com`, because the GitHub
+  client is github.com-only by design (GitHub Enterprise is unsupported for the
+  same reason on-premises Azure DevOps Server is — see
+  [Providers](#providers)) and its bare API paths never pass
   `--hostname`, so an ambient enterprise `GH_HOST` must not steer them. The runner is benign-allowlisted in the spawn
   audit once (`github_runner.py::run_gh`), covering every caller.
+- **Every provider has the same chokepoint, one per CLI.** `gitlab_client._glab_run`
+  and `azure_client._az_run` mirror `_gh_run`: one function every spawn passes
+  through, argv[0] replaced with the validated binary (resolved through
+  the shared `source_providers.provider_executable_candidates` +
+  `_validate_provider_executable` policy, with `KIROCREW_ISSUE_RADAR_GLAB` /
+  `KIROCREW_ISSUE_RADAR_AZ` as the override), a list argv rather than `shell=True`,
+  and a minimal environment instead of the gateway's. `_az_env` passes only az's own
+  auth roots (`AZURE_CONFIG_DIR`, `AZURE_EXTENSION_DIR`) plus proxy/TLS vars, and
+  forwards `AZURE_DEVOPS_EXT_PAT` **only** for the pinned cloud host — it is a single
+  ambient credential with no host binding, so sending it anywhere else would hand a
+  dev.azure.com token to that server. It also sets
+  `AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no`, which is a security setting rather than a
+  convenience one: with dynamic install on, a call naming an unknown command group
+  makes `az` download and execute an extension wheel, and an automated spawn must
+  never install code — a missing `azure-devops` extension has to surface as an error
+  the user resolves themselves.
+- **The host is re-checked at the spawn boundary, not only at the edge.**
+  `gitlab_client._resolve_host` and `azure_client._resolve_host` each re-validate the
+  target before the process starts (Azure: `dev.azure.com` and nothing else, an empty
+  host refused rather than defaulted), so a corrupted `config.json` entry or a future
+  code path that skipped `provider.normalize_host` fails closed instead of pointing a
+  credential-bearing CLI at a server the caller never named.
 - **SEL audit**: Every `_gh_run` invocation is audit-or-deny: the shared
   runner writes a fail-closed `invoked` event before the spawn (SEL storage
   unusable ⇒ the gh call is refused, surfaced as a retryable `GhCliError`),
   then a best-effort outcome event on success/failure/timeout — emitted inside
-  the shared runner so no gh caller can drift out of the audit. Write handlers additionally emit
+  the shared runner so no gh caller can drift out of the audit. The GitLab and
+  Azure runners audit their own spawns the same way (`azure_client._audit`, one
+  `issue_radar.*` access event per `az` call, reads included). Write handlers additionally emit
   denied/ok/failure events around the permission check and mutation.
-- **Input validation**: Owner/repo are charset-restricted + github.com host
-  allowlisted (SSRF guard). Numbers are `int()`-coerced. Write bodies go via
-  JSON stdin, never argv. Request bodies validated as `dict` before `.get()`.
+- **Input validation**: Owner/repo are charset-restricted and the host is checked
+  against the provider's own rule — allowlisted exactly for GitHub and Azure
+  (`_PINNED_HOSTS`), and against the operator's `dashboard.gitlab_hosts` allowlist
+  for a self-managed GitLab (SSRF guard). A pasted URL is dispatched on its PARSED
+  hostname, never on a substring of the URL, so text appearing in a path or query
+  cannot route it to another provider's parser. Numbers are `int()`-coerced. Write
+  bodies go via JSON stdin, never argv. Request bodies validated as `dict` before
+  `.get()`.
 - **Enabled-state guard**: All handlers wrapped in `_require_enabled`; returns 403
   when the app is disabled.
 - **Prompt-injection containment**: The AI routes feed UNTRUSTED repo text to the
@@ -662,6 +1185,18 @@ the parent RUN and needs its id.
   output is redacted. Issue label suggestions are additionally intersected with the
   repo's real label set, so injected text cannot invent a label; a PR summary is
   prose that nothing downstream acts on.
+- **Output language**: when `dashboard.language` names a shipped catalog, each AI
+  prompt appends a directive (outside the untrusted fence) to write its PROSE —
+  the summaries, per-label `reason`, and recommendation `rationale` — in that
+  language. Label names stay verbatim (the intersection above still matches), and
+  a recommendation's `name`/`description` stay in the repo's own language because
+  `/labels/create` writes them onto GitHub. With no configured language the
+  prompts are byte-identical to before and the model defaults to English.
+  Caches follow suit: the PR-summary fingerprint folds the tag in, and the
+  issue-AI cache stores the tag beside the payload and treats a mismatch as a
+  miss, so a language switch regenerates both on next open. The recommendations
+  cache is regenerate-only by design — it renders the last explicitly generated
+  proposal until the user presses "Recommend labels" again.
 
 ## Background Watcher
 
@@ -669,6 +1204,16 @@ An in-process asyncio loop (`watch.py`) polls opted-in repos every 60s for new
 issues (high-water mark in `watch-state.json`). Sends dashboard bell
 notifications via `state.notify`. Zero-LLM. Guarded by `is_app_enabled` — silent
 when disabled. Lifecycle hooks registered via `app.on_startup`/`on_cleanup`.
+
+The same loop drives the crew sweep, `crew_runtime.sweep_repo`. `crew_runtime.py`
+keeps the sweep and its unblock signals, and is a mirror façade
+(`kiro_crew._facade_mirror`) for the rest of the crew runtime:
+`crew_runtime_prompt` (the brief, the nudge and the turn prompt),
+`crew_runtime_session` (a crew's slot, minting its scoped auto-approve grant, launch
+and turn dispatch) and `crew_runtime_supervision` (trust reconciliation, the wake,
+the watchdog, the slot-close and app-disable hooks, and the revocation of a crew's
+execution and grants). New crew-runtime code goes to the owner of its
+responsibility.
 
 ## First Paint (progressive open-list load)
 
@@ -713,7 +1258,9 @@ gate both key off that, and a partial page must not satisfy "the repo's issues a
 loaded". The list footer shows an `issuesPartial` "loading the rest" hint so the count
 does not read as the whole repo. Net cost: exactly one extra single-page request per
 cold repo-open. `list_open_issues_first_page` is on the `ProviderClient` protocol, so
-GitLab implements the symmetric single-page variant and `test_provider_parity` holds.
+GitLab and Azure DevOps each implement the symmetric single-page variant (Azure's is
+one WIQL+hydrate pair capped at `_PAGE_SIZE`, in the same changed-date order as the
+full list) and `apps/builtins/issue_radar/tests/test_gitlab.py::TestClientParity::test_every_module_implements_the_whole_surface` holds.
 
 `GET /pulls?first_page=1` (open state only) is the PR twin, handled by
 `_handle_pulls_first_page` with one added rule: the first page is returned
@@ -730,8 +1277,9 @@ PR surface actually in use (same gate as `pullsQuery`, so no request is spent on
 unopened pane), and `pullsQuery.data === undefined`. Its rows feed `pulls` and clear the
 skeleton until the full list lands; the footer shows a `pullsPartial` "loading the rest"
 hint. `list_open_pulls_first_page` is on the `ProviderClient` protocol (GitLab's variant
-is card-complete already, since it inlines `head_pipeline`), and `test_provider_parity`
-holds.
+is card-complete already, since it inlines `head_pipeline`; Azure's is un-enriched like
+GitHub's, because its check state is a per-PR policy-evaluation call), and
+`apps/builtins/issue_radar/tests/test_gitlab.py::TestClientParity::test_every_module_implements_the_whole_surface` holds.
 
 `enrich_pulls` runs its two INDEPENDENT GraphQL families — card summaries and merge
 readiness — **concurrently** on a two-worker `ThreadPoolExecutor` rather than
@@ -745,7 +1293,7 @@ internally, preserving the best-effort contract: one failing does not sink the o
 
 The issue and PR lists poll every 60s (`LIST_POLL_MS`, matching the watcher's
 cadence so a bell notification and the row it refers to land in the same
-window). Deliberately 6x the per-item detail interval (`DETAIL_POLL_MS`, 30s):
+window). Deliberately 2x the per-item detail interval (`DETAIL_POLL_MS`, 30s):
 the open lists are FULLY paginated, so a whole-repo refetch is tens of REST
 requests plus a multi-MB cache rewrite on a large repo, not one item's worth of
 work.
@@ -755,7 +1303,7 @@ current data"); the **cost policy lives server-side** so it cannot be multiplied
 by open tabs:
 
 - `poll=1` — probe-gated. `_poll_can_serve_cache` runs ONE
-  `github_client.probe_open_list` search call (`{total_count, top_updated_at}`
+  `probe_open_list` search call on the repo's provider client (`{total_count, top_updated_at}`
   for the open set) and serves the cache untouched unless that reading differs
   from the one recorded when the rows were last fetched. Two fields because
   either alone has a blind spot: `top_updated_at` catches a new/edited/commented
@@ -884,8 +1432,17 @@ the list, the filters, the selected item — is untouched.
   the ACTIVE repo (case-insensitively) is claimed. Trailing segments (`/files`),
   query strings and `#issuecomment-…` fragments are ignored — same target. Any
   other link (a different repo, an Enterprise host, `/discussions/`, `/commit/`,
-  a relative href, a non-`http(s)` scheme) keeps its existing behaviour and opens
-  externally. A repo is identified by owner/repo only, so a same-path URL on an
+  a relative href) is NOT claimed: it falls through to `MdAnchor`'s own branch
+  ladder (forge/Jira chips, unfurl chips, session links, path interception,
+  default anchor — see `MarkdownRenderer.tsx`, which owns that contract and its
+  tests), exactly as if no override were installed. Two facts matter to an
+  override author: a scheme `defaultUrlTransform` also refuses (anything
+  outside `http(s)`, `mailto:`, `xmpp:`, `irc(s):` and the renderer's
+  editor-scheme allowlist) never reaches the override at all — `urlTransform`
+  rejects it and the renderer shows the label as inert text (no anchor); and a
+  `mailto:`/`xmpp:`/`irc(s):` href DOES reach the override, so a provider must
+  keep its own scheme check.
+  A repo is identified by owner/repo only, so a same-path URL on an
   Enterprise host is a DIFFERENT repo and is never claimed.
 - **Interception** happens at the ANCHOR, not on the DOM: `MarkdownRenderer`
   exposes a `LinkOverrideCtx` seam (a predicate-style render override consulted by
@@ -936,10 +1493,45 @@ the list, the filters, the selected item — is untouched.
 
 ## Platform Requirements
 
-- POSIX only (macOS/Linux). Windows raises `GhCliError` immediately.
-- `gh` CLI authenticated on the host.
-- Any `gh` the user can run from their terminal is accepted: the well-known dirs
+- **GitHub, GitLab and Azure DevOps work on macOS, Linux and Windows.** The provider-CLI trust
+  check is answered from POSIX ownership (`st_uid` + the group/other write bits)
+  or, on Windows, from the object's ACL — see
+  `github_runner.check_provider_path_component_windows` and
+  `kiro_crew.windows_acl`. A **root** POSIX gateway is refused: the sandbox
+  masks the credential homes from the agent's children but leaves the filesystem
+  writable, and a provider child runs unsandboxed with those credentials, so a
+  root agent could overwrite a root-owned `gh` that the ownership walk cannot
+  tell from the operator's install. An **elevated** Windows gateway (the
+  built-in `Administrator` account is always elevated) is not refused: Windows
+  has no OS sandbox here, so the agent's shell already holds the gateway's full
+  token and the refusal would remove the feature without removing any exposure.
+  The ACL walk runs unchanged for it, keyed on the gateway user's SID.
+  `azure_client._az_bin` resolves `az` through the same
+  `provider_executable_candidates` + `_validate_provider_executable` pair as
+  `gh` and `glab`, with no platform refusal; on Windows a bare `az` matches the
+  `az.cmd` launcher through `PATHEXT`.
+- An authenticated CLI for each provider you actually connect: `gh`, `glab`, or
+  `az` with the `azure-devops` extension (`az extension add --name azure-devops`)
+  and an `az login` session or `AZURE_DEVOPS_EXT_PAT`. **None of the three is a
+  hard dependency** — `app.json` lists all of them under
+  `dependencies.optionalCommands`, so a shop using one provider installs without
+  the other two. A missing CLI is a `ProviderSetupError` on the first call to that
+  provider (`reason: "not_installed"`), not an install-time refusal.
+- Any CLI the user can run from their terminal is accepted: the well-known dirs
   (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/home/linuxbrew/…`, the
-  managed `libexec/kirocrew` dirs) are searched first, then `PATH`. No `sudo`
-  copy is required. Override with `KIROCREW_ISSUE_RADAR_GH`; harden with
-  `KIROCREW_PROVIDER_BIN_STRICT=1`.
+  managed `libexec/kirocrew` dirs, and on Windows a per-CLI subdirectory of each
+  Program Files root from `github_runner.WINDOWS_PROVIDER_EXECUTABLE_SUBDIRS`:
+  `GitHub CLI` for `gh`, `GitLab CLI` and `glab` for `glab`,
+  `Microsoft SDKs/Azure/CLI2/wbin` for `az`) are searched first, then `PATH`. No `sudo`
+  copy is required. Override with `KIROCREW_ISSUE_RADAR_GH` /
+  `KIROCREW_ISSUE_RADAR_GLAB` / `KIROCREW_ISSUE_RADAR_AZ`; harden with
+  `KIROCREW_PROVIDER_BIN_STRICT=1`. All three executables carry the same
+  well-known-directory entries (`github_runner.PROVIDER_EXECUTABLE_CANDIDATES`),
+  so strict mode resolves a packaged `/usr/bin/az` exactly as it does `gh`; what
+  strict mode hides is any install reachable only through `PATH`, which is what
+  the override is for.
+- Reachable hosts: `github.com`, `dev.azure.com`, `gitlab.com`, and any
+  self-managed GitLab in the operator's `dashboard.gitlab_hosts` allowlist. GitHub
+  Enterprise Server and Azure DevOps Server (on-premises) are **not supported** —
+  see [Providers](#providers) for why the CLI-passthrough transport cannot serve
+  them.

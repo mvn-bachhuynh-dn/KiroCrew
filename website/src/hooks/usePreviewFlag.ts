@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react'
 
-import { PREVIEW_FLAG_EVENT, PREVIEW_FLAG_PREFIX, readPreviewFlag } from '../utils/previewFlags'
+import {
+  PREVIEW_FLAG_EVENT, PREVIEW_FLAG_PREFIX, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, readPreviewFlag,
+} from '../utils/previewFlags'
 import type { PreviewFlagChange } from '../utils/previewFlags'
 
 /**
  * Reactive read of a preview flag (see `utils/previewFlags.ts`).
  *
  * Subscribing matters here, not just reading: the nav rail is rendered by the
- * app shell, which does not remount when the Developer > Config toggle flips.
+ * app shell, which does not remount when the Settings > Developer > Feature Previews toggle flips.
  * Without this hook the rail would keep its pre-toggle contents until a reload,
  * and a user who just enabled a surface would conclude the toggle is broken.
  *
@@ -35,6 +37,13 @@ export function usePreviewFlag(flag: string): boolean {
     }
   }, [flag])
   return on
+}
+
+/** The one "Chat on a crew" switch. The retired instance-sessions key counts as ON too. */
+export function useRemoteCrewChat(): boolean {
+  const current = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
+  const legacy = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
+  return current || legacy
 }
 
 /**

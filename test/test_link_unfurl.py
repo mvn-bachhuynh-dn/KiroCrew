@@ -4,17 +4,22 @@ No test in this file opens a socket. The vet takes an injected resolver and the
 handler's transport is swapped for :class:`_FakeTransport`, so every path
 (redirect re-vetting, the read cap, icon rejection, cache/dedup) is exercised
 against canned bytes.
+
+The URL vet's scheme, host, port, IP-literal and DNS rules, metadata extraction and
+the icon lanes are in ``test_link_unfurl_vet_and_extraction.py``; the resolver stub and
+the autouse isolation both modules use are in ``link_unfurl_helpers.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
-from types import SimpleNamespace
+import socket
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import pytest
-import yarl
+from link_unfurl_helpers import _isolate  # noqa: F401
+from link_unfurl_helpers import _public, _set_enabled
 
 from kiro_crew import link_unfurl as lu
 from kiro_crew.dashboard.handlers import link_meta as lm
@@ -24,452 +29,70 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _public(_host: str, _port: int) -> List[str]:
-    """Resolver stub: everything resolves to one public address."""
-    return ["93.184.216.34"]
+def _multi_homed(_host: str, _port: int) -> List[str]:
+    """Resolver stub for a CDN: several public nodes, plus a v6 one.
+
+    Shaped like what `getaddrinfo` returns for a real CDN host, including the
+    duplicate a host answering on several socket protocols produces.
+    """
+    return [
+        "93.184.216.34",
+        "93.184.216.34",
+        "93.184.216.35",
+        "2606:4700::1111",
+    ]
 
 
-# --- vet: scheme / host / port ---------------------------------------------
+# --- login-gate titles -------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "url",
+    "title",
     [
-        "ftp://example.com/",
-        "file:///etc/passwd",
-        "javascript:alert(1)",
-        "data:text/html,<b>x</b>",
-        "example.com/no-scheme",
+        "Sign in to Amazon | Slack",
+        "Sign In",
+        "sign-in",
+        "Signin",
+        "Log in",
+        "Login",
+        "Log On",
+        "Sign in - Google Accounts",
+        "Sign in to GitHub · GitHub",
+        "Sign into your account",
+        "Sign in with your Apple ID",
+        "Please log in",
+        "Acme Corp - Sign In",
+        "Slack | Sign in",
+        "Single Sign-On",
+        "Authentication Required",
+    ],
+)
+def test_login_gate_titles_are_detected(title: str) -> None:
+    assert lu.is_login_page_title(title)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
         "",
-        "   ",
+        "Slack is your digital HQ",
+        "How to sign in to AWS",
+        "Assign in bulk",
+        "Logging in production systems",
+        "Log4j vulnerability",
+        "The Sign",
+        "Design tokens - a primer",
+        "Login security best practices",
+        "Sign in with Apple: a guide",
+        "Single sign-on explained",
+        "Sign-in sheets for classrooms",
     ],
 )
-def test_vet_rejects_non_http_scheme(url: str) -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(url, resolve=_public)
-    assert exc.value.code == "invalid_url"
-
-
-def test_vet_rejects_missing_host() -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url("http:///path", resolve=_public)
-    assert exc.value.code == "invalid_url"
-
-
-@pytest.mark.parametrize("port", [22, 25, 3306, 6379, 8080, 5476])
-def test_vet_rejects_disallowed_port(port: int) -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://example.com:{port}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-@pytest.mark.parametrize("url", ["http://example.com:80/", "https://example.com:443/"])
-def test_vet_allows_explicit_default_ports(url: str) -> None:
-    assert lu.vet_unfurl_url(url, resolve=_public).ip == "93.184.216.34"
-
-
-def test_vet_rejects_malformed_port() -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url("http://example.com:notaport/", resolve=_public)
-    assert exc.value.code == "invalid_url"
-
-
-@pytest.mark.parametrize("host", ["secret.onion", "printer.local", "DEEP.SUB.ONION"])
-def test_vet_rejects_blocked_suffixes(host: str) -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-# --- vet: IP literals ------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "host",
-    [
-        "127.0.0.1",  # loopback
-        "127.1",  # short form
-        "0x7f000001",  # hex
-        "2130706433",  # 32-bit decimal
-        "0177.0.0.1",  # octal
-        "10.0.0.5",  # private
-        "172.16.3.4",  # private
-        "192.168.1.1",  # private
-        "169.254.169.254",  # link-local (cloud metadata)
-        "0xa9fea9fe",  # link-local, hex-encoded
-        "224.0.0.1",  # multicast
-        "240.0.0.1",  # reserved
-        "0.0.0.0",  # unspecified
-    ],
-)
-def test_vet_rejects_internal_ipv4_literals(host: str) -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-@pytest.mark.parametrize(
-    "host",
-    [
-        "[::1]",  # loopback
-        "[::]",  # unspecified
-        "[fe80::1]",  # link-local
-        "[fc00::1]",  # unique local (private)
-        "[fd12:3456::1]",  # unique local
-        "[ff02::1]",  # multicast
-    ],
-)
-def test_vet_rejects_internal_ipv6_literals(host: str) -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-@pytest.mark.parametrize(
-    "host",
-    [
-        "100.64.0.1",  # first usable address of the shared block
-        "100.100.100.100",
-        "100.127.255.254",  # last usable address of the shared block
-    ],
-)
-def test_vet_rejects_rfc6598_shared_address_space(host: str) -> None:
-    """`100.64.0.0/10` is not `is_private`, so an enumerated denylist misses it.
-
-    This is the range a Tailscale tailnet and most carrier-grade NAT deployments
-    assign, so admitting it means a model-emitted link can reach a service on the
-    user's private overlay network. Guarding the whole class (`is_global`) rather
-    than a list of categories is what keeps this closed.
-    """
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-@pytest.mark.parametrize(
-    "host",
-    [
-        "224.0.0.1",  # IPv4 multicast — CPython reports is_global True for these,
-        "[ff02::1]",  # so `not is_global` alone would admit them
-    ],
-)
-def test_vet_rejects_multicast_despite_is_global(host: str) -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-@pytest.mark.parametrize(
-    "prefix",
-    [
-        # IPv4 special-purpose (RFC 6890 + the ones CPython classifies unevenly)
-        "0.0.0.0/8",  # this host, this network
-        "10.0.0.0/8",
-        "100.64.0.0/10",  # RFC 6598 shared address space (CGNAT, Tailscale)
-        "127.0.0.0/8",
-        "169.254.0.0/16",  # link-local, incl. the cloud metadata address
-        "172.16.0.0/12",
-        "192.0.0.0/24",
-        "192.0.2.0/24",  # TEST-NET-1
-        "192.168.0.0/16",
-        "198.18.0.0/15",  # benchmarking
-        "198.51.100.0/24",  # TEST-NET-2
-        "203.0.113.0/24",  # TEST-NET-3
-        "224.0.0.0/4",  # multicast — `is_global` is True for these
-        "240.0.0.0/4",  # reserved
-        # IPv6 special-purpose
-        "::/128",  # unspecified
-        "::1/128",  # loopback
-        "100::/64",  # discard-only
-        "2001:db8::/32",  # documentation
-        "fc00::/7",  # unique local
-        "fe80::/10",  # link-local
-        "fec0::/10",  # DEPRECATED site-local — `is_global` is True for these
-        "ff00::/8",  # multicast — `is_global` is True for these
-        # IPv6 prefixes that EMBED an IPv4 address, and so reach v4 space from a
-        # v6 literal. `64:ff9b::7f00:1` is 127.0.0.1 behind a NAT64 gateway —
-        # `is_global` is True for it, which is exactly why the guard cannot rest
-        # on that property alone.
-        "64:ff9b::/96",  # RFC 6052 NAT64 well-known prefix
-        "64:ff9b:1::/48",  # RFC 8215 NAT64 local-use prefix
-        "2002::/16",  # 6to4
-    ],
-)
-def test_vet_rejects_every_special_purpose_range(prefix: str) -> None:
-    """Table-driven: no IANA special-purpose prefix may pass the vet.
-
-    Two separate gaps were found one at a time by reviewers — `100.64.0.0/10`
-    (absent from CPython's IPv4 private table) and `fec0::/10` (absent from its
-    IPv6 one, so `is_global` reports True). Both classes of mistake come from
-    trusting a single property, so this asserts the union over a table instead:
-    a future CPython reclassification or a new special-purpose assignment fails
-    HERE rather than in a review comment.
-
-    The first, last and a middle address of each prefix are checked — a guard
-    written against one representative address can still miss a boundary.
-    """
-    net = ipaddress.ip_network(prefix)
-    first, last = net[0], net[-1]
-    middle = net[int(net.num_addresses // 2)]
-    for addr in (first, middle, last):
-        host = f"[{addr}]" if addr.version == 6 else str(addr)
-        with pytest.raises(lu.UnfurlRejected) as exc:
-            lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-        assert exc.value.code == "blocked_url", f"{addr} in {prefix} was not blocked"
-
-
-@pytest.mark.parametrize("host", ["8.8.8.8", "[2606:4700::1111]", "93.184.216.34"])
-def test_vet_allows_globally_routable_literals(host: str) -> None:
-    """The allowlist must not be so tight that ordinary public addresses fail."""
-    lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-
-
-@pytest.mark.parametrize(
-    "url,expected_wire",
-    [
-        ("https://例え.jp/", "xn--r8jz45g.jp"),  # IDN: the client asks in punycode
-        ("http://example.com./", "example.com."),  # trailing dot is kept on the wire
-        ("https://EXAMPLE.com/x", "example.com"),
-        ("http://[2606:4700::1111]/", "2606:4700::1111"),
-    ],
-)
-def test_wire_host_is_what_the_client_will_ask_the_resolver(url: str, expected_wire: str) -> None:
-    """`wire_host` must equal `yarl.URL(...).raw_host`, or the pin never matches.
-
-    The resolver pin is the mechanism that makes the whole vet meaningful, and it
-    compares by hostname. aiohttp asks with `raw_host` (IDNA-encoded, trailing dot
-    intact) while `host` is the display form, so pinning on `host` refuses every
-    internationalized link with our own guard — a 502 plus a ten-minute negative
-    cache entry. Asserting the two agree locks the invariant rather than the
-    incidental encoding.
-    """
-    vetted = lu.vet_unfurl_url(url, resolve=_public)
-    assert vetted.wire_host == expected_wire
-    assert vetted.wire_host == yarl.URL(vetted.url).raw_host
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://key:secret@example.com/",
-        "https://user@example.com/",
-        "http://:secret@example.com/",
-    ],
-)
-def test_vet_rejects_userinfo(url: str) -> None:
-    """aiohttp turns URL userinfo into `Authorization: Basic`, so it must not pass.
-
-    A model-emitted URL carrying credentials would send them to a model-chosen
-    host and echo them into the gateway log through the cache-key debug line.
-    """
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(url, resolve=_public)
-    assert exc.value.code == "invalid_url"
-
-
-@pytest.mark.parametrize(
-    "host",
-    [
-        "[::ffff:127.0.0.1]",
-        "[::ffff:10.0.0.1]",
-        "[::ffff:169.254.169.254]",
-        "[0:0:0:0:0:ffff:127.0.0.1]",
-        "[::ffff:7f00:1]",
-    ],
-)
-def test_vet_unwraps_ipv4_mapped_ipv6(host: str) -> None:
-    """The mapped form is a clean bypass unless unwrapped.
-
-    ``IPv6Address('::ffff:127.0.0.1').is_loopback`` is False, and its
-    ``is_private`` only consults the mapped address on Python 3.13+.
-    """
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(f"http://{host}/", resolve=_public)
-    assert exc.value.code == "blocked_url"
-
-
-def test_vet_allows_public_ip_literal_without_dns() -> None:
-    def _explode(_h: str, _p: int) -> List[str]:
-        raise AssertionError("an IP literal must not be resolved")
-
-    vetted = lu.vet_unfurl_url("https://93.184.216.34/x", resolve=_explode)
-    assert (vetted.ip, vetted.port, vetted.domain) == ("93.184.216.34", 443, "93.184.216.34")
-
-
-def test_vet_canonicalizes_encoded_public_literal() -> None:
-    """A public host in an alternate encoding must be dialled in dotted-quad."""
-    vetted = lu.vet_unfurl_url("http://1568397574/", resolve=_public)
-    assert vetted.ip == "93.123.217.6"
-
-
-# --- vet: DNS --------------------------------------------------------------
-
-
-def test_vet_rejects_host_resolving_to_loopback() -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url("http://rebind.example/", resolve=lambda h, p: ["127.0.0.1"])
-    assert exc.value.code == "blocked_url"
-
-
-def test_vet_rejects_when_any_answer_is_internal() -> None:
-    """A split answer is a rebind attempt whichever address we happen to pick."""
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url(
-            "http://split.example/", resolve=lambda h, p: ["93.184.216.34", "10.1.2.3"]
-        )
-    assert exc.value.code == "blocked_url"
-
-
-def test_vet_rejects_unresolvable_host() -> None:
-    def _fail(_h: str, _p: int) -> List[str]:
-        raise OSError("NXDOMAIN")
-
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url("http://nope.example/", resolve=_fail)
-    assert exc.value.code == "blocked_url"
-
-
-def test_vet_rejects_empty_resolution() -> None:
-    with pytest.raises(lu.UnfurlRejected) as exc:
-        lu.vet_unfurl_url("http://nope.example/", resolve=lambda h, p: [])
-    assert exc.value.code == "blocked_url"
-
-
-def test_vet_resolves_exactly_once_and_pins_the_address() -> None:
-    """The returned IP is what the caller dials — that is the rebind guard."""
-    calls: List[Tuple[str, int]] = []
-
-    def _counting(host: str, port: int) -> List[str]:
-        calls.append((host, port))
-        return ["93.184.216.34"]
-
-    vetted = lu.vet_unfurl_url("https://Example.COM./page?q=1#frag", resolve=_counting)
-    assert calls == [("example.com", 443)]
-    assert vetted.ip == "93.184.216.34"
-    assert vetted.host == "example.com"
-    assert vetted.url == "https://Example.COM./page?q=1"  # fragment dropped
-
-
-def test_vet_strips_www_for_display_domain() -> None:
-    vetted = lu.vet_unfurl_url("https://www.Example.com/", resolve=_public)
-    assert vetted.domain == "example.com"
-    assert vetted.host == "www.example.com"
-
-
-# --- extraction ------------------------------------------------------------
-
-
-def test_extract_prefers_open_graph() -> None:
-    html = """
-    <html><head>
-      <title>Tag title</title>
-      <meta property="og:title" content="OG title">
-      <meta name="description" content="Name description">
-      <meta property="og:description" content="OG description">
-      <meta property="og:site_name" content="Site">
-      <link rel="icon" href="/i.png">
-    </head><body>x</body></html>
-    """
-    meta = lu.extract_meta(html, base_url="https://example.com/a/b")
-    assert meta.title == "OG title"
-    assert meta.description == "OG description"
-    assert meta.site_name == "Site"
-    assert meta.icon_candidates[0] == "https://example.com/i.png"
-
-
-def test_extract_falls_back_to_title_tag_and_meta_description() -> None:
-    html = (
-        "<head><title>  Spaced\n  title </title>"
-        '<meta name="Description" content="Plain &amp; escaped"></head>'
-    )
-    meta = lu.extract_meta(html, base_url="https://example.com/")
-    assert meta.title == "Spaced title"
-    assert meta.description == "Plain & escaped"
-    assert meta.site_name == ""
-
-
-def test_extract_caps_lengths() -> None:
-    html = f"<head><title>{'t' * 900}</title>" f'<meta name="description" content="{"d" * 900}">'
-    meta = lu.extract_meta(html, base_url="https://example.com/")
-    assert len(meta.title) == lu.TITLE_MAX_CHARS
-    assert len(meta.description) == lu.DESCRIPTION_MAX_CHARS
-
-
-def test_extract_icon_order_and_favicon_fallback() -> None:
-    html = (
-        '<head><link rel="apple-touch-icon" href="/apple.png">'
-        '<link rel="shortcut icon" href="sub/fav.png"></head>'
-    )
-    meta = lu.extract_meta(html, base_url="https://example.com/dir/page")
-    assert meta.icon_candidates == (
-        "https://example.com/dir/sub/fav.png",
-        "https://example.com/apple.png",
-        "https://example.com/favicon.ico",
-    )
-
-
-def test_extract_favicon_only_when_no_link_tag() -> None:
-    meta = lu.extract_meta("<head></head>", base_url="https://example.com/deep/page")
-    assert meta.icon_candidates == ("https://example.com/favicon.ico",)
-
-
-def test_extract_drops_non_http_icon_href() -> None:
-    """A data: icon href would skip the type allowlist and the size cap."""
-    html = '<head><link rel="icon" href="data:image/svg+xml,<svg/>"></head>'
-    meta = lu.extract_meta(html, base_url="https://example.com/")
-    assert meta.icon_candidates == ("https://example.com/favicon.ico",)
-
-
-def test_extract_ignores_head_content_after_body() -> None:
-    html = "<head><title>Real</title></head><body><title>Injected</title></body>"
-    assert lu.extract_meta(html, base_url="https://example.com/").title == "Real"
-
-
-def test_extract_survives_garbage() -> None:
-    meta = lu.extract_meta("<<<>>> not html at all \x00", base_url="https://example.com/")
-    assert meta.title == ""
-
-
-def test_decode_html_uses_header_then_meta_then_utf8() -> None:
-    assert "café" in lu.decode_html("café".encode("latin-1"), "text/html; charset=latin-1")
-    body = b'<meta charset="latin-1"><title>caf\xe9</title>'
-    assert "café" in lu.decode_html(body, "text/html")
-    assert "caf\ufffd" in lu.decode_html(b"caf\xe9", "text/html")
-
-
-def test_decode_html_tolerates_unknown_charset() -> None:
-    assert lu.decode_html(b"hello", "text/html; charset=not-a-codec") == "hello"
-
-
-# --- icon data URI ---------------------------------------------------------
-
-
-def test_icon_svg_is_rejected() -> None:
-    assert lu.build_icon_data_uri("image/svg+xml", b"<svg/>") == ""
-    assert lu.build_icon_data_uri("image/svg+xml; charset=utf-8", b"<svg/>") == ""
-
-
-@pytest.mark.parametrize(
-    "content_type", ["text/html", "application/octet-stream", "image/avif", ""]
-)
-def test_icon_non_allowlisted_type_is_rejected(content_type: str) -> None:
-    assert lu.build_icon_data_uri(content_type, b"\x89PNG") == ""
-
-
-def test_icon_oversized_is_dropped_not_truncated() -> None:
-    assert lu.build_icon_data_uri("image/png", b"x" * (lu.MAX_ICON_BYTES + 1)) == ""
-    assert lu.build_icon_data_uri("image/png", b"x" * lu.MAX_ICON_BYTES).startswith(
-        "data:image/png;base64,"
-    )
-
-
-def test_icon_empty_body_is_dropped() -> None:
-    assert lu.build_icon_data_uri("image/png", b"") == ""
-
-
-def test_icon_data_uri_shape() -> None:
-    uri = lu.build_icon_data_uri("image/x-icon; charset=binary", b"AB")
-    assert uri == "data:image/x-icon;base64,QUI="
+def test_ordinary_titles_are_not_login_gates(title: str) -> None:
+    """Both ends are anchored: a leading gate phrase must be followed by the
+    title's end, a separator, or a gate continuation — a real title that merely
+    STARTS with "Login"/"Sign in" stays a title."""
+    assert not lu.is_login_page_title(title)
 
 
 # --- endpoint scaffolding --------------------------------------------------
@@ -522,24 +145,6 @@ def _html(title: str = "Example page", extra: str = "") -> bytes:
 
 
 _HTML_HEADERS = {"Content-Type": "text/html; charset=utf-8"}
-
-
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    """Fresh cache per test, feature ON, DNS stubbed to one public address."""
-    lm.reset_link_meta_cache()
-    monkeypatch.setattr(lu, "_default_resolve", _public)
-    _set_enabled(monkeypatch, True)
-    yield
-    lm.reset_link_meta_cache()
-
-
-def _set_enabled(monkeypatch, enabled: bool) -> None:
-    """Patch the config loader the handler imports at call time."""
-    from kiro_crew.config import loader as loader_mod
-
-    cfg = SimpleNamespace(dashboard=SimpleNamespace(link_previews=enabled))
-    monkeypatch.setattr(loader_mod.KiroCrewConfig, "load", staticmethod(lambda: cfg))
 
 
 def _install(monkeypatch, routes: Dict[str, Tuple[int, Dict[str, str], bytes]]) -> _FakeTransport:
@@ -664,6 +269,37 @@ def test_success_payload_shape(monkeypatch) -> None:
     assert isinstance(body["fetched_at"], int) and body["fetched_at"] > 0
 
 
+def test_login_gate_title_falls_back_to_domain_end_to_end(monkeypatch) -> None:
+    """An auth wall's 200 must not label the chip with the gate's own title.
+
+    The text fields are blanked so the client renders the domain; the entry
+    still lands in the POSITIVE cache, because an anonymous re-fetch would be
+    answered by the same gate.
+    """
+    _install(
+        monkeypatch,
+        {
+            "https://ws.slack.com/archives/C123/p456": (
+                200,
+                _HTML_HEADERS,
+                _html(
+                    title="Sign in to Amazon | Slack",
+                    extra='<meta property="og:site_name" content="Slack">',
+                ),
+            ),
+            "https://ws.slack.com/favicon.ico": (404, {}, b""),
+        },
+    )
+    status, body = _run(_call("https://ws.slack.com/archives/C123/p456"))
+    assert status == 200
+    assert body["title"] == ""
+    assert body["description"] == ""
+    assert body["site_name"] == ""
+    assert body["domain"] == "ws.slack.com"
+    entry = lm._CACHE[lu.normalize_cache_key("https://ws.slack.com/archives/C123/p456")]
+    assert entry.payload is not None
+
+
 def test_icon_failure_does_not_fail_the_preview(monkeypatch) -> None:
     _install(
         monkeypatch,
@@ -713,6 +349,165 @@ def test_oversized_icon_is_dropped_end_to_end(monkeypatch) -> None:
     )
     status, body = _run(_call("https://example.com/p"))
     assert (status, body["icon"]) == (200, "")
+
+
+# --- endpoint: dark icon variant -------------------------------------------
+
+_DARK_ICON_HTML = _html(
+    extra=(
+        '<link rel="icon" href="/light.png">'
+        '<link rel="icon" href="/dark.png" media="(prefers-color-scheme: dark)">'
+    )
+)
+
+
+def test_declared_dark_variant_is_returned_alongside_the_default(monkeypatch) -> None:
+    """Both are sent: the CLIENT picks, because the theme switches at runtime."""
+    transport = _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (200, _HTML_HEADERS, _DARK_ICON_HTML),
+            "https://example.com/light.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+            "https://example.com/dark.png": (200, {"Content-Type": "image/png"}, b"\x89PNGdark"),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert status == 200
+    assert body["icon"] == "data:image/png;base64,iVBORw=="
+    assert body["icon_dark"] == "data:image/png;base64,iVBOR2Rhcms="
+    assert transport.fetch_count == 3  # page + both icons, once each
+
+
+def test_no_declared_variant_costs_no_extra_request(monkeypatch) -> None:
+    """The common case must stay exactly as cheap as it was: one icon fetch."""
+    transport = _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (200, _HTML_HEADERS, _html()),
+            "https://example.com/favicon.ico": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert (status, body["icon_dark"]) == (200, "")
+    assert transport.fetch_count == 2  # page + favicon only
+
+
+def test_dark_variant_is_dropped_when_it_is_the_same_picture(monkeypatch) -> None:
+    """Identical bytes carry no information and would double the payload."""
+    _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (
+                200,
+                _HTML_HEADERS,
+                _html(
+                    extra=(
+                        '<link rel="icon" href="/a.png">'
+                        '<link rel="icon" href="/b.png" media="(prefers-color-scheme: dark)">'
+                    )
+                ),
+            ),
+            "https://example.com/a.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+            "https://example.com/b.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert status == 200
+    assert body["icon"] == "data:image/png;base64,iVBORw=="
+    assert body["icon_dark"] == ""
+
+
+def test_dark_variant_failure_does_not_fail_the_preview(monkeypatch) -> None:
+    """A 404 on the nicety leaves the default icon and the card intact."""
+    _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (200, _HTML_HEADERS, _DARK_ICON_HTML),
+            "https://example.com/light.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+            "https://example.com/dark.png": (404, {}, b""),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert status == 200
+    assert body["icon"] == "data:image/png;base64,iVBORw=="
+    assert body["icon_dark"] == ""
+
+
+def test_dark_lane_is_vetted_like_any_other_fetch(monkeypatch) -> None:
+    """The variant href is a second attacker-chosen URL; the vet still owns it."""
+    transport = _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (
+                200,
+                _HTML_HEADERS,
+                _html(
+                    extra=(
+                        '<link rel="icon" href="/light.png">'
+                        '<link rel="icon" href="http://169.254.169.254/latest/meta-data"'
+                        ' media="(prefers-color-scheme: dark)">'
+                    )
+                ),
+            ),
+            "https://example.com/light.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert (status, body["icon_dark"]) == (200, "")
+    assert transport.fetch_count == 2  # page + the default icon; the link-local host was refused
+
+
+def test_dark_svg_variant_is_dropped_like_any_other_svg(monkeypatch) -> None:
+    """SVG is active content in an `<img src>`; a second icon field is no exemption."""
+    _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (
+                200,
+                _HTML_HEADERS,
+                _html(
+                    extra=(
+                        '<link rel="icon" href="/light.png">'
+                        '<link rel="icon" href="/dark.svg" media="(prefers-color-scheme: dark)">'
+                    )
+                ),
+            ),
+            "https://example.com/light.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+            "https://example.com/dark.svg": (
+                200,
+                {"Content-Type": "image/svg+xml"},
+                b"<svg onload='fetch(1)'/>",
+            ),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert (status, body["icon_dark"]) == (200, "")
+
+
+def test_dark_lane_spends_exactly_one_request(monkeypatch) -> None:
+    """Two declared dark variants, one attempt: this lane buys a nicety."""
+    transport = _install(
+        monkeypatch,
+        {
+            "https://example.com/p": (
+                200,
+                _HTML_HEADERS,
+                _html(
+                    extra=(
+                        '<link rel="icon" href="/light.png">'
+                        '<link rel="icon" href="/d1.png" media="(prefers-color-scheme: dark)">'
+                        '<link rel="icon" href="/d2.png" media="(prefers-color-scheme: dark)">'
+                    )
+                ),
+            ),
+            "https://example.com/light.png": (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+            "https://example.com/d1.png": (404, {}, b""),
+            "https://example.com/d2.png": (200, {"Content-Type": "image/png"}, b"\x89PNGtwo"),
+        },
+    )
+    status, body = _run(_call("https://example.com/p"))
+    assert (status, body["icon_dark"]) == (200, "")
+    assert transport.fetch_count == 3  # page + default icon + ONE dark attempt
 
 
 # --- endpoint: body caps ---------------------------------------------------
@@ -845,7 +640,8 @@ def test_head_end_markers_inside_a_script_do_not_pass_the_cut_guard(monkeypatch)
                 200,
                 _HTML_HEADERS,
                 b"<html><head><script>var s = '</head><body>';"
-                + b"//" + b"z" * (lu.MAX_BODY_BYTES + 4096)
+                + b"//"
+                + b"z" * (lu.MAX_BODY_BYTES + 4096)
                 + b"</script><title>Never read</title></head>",
             )
         },
@@ -965,30 +761,30 @@ def test_fat_head_with_a_decoy_marker_is_a_502(monkeypatch, shape: str) -> None:
     assert (status, body) == (502, {"code": "fetch_failed"})
 
 
-#: Truncated pages that DO carry their metadata before the cut. Each names the
-#: shape that could be mis-rejected by a stricter guard.
+#: Truncated pages that DO carry their metadata before the cut, as
+#: ``(head_prefix, filler_byte, expected_title)``. Each names the shape that
+#: could be mis-rejected by a stricter guard. Only the prefix is held here: the
+#: filler past the cap is appended in the test body, because a payload built at
+#: module scope is allocated during collection and then held for the whole
+#: session by every xdist worker, including those that never run this file.
 _TRUNCATED_BUT_TITLED = {
     # `<body/>` as the sole head terminator — a byte pattern keyed on `<body[\s>]`
     # misses the self-closing form and would reject this.
-    "self_closing_body": (
-        b"<html><head><title>Ok</title><body/>" + b"A" * (lu.MAX_BODY_BYTES + 4096),
-        "Ok",
-    ),
+    "self_closing_body": (b"<html><head><title>Ok</title><body/>", b"A", "Ok"),
     # No `<title>` at all, but an `og:title` — `extract_meta` prefers og, so the
     # preview is complete and the cut is harmless.
     "og_title_only": (
-        b'<html><head><meta property="og:title" content="Via OG"><style>'
-        + b"z" * (lu.MAX_BODY_BYTES + 4096),
+        b'<html><head><meta property="og:title" content="Via OG"><style>',
+        b"z",
         "Via OG",
     ),
 }
 
 
 @pytest.mark.parametrize("shape", sorted(_TRUNCATED_BUT_TITLED))
-def test_truncated_page_keeps_its_preview_when_the_title_arrived(
-    monkeypatch, shape: str
-) -> None:
-    page, expected = _TRUNCATED_BUT_TITLED[shape]
+def test_truncated_page_keeps_its_preview_when_the_title_arrived(monkeypatch, shape: str) -> None:
+    prefix, filler, expected = _TRUNCATED_BUT_TITLED[shape]
+    page = prefix + filler * (lu.MAX_BODY_BYTES + 4096)
     _install(
         monkeypatch,
         {
@@ -1012,8 +808,7 @@ def test_oversized_body_with_lying_content_length(monkeypatch) -> None:
             "https://example.com/big": (
                 200,
                 {"Content-Type": "text/html", "Content-Length": "42"},
-                b"<html><head><title>x</title></head><body>"
-                + b"A" * (lu.MAX_BODY_BYTES + 4096),
+                b"<html><head><title>x</title></head><body>" + b"A" * (lu.MAX_BODY_BYTES + 4096),
             ),
             "https://example.com/favicon.ico": (404, {}, b""),
         },
@@ -1319,6 +1114,201 @@ def test_concurrency_is_capped_at_four(monkeypatch) -> None:
     assert peak <= lm._MAX_CONCURRENT_FETCHES
 
 
+def test_the_vet_records_every_approved_address_and_ip_is_the_first() -> None:
+    """`ip` stays the first address for callers that dial one; `addresses` is the
+    whole approved answer, which is what a pin must serve. Both are needed: every
+    entry already passed `_reject_if_internal_ip`, so the set is as safe as `ip`."""
+    vetted = lu.vet_unfurl_url("https://cdn.example/o", resolve=_multi_homed)
+    assert vetted.ip == "93.184.216.34"
+    assert vetted.addresses == ("93.184.216.34", "93.184.216.35", "2606:4700::1111")
+
+
+def test_an_ip_literal_records_its_canonical_form_as_the_only_address() -> None:
+    # No resolution happens, so the recorded set is the literal the vet canonicalized.
+    vetted = lu.vet_unfurl_url("https://93.184.216.34/a", resolve=_public)
+    assert vetted.addresses == ("93.184.216.34",)
+    assert vetted.ip == "93.184.216.34"
+
+
+# --- PinnedResolver: the other half of the vet -------------------------------
+#
+# The vet resolves the host and approves an address; this is what makes the socket
+# go to THAT address. Without it the connector performs a second lookup, which an
+# attacker-controlled DNS server answers differently (rebinding) and the vet has
+# proved nothing. Both the link-preview handler and WeCom media install it.
+
+
+class TestPinnedResolver:
+    def test_it_answers_with_the_pinned_ipv4_address(self) -> None:
+        resolver = lu.PinnedResolver("example.com", ("93.184.216.34",), 443)
+        (answer,) = _run(resolver.resolve("example.com", 443))
+        assert answer["host"] == "93.184.216.34"
+        assert answer["port"] == 443
+        assert answer["family"] is socket.AF_INET
+        # The NAME travels on, so TLS SNI and the `Host` header stay correct --
+        # connecting by IP instead would break certificate validation.
+        assert answer["hostname"] == "example.com"
+
+    def test_an_ipv6_pin_reports_the_v6_family(self) -> None:
+        # aiohttp opens the socket with the family the resolver reports, so a v6
+        # literal announced as AF_INET is an immediate connection failure.
+        resolver = lu.PinnedResolver("example.com", ("2606:4700::1111",), 443)
+        (answer,) = _run(resolver.resolve("example.com", 443))
+        assert answer["host"] == "2606:4700::1111"
+        assert answer["family"] is socket.AF_INET6
+
+    def test_a_zero_port_falls_back_to_the_pinned_port(self) -> None:
+        resolver = lu.PinnedResolver("example.com", ("93.184.216.34",), 8080)
+        (answer,) = _run(resolver.resolve("example.com", 0))
+        assert answer["port"] == 8080
+
+    def test_a_foreign_host_is_refused_rather_than_resolved(self) -> None:
+        """Fails CLOSED: a session reused for a second host must not silently get
+        the first host's address, and OSError is what aiohttp reports as a
+        connection error rather than a crash."""
+        resolver = lu.PinnedResolver("example.com", ("93.184.216.34",), 443)
+        with pytest.raises(OSError, match="refusing evil.example"):
+            _run(resolver.resolve("evil.example", 443))
+
+    def test_it_returns_the_six_keys_every_aiohttp_version_reads(self) -> None:
+        """A plain dict, not `ResolveResult`: that name landed in aiohttp 3.10 and
+        setup.cfg allows `aiohttp>=3.9`, so a runtime import would break the
+        gateway's import on an allowed install."""
+        resolver = lu.PinnedResolver("example.com", ("93.184.216.34",), 443)
+        (answer,) = _run(resolver.resolve("example.com", 443))
+        assert set(answer) == {"hostname", "host", "port", "family", "proto", "flags"}
+
+    def test_close_is_a_no_op(self) -> None:
+        # The connector closes its resolver; there is nothing to release.
+        assert _run(lu.PinnedResolver("example.com", ("93.184.216.34",), 443).close()) is None
+
+    def test_the_handler_installs_it_on_its_connector(self) -> None:
+        """Pins the lift: the pin moved to `link_unfurl`, the handler still gets
+        its connector from there, so the dashboard fetch is still pinned."""
+        assert lm.pinned_connector is lu.pinned_connector
+
+    def test_it_serves_EVERY_vetted_address_so_fallbacks_survive(self) -> None:
+        """The regression this class exists to prevent.
+
+        aiohttp dials the addresses a resolver returns IN ORDER and falls back to
+        the next when a connection fails. A pin that answers with only the first
+        address turns one dead CDN node -- or an AAAA record on a host with no
+        working IPv6 route -- into a failed fetch that succeeded before the pin
+        existed. Every address here passed the same internal-address check, so
+        serving the whole set costs the vet nothing.
+        """
+        vetted = lu.vet_unfurl_url("https://cdn.example/o", resolve=_multi_homed)
+        resolver = lu.PinnedResolver(vetted.wire_host, vetted.addresses, vetted.port)
+        answers = _run(resolver.resolve(vetted.wire_host, vetted.port))
+        assert [a["host"] for a in answers] == [
+            "93.184.216.34",
+            "93.184.216.35",
+            "2606:4700::1111",
+        ], "every vetted address, resolver order, the duplicate dropped"
+
+    def test_each_address_reports_its_own_family(self) -> None:
+        # One family for the whole set would announce the v6 node as AF_INET, and
+        # aiohttp would fail that connection instead of falling back.
+        resolver = lu.PinnedResolver("cdn.example", ("93.184.216.34", "2606:4700::1111"), 443)
+        answers = _run(resolver.resolve("cdn.example", 443))
+        assert [a["family"] for a in answers] == [socket.AF_INET, socket.AF_INET6]
+
+    def test_no_addresses_is_refused_at_construction(self) -> None:
+        """Fails CLOSED, and early: a resolver with nothing to serve answers every
+        lookup with an empty list, which aiohttp reports as a connection error far
+        from the cause."""
+        with pytest.raises(ValueError, match="no addresses"):
+            lu.PinnedResolver("example.com", (), 443)
+
+    def test_an_idn_pin_matches_what_aiohttp_will_ask_for(self) -> None:
+        """`wire_host`, not `host`: aiohttp asks its resolver with the IDNA form, so
+        a pin on the unicode name would refuse every internationalized link."""
+        vetted = lu.vet_unfurl_url("https://例え.jp/a", resolve=_public)
+        resolver = lu.PinnedResolver(vetted.wire_host, (vetted.ip,), vetted.port)
+        (answer,) = _run(resolver.resolve(vetted.wire_host, vetted.port))
+        assert answer["host"] == "93.184.216.34"
+        with pytest.raises(OSError):
+            _run(resolver.resolve("例え.jp", 443))
+
+
+class TestPinnedConnector:
+    """One factory, so no caller can copy the pin and drop what makes it hold.
+
+    `limit=1` and `family=AF_UNSPEC` are not decoration. A caller that installs the
+    resolver but lets aiohttp narrow the family either loses every IPv6 target or
+    gets a second lookup — which is the rebinding window the pin exists to close.
+    Asserting them here is what keeps a future caller from re-opening it.
+    """
+
+    def _vetted(self, url: str = "https://example.com/a"):
+        return lu.vet_unfurl_url(url, resolve=_public)
+
+    def test_it_pins_the_connector_to_the_vetted_address(self) -> None:
+        vetted = self._vetted()
+
+        async def _check() -> None:
+            connector = lu.pinned_connector(vetted)
+            try:
+                (answer,) = await connector._resolver.resolve(vetted.wire_host, vetted.port)
+                assert answer["host"] == "93.184.216.34"
+                assert answer["hostname"] == "example.com", "SNI and Host keep the name"
+            finally:
+                await connector.close()
+
+        _run(_check())
+
+    def test_it_serves_the_whole_vetted_set(self) -> None:
+        """The factory is where the fallbacks are kept or lost, so assert it here
+        too: a caller that reads `vetted.ip` builds a one-address pin."""
+        vetted = lu.vet_unfurl_url("https://cdn.example/o", resolve=_multi_homed)
+
+        async def _check() -> None:
+            connector = lu.pinned_connector(vetted)
+            try:
+                answers = await connector._resolver.resolve(vetted.wire_host, vetted.port)
+                assert [a["host"] for a in answers] == [
+                    "93.184.216.34",
+                    "93.184.216.35",
+                    "2606:4700::1111",
+                ]
+            finally:
+                await connector.close()
+
+        _run(_check())
+
+    def test_it_carries_the_settings_the_pin_needs(self) -> None:
+        async def _check() -> None:
+            connector = lu.pinned_connector(self._vetted())
+            try:
+                assert connector.limit == 1, "nothing else may ride this pinned pool"
+                assert (
+                    connector.family is socket.AF_UNSPEC
+                ), "the resolver reports the family; aiohttp must not re-derive it"
+                assert isinstance(connector._resolver, lu.PinnedResolver)
+            finally:
+                await connector.close()
+
+        _run(_check())
+
+    def test_an_idn_target_is_pinned_on_the_wire_form(self) -> None:
+        """The factory reads `wire_host`, so an internationalized host is pinned on
+        the IDNA name aiohttp will actually ask for -- a pin on the unicode form
+        refuses every such fetch."""
+        vetted = self._vetted("https://例え.jp/a")
+
+        async def _check() -> None:
+            connector = lu.pinned_connector(vetted)
+            try:
+                (answer,) = await connector._resolver.resolve(vetted.wire_host, vetted.port)
+                assert answer["host"] == "93.184.216.34"
+                with pytest.raises(OSError):
+                    await connector._resolver.resolve("例え.jp", 443)
+            finally:
+                await connector.close()
+
+        _run(_check())
+
+
 # --- route registration ----------------------------------------------------
 
 
@@ -1329,3 +1319,150 @@ def test_route_is_registered_on_the_app() -> None:
     lm.setup_link_meta_routes(app)
     routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
     assert ("GET", "/api/link-meta") in routes
+
+
+# --- address_is_not_public: the vet for a caller holding a resolution result ---
+#
+# The channels' attachment downloads consult this instead of enumerating category
+# flags locally, so a gap here is a server-side request forgery in each of them.
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        # The two ranges every hand-rolled category-flag list has missed. Both were
+        # APPROVED by the check this function replaced in `teams/client.py`.
+        "100.64.0.1",  # RFC 6598 shared space: absent from CPython's is_private
+        "100.127.255.254",  # last usable address of the same block
+        "fec0::1",  # deprecated IPv6 site-local: reports is_global True
+        # Tunnel encodings, which that check evaluated as WRITTEN.
+        "::ffff:127.0.0.1",  # v4-mapped loopback: is_loopback is False on the wrapper
+        "::ffff:169.254.169.254",
+        "2002:0a00:0001::1",  # 6to4 naming the v4 tunnel endpoint 10.0.0.1
+        # Classics, which must stay refused.
+        "127.0.0.1",
+        "169.254.169.254",  # the cloud instance-metadata endpoint
+        "10.1.2.3",
+        "192.168.0.9",
+        "::1",
+        "fe80::1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "ff02::1",
+        # Alternate IPv4 encodings the OS resolver accepts but `ipaddress` rejects,
+        # folded by `canonicalize_ip` so the verdict does not ride on getaddrinfo's
+        # reading of a string the vet declined to parse.
+        "0x7f000001",
+        "2130706433",
+        "127.1",
+    ],
+)
+def test_address_is_not_public_refuses_every_non_public_form(address: str) -> None:
+    assert lu.address_is_not_public(address) is True
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["93.184.216.34", "1.1.1.1", "8.8.8.8", "2606:4700::1111"],
+)
+def test_address_is_not_public_allows_globally_routable_addresses(address: str) -> None:
+    """A vet that refused real addresses would break every inbound attachment.
+
+    The refusal half is only half the property: this is the half that keeps the
+    fix from being a channel-wide outage.
+    """
+    assert lu.address_is_not_public(address) is False
+
+
+@pytest.mark.parametrize("address", ["", "   ", "not-an-ip", "example.com", "::gg"])
+def test_address_is_not_public_fails_closed_on_an_unreadable_value(address: str) -> None:
+    """The OPPOSITE default to :func:`_reject_if_internal_ip`, deliberately.
+
+    That function passes a non-literal through because for it a non-literal is a
+    hostname still to be resolved. Here the value is already a resolution result
+    about to reach a socket, so one that cannot be parsed must not be approved --
+    otherwise an unreadable answer reaches the pin unchecked.
+    """
+    assert lu.address_is_not_public(address) is True
+
+
+def test_the_url_vet_still_treats_a_non_literal_as_a_hostname() -> None:
+    """Pins the refactor: extracting the shared helper must not change this contract.
+
+    `_reject_if_internal_ip` returning silently for a hostname is what lets
+    `vet_unfurl_url` fall through to its DNS branch. If the extraction had given it
+    the fail-closed default, every named host would be refused.
+    """
+    lu._reject_if_internal_ip("example.com")  # must not raise
+    with pytest.raises(lu.UnfurlRejected) as exc:
+        lu._reject_if_internal_ip("127.0.0.1")
+    assert exc.value.code == "blocked_url"
+
+
+@pytest.mark.parametrize("address", ["100.64.0.1", "fec0::1"])
+def test_the_replaced_category_flag_list_would_have_approved_these(address: str) -> None:
+    """Proves the finding's premise rather than assuming it.
+
+    Reconstructs the exact six-flag check from `teams/client.py::_vet_resolved_address`
+    and shows it says "fine" for both ranges. Without this, a future
+    reader cannot tell whether the delegation fixed a real hole or was cosmetic.
+    """
+    ip = ipaddress.ip_address(address)
+    old_verdict = (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+    assert old_verdict is False, "the old check already caught this; premise is wrong"
+    assert lu.address_is_not_public(address) is True
+
+
+@pytest.mark.parametrize("title_source", ["title", "og:title"])
+def test_endpoint_decodes_html_entities_once(monkeypatch, title_source):
+    escaped = "How to spell &amp;lt; and &amp;#65;"
+    title = (
+        f"<title>{escaped}</title>"
+        if title_source == "title"
+        else (f'<meta property="og:title" content="{escaped}">')
+    )
+    html = (
+        f"<head>{title}"
+        f'<meta name="description" content="{escaped}">'
+        f'<meta property="og:site_name" content="{escaped}">'
+        '<link rel="icon" href="/icon.png?name=one&amp;amp;two">'
+        "</head>"
+    ).encode()
+    expected_icon = "https://example.com/icon.png?name=one&amp;two"
+    transport = _install(
+        monkeypatch,
+        {
+            "https://example.com/": (200, _HTML_HEADERS, html),
+            expected_icon: (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+        },
+    )
+    status, body = _run(_call("https://example.com/"))
+    assert status == 200
+    for field in ("title", "description", "site_name"):
+        assert body[field] == "How to spell &lt; and &#65;"
+    assert body["icon"].startswith("data:image/png;base64,")
+    assert transport.fetch_count == 2
+
+
+def test_a_url_the_redactors_would_change_is_never_previewed(monkeypatch) -> None:
+    """A preview is a fetch nobody clicked, so a link whose query the exfil check
+    blocks is refused even when a reader allowed its host for opening: it is
+    neither fetched nor cached."""
+    from kiro_crew.security.exfil import scoped_exempt_hosts
+
+    _set_enabled(monkeypatch, True)
+    transport = _install(monkeypatch, {})
+    long_query = "https://reviews.corp.example/r?filter=" + "a" * 260
+    with scoped_exempt_hosts(frozenset({"reviews.corp.example"})):
+        status, body = _run(_call(long_query))
+    assert status == 400
+    assert body == {"code": "blocked_url"}
+    assert transport.fetch_count == 0
+    assert lm._cache_get(lm.normalize_cache_key(long_query)) is None

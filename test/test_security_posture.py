@@ -1,8 +1,8 @@
 """Tests for the security-posture detail registry (``security_posture``).
 
-The registry exists because Settings → Security used to render hardcoded counts
-that had silently gone stale by 2-3x. These tests pin the two properties that
-make that regression structurally impossible:
+The registry exists so Settings → Security cannot render hardcoded counts that
+silently go stale by 2-3x. These tests pin the two properties that make that
+class of drift structurally impossible:
 
 1. **Derivation** — every ``count`` is ``len(items)``, and the items come from the
    LIVE control (``security._SENSITIVE_HOME_DIRS``, ``BUILTIN_DENIED_RULES``,
@@ -14,7 +14,9 @@ make that regression structurally impossible:
 
 from __future__ import annotations
 
+import ast
 import base64
+import functools
 import re
 
 import pytest
@@ -28,6 +30,23 @@ from kiro_crew.security_posture import (
     build_posture_snapshot,
     build_posture_snapshot_async,
 )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _drop_source_corpus_after_module():
+    """Release the whole-tree corpus this module's census pulls in.
+
+    ``_package_baseline_log_census`` below is its own ``lru_cache(maxsize=1)``
+    wrapping a ``source_corpus.parsed_candidates`` walk, so it holds two
+    references on the corpus: its own cached census AND (via
+    ``source_corpus``) the ~160 MB raw+NFKC text cache. ``test/conftest.py``
+    releases the corpus itself at every module's teardown; this releases the
+    census on top. Module teardown rather than per test, because the two tests
+    here deliberately share the census cache within the module.
+    """
+    yield
+    _package_baseline_log_census.cache_clear()
+
 
 # ANY use of a redactor, including every wrapper.
 #
@@ -46,6 +65,285 @@ _REDACTOR_CALL_RE = re.compile(
     r"|\b\w*redact\w*\("  # redact/redact_credentials/redact_and_truncate/_redact/...
     r"|\.redact\("  # qualified: security.redact(...), credentials.redact(...)
 )
+
+
+#: The baseline (companion-blind) redactor entry points defined in ``security.py``.
+#: A call to any of these runs the OSS credential/exfil pass and nothing else, so on
+#: a host with a companion loaded it misses whatever the companion's extra regexes
+#: would have caught. The context spellings (``redact_via_context`` for an egress
+#: sink, ``redact_log_via_context`` for a gate-side log line) are deliberately NOT
+#: here: they are the answer, not the finding.
+_BASELINE_REDACTORS = frozenset(
+    {
+        "redact",
+        "redact_credentials",
+        "redact_exfiltration_urls",
+        "redact_and_truncate",
+        "redact_with_findings",
+    }
+)
+
+#: Logger method names. Paired with a receiver whose source spells ``log`` (so
+#: ``logger.warning``, ``self._log.debug`` and ``LOG.error`` all count, while
+#: ``resp.warning`` does not).
+_LOG_LEVEL_ATTRS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical"})
+
+
+def _is_log_write(call: ast.Call) -> bool:
+    """True when *call* writes an operational log or audit line.
+
+    Keys on how a log WRITE is spelled — a logger level method, or a ``log_*``
+    function/method such as the SEL rows ``log_tool_invocation`` /
+    ``log_api_access`` / ``log_governance_decision``. That is deliberately the
+    only name-shaped input to this scan: the SUBJECT of the line is matched
+    structurally (see :func:`_gate_side_baseline_log_sites`), because keying on
+    the subject's name is exactly what missed ``task_planner.py`` (an LLM
+    response) and ``name_grant.py`` (a model-authored title) when the class was
+    first swept with a grep scoped to files mentioning stderr.
+    """
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        if func.attr in _LOG_LEVEL_ATTRS:
+            return "log" in ast.unparse(func.value).lower()
+        return func.attr.startswith("log_")
+    if isinstance(func, ast.Name):
+        return func.id.startswith("log_")
+    return False
+
+
+def _wraps_baseline_call(node: ast.AST | None) -> bool:
+    """True when *node* invokes or passes a baseline redactor callback."""
+
+    if node is None:
+        return False
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, (ast.Name, ast.Attribute)):
+            name = sub.func.id if isinstance(sub.func, ast.Name) else sub.func.attr
+            if name in _BASELINE_REDACTORS:
+                return True
+        if isinstance(sub, ast.keyword) and sub.arg == "redactor":
+            value = sub.value
+            if isinstance(value, (ast.Name, ast.Attribute)):
+                name = value.id if isinstance(value, ast.Name) else value.attr
+                if name in _BASELINE_REDACTORS:
+                    return True
+    return False
+
+
+def _scope_body(scope: ast.AST):
+    """Walk *scope*'s own statements, not those of a nested def/class.
+
+    Taint must not leak between scopes: a name redacted inside one method says
+    nothing about a same-named local in a sibling method. Lambdas and
+    comprehensions are NOT stopped at — they bind no assignments this scan cares
+    about, and stopping would hide a redactor call nested in one.
+    """
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _gate_side_baseline_log_sites(
+    source: str, *, tree: ast.AST | None = None
+) -> set[tuple[int, str]]:
+    """Find log/audit writes in *source* whose text came from a BASELINE redactor.
+
+    The property, not a name: a baseline redactor's result reaches a log write —
+    either nested directly in the call (``logger.error("%s", redact(x))``) or
+    through a local whose most recent assignment in the same scope was a baseline
+    call (the ``x, _ = redact_exfiltration_urls(x)`` / ``x, _ =
+    redact_credentials(x)`` pair idiom, which is a hand-rolled ``security.redact``
+    and the exact shape all three modules use).
+
+    Flow-lite, and honest about it: the most recent assignment WINS, so a name
+    reassigned from an unredacted source stops counting, but branches and loops
+    are not modelled and a value redacted in a helper and logged by its caller is
+    not seen. This is a floor on the class, not a proof of its absence.
+
+    Returns ``{(lineno, "<log call>")}`` — the count is what the ratchet pins;
+    the rendering is for the failure message.
+    """
+    if tree is None:
+        tree = ast.parse(source)
+    scopes: list[ast.AST] = [tree]
+    scopes += [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    sites: set[tuple[int, str]] = set()
+    for scope in scopes:
+        # (lineno, name, came-from-a-baseline-redactor). Collection order does not
+        # matter: the line number is what decides which assignment a log write sees.
+        assignments: list[tuple[int, str, bool]] = []
+        log_writes: list[ast.Call] = []
+        for node in _scope_body(scope):
+            targets: list[ast.expr] = []
+            value: ast.expr | None = None
+            if isinstance(node, ast.Assign):
+                targets, value = list(node.targets), node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets, value = [node.target], node.value
+            elif isinstance(node, ast.NamedExpr):
+                targets, value = [node.target], node.value
+            for target in targets:
+                # `obj.attr = redact(...)` and `d[k] = redact(...)` do NOT make the
+                # BASE object redacted text; tainting it would fire on every later
+                # log line that merely mentions the object.
+                if isinstance(target, ast.Name):
+                    bound = [target]
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    bound = [e for e in target.elts if isinstance(e, ast.Name)]
+                else:
+                    bound = []
+                for name_node in bound:
+                    assignments.append(
+                        (name_node.lineno, name_node.id, _wraps_baseline_call(value))
+                    )
+            if isinstance(node, ast.Call) and _is_log_write(node):
+                log_writes.append(node)
+        for call in log_writes:
+            args = list(call.args) + [kw.value for kw in call.keywords]
+            if any(_wraps_baseline_call(arg) for arg in args):
+                sites.add((call.lineno, ast.unparse(call.func)))
+                continue
+            referenced = {
+                sub.id for arg in args for sub in ast.walk(arg) if isinstance(sub, ast.Name)
+            }
+            for name in sorted(referenced):
+                prior = [
+                    (lineno, tainted)
+                    for lineno, bound_name, tainted in assignments
+                    if bound_name == name and lineno <= call.lineno
+                ]
+                if prior and max(prior)[1]:
+                    sites.add((call.lineno, ast.unparse(call.func)))
+                    break
+    return sites
+
+
+#: Gate-side log/audit sites still reading the BASELINE redactor, counted per
+#: module on the commit that added this ratchet. A census, and three things it is
+#: NOT:
+#:
+#: * NOT a to-do list. For a site in a process that never composes a companion the
+#:   baseline is the honest answer, not a defect — ``mcp_gateway/backend.py`` is
+#:   exactly that case (``gatewayd`` never runs ``boot_platform``, which
+#:   ``mcp_gateway/app_call.py`` relies on for its security ceiling), and
+#:   converting it would trade every backend diagnostic for a per-line lazy
+#:   resolution on the event loop.
+#: * NOT a list of approved exceptions. No entry here has been ruled correct. The
+#:   only claim these numbers make is "this many were here when the gate went up".
+#: * NOT the egress axis. ``NON_EGRESS_REDACTION_MODULES`` and ``_REDACTION_SINKS``
+#:   decide whether a module is an output boundary; that decision says nothing
+#:   about WHICH redactor spelling a site uses, which is why all three sites
+#:   sat correctly bucketed for years while reading the weaker pass.
+#:
+#: What the gate buys: a NEW gate-side log line cannot be born on the baseline
+#: silently. Growth in any module — or a first site in a module absent from here —
+#: fails, and clearing it means either calling ``redact_log_via_context`` or
+#: raising the number and saying which PROCESS the site runs in and why the
+#: baseline is right there, to the standard that helper's docstring sets.
+#:
+#: Two limits, stated so nobody reads more into a green run: counts do not pin
+#: identity, so converting one site while adding another inside the SAME module
+#: nets to zero (both edits land in one reviewed diff), and the scan is
+#: single-scope (see :func:`_gate_side_baseline_log_sites`).
+_BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
+    "acp/client_lifecycle.py": 1,
+    # +1: model-unavailable warning log in the rejected-model path
+    "acp/client_model_selection.py": 2,
+    "acp/client_permissions.py": 1,
+    "acp/client_start.py": 2,
+    "acp/client_transport.py": 1,
+    # _format_acp_error's scrubbed-content warning, in the same gateway process as
+    # the client owners' sites.
+    "acp/transport_errors.py": 1,
+    "apps/builtins/pptx_maker/backend/routes.py": 1,
+    "dashboard/chat_nav.py": 1,
+    "dashboard/chat_runner.py": 2,
+    "dashboard/chat_title.py": 1,
+    # The native sub-agent card sync's gate-side log, moved out of chat_runner.py with
+    # its helper; the same gateway process as the runner's sites.
+    "dashboard/chat_turn/native_cards.py": 1,
+    # The permission and tool arms' gate-side logs, moved out of chat_runner.py with
+    # their phases; the same gateway process as the runner's sites.
+    "dashboard/chat_turn/permission_prompt.py": 1,
+    "dashboard/chat_turn/tool_approval.py": 4,
+    "dashboard/chat_turn/tool_rows.py": 1,
+    # The outbox owner composed into dashboard/handlers/files.py: api_outbox_notify's
+    # refusal audit, in the same gateway process as the facade.
+    "dashboard/file_api/outbox.py": 1,
+    "dashboard/handlers/discover.py": 3,
+    "dashboard/handlers/hooks.py": 1,
+    "dashboard/handlers/messaging.py": 2,
+    # The Slack pins, reactions and profile routes' sites, composed into
+    # dashboard/handlers/messaging.py: the gateway process, as the facade's two.
+    "dashboard/messaging_api/slack_workspace.py": 10,
+    "dashboard/session_control_parts/target_authorization.py": 1,
+    "dashboard/session_transfer_install.py": 1,
+    "dashboard/state_parts/slot_turns.py": 1,
+    "knowledge/agent_fetch.py": 1,
+    "mcp_cron_vet.py": 1,
+    # The pooled-backend daemon never composes a companion context. Its
+    # declared-temp warnings therefore use the baseline pass deliberately.
+    "mcp_gateway/backend.py": 3,
+    "mcp_gateway/gatewayd.py": 1,
+    "mcp_tools/knowledge.py": 5,
+    "mcp_tools/messaging.py": 1,
+    "mcp_tools/skills.py": 2,
+    "messaging/sessions_view.py": 1,
+    # The sessions slash command and the Home tab, moved out of slack/events.py to the
+    # owners behind that facade: the same gateway process.
+    "slack/events_home_tab.py": 1,
+    "slack/events_slash.py": 1,
+    # Owners composed into slack/gateway.py (the cron script arm, boot-time install
+    # repair, the unattended result delivery, a sub-agent completion's injection
+    # into its parent, the tool-approval callbacks): the gateway process.
+    "slack/gateway_runtime/cron_exec.py": 1,
+    "slack/gateway_runtime/install_repair.py": 2,
+    "slack/gateway_runtime/result_egress.py": 1,
+    "slack/gateway_runtime/subagent_injection.py": 1,
+    "slack/gateway_runtime/turn_approvals.py": 2,
+    # Owners composed into slack/handler.py (the reply decorator's re-redaction, the
+    # sessions keyword's collector failure): the same handler process as the facade.
+    "slack/handler_runtime/delivery.py": 2,
+    "slack/handler_runtime/dispatch.py": 1,
+    "voice_reply.py": 4,
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _package_baseline_log_census() -> "tuple[tuple[str, int], ...]":
+    """Live per-module count of gate-side log writes reading a baseline redactor.
+
+    Cached because two tests read it and the walk parses every package module;
+    returned as a tuple of pairs so the cached value cannot be mutated by a
+    caller. A ``SyntaxError`` is deliberately NOT swallowed: a module the scanner
+    cannot parse is a module it cannot see, and skipping one quietly is how a
+    scan-based gate goes blind.
+    """
+    from source_corpus import parsed_candidates, src_root  # noqa: PLC0415
+
+    pkg = src_root()
+    found: list[tuple[str, int]] = []
+    # Every name in `_BASELINE_REDACTORS` starts with "redact", so a module
+    # without that text cannot hold a site and is not worth parsing. The
+    # SyntaxError is still not swallowed (`skip_syntax_errors=False`).
+    for path, source, tree in parsed_candidates(("redact",), skip_syntax_errors=False):
+        rel = path.relative_to(pkg).as_posix()
+        if rel.startswith(("_vendor/", "testing/")):
+            continue
+        if "/tests/" in rel or rel.endswith("_test.py"):
+            continue
+        sites = _gate_side_baseline_log_sites(source, tree=tree)
+        if sites:
+            found.append((rel, len(sites)))
+    return tuple(found)
 
 
 def _mcp_schema_registry_names() -> list[str]:
@@ -171,12 +469,12 @@ class TestDerivation:
     def test_every_mcp_schema_registry_is_covered_by_the_posture_view(self, snapshot):
         """The drift guard's OWN blind spot, closed.
 
-        This class previously hardcoded ``MCP_CORE_SCHEMAS | MCP_CRON_SCHEMAS`` — the
-        same two names the implementation hardcoded — so when ``MCP_COMPUTER_SCHEMAS``
-        was added, all ten computer-use tools were absent from the security-posture
-        report and the test written to catch exactly that stayed green. Discovering the
-        registries from ``validation`` instead means a NEW one fails here until it is
-        added to ``security_posture._SCHEMA_REGISTRY_NAMES``.
+        This class discovers the MCP schema registries from ``validation`` rather
+        than hardcoding a set like ``MCP_CORE_SCHEMAS | MCP_CRON_SCHEMAS``: a
+        hardcoded set leaves a newly added registry (say ``MCP_COMPUTER_SCHEMAS``)
+        absent from the security-posture report while the test written to catch
+        exactly that stays green. Discovering them means a NEW registry fails here
+        until it is added to ``security_posture._SCHEMA_REGISTRY_NAMES``.
         """
         from kiro_crew import security_posture
 
@@ -387,13 +685,23 @@ class TestEndpoint:
         A `hasattr(handlers, ...)` check passes even if the
         `app.router.add_get("/api/security/posture", ...)` line is deleted — which
         would ship a 404 with the whole suite green.
+
+        The registration lives in the route table under ``dashboard/routes/``, so
+        both that package and ``server`` are scanned and the assertion holds
+        wherever the route sits.
         """
+        import importlib
         import inspect
 
-        from kiro_crew.dashboard import handlers, server
+        from kiro_crew.dashboard import handlers
+        from kiro_crew.dashboard import routes as routes_pkg
+        from kiro_crew.dashboard import server
 
         assert hasattr(handlers, "api_security_posture")
-        src = inspect.getsource(server)
+        src = inspect.getsource(server) + "".join(
+            inspect.getsource(importlib.import_module(f"kiro_crew.dashboard.routes.{name}"))
+            for name in routes_pkg.REGISTRAR_NAMES
+        )
         assert '"/api/security/posture"' in src
         assert "handlers.api_security_posture" in src
 
@@ -445,18 +753,20 @@ class TestOmissionDetection:
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         call = _REDACTOR_CALL_RE
 
         registered = {module for _label, module, _detail in security_posture._REDACTION_SINKS}
         allowlisted = security_posture.NON_EGRESS_REDACTION_MODULES
-        # security.py DEFINES the redactors; security_posture.py only names them.
-        self_referential = {"security.py", "security_posture.py"}
+        # The ``security`` package DEFINES the redactors; security_posture.py only
+        # names them. The whole package is skipped, not one file, because the
+        # definitions are spread across its submodules.
+        self_referential = {"security_posture.py"}
 
         unclassified: list[str] = []
         for path in sorted(pkg.rglob("*.py")):
             rel = path.relative_to(pkg).as_posix()
-            if rel in self_referential or rel.startswith(("_vendor/", "testing/")):
+            if rel in self_referential or rel.startswith(("security/", "_vendor/", "testing/")):
                 continue
             if "/tests/" in rel or rel.endswith("_test.py"):
                 continue
@@ -474,14 +784,14 @@ class TestOmissionDetection:
         )
 
     def test_allowlist_has_no_stale_entries(self):
-        """A path that no longer calls a redactor must leave the allowlist.
+        """A path that does not call a redactor must leave the allowlist.
 
         Otherwise the allowlist silently grows into a place where a real sink can
         hide behind a dead entry.
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         call = _REDACTOR_CALL_RE
         stale = [
             rel
@@ -582,8 +892,11 @@ class TestOmissionDetection:
             "telegram:1": "telegram",
             "wecom:1": "wecom",
             "weixin:1": "weixin",
+            "whatsapp:1": "whatsapp",
+            "feishu:1": "feishu",
             "webex:1": "webex",
             "teams:1": "teams",
+            "imessage:1": "imessage",
             "C123:456.789": "slack",
         }
         for key, expected in probes.items():
@@ -614,7 +927,7 @@ class TestOmissionDetection:
         import re
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         explicit: set[str] = set()
         for path in pkg.rglob("*.py"):
             if path.name in {"sel.py", "security_posture.py"}:
@@ -633,10 +946,13 @@ class TestOmissionDetection:
     def test_token_auth_controls_name_live_mechanisms(self):
         """Each advertised auth control must have its enforcement present."""
         import inspect
+        import sys
 
         from kiro_crew.dashboard import token_auth
 
-        src = inspect.getsource(token_auth)
+        # The facade and the owner modules it serves the moved code from.
+        family = (token_auth.__name__, *token_auth._OWNERS)
+        src = "\n".join(inspect.getsource(sys.modules[name]) for name in family)
         for marker in (
             "hmac.new",  # HMAC-SHA256 signature
             "bind_peer",  # session pinning (peer-keyed: ip:<addr> / ts:… identity)
@@ -648,23 +964,149 @@ class TestOmissionDetection:
             assert marker in src, f"advertised auth control's mechanism is gone: {marker}"
 
 
+#: Callees that count as a redactor call although no ``_``-separated word of their
+#: name is ``redact``/``redacted``/``redactor``: the rolling stream redactor and the
+#: display wrapper that runs both scanners.
+_REDACTOR_CALLEES = frozenset({"StreamRedactor", "display_safe"})
+_REDACTOR_WORDS = frozenset({"redact", "redacted", "redactor"})
+
+
+def _called_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+    return names
+
+
+def _is_redactor_call(name: str) -> bool:
+    # ``redact``, ``redact_credentials``, ``_redact_frame``, ``prepare_redacted_copy``
+    # count; ``count_redaction_tags``, ``needs_redaction``, ``redaction_notice`` do not.
+    if name in _REDACTOR_CALLEES:
+        return True
+    return any(word.lower() in _REDACTOR_WORDS for word in name.split("_"))
+
+
+def _declared_owner_modules(tree: ast.Module) -> list[str]:
+    """Dotted owner modules a split module's facade declares.
+
+    Two declarations count, both module-level: an ``_OWNERS`` tuple of dotted names,
+    and ``from <pkg> import <owner> as _owner_<owner>``. Any other import does not, so
+    a facade cannot borrow a redactor call from a module it merely imports.
+    """
+    owners: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_OWNERS" for t in node.targets
+        ):
+            if isinstance(node.value, (ast.Tuple, ast.List)):
+                owners.extend(
+                    e.value
+                    for e in node.value.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                )
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for alias in node.names:
+                if alias.asname and alias.asname.startswith("_owner_"):
+                    owners.append(f"{node.module}.{alias.name}")
+    return owners
+
+
+def _sink_module_calls_a_redactor(pkg, module: str) -> bool:
+    """True when ``module`` (relative to the ``kiro_crew`` package dir ``pkg``) calls
+    a redactor, or, as a split module's facade, one of its declared owners does."""
+    path = pkg / module
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    if any(_is_redactor_call(n) for n in _called_names(tree)):
+        return True
+    for dotted in _declared_owner_modules(tree):
+        parts = dotted.split(".")
+        if parts[0] != "kiro_crew":
+            continue
+        owner = pkg.joinpath(*parts[1:])
+        candidates = (owner.with_suffix(".py"), owner / "__init__.py")
+        for candidate in candidates:
+            if candidate.is_file():
+                owner_tree = ast.parse(candidate.read_text(encoding="utf-8"))
+                if any(_is_redactor_call(n) for n in _called_names(owner_tree)):
+                    return True
+    return False
+
+
 class TestRedactionSinkRegistry:
     def test_every_named_sink_module_exists(self):
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         for _label, module, _detail in security_posture._REDACTION_SINKS:
             assert (pkg / module).is_file(), module
 
     def test_every_named_sink_module_actually_redacts(self):
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         for label, module, _detail in security_posture._REDACTION_SINKS:
-            text = (pkg / module).read_text(encoding="utf-8")
             # The claim "this is an output path where redaction is applied" must be
-            # true of the module named, or the count is fiction.
-            assert "redact" in text or "StreamRedactor" in text, label
+            # true of the module named, or the count is fiction. A CALL is required:
+            # an import, a docstring or a comment that mentions a redactor is not one.
+            assert _sink_module_calls_a_redactor(pkg, module), (
+                f"{label} ({module}) names no call to a redactor, in the module or "
+                "in the owner modules its facade declares"
+            )
+
+    def test_a_module_that_only_imports_a_redactor_fails_the_sink_check(self, tmp_path):
+        """The check above must be able to fail: a mention is not a call."""
+        (tmp_path / "mention.py").write_text(
+            '"""Output is redacted before it is sent."""\n'
+            "from kiro_crew.security import redact_credentials  # noqa: F401\n"
+            "from kiro_crew.security import StreamRedactor  # noqa: F401\n"
+            "def send(text):\n"
+            "    # redact(text) used to run here\n"
+            "    return text\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "calls.py").write_text(
+            "from kiro_crew.security import redact_credentials\n"
+            "def send(text):\n"
+            "    return redact_credentials(text)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "helper_only.py").write_text(
+            "def send(text):\n    return count_redaction_tags(text), needs_redaction(text)\n",
+            encoding="utf-8",
+        )
+        assert not _sink_module_calls_a_redactor(tmp_path, "mention.py")
+        assert not _sink_module_calls_a_redactor(tmp_path, "helper_only.py")
+        assert _sink_module_calls_a_redactor(tmp_path, "calls.py")
+
+    def test_a_facade_counts_only_through_the_owners_it_declares(self, tmp_path):
+        """A split module's facade keeps its sink row; its declared owners must call."""
+        pkg = tmp_path / "kiro_crew"
+        (pkg / "fam").mkdir(parents=True)
+        (pkg / "fam" / "owner.py").write_text(
+            "def send(text):\n    return redact(text)\n", encoding="utf-8"
+        )
+        (pkg / "fam" / "silent.py").write_text(
+            "def send(text):\n    return text\n", encoding="utf-8"
+        )
+        (pkg / "by_owners.py").write_text(
+            '_OWNERS = ("kiro_crew.fam.silent", "kiro_crew.fam.owner")\n', encoding="utf-8"
+        )
+        (pkg / "by_alias.py").write_text(
+            "from kiro_crew.fam import owner as _owner_owner  # noqa: F401\n", encoding="utf-8"
+        )
+        (pkg / "silent_family.py").write_text(
+            '_OWNERS = ("kiro_crew.fam.silent",)\n'
+            "from kiro_crew.fam import owner  # noqa: F401  (not an _owner_ alias)\n",
+            encoding="utf-8",
+        )
+        assert _sink_module_calls_a_redactor(pkg, "by_owners.py")
+        assert _sink_module_calls_a_redactor(pkg, "by_alias.py")
+        assert not _sink_module_calls_a_redactor(pkg, "silent_family.py")
 
     def test_a_partially_covered_sink_says_so(self):
         """A sink running only ONE scanner must disclose that on its own row.
@@ -677,13 +1119,51 @@ class TestRedactionSinkRegistry:
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         # Wrappers that run BOTH scanners internally, so a sink using one is fully
         # covered: StreamRedactor (rolling dual-pass), redact() (the dual-pass
-        # helper), redact_and_truncate() (redact-then-slice, so a credential cannot
-        # straddle the truncation boundary), and redact_via_context() (routes to
-        # CredentialPolicy.redact, whose Default delegates to security.redact).
-        dual_pass = ("StreamRedactor", "redact(", "redact_tree", "redact_and_truncate", "redact_via_context")
+        # helper), redact_with_findings() (the same two passes in the same order,
+        # returning each one's warnings), redact_and_truncate() (redact-then-slice,
+        # so a credential cannot
+        # straddle the truncation boundary), redact_via_context() (routes to
+        # CredentialPolicy.redact, whose Default delegates to security.redact), and
+        # display_safe() (redact_for_display with the exfil+credential redactor,
+        # then the mention defang).
+        dual_pass = (
+            "StreamRedactor",
+            "redact(",
+            "redact_with_findings",
+            "redact_tree",
+            "redact_and_truncate",
+            "redact_via_context",
+            "display_safe",
+            # The shared dashboard memory helper recursively runs the exfil
+            # scanner followed by the credential scanner for every text value.
+            "_redact_memory_field(",
+            # redact_mcp_error runs redact_exfiltration_urls THEN redact_credentials
+            # (mcp_discovery_server_info.py) and then scrubs the exact configured header values
+            # the generic scanners cannot know about — strictly more than either
+            # scanner alone, so a sink using it is fully covered.
+            "redact_mcp_error",
+            # _redact_projection_value (eventlog/service.py) recursively runs the
+            # exfil scanner THEN the credential scanner over every string in a
+            # projection view or event `data`, so a sink using it is fully covered.
+            "_redact_projection_value",
+            # redact_peer_text (dashboard/peer_redaction.py) IS the pair: it runs
+            # redact_exfiltration_urls THEN redact_credentials in the repo's fixed
+            # order. Its two wrappers reach it for a whole JSON document and for one
+            # SSE event respectively, so a sink calling any of the three is fully
+            # covered. Named here because that module exists so its callers "share
+            # one registered sink instead of each inventing a redactor pair" -- which
+            # means a covered sink need not mention either scanner itself.
+            "redact_peer_text",
+            "_redact_peer_payload",
+            "_redact_sse_event_async",
+            # _redact_for_display (dashboard/chat_utils_display.py) runs redact_exfiltration_urls
+            # THEN redact_credentials, cached by content hash, so a sink calling it is
+            # fully covered; test_the_display_redactor_runs_both_scanners pins that.
+            "_redact_for_display(",
+        )
         for label, module, detail in security_posture._REDACTION_SINKS:
             text = (pkg / module).read_text(encoding="utf-8")
             full = any(w in text for w in dual_pass) or (
@@ -697,6 +1177,18 @@ class TestRedactionSinkRegistry:
                 "the sink to run both"
             )
 
+    def test_the_display_redactor_runs_both_scanners(self):
+        """Why ``_redact_for_display(`` is a dual pass above: one input carrying a
+        credential and an exfiltration URL comes back with both removed."""
+        from kiro_crew.dashboard import chat_utils
+
+        chat_utils._clear_display_redaction_cache()
+        url = "https://collect.attacker.example/?token=" + "aB3" * 70 + "&host=corp-laptop"
+        out = chat_utils._redact_for_display(f"key AKIAIOSFODNN7EXAMPLE then {url}")
+        chat_utils._clear_display_redaction_cache()
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "corp-laptop" not in out and "attacker.example/?token" not in out
+
     def test_sink_prose_claims_are_true_of_the_named_module(self):
         """A sink's `detail` makes testable claims — pin them to the call site.
 
@@ -708,12 +1200,13 @@ class TestRedactionSinkRegistry:
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         # claim substring (case-insensitive) -> symbol that must exist in the module
         claims = {
             "streamredactor": "StreamRedactor",
             "redact_and_truncate": "redact_and_truncate",
             "redact_via_context": "redact_via_context",
+            "display_safe": "display_safe",
             "exfiltration-url scanning only": "redact_exfiltration_urls",
         }
         for label, module, detail in security_posture._REDACTION_SINKS:
@@ -735,3 +1228,253 @@ class TestRedactionSinkRegistry:
     def test_sink_labels_are_unique(self):
         labels = [label for label, _m, _d in security_posture._REDACTION_SINKS]
         assert len(labels) == len(set(labels))
+
+
+class TestGateSideLogRedactorSpelling:
+    """The second axis: WHICH redactor spelling a gate-side log line reads.
+
+    ``TestOmissionDetection`` above forces every redactor call site into a bucket —
+    egress sink or not. That decision is orthogonal to this one, and all three
+    converged sites prove it: each was correctly listed as non-egress,
+    with an accurate reason, while reading the companion-blind baseline pass. The
+    bucket was never wrong; the redactor was, and no gate looked at that.
+
+    So this class asks the other question — does a gate-side log line reach its
+    text through ``redact_log_via_context`` — and it asks it of a PROPERTY rather
+    than of a list of already-decided sites, because a converged-sites list (the
+    narrow guard in ``test_platform_context``) is a regression
+    guard: it protects what has been decided and says nothing about a site born
+    tomorrow, which is the direction the class grew in the first place.
+    """
+
+    def test_no_new_gate_side_log_line_reads_the_baseline_redactor(self):
+        """A gate-side log line born on the baseline fails until someone decides.
+
+        The half the narrow guard cannot cover. Two ways to fail: a module absent
+        from the census growing its first site, and a module in it growing another
+        one. Either is cleared by calling ``redact_log_via_context`` — or, when the
+        site runs in a process that never composes a companion, by raising that
+        module's number and recording which process and why, to the standard
+        ``redact_log_via_context``'s own docstring sets for ``gatewayd``.
+        """
+        found = dict(_package_baseline_log_census())
+        grew = {
+            rel: (count, _BASELINE_LOG_SITE_CENSUS.get(rel, 0))
+            for rel, count in found.items()
+            if count > _BASELINE_LOG_SITE_CENSUS.get(rel, 0)
+        }
+        assert not grew, (
+            "New gate-side log/audit line(s) reading the BASELINE redactor "
+            + ", ".join(
+                f"{rel}: {now} sites, census says {was}" for rel, (now, was) in grew.items()
+            )
+            + ". A gate-side log line goes through `redact_log_via_context` so a host with a "
+            "companion loaded is not scanned with the weaker OSS pass. If the baseline is "
+            "correct here because this PROCESS never composes a companion, raise the number "
+            "in `_BASELINE_LOG_SITE_CENSUS` and say which process and why."
+        )
+
+    def test_the_census_holds_no_slack(self):
+        """A converted site must lower its number, and an emptied module must go.
+
+        Without this the census only ever ratchets one way: a module that drops
+        from 7 sites to 1 would keep 6 free slots for a future baseline line to
+        appear in silently.
+        """
+        found = dict(_package_baseline_log_census())
+        slack = {
+            rel: (found.get(rel, 0), recorded)
+            for rel, recorded in _BASELINE_LOG_SITE_CENSUS.items()
+            if found.get(rel, 0) < recorded
+        }
+        assert not slack, (
+            "`_BASELINE_LOG_SITE_CENSUS` is now looser than the code — lower or drop these: "
+            + ", ".join(
+                f"{rel}: {now} sites, census says {was}" for rel, (now, was) in slack.items()
+            )
+        )
+
+    def test_the_scanner_flags_the_shape_it_exists_to_catch(self):
+        """Teeth, proven on planted source rather than assumed.
+
+        A scan-based ratchet whose matcher silently matches nothing keeps a green
+        census forever, so each half is planted here: the pair idiom feeding an
+        audit row (``name_grant``'s shape), a lone baseline call nested in a logger
+        call (``update_provider``'s shape), and — as the control — the same lines
+        written through the context spelling, which must NOT be flagged.
+        """
+        pair_into_audit = (
+            "def log_decline(title):\n"
+            "    title, _ = redact_exfiltration_urls(title)\n"
+            "    title, _ = redact_credentials(title)\n"
+            "    sel().log_tool_invocation(session_key='s', tool_name=title)\n"
+        )
+        nested_in_logger = (
+            "def apply(stderr):\n"
+            "    logger.error('install failed: %s', redact(stderr.decode()))\n"
+        )
+        callback_in_logger = (
+            "def apply(value):\n" "    logger.warning('%s', format_field(value, redactor=redact))\n"
+        )
+        assert len(_gate_side_baseline_log_sites(pair_into_audit)) == 1
+        assert len(_gate_side_baseline_log_sites(nested_in_logger)) == 1
+        assert len(_gate_side_baseline_log_sites(callback_in_logger)) == 1
+
+        converged_pair = (
+            "def log_decline(title):\n"
+            "    title = redact_log_via_context(title)\n"
+            "    sel().log_tool_invocation(session_key='s', tool_name=title)\n"
+        )
+        converged_nested = (
+            "def apply(stderr):\n"
+            "    logger.error('install failed: %s', redact_log_via_context(stderr.decode()))\n"
+        )
+        assert _gate_side_baseline_log_sites(converged_pair) == set()
+        assert _gate_side_baseline_log_sites(converged_nested) == set()
+
+    def test_the_scanner_does_not_flag_what_is_not_a_log_line(self):
+        """Zero false positives on the shapes that are NOT this class.
+
+        Each of these would put an unearned entry in the census and, worse, teach
+        the next reader that the gate fires on noise: a baseline call whose result
+        never reaches a log write, an egress send (whose spelling question is
+        ``redact_via_context`` and a separate decision), a same-named local in a
+        SIBLING scope, and a redacted value written to an object ATTRIBUTE whose
+        base object is later merely mentioned in a log line.
+        """
+        not_logged = "def f(x):\n    safe, _ = redact_credentials(x)\n    return safe\n"
+        egress = (
+            "def f(x):\n"
+            "    safe, _ = redact_credentials(x)\n"
+            "    await client.chat_postMessage(text=safe)\n"
+        )
+        sibling_scope = (
+            "def a(x):\n"
+            "    text, _ = redact_credentials(x)\n"
+            "    return text\n"
+            "def b(text):\n"
+            "    logger.info('raw %s', text)\n"
+        )
+        attribute_target = (
+            "def f(job, err):\n"
+            "    job.last_error = redact(err)\n"
+            "    logger.warning('job %s paused', job.name)\n"
+        )
+        reassigned = (
+            "def f(x, raw):\n"
+            "    text, _ = redact_credentials(x)\n"
+            "    text = raw\n"
+            "    logger.info('%s', text)\n"
+        )
+        for label, source in (
+            ("not logged", not_logged),
+            ("egress send", egress),
+            ("sibling scope", sibling_scope),
+            ("attribute target", attribute_target),
+            ("reassigned from raw", reassigned),
+        ):
+            assert _gate_side_baseline_log_sites(source) == set(), label
+
+    def test_the_converged_sites_stay_out_of_the_census(self):
+        """The three converged sites must have nothing left for this scan to find.
+
+        Ties the general rule to the narrow guard: ``test_platform_context`` pins
+        that each of these still CALLS the helper, and this pins that none of them
+        has a gate-side log line reading the baseline alongside it — a drift the
+        call-count check on its own would not see.
+        """
+        for rel in ("platform/update_provider.py", "task_planner.py", "name_grant.py"):
+            assert (
+                rel not in _BASELINE_LOG_SITE_CENSUS
+            ), f"{rel} was converged by #7151 and must not carry a baseline log site"
+
+
+class TestPostureClaimsMatchEnforcement:
+    """The posture must not claim protection the code does not enforce.
+
+    This module's whole value is truthful attestation -- a report that
+    OVERSTATES coverage is worse than no report, because consumers treat it as
+    ground truth. These pin the three claims that were stronger than the code.
+    """
+
+    def test_dispatcher_falls_open_on_an_unregistered_tool(self) -> None:
+        """The behaviour the summary must not paper over.
+
+        Registry membership is NOT a proxy for coverage: ``spawn_steer`` and
+        friends are absent from ``MCP_CORE_SCHEMAS`` yet validate inside their
+        own handler. So this probes the DISPATCHER seam directly -- a registered
+        name rejects an unknown field, an unregistered one returns the caller's
+        dict untouched, which is what makes the old universal claim false.
+        """
+        from kiro_crew import mcp_computer, mcp_core
+        from kiro_crew.validation import ValidationError
+
+        payload = {"UNKNOWN_FIELD": "z" * 4096}
+        passed_through = mcp_core._validate_args("browser", dict(payload))
+        assert passed_through == payload, "expected the unregistered tool to fall open"
+
+        with pytest.raises(ValidationError):
+            mcp_core._validate_args("learn_add", {"rule": "r", "category": "tool", **payload})
+
+        # Computer-use is the one server that fails closed, which the summary says.
+        with pytest.raises(ValidationError):
+            mcp_computer._validate_args("definitely_not_a_tool", {})
+
+    def test_tool_schema_summary_does_not_claim_universal_coverage(self, snapshot) -> None:
+        control = self._control(snapshot, "tool_schemas")
+        summary = " ".join(control["summary"].split())
+        # The claim must be scoped to REGISTERED schemas and must name the
+        # pass-through, because two of the three servers fall open.
+        assert "registered schema" in summary
+        assert "unvalidated" in summary
+        assert not summary.startswith("Every MCP tool call is checked")
+
+    def test_denied_command_summary_names_shipped_vs_enforced(self, snapshot) -> None:
+        from kiro_crew import security
+
+        control = self._control(snapshot, "denied_commands")
+        summary = " ".join(control["summary"].split())
+        # The count is the catalogue; the enforced set drops disabled rules.
+        assert control["count"] == len(security.BUILTIN_DENIED_RULES)
+        assert "SHIPPED catalogue" in summary
+        assert (
+            len(security.compute_effective_denied(security.BUILTIN_DENIED_RULES, (), True, (), ()))
+            < control["count"]
+        )
+
+    def test_write_protected_detail_is_not_unconditional(self, snapshot) -> None:
+        control = self._control(snapshot, "write_protected_paths")
+        for item in control["items"]:
+            detail = " ".join(item["detail"].split())
+            assert "edit kind" in detail, detail
+            assert "cannot modify it when" in detail, detail
+            # The bash gate does NOT cover these paths, so the detail must not
+            # claim it does.
+            assert "shell writes are blocked" not in detail, detail
+
+    def test_the_bash_gate_really_does_not_cover_write_protected_paths(self) -> None:
+        """The detail says shell writes are uncovered; prove that is still true.
+
+        Every shell-write form against every protected entry is allowed today.
+        If the bash gate ever grows real coverage here this fails, and the
+        posture wording should then be corrected upwards rather than left stale.
+        """
+        entries = list(security.write_protected_home_paths())
+        assert entries, "expected at least one write-protected path"
+        for entry in entries:
+            assert security.is_denied(f"echo x > ~/{entry}") is None, entry
+
+    def test_mcp_summary_names_every_fall_open_dispatcher(self, snapshot) -> None:
+        """The summary attests over the dispatchers; all three that fall open
+        must be named, or the claim re-rots the moment a schemaless tool lands.
+        """
+        from kiro_crew import mcp_dashboard
+
+        control = self._control(snapshot, "tool_schemas")
+        summary = " ".join(control["summary"].split())
+        for dispatcher in ("core", "cron", "dashboard"):
+            assert dispatcher in summary, (dispatcher, summary)
+        assert mcp_dashboard._validate_args("__not_a_tool__", {"a": 1}) == {"a": 1}
+
+    def _control(self, snapshot, key):
+        return next(c for c in snapshot["controls"] if c["key"] == key)

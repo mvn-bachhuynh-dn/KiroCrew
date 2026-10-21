@@ -19,12 +19,12 @@
  *     to cover Latin, every stack in the app silently switches its Latin face.
  *     This is the assertion that matters most.
  *  2. **Every declaration site must reference the alias token.** The stacks are
- *     declared in TWELVE places across three files — nine `--font-body`/`--mono`
- *     declarations (`index.css` 4, `hooks/useTheme.tsx` 5) plus the three
- *     `FAMILY_MAP` entries in `hooks/useZoom.ts` that are written into `--font-body`
- *     at runtime. A thirteenth added later without the aliases would silently lose
- *     script coverage on whichever path it feeds, so the check globs the tree rather
- *     than naming files.
+ *     declared across `index.css`, `hooks/themeCss.ts` (the built-in defaults plus
+ *     the `--theme-font-sans` / `--theme-font-mono` role tokens an installed pack
+ *     fills) and the three `FAMILY_MAP` entries in `hooks/useZoom.ts` that are
+ *     written into `--font-body` at runtime. One added later without the aliases
+ *     would silently lose script coverage on whichever path it feeds, so the check
+ *     globs the tree rather than naming files.
  *  3. **Each alias needs a REAL bold face.** Weight matching happens *within* the
  *     selected family, so an alias backed by one Regular face makes every
  *     `font-semibold` in these scripts render as Chromium's synthetic bold — worse
@@ -39,13 +39,14 @@
  * leading unicode-ranged alias is deterministic regardless of what follows it.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { readFile, readdir } from 'node:fs/promises'
+import { basename, join, relative } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
+import { readIndexCss } from '../test/indexCssSource'
 
 const SRC = join(__dirname, '..')
-const INDEX_CSS = readFileSync(join(SRC, 'index.css'), 'utf8')
+const INDEX_CSS = readIndexCss()
 
 /** Region-specific Han aliases must never share an active token. */
 const SC_ALIASES = [
@@ -56,12 +57,13 @@ const SC_ALIASES = [
 /**
  * Locale-specific aliases, keyed by the `html:lang()` rule that activates them.
  *
- * `KC Han Fallback` draws Simplified glyph forms and no Hangul at all, so leaving
- * it in front for `lang=ja` or `lang=ko` puts an alias that cannot serve the locale
- * ahead of one that can — which is why each entry REPLACES the default pair rather
- * than prepending to it.
+ * These are NOT the untagged default. A leading Simplified Chinese face would
+ * draw Japanese and Korean content (and untagged CJK in an English UI) with
+ * the wrong regional glyph forms. Each entry REPLACES every other Han pair
+ * rather than prepending to it.
  */
 const REGIONAL = [
+  { lang: 'zh-CN', body: 'KC Han Fallback', mono: 'KC Han Mono Fallback' },
   { lang: 'ja', body: 'KC Japanese Fallback', mono: 'KC Japanese Mono Fallback' },
   { lang: 'ko', body: 'KC Korean Fallback', mono: 'KC Korean Mono Fallback' },
 ] as const
@@ -74,6 +76,7 @@ const REGIONAL_ALIASES = REGIONAL.flatMap(r => [r.body, r.mono])
  * or merged token fails here rather than rendering from the OS cascade.
  */
 const SCRIPT_PROBES: Record<string, ReadonlyArray<readonly [string, number]>> = {
+  'zh-CN': [['CJK Unified Ideographs', 0x4e00], ['CJK punctuation', 0x3001]],
   ja: [['hiragana', 0x3042], ['katakana', 0x30a2]],
   ko: [['Hangul syllables', 0xac00], ['Hangul compatibility jamo', 0x3131]],
 }
@@ -84,12 +87,32 @@ const COMMON_ALIASES = [
   'KC Bengali Fallback',
 ] as const
 
-const ALIASES = [...SC_ALIASES, ...REGIONAL_ALIASES, ...COMMON_ALIASES] as const
+/**
+ * Kana-only and Hangul-only faces added to the DEFAULT token (#13085). Unlike the
+ * REGIONAL faces, these carry NO Han range, so they draw only the kana/Hangul code
+ * points that render as tofu under a non-ja/ko UI and leave bare Han to the OS
+ * cascade. They are regular aliases for the generic face checks (local()-only,
+ * out of Latin, real 400+700 pair).
+ */
+const DEFAULT_CJK_ALIASES = [
+  'KC Kana Fallback',
+  'KC Kana Mono Fallback',
+  'KC Hangul Fallback',
+  'KC Hangul Mono Fallback',
+] as const
+
+const ALIASES = [...SC_ALIASES, ...REGIONAL_ALIASES, ...DEFAULT_CJK_ALIASES, ...COMMON_ALIASES] as const
 
 /**
  * Ranges that must stay OUT of every alias. Latin proper plus general punctuation:
  * an alias claiming U+2000-206F would take over quotes, dashes and ellipses in
  * Latin text, which is the same class of silent regression as claiming Latin.
+ *
+ * The ONE intentional exception is 'KC Straight Quotes' (#6374): it claims exactly
+ * U+0022 and U+0027 to replace Space Grotesk's miscut straight quotes. It is
+ * deliberately NOT in ALIASES, so the checks above never run on it; instead it is
+ * pinned separately at the bottom of this file to those two code points and nothing
+ * wider, which is what keeps the exception from quietly growing into a Latin claim.
  */
 const FORBIDDEN = [
   { name: 'Latin (Basic through Extended-B)', lo: 0x0000, hi: 0x024f },
@@ -152,6 +175,11 @@ function ruleBody(pattern: RegExp): string {
   return INDEX_CSS.match(pattern)?.[1] ?? ''
 }
 
+/** An `html:lang(tag)` rule. Document-level only — no descendant content scope. */
+function htmlLangRuleBody(lang: string): string {
+  return ruleBody(new RegExp(`html:lang\\(${lang}\\)\\s*\\{([^}]*)\\}`))
+}
+
 /** A token is unusable unless it is present and carries the shared script aliases. */
 function expectCommon(label: string, value: string): void {
   expect(value, `no script fallback token for ${label}`).not.toBe('')
@@ -189,36 +217,62 @@ function scriptToken(block: string, mono = false): string {
 }
 
 /** Every file that DECLARES --font-body or --mono, found by walking the tree. */
-function declarationSites(): Array<{ file: string; line: number; text: string }> {
+async function declarationSites(): Promise<Array<{ file: string; line: number; text: string }>> {
   const out: Array<{ file: string; line: number; text: string }> = []
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir)) {
-      if (entry === 'node_modules' || entry.startsWith('.')) continue
-      const full = join(dir, entry)
-      if (statSync(full).isDirectory()) {
-        walk(full)
-        continue
-      }
-      if (!/\.(css|ts|tsx)$/.test(entry)) continue
+  const sourceFiles = async (dir: string): Promise<string[]> => {
+    const entries = await readdir(dir, { withFileTypes: true })
+    const nested = await Promise.all(entries.map(async (entry) => {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) return []
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) return sourceFiles(full)
+      return /\.(css|ts|tsx)$/.test(entry.name) ? [full] : []
+    }))
+    return nested.flat()
+  }
+
+  const files = await sourceFiles(SRC)
+  let next = 0
+  const scan = async () => {
+    while (next < files.length) {
+      const full = files[next++]
+      const entry = basename(full)
       // Tests never declare a font stack, and this file necessarily contains the
       // detection pattern as a literal — without the exclusion it matches itself.
       // The only false-negative this creates is a stack declared inside a test,
       // which would not reach the app.
       if (/\.test\.(ts|tsx)$/.test(entry)) continue
-      readFileSync(full, 'utf8')
+      const content = await readFile(full, 'utf8')
+      content
         .split('\n')
         .forEach((text, i) => {
-          // A declaration, not a read: `--font-body:` / `--mono:` with a value, and
-          // the FAMILY_MAP entries that are written into --font-body at runtime.
-          const declares = /--(?:font-body|mono)\s*:/.test(text)
+          // A declaration, not a read: `--font-body:` / `--mono:` / a role token
+          // with a value, and the FAMILY_MAP entries that are written into
+          // --font-body at runtime. The role tokens count because a pack's stack
+          // is built from them, so one declared without the aliases loses script
+          // coverage for every user of that pack.
+          // tailwind-theme.css re-exports the runtime token under Tailwind's
+          // `--font-*` theme namespace (`--font-body: var(--font-body)`) so the
+          // `font-body` utility compiles. That line reads the stack; it declares
+          // no families of its own, so it is not a site.
+          const themeAlias = /--font-body\s*:\s*var\(--font-body\)\s*;/.test(text)
+          const declares = !themeAlias
+            && /--(?:font-body|mono|theme-font-sans|theme-font-mono)\s*:/.test(text)
           const familyMap = /^\s*(?:sans|mono|system):\s*"/.test(text)
           if (declares || familyMap) out.push({ file: relative(SRC, full), line: i + 1, text })
         })
     }
   }
-  walk(SRC)
-  return out
+  // Files are independent. A bounded worker set avoids both the serial OneDrive
+  // walk that exceeded Vitest's test budget under full-suite load and an
+  // unbounded Promise.all that could exhaust file descriptors on a larger tree.
+  await Promise.all(Array.from({ length: Math.min(16, files.length) }, scan))
+  return out.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line)
 }
+
+// The three assertions inspect the same immutable source snapshot. Scan once so
+// later assertions cannot pay another full-tree I/O pass or observe a different
+// tree halfway through the file.
+const allDeclarationSites = declarationSites()
 
 describe('script fallback faces', () => {
   it.each(ALIASES)('defines %s with a unicode-range and local()-only sources', (family) => {
@@ -268,6 +322,20 @@ describe('script fallback faces', () => {
     }
   })
 
+  it('tries the dedicated JP face before the pan-CJK Droid Sans Fallback in KC Kana Fallback', () => {
+    // 'Droid Sans Fallback' is a broad pan-CJK face; 'Source Han Sans JP' is a
+    // dedicated Japanese face. A kana glyph should be drawn by the dedicated face
+    // when both are installed, so the dedicated name must come first in the stack.
+    for (const block of faceBlocks('KC Kana Fallback')) {
+      const droid = block.indexOf("local('Droid Sans Fallback')")
+      const han = block.indexOf("local('Source Han Sans JP")
+      expect(droid, "KC Kana Fallback must list 'Droid Sans Fallback'").toBeGreaterThan(-1)
+      expect(han, "KC Kana Fallback must list a 'Source Han Sans JP' face").toBeGreaterThan(-1)
+      expect(han, "'Source Han Sans JP' must precede 'Droid Sans Fallback' in KC Kana Fallback")
+        .toBeLessThan(droid)
+    }
+  })
+
   it('declares both tokens in :root so every consumer inherits them', () => {
     // If either moved into a [data-theme=…] block or was renamed, every --font-body
     // would become guaranteed-invalid at computed-value time and `font-family:
@@ -279,7 +347,7 @@ describe('script fallback faces', () => {
     expect(root).toMatch(/--script-fallbacks-mono:/)
   })
 
-  it('keeps the Simplified Chinese aliases as the default token', () => {
+  it('keeps regional Han aliases out of the untagged default token', () => {
     const rootBlock = ruleBody(/:root\s*\{([^}]*)\}/)
     expect(rootBlock, 'no :root block found in index.css').not.toBe('')
 
@@ -287,7 +355,9 @@ describe('script fallback faces', () => {
     const rootMono = scriptToken(rootBlock, true)
     expectCommon('root body', root)
     expectCommon('root mono', rootMono)
-    expectAliasPair('root', root, rootMono, ...SC_ALIASES)
+    // Untagged CJK (English UI, Japanese chat, mixed messages) must reach the
+    // browser/OS locale-aware cascade. A leading regional Han alias would force
+    // every shared ideograph through one region's glyph forms.
     for (const family of REGIONAL_ALIASES) {
       expect(root, `${family} leaked into the default body token`).not.toContain(family)
       expect(rootMono, `${family} leaked into the default mono token`).not.toContain(family)
@@ -295,7 +365,7 @@ describe('script fallback faces', () => {
   })
 
   it.each(REGIONAL)('swaps to isolated aliases for html:lang($lang)', ({ lang, body, mono }) => {
-    const block = ruleBody(new RegExp(`html:lang\\(${lang}\\)\\s*\\{([^}]*)\\}`))
+    const block = htmlLangRuleBody(lang)
     expect(block, `no html:lang(${lang}) block found in index.css`).not.toBe('')
 
     const bodyToken = scriptToken(block)
@@ -313,17 +383,172 @@ describe('script fallback faces', () => {
       expect(monoToken, `${family} leaked into the ${lang} mono token`).not.toContain(family)
     }
   })
+
+  it('scopes Simplified aliases to html:lang(zh-CN), not a bare :lang(zh)', () => {
+    // `:lang(zh)` also matches zh-TW / zh-HK / zh-Hant and would force
+    // Traditional content through Simplified faces — the same class of bug
+    // this change removes for Japanese. The dashboard's Chinese UI is zh-CN.
+    const bareZh = INDEX_CSS.match(/(?<![\w-]):lang\(zh\)(?=\s*[,{])/)
+    expect(bareZh, 'bare :lang(zh) matches Traditional Chinese tags').toBeNull()
+    expect(INDEX_CSS).toMatch(/html:lang\(zh-CN\)/)
+    expect(INDEX_CSS).not.toMatch(/:lang\(zh-Hans\)/)
+  })
+})
+
+/**
+ * CJK content fallback in the DEFAULT token (#13085). The default
+ * `--script-fallbacks` / `--script-fallbacks-mono` tokens (the ones that apply
+ * under a non-ja/ko UI, e.g. an English display language) named no face that
+ * draws kana or Hangul, so Japanese and Korean CONTENT fell to the browser's
+ * per-script OS fallback and rendered as tofu on the Linux Electron AppImage —
+ * everywhere, because every surface inherits these tokens.
+ *
+ * The fix adds kana-only and Hangul-only faces to those default tokens. Three
+ * properties are pinned here, none visible from reading the token alone:
+ *  1. The default token carries the kana and Hangul faces (sans), and the mono
+ *     token carries their mono variants. This is what reaches every surface.
+ *  2. Those faces DRAW kana (U+3042) and Hangul (U+AC00) but carry NO Han range,
+ *     so bare Han (U+4E00) is left to the OS/locale cascade — a Japanese/Korean
+ *     Han glyph form is never forced onto all content under an English UI, which
+ *     is the regression the :root/html:lang() split exists to prevent. (The
+ *     "out of Latin" and "real 400/700" guarantees are already covered for these
+ *     faces by the generic alias checks above.)
+ *  3. These are added to the DEFAULT token specifically, not to a per-container
+ *     selector — so session titles, the sidebar, file names and every other
+ *     non-message surface are covered too.
+ */
+describe('CJK content fallback in the default token (#13085)', () => {
+  const DEFAULT_FACES = [
+    { script: 'kana', body: 'KC Kana Fallback', mono: 'KC Kana Mono Fallback', draws: 0x3042, han: false },
+    { script: 'Hangul', body: 'KC Hangul Fallback', mono: 'KC Hangul Mono Fallback', draws: 0xac00, han: false },
+  ] as const
+
+  const rootBlock = ruleBody(/:root\s*\{([^}]*)\}/)
+  const rootSans = scriptToken(rootBlock)
+  const rootMono = scriptToken(rootBlock, true)
+
+  it('has a :root block with both tokens', () => {
+    expect(rootBlock, 'no :root block found in index.css').not.toBe('')
+    expect(rootSans, 'no --script-fallbacks in :root').not.toBe('')
+    expect(rootMono, 'no --script-fallbacks-mono in :root').not.toBe('')
+  })
+
+  it.each(DEFAULT_FACES)('puts $script coverage in the default sans and mono tokens', ({ body, mono }) => {
+    expect(rootSans, `${body} missing from the default --script-fallbacks token`).toContain(body)
+    expect(rootMono, `${mono} missing from the default --script-fallbacks-mono token`).toContain(mono)
+  })
+
+  it.each(DEFAULT_FACES)('draws $script but NOT bare Han, so Han stays locale-neutral', ({ body, mono, draws }) => {
+    for (const family of [body, mono]) {
+      expect(covers(family, draws), `'${family}' must cover ${draws.toString(16)}`).toBe(true)
+      // A Han range would force this region's ideograph forms onto all content.
+      expect(covers(family, 0x4e00), `'${family}' must NOT claim bare Han U+4E00`).toBe(false)
+    }
+  })
+
+  it('leads the mono token with the mono variants, falling through to the proportional faces', () => {
+    for (const { body, mono } of DEFAULT_FACES) {
+      expect(rootMono, `${mono} missing from the default mono token`).toContain(mono)
+      expect(rootMono, `${body} must follow ${mono} in the default mono token`).toContain(body)
+      expect(rootMono.indexOf(mono), `${mono} must lead ${body} in the default mono token`)
+        .toBeLessThan(rootMono.indexOf(body))
+    }
+  })
+
+  it('fixes CJK content without a per-container data-content-script hook', () => {
+    // The default-token fix reaches every surface by inheritance, so the earlier
+    // per-container detector and its selectors must be gone.
+    expect(INDEX_CSS, 'per-container data-content-script rules should be removed').not.toMatch(
+      /\.msg-content\[data-content-script/,
+    )
+  })
+})
+
+/**
+ * Cross-script coverage inside each html:lang() token (#13085). Each
+ * `html:lang(ja|ko|zh-CN)` rule REPLACES the default `--script-fallbacks`
+ * token with its own regional face, and a regional face draws only its own
+ * script's CJK: `KC Japanese Fallback` has no Hangul, `KC Korean Fallback` has
+ * no kana, and `KC Han Fallback` has neither. So without this, kana under a ko
+ * UI, Hangul under a ja or zh-CN UI, and both under a zh-CN UI fall to the OS
+ * cascade and render as tofu — the SAME #13085 bug, just in a different UI
+ * language.
+ *
+ * The fix appends the kana-only / Hangul-only aliases (the ones the regional
+ * face omits) AFTER the regional face in each token. They carry no Han range,
+ * so the leading regional face still wins every shared ideograph; they only add
+ * coverage for the script that was previously tofu. Pinned here per locale:
+ *  - the kana/Hangul alias the regional face lacks is present in both the sans
+ *    and mono tokens;
+ *  - it follows the regional face, never leads it, so Han glyph forms are never
+ *    overridden;
+ *  - the mono token still leads its mono variant before the proportional one.
+ */
+describe('cross-script CJK coverage in html:lang() tokens (#13085)', () => {
+  // Per locale: the regional face that must lead, and the alias(es) the regional
+  // face does NOT cover and so must follow it. `probe` is a code point only the
+  // appended alias can draw, proving the token actually reaches it.
+  const CASES = [
+    {
+      lang: 'zh-CN',
+      lead: 'KC Han Fallback',
+      leadMono: 'KC Han Mono Fallback',
+      appended: [
+        { sans: 'KC Kana Fallback', mono: 'KC Kana Mono Fallback', probe: 0x3042, script: 'kana' },
+        { sans: 'KC Hangul Fallback', mono: 'KC Hangul Mono Fallback', probe: 0xac00, script: 'Hangul' },
+      ],
+    },
+    {
+      lang: 'ja',
+      lead: 'KC Japanese Fallback',
+      leadMono: 'KC Japanese Mono Fallback',
+      appended: [
+        { sans: 'KC Hangul Fallback', mono: 'KC Hangul Mono Fallback', probe: 0xac00, script: 'Hangul' },
+      ],
+    },
+    {
+      lang: 'ko',
+      lead: 'KC Korean Fallback',
+      leadMono: 'KC Korean Mono Fallback',
+      appended: [
+        { sans: 'KC Kana Fallback', mono: 'KC Kana Mono Fallback', probe: 0x3042, script: 'kana' },
+      ],
+    },
+  ] as const
+
+  it.each(CASES)('$lang carries the kana/Hangul its regional face omits', ({ lang, lead, leadMono, appended }) => {
+    const block = htmlLangRuleBody(lang)
+    expect(block, `no html:lang(${lang}) block found in index.css`).not.toBe('')
+    const sans = scriptToken(block)
+    const mono = scriptToken(block, true)
+
+    for (const { sans: s, mono: m, probe, script } of appended) {
+      // Present in both tokens.
+      expect(sans, `${s} missing from the ${lang} sans token`).toContain(s)
+      expect(mono, `${m} missing from the ${lang} mono token`).toContain(m)
+      // Follows the regional face, never leads it: a cross-script alias must not
+      // sit in front of the UI language's own face.
+      expect(sans.indexOf(lead), `${s} must follow ${lead} in the ${lang} sans token`)
+        .toBeLessThan(sans.indexOf(s))
+      expect(mono.indexOf(leadMono), `${m} must follow ${leadMono} in the ${lang} mono token`)
+        .toBeLessThan(mono.indexOf(m))
+      // The appended alias actually draws the previously-tofu script, and still
+      // carries no Han range, so the regional face keeps every shared ideograph.
+      expect(covers(s, probe), `'${s}' must cover ${script} U+${probe.toString(16)}`).toBe(true)
+      expect(covers(s, 0x4e00), `'${s}' must NOT claim bare Han U+4E00`).toBe(false)
+    }
+  })
 })
 
 describe('font stack declarations', () => {
-  it('finds every declaration site the tree actually contains', () => {
+  it('finds every declaration site the tree actually contains', async () => {
     // Guards the walker itself: if this drops to a handful, the glob broke and the
     // next assertion would pass vacuously.
-    expect(declarationSites().length).toBeGreaterThanOrEqual(12)
+    expect((await allDeclarationSites).length).toBeGreaterThanOrEqual(12)
   })
 
-  it('references the alias token at every declaration site', () => {
-    const offenders = declarationSites()
+  it('references the alias token at every declaration site', async () => {
+    const offenders = (await allDeclarationSites)
       .filter((s) => !/var\(--script-fallbacks(-mono)?\)/.test(s.text))
       .map((s) => `${s.file}:${s.line}: ${s.text.trim().slice(0, 96)}`)
     expect(
@@ -332,9 +557,9 @@ describe('font stack declarations', () => {
     ).toEqual([])
   })
 
-  it('puts the aliases ahead of every Latin base family', () => {
+  it('puts the aliases ahead of every Latin base family', async () => {
     const offenders: string[] = []
-    for (const site of declarationSites()) {
+    for (const site of await allDeclarationSites) {
       const aliasAt = site.text.search(/var\(--script-fallbacks(-mono)?\)/)
       if (aliasAt < 0) continue
       for (const base of BASE_FAMILIES) {
@@ -345,5 +570,51 @@ describe('font stack declarations', () => {
       }
     }
     expect(offenders, offenders.join('\n')).toEqual([])
+  })
+})
+
+/**
+ * The straight-quote alias is the deliberate inverse of every alias above: those
+ * exist to add script coverage WITHOUT touching Latin, while this one exists to
+ * REPLACE the Latin body face for exactly two code points. Space Grotesk (the
+ * default body face) draws U+0022 and U+0027 as its closing curly glyph, so a
+ * straight quote in UI copy — or one a user types — renders as ” / ’ on the wrong
+ * side of the word (#6374). The alias leads the sans stack with a local()
+ * straight-quote face and a unicode-range of just those two code points.
+ *
+ * Two properties keep it safe, and both are pinned here because neither is visible
+ * from reading a family list: it may claim ONLY U+0022 and U+0027 (widening it back
+ * into Latin is the regression FORBIDDEN guards for the other aliases), and it must
+ * stay OUT of the mono tokens (JetBrains Mono already draws straight quotes, so the
+ * override is neither needed nor wanted there).
+ */
+describe('KC Straight Quotes (#6374) — the one deliberate Latin-claiming alias', () => {
+  const FAMILY = 'KC Straight Quotes'
+
+  it('exists, is local()-only, and claims EXACTLY U+0022 and U+0027', () => {
+    const block = faceBlock(FAMILY)
+    expect(block, `no @font-face for '${FAMILY}' in index.css`).not.toBe('')
+    expect(block).toMatch(/src:[^;]*local\(/)
+    expect(block, `'${FAMILY}' must not fetch a remote font`).not.toMatch(/url\(/)
+    const ranges = parseUnicodeRange(block).map((r) => [r.lo, r.hi]).sort((a, b) => a[0] - b[0])
+    // The whole safety of a Latin-claiming leading alias is that it claims these
+    // two code points and no others. Any wider range is a silent Latin takeover.
+    expect(ranges).toEqual([[0x22, 0x22], [0x27, 0x27]])
+  })
+
+  it('leads every sans --script-fallbacks and appears in none of the mono ones', () => {
+    const sansSites: Array<[string, string]> = [
+      ['root', ruleBody(/:root\s*\{([^}]*)\}/)],
+      ...REGIONAL.map(({ lang }) => [lang, htmlLangRuleBody(lang)] as [string, string]),
+    ]
+    for (const [label, block] of sansSites) {
+      const sans = scriptToken(block)
+      const mono = scriptToken(block, true)
+      expect(sans, `'${FAMILY}' missing from the ${label} sans token`).toContain(FAMILY)
+      // Leading is what makes it win for U+0022/U+0027 over the body face without a
+      // unicode-range collision changing anything else (see the aliases' rationale).
+      expect(sans.trimStart().startsWith(`'${FAMILY}'`), `'${FAMILY}' must lead the ${label} sans token`).toBe(true)
+      expect(mono, `'${FAMILY}' must not appear in the ${label} mono token`).not.toContain(FAMILY)
+    }
   })
 })

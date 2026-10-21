@@ -36,7 +36,7 @@ def store(tmp_path, monkeypatch):
         d.mkdir(parents=True, exist_ok=True)
         shard = d / "shard.jsonl"
         shard.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days: [shard])
+        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days, until=None: [shard])
         # The 30s memo would otherwise serve a previous test's answer.
         monkeypatch.setattr(usage_mod, "_COST_CACHE", None)
         monkeypatch.setattr(usage_mod, "_COST_CACHE_KEY", None)
@@ -160,6 +160,15 @@ class TestConversations:
         assert c["growth_pct_per_turn"] == 10.0
         assert c["turns_to_compaction"] == 3
 
+    def test_growth_counts_a_partial_final_turn_to_reach_compaction(self, store):
+        # 35% -> 85% over 6 turns = +10%/turn. The 5 remaining points still
+        # require one more completed turn; truncating 5 / 10 would report zero.
+        store([_row(slot="chat-1-1", credits=1.0, used=350_000 + 100_000 * i,
+                    age_days=1 - i * 0.1) for i in range(6)])
+        c = usage_mod.cost_breakdown(7)["conversations"][0]
+        assert c["growth_pct_per_turn"] == 10.0
+        assert c["turns_to_compaction"] == 1
+
     def test_the_slope_is_fitted_after_the_last_compaction_not_across_it(self, store):
         # Occupancy is a sawtooth, not a ramp. Six turns climbing 10%->60%, a
         # compaction back to 10%, then six more climbing 10%->60% at the same
@@ -201,9 +210,9 @@ class TestConversations:
         assert c["growth_pct_per_turn"] is not None
 
     def test_every_session_is_reported_not_a_ranked_slice(self, store):
-        # This used to be a top-8 cut, which hid most of a user's sessions behind
-        # a count they could not reach. The list is now the whole population; the
-        # remaining cap is a payload backstop far above any real account.
+        # Every session is reported, not a ranked slice that hides sessions behind
+        # a count the user cannot reach. The cap is a payload backstop far above
+        # any real account.
         store([_row(slot=f"chat-{i}-1", credits=float(i)) for i in range(1, 15)])
         d = usage_mod.cost_breakdown(7)
         assert d["conversation_count"] == 14
@@ -334,11 +343,13 @@ class TestNonFiniteCredits:
 
     def test_a_clean_record_is_written_quietly(self, tmp_path, monkeypatch, caplog):
         # The warning has to mean something when it appears, so the ordinary
-        # path must not emit one.
+        # path must not emit one. Ordinary means attributed: a billed row with
+        # no model is its own failure and is reported by the write site.
         monkeypatch.setattr(usage_mod, "_token_usage_dir", lambda: tmp_path)
         with caplog.at_level(logging.WARNING, logger=usage_mod.__name__):
             usage_mod._write_token_record(
-                {"_type": "tokens", "credits": 12.5}, datetime.now(timezone.utc)
+                {"_type": "tokens", "model": "claude-opus-5", "credits": 12.5},
+                datetime.now(timezone.utc),
             )
         assert caplog.records == []
 
@@ -376,7 +387,7 @@ class TestDegenerateInputs:
             + json.dumps(_row(slot="chat-1-1", credits=2.0)) + "\n",
             encoding="utf-8",
         )
-        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days: [shard])
+        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days, until=None: [shard])
         monkeypatch.setattr(usage_mod, "_COST_CACHE", None)
         monkeypatch.setattr(usage_mod, "_COST_CACHE_KEY", None)
         assert usage_mod.cost_breakdown(7)["credits"] == 2.0

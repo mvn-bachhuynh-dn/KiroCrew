@@ -10,7 +10,7 @@
 // - user-facing copy comes from the failure `code`, not from the raw library
 //   `message`
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 
@@ -24,7 +24,7 @@ type UpdateState = Record<string, unknown>
  * Mount the panel and return a setter that publishes an update state.
  *
  * AboutPanel does NOT subscribe to the bridge itself: useUpdateSubscription is
- * mounted in App.tsx and writes every payload into the shared ['update-state']
+ * mounted in shell/appShell.tsx and writes every payload into the shared ['update-state']
  * React Query cache, which the panel reads with a disabled query. So the test
  * seeds that cache directly -- pushing through a locally-captured onState
  * callback would never reach the component.
@@ -75,6 +75,30 @@ describe('AboutPanel download states', () => {
     cleanup()
     vi.unstubAllGlobals()
     delete (window as unknown as { updateAPI?: unknown }).updateAPI
+  })
+
+  it('takes the lane pair from the live push over the mount-time getInfo answer', async () => {
+    // `info` is a one-shot getInfo() read from mount; every later check pushes its
+    // own answer on the lifecycle payload. A check that runs while this panel is
+    // open therefore has to win, or the chip keeps folding on a stale not-ahead
+    // and renames insider bytes to a stable release that does not exist.
+    const { setState } = mountWithStates({
+      version: '0.5.0-insider.2',
+      channel: 'stable',
+      stampedChannel: 'insider',
+      channelSwitchable: true,
+      // The mount-time answer: stable publishes exactly these bytes.
+      laneVersion: '0.5.0-insider.2',
+      runningAheadOfLane: false,
+    })
+    // With only that, the chip folds -- the promoted-stable case.
+    const chip = await screen.findByTestId('about-version')
+    await waitFor(() => expect(chip.textContent).toContain('0.5.0'))
+    expect(chip.textContent).not.toContain('insider')
+
+    // A later check finds stable at an OLDER release: these bytes are ahead of it.
+    setState({ state: 'not-available', laneVersion: '0.4.1-insider.1', runningAheadOfLane: true })
+    await waitFor(() => expect(chip.textContent).toContain('0.5.0-insider.2'))
   })
 
   it('renders a determinate progress bar when percent is present', async () => {
@@ -160,21 +184,33 @@ describe('AboutPanel download states', () => {
   it('keeps the install button terminal after dispatch (no re-arm before the quit)', async () => {
     // `update:install` resolves as soon as the install is DISPATCHED; on macOS the
     // platform installer then works for several more seconds before the app quits.
-    // The button must NOT become clickable again in that window -- a clickable
-    // "Restart & Update" followed by an unexplained quit reads as a crash.
+    // The button must NOT become clickable again in that window -- an
+    // install-and-restart action followed by an unexplained quit reads as a crash.
     const { setState } = mountWithStates()
     setState({ state: 'downloaded', version: '0.1.3' })
 
-    const btn = await screen.findByRole('button', { name: /restart & update/i })
+    const btn = await screen.findByRole('button', { name: /install update & restart app/i })
     expect(btn.hasAttribute('disabled')).toBe(false)
     fireEvent.click(btn)
 
     const restarting = await screen.findByRole('button', { name: /restarting/i })
     // The card's last words before the gateway goes down must explain the
-    // coming silence -- the dashboard disconnects for the whole handoff.
-    expect((await screen.findByTestId('update-card')).textContent).toMatch(/go quiet/i)
+    // potentially long handoff and the automatic return.
+    const cardText = (await screen.findByTestId('update-card')).textContent
+    expect(cardText).toMatch(/several minutes/i)
+    expect(cardText).toMatch(/reopen automatically/i)
+    expect(cardText).not.toMatch(/installation progress/i)
     expect(restarting.hasAttribute('disabled')).toBe(true)
-    expect(screen.queryByRole('button', { name: /restart & update/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /install update & restart app/i })).toBeNull()
+  })
+
+  it('warns before dispatch when Windows will take over in a separate installer window', async () => {
+    const { setState } = mountWithStates()
+    setState({ state: 'downloaded', version: '0.1.3', installHandoff: 'windows-installer' })
+
+    const cardText = (await screen.findByTestId('update-card')).textContent
+    expect(cardText).toMatch(/Windows installation window/i)
+    expect(cardText).toMatch(/progress/i)
   })
 
   // When an update downloads but never applies, the card just re-offers the
@@ -222,7 +258,8 @@ describe('AboutPanel download states', () => {
     expect(screen.queryByTestId('update-manual-fallback')).toBeNull()
   })
 
-  // auto-update.js emits phase:'install'; the panel must branch on it, or an
+  // The update lanes under electron/runtime/update/ (feed-lane.js,
+  // managed-lane.js) emit phase:'install'; the panel must branch on it, or an
   // install failure is labelled "couldn't check for updates", unmounts the card,
   // and hides the manual-reinstall link at the exact moment it exists for.
   it('keeps an INSTALL failure in the card, labelled honestly, with the escape hatch', async () => {
@@ -236,6 +273,34 @@ describe('AboutPanel download states', () => {
     // The card survives and still offers the manual route.
     expect(screen.getByTestId('update-card')).toBeTruthy()
     expect(screen.getByTestId('update-manual-fallback')).toBeTruthy()
+  })
+
+  it('names the stop command when an install was refused because the gateway kept running', async () => {
+    const { setState } = mountWithStates()
+    setState({
+      state: 'error',
+      phase: 'install',
+      code: 'gateway-still-running',
+      stopCommand: 'kirocrew stop',
+      message: "a gateway from this app's bundle still holds port 5476",
+      version: '9.9.9',
+    })
+    const row = await screen.findByTestId('update-download-error')
+    expect(row.textContent).toMatch(/couldn.t install the update/i)
+    expect(row.textContent).toMatch(/still using the files this update replaces/i)
+    expect(row.textContent).toMatch(/your chats and settings are kept/i)
+    expect(row.textContent).toMatch(/the command below/i)
+    // The raw main-process message is a log line, not copy.
+    expect(row.textContent).not.toMatch(/still holds port/i)
+    expect(screen.getByTestId('update-gateway-stop-command').textContent).toBe('kirocrew stop')
+  })
+
+  it('keeps the install generic for a gateway-still-running refusal that carries no command', async () => {
+    const { setState } = mountWithStates()
+    setState({ state: 'error', phase: 'install', code: 'gateway-still-running', version: '9.9.9' })
+    const row = await screen.findByTestId('update-download-error')
+    expect(row.textContent).toMatch(/something went wrong while installing/i)
+    expect(screen.queryByTestId('update-gateway-stop-command')).toBeNull()
   })
 
   it('renders the fallback sentence from ONE template so clause order is translatable', async () => {

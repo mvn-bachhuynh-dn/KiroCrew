@@ -48,7 +48,9 @@
 //   fetchFn(url, { method, headers, body })   -> a Response-like { ok, status,
 //                                                 async json(), async text() }
 //   getGatewayUrl()   -> base URL of the loopback gateway (e.g. http://127.0.0.1:PORT)
-//   getSecret()       -> the X-Internal-Secret value (NEVER read a file here)
+//   getSecret(url)    -> the X-Internal-Secret value for the gateway at `url`,
+//                        the same base URL this request dials (NEVER read a
+//                        file here)
 //   listPanelIds()    -> session keys that currently have a native panel
 //   dispatch(sessionKey, op, args) -> Promise of the op's result (or rejects)
 //   onError(err, context)          -> log sink; must never throw meaningfully
@@ -59,7 +61,14 @@
 const DRAIN_PATH = "/api/browser/command-drain";
 const RESULT_PATH = "/api/browser/command-result";
 
-const DEFAULT_WAIT_MS = 25000;
+// Drain long-poll wait (ms). Deliberately SHORT: the loop must re-read
+// listPanelIds this often to pick up a newly declared chat slot and register it
+// on the gateway bus. A long hold would strand a fresh session's first navigate
+// until it ended; aborting the hold instead would race an in-flight command the
+// bus already popped (dropping it), so a bounded re-poll is the race-free way to
+// stay responsive. Must stay below the bus's submit-side panel wait
+// (command_bus.py DEFAULT_PANEL_WAIT_MS) so registration lands inside it.
+const DEFAULT_WAIT_MS = 1500;
 const DEFAULT_BACKOFF_MS = 1000;
 // How long to idle when no panel exists. Kept short so a freshly-opened panel
 // starts being served promptly, but non-zero so we never busy-spin.
@@ -88,6 +97,12 @@ function createAgentCommandChannel(deps) {
     waitMs = DEFAULT_WAIT_MS,
     backoffMs = DEFAULT_BACKOFF_MS,
     idleMs = DEFAULT_IDLE_MS,
+    // Whether the gateway being polled is on THIS machine. The idle heartbeat
+    // fires only when true, so a window connected to a REMOTE gateway never
+    // pushes the local secret through the tunnel (which the remote would 403 —
+    // the same reason listPanelIds returns [] there). Defaults to false so a
+    // caller that does not wire it up gets the safe no-heartbeat behaviour.
+    isGatewayLocal = () => false,
   } = deps || {};
 
   if (typeof fetchFn !== "function") throw new Error("createAgentCommandChannel: fetchFn is required");
@@ -102,6 +117,9 @@ function createAgentCommandChannel(deps) {
   let wakeSleep = null;
   // Tracks the loop promise so callers/tests can be sure it has unwound.
   let loopDone = null;
+  // Set by poke() when the tracked-slot set changed while the loop was idling;
+  // tells the idle branch to re-read listPanelIds at once instead of sleeping.
+  let poked = false;
 
   const report = (err, context) => {
     try {
@@ -141,9 +159,12 @@ function createAgentCommandChannel(deps) {
     });
   }
 
-  function headers() {
+  // The secret is chosen for the URL the request dials, read once per request,
+  // so a backend URL that changes between the two reads cannot pair one
+  // gateway's secret with another's address.
+  function headers(gatewayUrl) {
     const h = { "Content-Type": "application/json" };
-    const secret = getSecret();
+    const secret = getSecret(gatewayUrl);
     if (secret) h["X-Internal-Secret"] = secret;
     return h;
   }
@@ -159,9 +180,10 @@ function createAgentCommandChannel(deps) {
   async function drainOnce(sessionKeys) {
     let res;
     try {
-      res = await fetchFn(joinUrl(getGatewayUrl(), DRAIN_PATH), {
+      const gatewayUrl = getGatewayUrl();
+      res = await fetchFn(joinUrl(gatewayUrl, DRAIN_PATH), {
         method: "POST",
-        headers: headers(),
+        headers: headers(gatewayUrl),
         body: JSON.stringify({ session_keys: sessionKeys, wait_ms: waitMs }),
       });
     } catch (err) {
@@ -193,14 +215,34 @@ function createAgentCommandChannel(deps) {
     return body;
   }
 
+  /** Host-presence heartbeat: a zero-wait drain with no session keys. It queues
+   *  nothing and returns 204 at once, but tells the gateway's command bus that a
+   *  local Electron host is polling, so a ``navigate`` racing a fresh slot's
+   *  registration is held briefly instead of falling back to Playwright. Fired
+   *  only while idle (no panels to drive) and only against a local gateway.
+   *  Best-effort: a failure here is reported but never breaks the loop. */
+  async function heartbeat() {
+    try {
+      const gatewayUrl = getGatewayUrl();
+      await fetchFn(joinUrl(gatewayUrl, DRAIN_PATH), {
+        method: "POST",
+        headers: headers(gatewayUrl),
+        body: JSON.stringify({ session_keys: [], wait_ms: 0 }),
+      });
+    } catch (err) {
+      report(err, { phase: "heartbeat" });
+    }
+  }
+
   /** POST the outcome of one command back to the gateway. Best-effort: a failure
    *  here is reported but never propagates into the loop. */
   async function postResult(payload) {
     let res;
     try {
-      res = await fetchFn(joinUrl(getGatewayUrl(), RESULT_PATH), {
+      const gatewayUrl = getGatewayUrl();
+      res = await fetchFn(joinUrl(gatewayUrl, RESULT_PATH), {
         method: "POST",
-        headers: headers(),
+        headers: headers(gatewayUrl),
         body: JSON.stringify(payload),
       });
     } catch (err) {
@@ -227,6 +269,11 @@ function createAgentCommandChannel(deps) {
 
   async function loop() {
     while (running) {
+      // Fresh each iteration; poke() sets it while this iteration is awaiting
+      // (a drain long-poll or an idle wait) to mean "the tracked-slot set
+      // changed — re-read listPanelIds now instead of backing off".
+      poked = false;
+
       let sessionKeys;
       try {
         sessionKeys = listPanelIds();
@@ -235,10 +282,17 @@ function createAgentCommandChannel(deps) {
         sessionKeys = null;
       }
 
-      // Nothing to drive — idle briefly instead of holding a long-poll open or
-      // busy-spinning.
+      // Nothing to drive — idle instead of holding a long-poll open or
+      // busy-spinning. On a LOCAL gateway, first send a host-presence heartbeat
+      // so a navigate racing a fresh slot's registration is held briefly rather
+      // than dropped to the Playwright mirror. A poke() interrupts the idle wait.
       if (!Array.isArray(sessionKeys) || sessionKeys.length === 0) {
-        await sleep(idleMs);
+        if (isGatewayLocal()) await heartbeat();
+        // A poke() during the heartbeat (no idle sleep was active for it to
+        // wake) still means the tracked set changed — re-read at once instead
+        // of sleeping out the interval.
+        if (poked) continue;
+        if (running) await sleep(idleMs);
         continue;
       }
 
@@ -281,6 +335,16 @@ function createAgentCommandChannel(deps) {
         report(err, { phase: "loop-crash" });
         running = false;
       });
+    },
+
+    /** Nudge the loop to re-read listPanelIds NOW. Called when the tracked-slot
+     *  set changes (a chat slot was declared / withdrawn). It wakes an in-flight
+     *  idle/backoff wait so the loop re-reads at once; a drain long-poll is left
+     *  to finish on its own (it is short — see DEFAULT_WAIT_MS — and aborting it
+     *  could drop a command the bus already popped). Safe to call when stopped. */
+    poke() {
+      poked = true;
+      if (wakeSleep) wakeSleep();
     },
 
     /** Stop the loop cleanly, interrupting any in-flight idle/backoff sleep.

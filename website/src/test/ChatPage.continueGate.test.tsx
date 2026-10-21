@@ -6,7 +6,7 @@
  * Why this is pinned at the ChatPage layer: `ChatInput` is prop-driven and
  * cannot tell the two situations apart, and `selectContinuable` /
  * `selectTurnInterrupted` are deliberately independent (availability vs copy).
- * The composition of the two happens exactly once, where ChatPage passes
+ * The composition of the two happens exactly once, where ComposerDockView passes
  * `continuable={continuable && interrupted}` — so unit tests of either half
  * pass whether or not the gate exists. Without this file the gate can be
  * dropped in a refactor and every other test stays green.
@@ -19,7 +19,7 @@
  * common state, so the old gate showed it almost always.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, act, waitFor } from '@testing-library/react'
+import { render, screen, act, waitFor, fireEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
@@ -57,6 +57,7 @@ vi.mock('../api/client', () => ({
     workspaces: vi.fn().mockResolvedValue({ workspaces: [] }),
     slackChannels: vi.fn().mockResolvedValue([]),
     spawnList: vi.fn().mockResolvedValue({ agents: [] }),
+    continueSlot: vi.fn().mockResolvedValue({ ok: true }),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -127,6 +128,22 @@ beforeEach(() => {
 })
 
 describe('ChatPage — Continue appears only on an interrupted turn', { timeout: 15_000 }, () => {
+  it('allows legacy retry after an old setup refusal without offering mandatory initialization', async () => {
+    await renderWith([
+      { role: 'user', content: 'remember this', cls: '' },
+      { role: 'error', content: 'memory_unavailable: Open Workspace · Memory and choose Create private memory.', cls: '', meta: {
+        code: 'memory_unavailable', recovery: { kind: 'initialize_member_memory', member: 'reviewer' },
+      } },
+    ])
+
+    expect(screen.getByTestId('composer-continue')).toBeVisible()
+    expect(screen.getByTestId('error-card-continue')).toBeVisible()
+    expect(screen.queryByRole('link', { name: 'Set up private memory' })).toBeNull()
+    expect(screen.getByTestId('error-card')).not.toHaveTextContent('memory_unavailable:')
+    fireEvent.change(screen.getByLabelText('Message input'), { target: { value: 'try after setup' } })
+    expect(screen.getByLabelText('Send')).not.toBeDisabled()
+  })
+
   it('shows the ordinary Send button after a clean completion, not Continue', async () => {
     // The assistant answered and handed the floor back: the common resting
     // state of every chat the user returns to.
@@ -221,5 +238,28 @@ describe('ChatPage — Continue appears only on an interrupted turn', { timeout:
     ])
 
     expect(screen.getByTestId('composer-continue')).toBeTruthy()
+  })
+})
+
+/**
+ * A successful Continue says nothing.
+ *
+ * The refusal path lives in `ChatPage.refusedPress.test.tsx` alongside the other
+ * two presses that share that surface — one file owns the invariant "a refused
+ * press becomes pixels". What belongs HERE is its complement: pressing Continue
+ * on a slot the server accepts must not leave a notice behind, so the surface
+ * cannot drift into firing on the happy path.
+ */
+describe('ChatPage — an accepted Continue is silent', { timeout: 15_000 }, () => {
+  it('says nothing when the continue succeeds', async () => {
+    const { api } = await import('../api/client')
+    const continueSlot = api.continueSlot as unknown as ReturnType<typeof vi.fn>
+    continueSlot.mockResolvedValueOnce({ ok: true })
+
+    await renderWith([{ role: 'user', content: 'do the thing', cls: '' }])
+
+    await act(async () => { fireEvent.click(screen.getByTestId('composer-continue')) })
+
+    expect(screen.queryByTestId('refused-press-error')).toBeNull()
   })
 })

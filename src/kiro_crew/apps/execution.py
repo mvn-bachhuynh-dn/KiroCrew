@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from kiro_crew.sel import sel
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 _BUILTINS_DIR = (Path(__file__).resolve().parent / "builtins").resolve()
 _ALLOW_ALL_SETTING_PATH = "agent.apps_allow_third_party"
 _TRUST_SETTING_PATH = "agent.apps_trusted"
+_TRUST_REPOSITORIES_SETTING_PATH = "agent.apps_trusted_repositories"
 
 # App names admissible as a per-app trust grant. Deliberately the same shape the
 # dashboard's app routes accept, so a grant can only ever name a real app: no
@@ -46,10 +48,7 @@ def _builtin_manifest_sources() -> tuple[Path, ...]:
     try:
         from kiro_crew.platform import current_context
 
-        sources.extend(
-            Path(source)
-            for source in current_context().apps_loader.manifest_sources()
-        )
+        sources.extend(Path(source) for source in current_context().apps_loader.manifest_sources())
     except Exception:  # noqa: BLE001 - unavailable composition must not admit code
         logger.debug("edition builtin manifest sources unavailable", exc_info=True)
 
@@ -74,6 +73,28 @@ def shipped_builtin_app_root(app_name: str) -> Path | None:
     deliberately ignored, and a directory without a valid shipped manifest is
     not a builtin even when its name resembles one.
     """
+    for root, name in _shipped_builtin_apps():
+        if name == app_name:
+            return root
+    return None
+
+
+def shipped_builtin_app_name_at(path: Path) -> str | None:
+    """Return the manifest name of the shipped builtin whose root holds *path*.
+
+    *path* must already be resolved. A package directory need not match its
+    manifest name (``auto_improvement`` ships ``auto-improvement``), so a
+    caller holding a path inside a package asks here instead of reading the
+    directory name.
+    """
+    for root, name in _shipped_builtin_apps():
+        if path == root or root in path.parents:
+            return name
+    return None
+
+
+def _shipped_builtin_apps() -> Iterator[tuple[Path, str]]:
+    """Yield ``(resolved root, manifest name)`` for every shipped builtin."""
     for source in _builtin_manifest_sources():
         try:
             entries = sorted(source.iterdir())
@@ -91,9 +112,8 @@ def shipped_builtin_app_root(app_name: str) -> Path | None:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 continue
-            if isinstance(manifest, dict) and manifest.get("name") == app_name:
-                return root
-    return None
+            if isinstance(manifest, dict) and isinstance(manifest.get("name"), str):
+                yield root, manifest["name"]
 
 
 def builtin_app_names() -> frozenset[str]:
@@ -169,17 +189,29 @@ def builtin_app_mcp_servers() -> frozenset[str]:
     builtin-owned installs exactly like :func:`builtin_app_names`, so a shadowing
     user app cannot contribute declared servers.
 
+    The keys of :func:`_builtin_app_mcp_server_configs`, the one enumeration
+    :func:`builtin_app_host_cli_mcp_launches` also reads, so the two can never
+    disagree on which servers are shipped. Filesystem I/O; callers warm it ONCE
+    off the event loop. A source or manifest that fails to read is skipped
+    (fail-closed), never widening the trusted set.
+    """
+    return frozenset(_builtin_app_mcp_server_configs())
+
+
+def _builtin_app_mcp_server_configs() -> dict[str, tuple[str, object]]:
+    """Map ``"<app>:<server>"`` to ``(app_name, cfg)`` for shipped builtin servers.
+
     Enumerates its own manifest loop (mirroring :func:`builtin_app_names`) rather
     than sharing state with it, to keep that security-sensitive function
-    untouched. Filesystem I/O; callers warm it ONCE off the event loop. A source
-    or manifest that fails to read is skipped (fail-closed), never widening the
-    trusted set.
+    untouched. Every key is a server a shipped, builtin-owned manifest declares,
+    and ``cfg`` is its raw ``mcpServers`` value, unvalidated, so each caller
+    applies its own narrowing on top.
     """
     # Deferred import: manager imports this module at load time (see
     # builtin_app_names), so the reverse edge resolves lazily.
     from kiro_crew.apps.manager import builtin_owns_installed
 
-    servers: set[str] = set()
+    servers: dict[str, tuple[str, object]] = {}
     owned: dict[str, bool] = {}
     for source in _builtin_manifest_sources():
         try:
@@ -207,10 +239,43 @@ def builtin_app_mcp_servers() -> frozenset[str]:
                 owned[name] = builtin_owns_installed(name)
             if not owned[name]:
                 continue
-            for server_name in mcp_servers:
+            for server_name, cfg in mcp_servers.items():
                 if isinstance(server_name, str) and server_name:
-                    servers.add(f"{name}:{server_name}")
-    return frozenset(servers)
+                    servers[f"{name}:{server_name}"] = (name, cfg)
+    return servers
+
+
+def builtin_app_host_cli_mcp_launches() -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Builtin app MCP servers that run the gateway's OWN code, with their shipped args.
+
+    Maps ``"<app>:<server>"`` to ``(app_name, args)`` for every server a shipped,
+    builtin-owned manifest declares as ``command: "kirocrew"`` (the host CLI) with
+    a list of string ``args`` and no ``url``. Those are the app servers
+    ``bridges._pin_host_cli_command`` pins to this gateway's interpreter, so they
+    are Kiro Crew's own process exactly as the managed ``kirocrew-*`` servers are,
+    and the only app servers a per-session identity element may be built for.
+
+    The launch comes from the IMMUTABLE manifest, never from the mutable global
+    MCP config or an agent spec, so a hand-edited ``mochi:mochi`` entry naming a
+    different program cannot obtain the element (and with it the session token).
+    An app shipping its own binary is not the gateway's code and is left out.
+
+    Filters :func:`_builtin_app_mcp_server_configs`, the same enumeration
+    :func:`builtin_app_mcp_servers` takes its keys from, so every launch is by
+    construction a server that function trusts. Same sources, same
+    builtin-owned narrowing, same fail-closed skips.
+    """
+    launches: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for key, (name, cfg) in _builtin_app_mcp_server_configs().items():
+        if not isinstance(cfg, dict):
+            continue
+        if cfg.get("command") != "kirocrew" or "url" in cfg:
+            continue
+        args = cfg.get("args") or []
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            continue
+        launches[key] = (name, tuple(args))
+    return launches
 
 
 def builtin_app_agents() -> dict[str, str]:
@@ -284,7 +349,7 @@ def builtin_app_agents() -> dict[str, str]:
                     if not agent_path.is_file() or not agent_path.is_relative_to(root):
                         continue
                     agent_doc = json.loads(agent_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                except (OSError, UnicodeError, ValueError):
                     continue
                 if not isinstance(agent_doc, dict):
                     continue
@@ -325,9 +390,7 @@ def shipped_builtin_module_path(app_name: str, module_name: str) -> Path | None:
     return None
 
 
-def is_builtin_app(
-    *, app_root: Path | None = None, app_name: str | None = None
-) -> bool:
+def is_builtin_app(*, app_root: Path | None = None, app_name: str | None = None) -> bool:
     """Return whether immutable package provenance covers the executed path.
 
     Path-only callers must point inside one of the composed shipped-manifest
@@ -342,10 +405,7 @@ def is_builtin_app(
     except (OSError, ValueError):
         return False
     if app_name is None:
-        return any(
-            resolved.is_relative_to(source)
-            for source in _builtin_manifest_sources()
-        )
+        return any(resolved.is_relative_to(source) for source in _builtin_manifest_sources())
     shipped_root = shipped_builtin_app_root(app_name)
     return shipped_root is not None and resolved.is_relative_to(shipped_root)
 
@@ -417,10 +477,243 @@ def trusted_app_names() -> frozenset[str]:
         )
         raw = raw[:_MAX_GRANT_ENTRIES]
     return frozenset(
-        entry
-        for entry in raw
-        if isinstance(entry, str) and APP_NAME_RE.fullmatch(entry)
+        entry for entry in raw if isinstance(entry, str) and APP_NAME_RE.fullmatch(entry)
     )
+
+
+def trusted_app_repository(app_name: str) -> str:
+    """Repository recorded when *app_name* received its execution grant.
+
+    An empty result means there is no active repository-bound grant. A legacy
+    name grant written before repository binding existed therefore returns
+    empty; :func:`repository_bound_grant_denied` decides whether that grant can
+    still cover confirmed-local code or needs one-time repository re-consent.
+    A repository record without a matching effective entry in
+    ``agent.apps_trusted`` is inert, so stale metadata can never block an
+    unrelated install after its grant was removed.
+    """
+    try:
+        # Deferred for the same reason as third_party_execution_allowed().
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        agent = KiroCrewConfig.load().agent
+        raw_names = getattr(agent, "apps_trusted", [])
+        raw_repositories = getattr(agent, "apps_trusted_repositories", {})
+    except Exception as exc:  # noqa: BLE001 - unreadable policy has no usable binding
+        logger.error(
+            "%s: config load failed (%s); ignoring repository bindings",
+            _TRUST_REPOSITORIES_SETTING_PATH,
+            exc,
+        )
+        return ""
+    if not isinstance(raw_names, list) or app_name not in raw_names:
+        return ""
+    if not APP_NAME_RE.fullmatch(app_name) or not isinstance(raw_repositories, dict):
+        return ""
+    repository = raw_repositories.get(app_name)
+    return repository.strip() if isinstance(repository, str) else ""
+
+
+def trusted_local_app_names() -> frozenset[str]:
+    """Explicit local-source grant markers that also hold an active name grant."""
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        agent = KiroCrewConfig.load().agent
+        raw_names = getattr(agent, "apps_trusted", [])
+        raw_local = getattr(agent, "apps_trusted_local", [])
+    except Exception as exc:  # noqa: BLE001 - unreadable policy must fail closed
+        logger.error(
+            "agent.apps_trusted_local: config load failed (%s); ignoring local grants",
+            exc,
+        )
+        return frozenset()
+    if not isinstance(raw_names, list) or not isinstance(raw_local, list):
+        return frozenset()
+    active = {
+        name
+        for name in raw_names[:_MAX_GRANT_ENTRIES]
+        if isinstance(name, str) and APP_NAME_RE.fullmatch(name)
+    }
+    return frozenset(
+        name
+        for name in raw_local[:_MAX_GRANT_ENTRIES]
+        if isinstance(name, str) and APP_NAME_RE.fullmatch(name) and name in active
+    )
+
+
+def _repository_grant_denied_for_binding(
+    app_name: str,
+    *,
+    binding: str,
+    local_binding: bool = False,
+    repository: str | None = None,
+) -> str | None:
+    """Compare one already-active grant without re-reading trust config.
+
+    Kept separate so snapshot construction can classify every bounded grant from
+    one config read while sharing the exact runtime provenance decision.
+    """
+    if not binding:
+        # Any non-empty source coordinate is repository-backed. An explicit local
+        # marker covers an empty coordinate without consulting mutable installed
+        # metadata; that is what prevents an old name-only grant from authorising
+        # a fresh same-name local takeover.
+        if repository is not None and repository.strip():
+            repository_backed = True
+        elif repository is not None and local_binding:
+            return None
+        else:
+            repository_backed = True
+            try:
+                from kiro_crew.apps.manager import get_app
+                from kiro_crew.apps.registry import resolve_installed_trust_repository
+
+                installed = get_app(app_name)
+                if installed is not None:
+                    resolved, installed_repository = resolve_installed_trust_repository(
+                        installed, allow_registry_lookup=False
+                    )
+                    repository_backed = not resolved or bool(installed_repository)
+            except Exception:  # noqa: BLE001 - unknown provenance must fail closed
+                # This helper is also called while classifying config-derived
+                # grant names for the dashboard snapshot.  Config values are
+                # untrusted and may themselves be secrets, while exception
+                # messages can reflect repository coordinates.  Keep the
+                # diagnostic to a compile-time classification: neither value is
+                # needed to make the fail-closed decision below.
+                logger.warning("legacy app trust provenance could not be resolved")
+                repository_backed = True
+        if not repository_backed:
+            # Migration compatibility for an old grant over an app that remains
+            # installed with positively local provenance. It does not cover a
+            # fresh install after that occupant disappears.
+            return None
+        # No coordinates cross this boundary. Repository URLs may contain
+        # userinfo credentials and this reason is returned and audited broadly.
+        if local_binding:
+            return (
+                "local-source execution trust does not cover repository-backed "
+                "code; refresh the app listing, review its current repository, "
+                "and grant trust again"
+            )
+        return (
+            "execution trust predates repository binding and is inactive for "
+            "repository-backed code; refresh the app listing, review its current "
+            "repository, and grant trust again"
+        )
+
+    actual = repository
+    if actual is None:
+        try:
+            from kiro_crew.apps.manager import get_app
+            from kiro_crew.apps.registry import resolve_installed_trust_repository
+
+            installed = get_app(app_name)
+            if installed is None:
+                actual = ""
+            else:
+                resolved, actual = resolve_installed_trust_repository(
+                    installed, allow_registry_lookup=False
+                )
+                if not resolved:
+                    actual = ""
+        except Exception:  # noqa: BLE001 - provenance failure must deny execution
+            logger.warning("bound app trust provenance could not be resolved")
+            actual = ""
+
+    try:
+        # Deferred with the resolver above to avoid execution -> registry import
+        # recursion during module initialisation.
+        from kiro_crew.apps.registry import _same_git_target
+
+        matches = bool(actual) and _same_git_target(binding, actual)
+    except Exception:  # noqa: BLE001 - comparison failure must not widen trust
+        logger.warning("app trust repository comparison failed")
+        matches = False
+    if matches:
+        return None
+    # Do not echo either coordinate. Clone URLs may contain userinfo or other
+    # credentials, and this denial is returned through APIs and logged by every
+    # execution caller. The comparison above needs the exact values; the error
+    # surface only needs the decision and remediation.
+    return (
+        "execution trust does not match the current code source; revoke the grant "
+        "and review this source before granting it again"
+    )
+
+
+def repository_bound_grant_denied(app_name: str, *, repository: str | None = None) -> str | None:
+    """Return why *app_name*'s repository-bound grant does not cover this code.
+
+    ``repository`` is the clone target a source-changing caller is about to use.
+    Runtime callers omit it; the installed record is then resolved independently.
+    A grant without a repository entry is the historical name-only form.  It
+    remains sufficient only for code the caller positively identifies as local.
+    Repository-backed code (and runtime provenance that cannot be resolved) must
+    receive one fresh consent so the repository coordinate is recorded.
+
+    Imports are deferred because ``apps.registry`` imports this module.  Any
+    failure to resolve a bound grant denies: treating an unreadable provenance as
+    a legacy name-only grant would turn a metadata failure into code execution.
+    """
+    # Manager install/update/register call this helper even for untrusted apps;
+    # an inert/stale binding must not become an independent denial surface.
+    if app_name not in trusted_app_names():
+        return None
+    return _repository_grant_denied_for_binding(
+        app_name,
+        binding=trusted_app_repository(app_name),
+        local_binding=app_name in trusted_local_app_names(),
+        repository=repository,
+    )
+
+
+def _execution_admission(
+    app_name: str,
+    *,
+    app_root: Path | None = None,
+    repository: str | None = None,
+) -> tuple[str | None, str]:
+    """Decide execution admission for *app_name*, and nothing else.
+
+    Returns ``(denial_reason, provenance)``; a reason of ``None`` is an
+    admission. Writes no SEL audit row — that is the whole difference from
+    :func:`app_execution_denied`. It is not silent: the provenance helpers it
+    calls warn when a trust record cannot be read.
+
+    Split out so its two callers cannot drift apart.
+    :func:`app_execution_denied` is this plus the SEL admission row, and is what
+    every surface about to run code must use. :func:`third_party_ceiling_closed`
+    is this WITHOUT the row, for a poller that re-asks the same question about an
+    already-running backend every few seconds. Restating the decision in the
+    poller instead would let the two answers diverge, and on this boundary a
+    divergence means a backend still executing under a ceiling the operator
+    believes is closed — the exact failure the ceiling exists to prevent.
+    """
+    builtin = is_builtin_app(app_name=app_name, app_root=app_root)
+    name_granted = not builtin and app_name in trusted_app_names()
+    repository_denied = (
+        repository_bound_grant_denied(app_name, repository=repository) if name_granted else None
+    )
+    granted = name_granted and repository_denied is None
+    if builtin:
+        provenance = "provenance=shipped_builtin"
+    elif granted:
+        provenance = "provenance=trusted_grant"
+    elif name_granted:
+        provenance = "provenance=trusted_grant_repository_mismatch"
+    else:
+        provenance = "provenance=unverified"
+    if builtin or granted or third_party_execution_allowed():
+        return None, provenance
+
+    reason = repository_denied or (
+        "third-party app execution is disabled; trust this app alone in Settings "
+        f"({_TRUST_SETTING_PATH}), or set {_ALLOW_ALL_SETTING_PATH}=true to allow "
+        "every third-party app's Python, backend, and manifest shell code"
+    )
+    return reason, provenance
 
 
 def app_execution_denied(
@@ -429,6 +722,7 @@ def app_execution_denied(
     action: str,
     app_root: Path | None = None,
     caller: str = "gateway",
+    repository: str | None = None,
 ) -> str | None:
     """Return a denial reason when an app execution surface must not run.
 
@@ -436,43 +730,88 @@ def app_execution_denied(
     immutable builtin package registered for ``app_name``.  Every other target
     requires EITHER a per-app grant in ``agent.apps_trusted`` (the narrow form,
     admitting this app alone) OR ``agent.apps_allow_third_party`` set to the JSON
-    boolean ``true`` (the blanket form).  Allowed and denied decisions are
-    audited best-effort, but audit unavailability never changes the execution
-    decision.
+    boolean ``true`` (the blanket form). A repository-bound name grant must also
+    match either the caller-supplied source coordinate (before install/update) or
+    the independently resolved installed provenance (at runtime). Allowed and
+    denied decisions are audited best-effort, but audit unavailability never
+    changes the execution decision.
+
+    The decision itself lives in :func:`_execution_admission`; this is that
+    decision plus its audit row. Use THIS at every surface that is about to run
+    code, so the admission or the refusal is recorded.
     """
-    builtin = is_builtin_app(app_name=app_name, app_root=app_root)
-    granted = not builtin and app_name in trusted_app_names()
-    if builtin:
-        provenance = "provenance=shipped_builtin"
-    elif granted:
-        provenance = "provenance=trusted_grant"
-    else:
-        provenance = "provenance=unverified"
-    if builtin or granted or third_party_execution_allowed():
+    reason, provenance = _execution_admission(app_name, app_root=app_root, repository=repository)
+    if reason is None:
         try:
             sel().log_api_access(
                 caller=caller,
                 operation="app_execution_admission",
                 outcome="allowed",
-                resources=f"app={app_name!r} action={action!r} {provenance}",
+                resources=f"action={action!r} {provenance}",
             )
         except Exception:  # noqa: BLE001 - admission must survive audit unavailability
             logger.debug("app execution admission audit failed", exc_info=True)
         return None
 
-    reason = (
-        "third-party app execution is disabled; trust this app alone by adding "
-        f"{app_name!r} to {_TRUST_SETTING_PATH}, or set {_ALLOW_ALL_SETTING_PATH}=true to allow every "
-        "third-party app's Python, backend, and manifest shell code"
-    )
     try:
         sel().log_api_access(
             caller=caller,
             operation="app_execution_admission",
             outcome="denied",
-            resources=f"app={app_name!r} action={action!r} {provenance}",
+            resources=f"action={action!r} {provenance}",
             error=reason,
         )
     except Exception:  # noqa: BLE001 - denial must survive audit unavailability
         logger.debug("app execution denial audit failed", exc_info=True)
+    return reason
+
+
+def third_party_ceiling_closed(app_name: str) -> str | None:
+    """Denial reason when an ALREADY-RUNNING app is not admitted to execute.
+
+    The same decision as :func:`app_execution_denied`, read from the same
+    :func:`_execution_admission` core, and deliberately WITHOUT its audit row.
+
+    Takes a NAME ONLY, and deliberately offers no ``app_root``.
+    :func:`_execution_admission` accepts one and resolves it through
+    :func:`is_builtin_app`; that is right at an admission, where the gate holds
+    the path it is about to execute and vets it once, before the code runs. It is
+    wrong here. A path resolved at RE-CHECK time is read from a filesystem the
+    app can write, so a symlink planted after admission would win the
+    shipped-code exemption from the very sweep that exists to stop it. The
+    re-check resolves nothing: it reads ``AppProcess.admitted_builtin``, the
+    boolean this gate already decided on the vetted path. A parameter here would
+    be the door back into that, so there is none to pass.
+
+    The caller is a poller, not an admission point: the per-backend liveness
+    watch re-asks this about every live third-party backend every
+    ``_HEALTH_WATCH_INTERVAL`` seconds. An ``allowed`` row per app per sweep
+    would add thousands of rows a day whose whole content is "nothing changed",
+    burying the admissions the audit trail exists to show — the ones taken at a
+    module load, a backend spawn, or an enable. Nothing is being authorised here;
+    something already running is being re-examined.
+
+    A DENIAL from here is never silent. A caller that acts on the reason audits
+    through :func:`app_execution_denied` at the point it acts, so a revocation
+    writes exactly the row the gate writes. Only the unchanged answer goes
+    unrecorded.
+    """
+    reason, _provenance = _execution_admission(app_name)
+    if reason is None:
+        return None
+    # An UNRESOLVABLE provenance is a DENIAL here, exactly as it is at the gate.
+    #
+    # It is tempting to spare a legitimately trusted backend a transient
+    # ``installed.json`` read fault by returning no verdict when the record behind a
+    # name grant cannot be read. That suppression is reachable BY THE APP: the file
+    # lives in the app's own writable tree, so deleting it -- or chmod'ing it, or
+    # holding it locked -- makes its own provenance unresolvable on demand and buys its
+    # backend an indefinite reprieve from the sweep that exists to stop it. It is the
+    # evasion the POPULATION rule in ``_revoke_if_ceiling_closed`` already refuses,
+    # arriving by a different door.
+    #
+    # No signal derived from that file separates the fault from the forgery, because the
+    # app owns the file. So none is used. What can still spare a running backend here is
+    # what the app cannot write: the operator's config, and the builtin classification
+    # the gateway captured on the execution target it vetted at admission.
     return reason

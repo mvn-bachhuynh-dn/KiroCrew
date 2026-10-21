@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from chat_test_helpers import _make_state
@@ -10,6 +10,7 @@ from chat_test_helpers import _make_state
 from kiro_crew.dashboard.chat_utils import (
     _BUSY_RECOVER_MSG,
     _CONN_RECOVER_MSG,
+    CRON_NOTIFICATION_KIND,
     SYNTHETIC_RECOVERY_KIND,
     RecoveryPayload,
     ResetCause,
@@ -73,6 +74,30 @@ def test_requeue_before_output_preserves_original_request(cause: ResetCause) -> 
     ) == (original, RecoveryPayload.ORIGINAL)
 
 
+@pytest.mark.parametrize("cause", list(ResetCause))
+def test_ambiguous_delivery_continues_without_replaying_even_before_output(
+    cause: ResetCause,
+) -> None:
+    """A request-frame drain stall may have delivered the buffered prompt to a
+    kiro-cli that resumed reading, with no host-visible output -- so ``turn_emitted``
+    is False yet replaying the prompt verbatim would run its tools a second time.
+    ``ambiguous_delivery`` must force the same continuation an emitted turn takes."""
+    original = "Build and deploy the service"
+
+    requeued, payload = build_recovery_requeue(
+        original,
+        turn_emitted=False,
+        cause=cause,
+        message_is_synthetic=False,
+        ambiguous_delivery=True,
+    )
+
+    assert payload is RecoveryPayload.CONTINUATION
+    expected = _CONN_RECOVER_MSG if cause is ResetCause.CONNECTION_LOST else _BUSY_RECOVER_MSG
+    assert requeued == expected
+    assert original not in requeued
+
+
 def test_connection_recovery_uses_structural_system_injection_provenance() -> None:
     item = {
         "content": _CONN_RECOVER_MSG,
@@ -107,13 +132,58 @@ async def test_queue_dispatch_preserves_recovery_provenance(
     assert slot.task is not None
     await slot.task
 
+    _expected_kwargs = {
+        "_current_message": slot.messages[-1],
+        "_synthetic_payload": expected_recovery,
+        "_directive_user_origin": False,
+        "_directive_channel_origin": False,
+    }
+    if expected_recovery:
+        # A recovery-kind entry also tells the runner it IS a recovery
+        # dispatch, structurally — the refusal-retry allowance must not
+        # re-arm on a requeue of the user's own words.
+        _expected_kwargs["_synthetic_recovery_turn"] = True
     mock_run.assert_awaited_once_with(
         state,
         slot,
         _CONN_RECOVER_MSG,
-        _synthetic_payload=expected_recovery,
+        **_expected_kwargs,
     )
     assert slot.messages[-1]["role"] == expected_role
+
+
+@pytest.mark.asyncio
+async def test_queue_dispatch_preserves_consumption_callback(tmp_path, monkeypatch) -> None:
+    """A retry entry keeps the callback that settles its durable producer."""
+    from kiro_crew.dashboard import chat_runner
+
+    state = _make_state(tmp_path)
+    state.subagents = None
+    slot = state.get_or_create_slot("recovery-consumption")
+    on_consumed = Mock()
+    on_irreversibly_consumed = Mock()
+    slot.queue_insert(
+        0,
+        "Retry this exact prompt",
+        kind=SYNTHETIC_RECOVERY_KIND,
+        on_consumed=on_consumed,
+        on_irreversibly_consumed=on_irreversibly_consumed,
+    )
+    mock_run = AsyncMock()
+    monkeypatch.setattr(chat_runner, "_run_chat", mock_run)
+
+    assert await chat_runner._start_next_queued_turn(state, slot) is True
+    assert slot.task is not None
+    await slot.task
+
+    mock_run.assert_awaited_once()
+    args = mock_run.await_args
+    assert args.args == (state, slot, "Retry this exact prompt")
+    assert args.kwargs["_synthetic_payload"] is True
+    args.kwargs["_on_consumed"](True)
+    await args.kwargs["_on_irreversibly_consumed"]()
+    on_consumed.assert_called_once_with(True)
+    on_irreversibly_consumed.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -125,7 +195,7 @@ async def test_cron_injection_preserves_pending_session_reset_notice(tmp_path, m
     slot = state.get_or_create_slot("cron-during-reset")
     slot._stopping = True
     cron_message = f'{CRON_NOTIFY_PREFIX}"daily"]\nrun report'
-    slot.queue_insert(0, cron_message)
+    slot.queue_insert(0, cron_message, kind=CRON_NOTIFICATION_KIND)
     mock_run = AsyncMock()
     monkeypatch.setattr(chat_runner, "_run_chat", mock_run)
 
@@ -182,7 +252,13 @@ async def test_dispatch_classifies_the_payload_not_the_recovery(
         state,
         slot,
         "Build and deploy the service",
+        _current_message=slot.messages[-1],
         _synthetic_payload=expected_synthetic,
+        # Recovery-ness is its own structural signal, independent of the
+        # payload classification this test pins down.
+        _synthetic_recovery_turn=True,
+        _directive_user_origin=False,
+        _directive_channel_origin=False,
     )
     # Provenance is unchanged by the split: either payload still renders as an
     # inject row, which is what stops the duplicate user bubble.

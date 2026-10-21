@@ -123,7 +123,6 @@ _NMPWAIT_WAIT_FOREVER = 0xFFFFFFFF  # noqa: N806 - Windows API constant
 # ``None``, which is why the check below tests both shapes.
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value  # noqa: N806 - Windows API constant
 _SDDL_REVISION_1 = 1  # noqa: N806 - Windows API constant
-_ERROR_FILE_NOT_FOUND = 2  # noqa: N806 - Windows API constant
 _ERROR_SEM_TIMEOUT = 121  # noqa: N806 - Windows API constant
 _ERROR_PIPE_BUSY = 231  # noqa: N806 - Windows API constant
 
@@ -518,7 +517,7 @@ def prepare_dir(socket_path: str | os.PathLike[str]) -> None:
     """
     parent = Path(socket_path).parent
     # Called by attribute so the hermetic-test stub in conftest can intercept
-    # the Windows icacls path.
+    # the Windows DACL path.
     platform_compat.make_owner_only_dir(parent)
 
 
@@ -544,9 +543,30 @@ def probe_live(socket_path: str | os.PathLike[str]) -> bool:
     """Blocking check for a server currently listening on the endpoint.
 
     Runs in a thread at every call site (it blocks for up to a second) and
-    never raises: an inconclusive probe reports ``True`` so callers, which use
+    never raises.
+
+    On POSIX an inconclusive probe reports ``True`` so callers, which use
     this to decide whether it is safe to clobber an endpoint, err toward
-    leaving it alone.
+    leaving it alone. Only a *conclusive* negative -- a refused connect or a
+    name that does not exist -- reports ``False``; every other failure is
+    inconclusive and reports live.
+
+    On Windows the rule is an allowlist instead: only ``ERROR_SEM_TIMEOUT``
+    and ``ERROR_PIPE_BUSY`` (a server exists but has no free instance) report
+    live, and any other error reports ``False``. That answer feeds only the
+    readiness polls through :func:`endpoint_exists`; :func:`remove_stale`
+    unlinks nothing on Windows, so no clobber decision depends on it.
+
+    A full accept backlog is the POSIX case the live default protects: the
+    daemon is healthy but overloaded, so ``connect()`` neither succeeds nor is
+    refused. Which OSError
+    that surfaces as is kernel-dependent -- a ``settimeout``-armed socket is
+    non-blocking, so on Linux the connect fails at once with ``EAGAIN``
+    (``BlockingIOError``) rather than raising ``socket.timeout`` (that fires
+    only for the ``EINPROGRESS`` wait CPython installs) -- so enumerating the
+    live errnos would be a guess. Allowlisting the two conclusive negatives
+    instead is contract-faithful and covers ``EAGAIN``, ``EINTR`` and a real
+    timeout alike, without taking a loaded daemon's socket away.
     """
     address = resolve_address(socket_path)
     if not platform_compat.IS_WINDOWS:
@@ -555,8 +575,15 @@ def probe_live(socket_path: str | os.PathLike[str]) -> bool:
             s.settimeout(1.0)
             s.connect(address)
             return True
-        except (ConnectionRefusedError, OSError):
+        except (ConnectionRefusedError, FileNotFoundError):
+            # The only conclusive negatives: nothing is listening on the
+            # address (refused), or the socket file is gone (no such name).
             return False
+        except OSError:
+            # Anything else -- a full-backlog EAGAIN/BlockingIOError, a real
+            # timeout, EINTR -- is inconclusive. Report live so a loaded but
+            # healthy daemon's socket is never unlinked by ``remove_stale``.
+            return True
         finally:
             s.close()
 
@@ -585,6 +612,40 @@ def endpoint_exists(socket_path: str | os.PathLike[str]) -> bool:
     if platform_compat.IS_WINDOWS:
         return probe_live(socket_path)
     return Path(socket_path).exists()
+
+
+def singleton_lock_free(socket_path: str | os.PathLike[str]) -> bool:
+    """Whether a replacement daemon could win the singleton lock right now.
+
+    Blocking (it opens a file and takes an advisory lock), so callers run it in
+    a thread. Acquires and immediately releases, which is the only way to ask
+    the question: the lock is held by an fd in another process and there is no
+    read-only "is it held" call.
+
+    This -- not :func:`endpoint_exists` -- is what "the incumbent has finished
+    releasing" means. A draining daemon stops accepting FIRST and releases the
+    lock LAST (``run_gatewayd`` closes the server, drains, shuts the pool down,
+    tears the endpoint down, and only then drops the lock), so the endpoint
+    stops being reachable well before a replacement could bind: on Windows at
+    the very start of shutdown, because the kernel drops a pipe name when the
+    last handle closes, so the whole drain sits inside that gap; on POSIX
+    between ``teardown`` unlinking the socket and process exit closing the fd. A
+    replacement spawned inside the gap loses the lock and exits rc=0 without
+    binding, and nothing rebinds afterwards.
+
+    ``True`` on an inconclusive failure: the caller uses this to decide whether
+    to spawn, and the flock itself remains the real arbiter -- a spawn that
+    turns out to be premature loses the lock and exits cleanly, which is the
+    outcome this probe exists to make rare rather than the one it must prevent.
+    """
+    try:
+        fd = acquire_singleton_lock(socket_path)
+    except OSError:
+        return True
+    if fd is None:
+        return False
+    os.close(fd)
+    return True
 
 
 async def remove_stale(socket_path: str | os.PathLike[str]) -> None:

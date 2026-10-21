@@ -94,6 +94,55 @@ class ProviderPermissionError(ProviderCliError):
     """
 
 
+class ProviderNotFoundError(ProviderCliError):
+    """Raised when the provider answered that the addressed resource does not
+    exist, or is not visible to the caller (GitLab answers 404 for both).
+
+    Raised only by reads that opt into it -- a followed GitLab group's checks --
+    where "no such group" is a user-correctable answer rather than an outage. A
+    subclass of :class:`ProviderCliError` so existing handlers still catch it.
+    """
+
+
+class ProviderInvalidInputError(ProviderCliError):
+    """Raised when the provider REJECTED the request because a value in it is not
+    acceptable -- as distinct from the caller lacking permission (403) or the
+    upstream being broken (502).
+
+    The motivating case is an assignee the forge will not accept. GitHub answers
+    ``PATCH /issues/{n}`` with HTTP 422 ``{"field": "assignees", "code":
+    "invalid"}`` and applies NONE of the request; GitLab ignores an
+    ``assignee_id`` for a non-member. Both are the user having picked someone
+    unassignable, so the route must answer 400 and name them -- a 502 would tell
+    the user the forge is down and invite a pointless retry, and a silent success
+    would show an assignee the issue does not carry.
+
+    A subclass of :class:`ProviderCliError` so existing handlers still catch it,
+    following the same reasoning as :class:`ProviderPermissionError`.
+
+    ``values`` holds the rejected inputs when the provider named them, so the
+    route can say WHICH login was refused rather than echoing raw CLI stderr.
+    """
+
+    def __init__(self, message: str, *, values: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.values = list(values or [])
+
+
+class ProviderMergeRefusedError(ProviderCliError):
+    """Raised when the provider ACCEPTED a merge request and then declined to merge.
+
+    GitHub's asynchronous merge API answers a PR that is closed or a draft with
+    HTTP 400, and reports a merge its rules refuse as a ``failed`` result on the
+    poll rather than as an HTTP error. Both are the repository's own policy
+    answering, not a broken upstream, so the route maps this to its
+    ``merge_not_allowed`` 409 instead of the generic 502. The message is the
+    provider's reason when it gave one, sanitized.
+
+    A subclass of :class:`ProviderCliError` so existing handlers still catch it.
+    """
+
+
 class PrSearchError(ValueError):
     """Raised when a pull/merge-request search query is not expressible against
     the target provider."""

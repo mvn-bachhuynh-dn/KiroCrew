@@ -29,17 +29,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
 from kiro_crew import hooks, model_registry
+from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger("kirocrew.app.code-review-sage")
 
@@ -57,6 +62,7 @@ if str(_APP_ROOT) not in sys.path:
 from sage_lib import (  # noqa: E402,E501
     adapters,
     discovery,
+    followup,
     learning,
     pipeline,
     report,
@@ -71,19 +77,21 @@ from sage_lib import (  # noqa: E402,E501
 # per-change detail.
 _RUNS: list[dict[str, Any]] = []
 _RUNS_MAX = 25
-_LOCK = asyncio.Lock()
+_LOCK = LoopBoundLock()
 # Guards the claim/dedup step below. Runs themselves are NOT serialized: each run
 # owns a private ``data/runs/<run_id>/`` subtree (results + report), so several
 # reviews can be in flight at once. What still needs mutual exclusion is the
 # moment a run decides WHICH changes it owns.
 # Serializes whole runs. Workers hand results back through a directory shared
 # ACROSS runs, so overlapping runs would mean two writers to one path.
-_RUN_LOCK = asyncio.Lock()
+# LoopBoundLock excludes within one loop only; all run starters are route
+# handlers on the app's single gateway loop, so every contender shares it.
+_RUN_LOCK = LoopBoundLock()
 
 # Serialises "start a consolidation" against "delete this namespace". Both are
 # short critical sections; holding one lock across each removes the interleaving
 # rather than trying to place checks around the awaits.
-_NS_OPS_LOCK = asyncio.Lock()
+_NS_OPS_LOCK = LoopBoundLock()
 # reviewed-key -> run_id for every change a LIVE run has claimed. Two runs must
 # never review and post to the same PR concurrently: the old whole-run lock
 # prevented that by refusing to overlap at all; this claim registry gets the same
@@ -141,15 +149,41 @@ def _runs_file() -> Path:
     return store.data_dir() / "runs.json"
 
 
-def _save_runs() -> None:
-    """Atomically persist the run registry (0600). Never raises."""
+def _write_runs(payload: str) -> None:
+    """Blocking half of :func:`_save_runs` — never call this on the event loop.
+
+    This whole function is a blocking syscall sequence — mkdir, temp creation,
+    lockdown (in-process per ``platform_compat``), payload write, replace — and
+    filesystem calls can stall on a slow volume, so it belongs in a worker
+    thread (the same reason ``_write_review_section`` and
+    ``store.remove_run_dir`` are offloaded).
+    """
+    f = _runs_file()
+    # Guarded rather than a bare `mkdir(parents=True)`: the write below refuses a
+    # linked parent, but a bare mkdir has already BUILT the tree inside the link's
+    # target by the time it runs, so the refusal arrives after the directories
+    # exist where the planter wants them. The refusal has to come first.
+    store.mkdir_refusing_links(f.parent)
+    # The shared helper replaces through ``replace_with_retry``, so a transient
+    # Windows sharing violation does not silently lose the save. It also
+    # picks a random mkstemp name, applies the owner-only lockdown to the temp
+    # BEFORE the payload lands, and refuses to follow a planted parent link --
+    # the three properties the review worker's writable tree requires, since it
+    # is prompt-injectable and shares this directory.
+    atomic_write(f, payload, restrict_to_owner=True)
+
+
+async def _save_runs() -> None:
+    """Atomically persist the run registry (owner-only). Never raises.
+
+    The registry is serialized HERE, on the loop, so the payload is a consistent
+    snapshot taken under whatever lock the caller holds; only the file write and
+    the lockdown are offloaded. Serializing inside the thread instead would let
+    ``_RUNS`` mutate mid-iteration.
+    """
     try:
-        f = _runs_file()
-        f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_name(f.name + ".tmp")
-        tmp.write_text(json.dumps(_RUNS, indent=2), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, f)
+        payload = json.dumps(_RUNS, indent=2)
+        await asyncio.to_thread(_write_runs, payload)
     except Exception:  # pragma: no cover - defensive
         logger.warning("failed to persist runs.json", exc_info=True)
 
@@ -232,7 +266,7 @@ async def _record(run: dict) -> None:
             else:
                 evicted.append(str(r.get("run_id") or ""))
         _RUNS[:] = keep
-        _save_runs()
+        await _save_runs()
     for run_id in evicted:
         if run_id:
             await asyncio.to_thread(store.remove_run_dir, run_id)
@@ -426,12 +460,37 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             # the subprocess (and its memory) lives exactly as long as the batch. The
             # holder is reference-counted, so overlapping runs share one runtime and the
             # last one out tears it down.
-            await pool.begin_batch()
+            #
+            # Runtime preflight, read ONCE and reused: when the host cannot spawn a
+            # reviewer (no kiro-cli, ACP runtime unimportable) the batch is never
+            # opened — begin_batch would raise inside the spawn with a generic
+            # message — and the same verdict is handed to run_review, which fails
+            # every change fast with a reason naming the missing runtime. One
+            # reading keeps the bracket and the driver's verdict consistent.
+            # Offloaded: the executable resolution stats candidates across every
+            # PATH entry, and one stale network mount there would stall the loop.
+            runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
+            # `begin_batch` is the only thing that can answer the sandbox question,
+            # because the delegation decision is made inside the spawn (on Windows
+            # Kiro Crew has no native backend, so a review is confined only when
+            # kiro-cli's own sandbox takes it). A refusal is therefore reported
+            # through the SAME channel as a missing kiro-cli — every change fails
+            # fast with a reason naming the config key — instead of escaping as an
+            # undiscriminated run error. `batch_open` is tracked separately so a
+            # refused spawn never calls end_batch() on a batch that never opened.
+            batch_open = False
+            if not runtime_error:
+                try:
+                    await pool.begin_batch()
+                    batch_open = True
+                except review_pool.ReviewRuntimeUnavailable as exc:
+                    runtime_error = str(exc)
             try:
                 summary = await asyncio.to_thread(
                     review_driver.run_review, changes,  # type: ignore[attr-defined]
                     dispatch=dispatch, progress=_make_progress(run),
                     run_id=run_id, cancelled=lambda: run_id in _CANCELLED,
+                    preflight=lambda: runtime_error,
                     # One reviewer at a time. Workers share the staging directory and
                     # each has shell and file tools, so two running at once means one
                     # can write another change's record between that change's slot
@@ -443,7 +502,8 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                     concurrency=1,
                 )
             finally:
-                await pool.end_batch()
+                if batch_open:
+                    await pool.end_batch()
             run["summary"] = summary
             _collect_delivered(run, summary)
             run["report_slug"] = summary.get("report_slug") or run.get("report_slug")
@@ -456,14 +516,14 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 run["status"] = "error"
             elif attempted > 0 and (recorded == 0 or deep == 0):
                 # run_review returns ok=True for any run with >=1 change, so a run
-                # whose every change failed used to report "done" with an empty
-                # report. Nothing was reviewed; say so rather than letting the UI
-                # claim success and then show an empty report.
+                # whose every change failed would otherwise report "done" with an
+                # empty report. Nothing was reviewed; say so rather than letting the
+                # UI claim success and then show an empty report.
                 #
                 # `deep == 0` is checked as well as `recorded == 0`: a change can
-                # persist a record and still never be deep-reviewed, which cleared the
-                # record count while leaving the report with no findings in it. Both
-                # are the same "claimed success, delivered nothing" failure.
+                # persist a record and still never be deep-reviewed, which leaves a
+                # non-zero record count with no findings in the report. Both are the
+                # same "claimed success, delivered nothing" failure.
                 run["status"] = "error"
                 run["error"] = _first_change_error(summary) or (
                     "the reviewer produced no result record")
@@ -477,6 +537,21 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 # repo-review skips it until its head changes. Only repo-review runs
                 # carry head_shas; pasted-link runs skip this (no-op).
                 await asyncio.to_thread(_record_reviewed, run)
+            if run["status"] == "error":
+                # The cause as a TOKEN, beside the sentence rather than instead of
+                # it. `_first_change_failure` collapses the token into English for
+                # `error`, so without this the payload names the cause nowhere and
+                # the dashboard's translator has to recognize causes by their
+                # wording -- which silently reverts a card to untranslated
+                # pass-through the next time a message is reworded, with no test
+                # going red. Set for BOTH error branches above: the summary-level
+                # `error` sentence and the per-change one describe the same
+                # `per_change` records, so the token is derived from those either
+                # way. Absent (never empty-string) when no record carried one, so a
+                # reader cannot mistake "no token" for a token.
+                reason = _first_change_failure(summary)[1]
+                if reason:
+                    run["reason"] = reason
     except Exception as exc:  # pragma: no cover - defensive
         run["status"] = "error"
         run["error"] = str(exc)
@@ -489,22 +564,49 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             _release_claims(run)
         _CANCELLED.discard(run_id)
         async with _LOCK:
-            _save_runs()
+            await _save_runs()
         await _notify_finished(run)
 
 
-def _first_change_error(summary: dict) -> str:
-    """The most useful per-change failure reason, for a run-level error message."""
+def _first_change_failure(summary: dict) -> tuple[str, str]:
+    """The most useful per-change failure, as ``(sentence, reason_token)``.
+
+    Both halves come from the SAME record in one pass, which is the whole reason
+    this is not two functions. The sentence is often built from ``deep_error`` --
+    prose from the spawn -- while the token lives in that record's
+    ``skipped_reason``; a second independent scan for the token would happily
+    return a LATER record's token and pair it with this record's sentence,
+    labelling a failure with an unrelated cause.
+
+    The token half is ``""`` when the chosen record kept no ``skipped_reason``.
+    """
     for rec in summary.get("per_change") or []:
         for key in ("deep_error", "gate_error", "skipped_reason"):
             val = str(rec.get(key) or "").strip()
             if val:
-                return {
+                sentence = {
                     "no_review_recorded": "the reviewer finished but wrote no "
                                           "findings record",
+                    "review_record_incomplete": "the reviewer wrote a findings "
+                                                "record but never completed the "
+                                                "review",
+                    # Reason-level fallback only: a preflight-failed record
+                    # carries the specific runtime message in its error fields,
+                    # which the key order above prefers, and the run-level error
+                    # for that case comes from the summary's own error. Kept so
+                    # the reason itself always renders as a cause, never as a
+                    # bare enum value.
+                    "runtime_unavailable": "the reviewer never ran: its agent "
+                                           "runtime is unavailable on this host",
                     "review_failed": "the review turn failed",
                 }.get(val, val)
-    return ""
+                return sentence, str(rec.get("skipped_reason") or "").strip()
+    return "", ""
+
+
+def _first_change_error(summary: dict) -> str:
+    """The most useful per-change failure reason, for a run-level error message."""
+    return _first_change_failure(summary)[0]
 
 
 def _run_headline(run: dict) -> str:
@@ -569,6 +671,9 @@ async def _handle_review(request: web.Request) -> web.Response:
 
     Body: ``{"links": "<pasted CR links>"}`` or ``{"changes": ["CR-1", ...]}``.
     Returns immediately with a ``run_id``; poll ``/runs`` for status."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.review")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -733,6 +838,9 @@ async def _handle_review_repo(request: web.Request) -> web.Response:
     Body: ``{"repo": "<github repo url>", "force": bool}``. By default only PRs
     NOT yet reviewed at their current head SHA are queued; ``force=true`` reviews
     ALL open PRs regardless of the dedup index."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.review_repo")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -866,21 +974,39 @@ async def _handle_run_detail(request: web.Request) -> web.Response:
     return web.json_response({"run": run})
 
 
+def _rebanded_report(run_id: str, dismissed: dict) -> dict | None:
+    """The run's stored report with each row's band recomputed for its dismissals.
+
+    A row's band is fixed when the report is written, but a dismissed finding no
+    longer counts against the change, so the band the user sees must come from
+    ``classify()`` run again with that finding removed. ``report.reband`` keeps
+    every other reason a row is red or yellow (design verdict, blast, branch gate,
+    regression, an AI override) and only drops the dismissed finding's weight.
+    Sync: it reads report.json and the result records, so callers run it off
+    the event loop."""
+    payload = report.read_report(None, run_id)
+    if payload is None or not dismissed:
+        return payload
+    return report.reband(payload, dismissed, None, run_id, store.read_config_quiet())
+
+
 async def _handle_run_report(request: web.Request) -> web.Response:
     """GET .../runs/{run_id}/report — the run's Focus Report, as data.
 
     This is what makes the report viewable INSIDE the app. The rows come from the
     run's own ``report.json`` (already redacted by ``report.build_report``), so
     reading a report never depends on the artifact store — a run whose artifact
-    archive failed still renders here."""
+    archive failed still renders here. Rows whose findings were dismissed are
+    re-banded on the way out (see ``_rebanded_report``)."""
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
         known = run is not None
         status = str((run or {}).get("status") or "")
+        dismissed = dict((run or {}).get("dismissed") or {})
     if not known:
         return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
-    payload = await asyncio.to_thread(report.read_report, None, run_id)
+    payload = await asyncio.to_thread(_rebanded_report, run_id, dismissed)
     if payload is None:
         # Not an error: a running run has no report yet, and the page renders
         # progress instead. Say so explicitly rather than 404-ing a live run.
@@ -899,6 +1025,9 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
     started are dropped, but a change already mid-review finishes, because its
     worker session owns an in-flight model turn that cannot be torn down without
     corrupting the shared pool. The UI must not promise an instant stop."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_cancel")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -909,7 +1038,7 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
                 {"code": "run_not_running", "error": f"run is {run.get('status')}, not running"}, status=409)
         _CANCELLED.add(run_id)
         run["cancel_requested_at"] = _now()
-        _save_runs()
+        await _save_runs()
     return web.json_response({
         "ok": True, "run_id": run_id, "status": "cancelling",
         "message": "queued changes dropped; a review already in progress will finish",
@@ -918,6 +1047,9 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
 
 async def _handle_run_delete(request: web.Request) -> web.Response:
     """DELETE .../runs/{run_id} — dismiss a finished thread and delete its data."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_delete")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -940,7 +1072,7 @@ async def _handle_run_delete(request: web.Request) -> web.Response:
                           "it to finish"},
                 status=409)
         _RUNS.remove(run)
-        _save_runs()
+        await _save_runs()
     await asyncio.to_thread(store.remove_run_dir, run_id)
     return web.json_response({"ok": True, "run_id": run_id})
 
@@ -978,6 +1110,10 @@ async def _post_comments_bg(run_id: str, run: dict,
                     continue
                 else:
                     sel = keys
+                sel = await asyncio.to_thread(
+                    _without_dismissed, run_id, run, cid, sel)
+                if sel is not None and not sel:
+                    continue
                 out = await asyncio.to_thread(
                     review_driver.post_recorded, cid, link,
                     dispatch=dispatch, run_id=run_id, keys=sel)
@@ -1021,7 +1157,7 @@ async def _post_comments_bg(run_id: str, run: dict,
                 rec = by_cid.get(str(r.get("change_id")))
                 if rec is not None:
                     review_driver.apply_post_outcome(rec, r)
-            _save_runs()
+            await _save_runs()
         # Indexing is what stops the re-review; do it on the retry path too, and
         # only after the records above reflect what actually landed.
         await asyncio.to_thread(_record_reviewed, run)
@@ -1031,7 +1167,7 @@ async def _post_comments_bg(run_id: str, run: dict,
         async with _LOCK:
             run["posting"] = False
             run["post_error"] = str(e)
-            _save_runs()
+            await _save_runs()
     finally:
         # Same contract as a review's claims: release on EVERY terminal path, or
         # the change stays unreviewable until the gateway restarts.
@@ -1069,6 +1205,9 @@ async def _handle_run_post(request: web.Request) -> web.Response:
     still going, when its records have been cleared, or when it already posted —
     a duplicate post is not undoable from here.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_post")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     force = request.query.get("force", "").lower() in ("1", "true", "yes")
     try:
@@ -1167,7 +1306,7 @@ async def _handle_run_post(request: web.Request) -> web.Response:
                 _INFLIGHT[_stage_key(cid)] = run_id
         run["posting"] = True
         run["post_error"] = None
-        _save_runs()
+        await _save_runs()
 
     # Keep a strong ref like the review path does, so the poster cannot be
     # garbage-collected mid-flight and leave `posting` set with nothing to clear
@@ -1179,6 +1318,129 @@ async def _handle_run_post(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True, "run_id": run_id, "posting": True, "pending": pending,
     })
+
+
+_DISMISS_REASON_MAX = 500
+
+
+def _dismissed_keys(run: dict, change_id: str) -> set[str]:
+    """The finding keys the user dismissed on one change of this run."""
+    per_change = (run.get("dismissed") or {}).get(change_id)
+    return set(per_change) if isinstance(per_change, dict) else set()
+
+
+def _without_dismissed(run_id: str, run: dict, change_id: str,
+                       sel: list[str] | None) -> list[str] | None:
+    """A post selection with the dismissed findings taken out.
+
+    ``None`` means "every pending comment", so when this change has dismissals the
+    full key list is spelled out first and then filtered: a dismissed finding is
+    never sent, whether it was picked by hand or swept up by "post all".
+    """
+    dismissed = _dismissed_keys(run, change_id)
+    if not dismissed:
+        return sel
+    if sel is None:
+        rec = results.read_result(change_id, None, run_id)
+        if not rec:
+            return sel
+        sel = [str(e.get("key")) for e in pipeline.build_pending_comments(rec)]
+    return [k for k in sel if k not in dismissed]
+
+
+async def _handle_run_dismiss(request: web.Request) -> web.Response:
+    """POST .../runs/{run_id}/dismiss — mark one finding as not worth sending.
+
+    Body: ``{"change_id", "key", "reason"}`` (reason required); ``"dismissed":
+    false`` undoes it. The reason is stored on the run record beside
+    ``posted_keys``, so it lives and ages out with the review it is about. A dismissed finding is left out of every
+    later post. A finding already on the pull request cannot be dismissed: the
+    comment is public by then and dismissing it here would change nothing there.
+    """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_dismiss")
+    if owner_denied is not None:
+        return owner_denied
+    run_id = _run_id_param(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    change_id = str(body.get("change_id") or "")
+    key = str(body.get("key") or "")
+    undo = body.get("dismissed") is False
+    raw_reason = body.get("reason")
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+    if not pipeline.FINDING_KEY_RE.match(key):
+        return web.json_response(
+            {"code": "bad_key", "error": "only a finding can be dismissed"}, status=400)
+    if not undo and not reason:
+        return web.json_response(
+            {"code": "reason_required", "error": "say why this finding is dismissed"},
+            status=400)
+    if len(reason) > _DISMISS_REASON_MAX:
+        return web.json_response(
+            {"code": "reason_too_long",
+             "error": f"keep the reason under {_DISMISS_REASON_MAX} characters"}, status=400)
+    async with _LOCK:
+        run = _find_run(run_id)
+        if run is None:
+            return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+        if change_id not in (run.get("change_ids") or []):
+            return web.json_response(
+                {"code": "change_not_found", "error": "that change is not in this review"}, status=404)
+        # While a post is in flight its delivered keys are not on the run yet,
+        # so "already on the pull request" cannot be answered; refuse instead.
+        if run.get("posting"):
+            return web.json_response(
+                {"code": "already_posting", "error": "this review is being posted; try again when it finishes"},
+                status=409)
+        if key in set((run.get("posted_keys") or {}).get(change_id) or []):
+            return web.json_response(
+                {"code": "already_posted", "error": "that finding is already on the pull request"},
+                status=409)
+        dismissed = dict(run.get("dismissed") or {})
+        per_change = dict(dismissed.get(change_id) or {})
+        changes: dict[str, Any] = {}
+        if undo:
+            # "Post all" may have counted this run fully posted only because the
+            # finding was dismissed; an undone finding is pending, so the run is not.
+            # An undo of a key that was never dismissed changes nothing.
+            if key in per_change:
+                per_change.pop(key)
+                changes["posted_at"] = None
+        else:
+            per_change[key] = {"reason": store.redact_text(reason)}
+        if per_change:
+            dismissed[change_id] = per_change
+        else:
+            dismissed.pop(change_id, None)
+        changes["dismissed"] = dismissed
+        # The run card's dots read the band tallies folded into the run summary
+        # when the review finished. A dismissal can move a row to another band,
+        # so refresh those tallies from the re-banded report; the report
+        # endpoint re-bands on read, and this keeps the card in step with it.
+        summary = run.get("summary")
+        if isinstance(summary, dict) and isinstance(summary.get("report"), dict):
+            rebanded = await asyncio.to_thread(_rebanded_report, run_id, dismissed)
+            if rebanded is not None:
+                changes["summary"] = {**summary, "report": {
+                    **summary["report"], "bands": rebanded["bands"]}}
+        # Persist a staged copy first and touch the live run only once the write
+        # lands: a concurrent /runs read holds the same run objects, and
+        # `_save_runs` swallows a failed write. Either way a dismissal could show
+        # as saved and then be lost on restart, making the finding postable again.
+        staged = [{**r, **changes} if r is run else r for r in _RUNS]
+        try:
+            await asyncio.to_thread(_write_runs, json.dumps(staged, indent=2))
+        except Exception:
+            logger.warning("failed to persist a dismissal", exc_info=True)
+            return web.json_response(
+                {"code": "save_failed", "error": "could not save the dismissal"}, status=500)
+        run.update(changes)
+    return web.json_response({"ok": True, "run_id": run_id, "change_id": change_id,
+                              "key": key, "dismissed": not undo})
 
 
 def _collect_delivered(run: dict, summary: dict) -> None:
@@ -1233,6 +1495,7 @@ def _pending_comment_count(run_id: str, run: dict,
         if not rec:
             continue
         already = set(rec.get("posted_keys") or delivered.get(cid) or [])
+        already |= _dismissed_keys(run, cid)
         try:
             for entry in pipeline.build_pending_comments(rec):
                 key = str(entry.get("key"))
@@ -1252,6 +1515,9 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
     Reports are archived automatically when a run finishes; this is the retry /
     share path for a run whose archive failed (or one archived before the artifact
     was pruned). The report itself lives in the run dir either way."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_archive")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1285,7 +1551,7 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
         run = _find_run(run_id)
         if run is not None:
             run["report_slug"] = slug
-        _save_runs()
+        await _save_runs()
     return web.json_response({"ok": True, "run_id": run_id, "report_slug": slug,
                               "created": True})
 
@@ -1368,6 +1634,24 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
         return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
 
 
+async def _handle_review_queue(request: web.Request) -> web.Response:
+    """GET .../review-queue — open PRs where the ``gh`` user is a requested
+    reviewer. Like ``/my-repos``, an unusable ``gh`` is a 200 ``setup_required``."""
+    try:
+        rows, truncated = await asyncio.to_thread(discovery.list_review_requested)
+    except discovery.GhSetupError as exc:
+        return web.json_response({"prs": [], "setup_required": True, "error": str(exc)})
+    except discovery.GhError as exc:
+        logger.warning("review queue failed: %s", exc)
+        return web.json_response(
+            {"code": "provider_unavailable", "error": "upstream service error"}, status=502)
+    # The same change id the repo list carries: the detail pane scopes posting by
+    # it, and an empty one would publish every change of a multi-PR run.
+    for row in rows:
+        row["change_id"] = review_driver.change_id_for(row["url"])
+    return web.json_response({"prs": rows, "truncated": truncated})
+
+
 def _pull_request_ref(link: str) -> dict | None:
     """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
 
@@ -1400,6 +1684,9 @@ async def _handle_repos(request: web.Request) -> web.Response:
     if request.method == "GET":
         repos = await asyncio.to_thread(discovery.read_repos)
         return web.json_response({"repos": repos})
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.repos_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1457,8 +1744,8 @@ async def _handle_repos(request: web.Request) -> web.Response:
         repos = await asyncio.to_thread(discovery.remove_repo, owner, name)
     out: dict[str, Any] = {"ok": True, "repos": repos}
     if request.method == "POST":
-        # Which repo was just added. The caller previously guessed at repos[0],
-        # which is only right if the store happens to prepend.
+        # Name the added repo explicitly: repos[0] is only it if the store
+        # happens to prepend.
         out["added"] = {"owner": owner, "repo": name}
     if request.method == "POST" and pr is not None:
         # The caller uses this to open the pasted pull request instead of leaving
@@ -1577,10 +1864,9 @@ def _write_review_section(patch: dict) -> dict:
         review["max_concurrent"] = max(1, min(mc, review_pool.MAX_CONCURRENT_CEIL))
 
     cfg["review"] = review
-    tmp = cfg_path.with_name(cfg_path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, cfg_path)
+    # Same helper, same reasons as ``_write_runs`` -- including the retrying
+    # replace this write also lacked.
+    atomic_write(cfg_path, json.dumps(cfg, indent=2), restrict_to_owner=True)
     return review
 
 
@@ -1612,6 +1898,9 @@ async def _handle_settings(request: web.Request) -> web.Response:
             }
         return web.json_response(await asyncio.to_thread(_build_settings_response))
     # PUT
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.settings_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1685,6 +1974,10 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
             logger.warning("namespace list failed: %s", exc, exc_info=True)
             return web.json_response({"namespaces": [], "active": ["default"]})
 
+    owner_denied = await require_owner_dashboard_request(
+        request, "code_review_sage.namespaces_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1829,13 +2122,10 @@ async def _consolidate_bg(ns: str) -> None:
         # flight must not have it cleared by that merge — the worker never saw it,
         # so it is not represented in the merged ruleset and a blanket clear would
         # destroy the only copy.
-        # One element per staged entry, not a set: duplicate ids are legitimate
-        # (same title+scope re-learned) and the COUNT is what tells
-        # clear_candidate how many occurrences this merge is entitled to drop.
-        cand_ids = [
-            p["id"] for p in await asyncio.to_thread(
-                learning.list_candidate, None, ns)
-        ]
+        # Each entry's equivalence key and `seen` count, not a set of ids: the
+        # COUNT is what tells clear_candidate how many sightings this merge is
+        # entitled to drop, so one staged again mid-merge is kept.
+        cand_ids = await asyncio.to_thread(learning.candidate_snapshot, None, ns)
         # Clear any residue BEFORE dispatching. The worker writes this path and
         # the backend applies it afterwards; a crash between those two steps
         # leaves a stale merge on disk, and the next consolidation whose
@@ -1956,6 +2246,9 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     APPLY is deterministic and refuses empty content, which is what keeps a bad
     merge from wiping the reviewer's memory.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.consolidate")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2003,28 +2296,337 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
                               "running": True})
 
 
+# --- follow-up sessions -----------------------------------------------------
+# A finished review can be asked about later. Its session transcript is kept (see
+# ``sage_lib/followup.py``) and a follow-up RESUMES it as an ordinary chat
+# session, so the reviewer's own reasoning comes back cold from disk and the
+# conversation from then on is a normal session: it survives restarts, is filed in
+# the sidebar, and its tool use runs through the dashboard's approval pipeline.
+#
+# This app's part is deliberately small — validate, seed the resume, and hand back
+# what the slot needs. Creating the slot itself stays with the dashboard's own
+# endpoint so slot policy (agent binding, workspace, title redaction, ownership)
+# has exactly one implementation.
+
+# How often kept transcripts are aged out. They are the largest thing this app
+# leaves on disk and a closed tab reports nothing, so this cannot be lazy.
+_FOLLOWUP_SWEEP_INTERVAL = 3600.0
+
+
+def _chat_params(run_id: str, change_id: str) -> str:
+    """Validate the pair identifying a review. Returns an error code, or ""."""
+    if not run_id or not change_id:
+        return "chat_params_required"
+    return ""
+
+
+_ChatHandler = Callable[[web.Request], Awaitable[web.Response]]
+
+
+def _require_enabled(handler: _ChatHandler) -> _ChatHandler:
+    """Deny when the app is disabled.
+
+    Routes are registered once at gateway startup, so a disabled app's endpoints
+    stay reachable — the platform's convention is that handlers check enabled
+    state themselves. Without this a disabled app could still start a session on
+    a reviewer's context, which no teardown hook can retroactively prevent for a
+    request already in flight.
+
+    ``is_app_enabled`` reads ``installed.json`` synchronously, so it runs off the
+    event loop. Deny-by-default: an unreadable state file disables the surface
+    rather than opening it.
+    """
+
+    @wraps(handler)
+    async def _wrapped(request: web.Request) -> web.Response:
+        if not await asyncio.to_thread(is_app_enabled, "code-review-sage"):
+            return web.json_response(
+                {"code": "app_disabled",
+                 "error": "code-review-sage is disabled"}, status=403)
+        return await handler(request)
+
+    return _wrapped
+
+
+@_require_enabled
+async def _handle_chat_get(request: web.Request) -> web.Response:
+    """GET .../chat?run_id=&change_id= — stored history plus follow-up readiness.
+
+    200 even with nothing to show: "this review was never discussed" is a normal
+    state for the panel, not an error.
+    """
+    run_id = (request.query.get("run_id") or "").strip()
+    change_id = (request.query.get("change_id") or "").strip()
+    bad = _chat_params(run_id, change_id)
+    if bad:
+        return web.json_response(
+            {"code": bad, "error": "missing run_id or change_id"}, status=400)
+    turns = await asyncio.to_thread(
+        followup.read_transcript, run_id, change_id)
+    async with _LOCK:
+        run = _find_run(run_id)
+        run_live = run is not None and _is_live(run)
+    desc, reason = await asyncio.to_thread(
+        followup.resumable, run_id, change_id)
+    # A run still in flight is not offerable even with a descriptor on disk: its
+    # first pass may be superseded by a second, which retires that descriptor and
+    # leaves an already-open conversation pointing at findings the run replaced.
+    if run_live:
+        desc, reason = None, followup.ERR_RUN_LIVE
+    slot_key = followup.slot_key(run_id, change_id)
+    return web.json_response({
+        "run_id": run_id,
+        "change_id": change_id,
+        "turns": turns,
+        # Whether a follow-up would restore the reviewer's own context. Told to
+        # the UI so it can explain why the button is absent instead of offering
+        # one that opens a session which knows nothing about the review.
+        "resumable": desc is not None,
+        "reason": reason,
+        "slot_key": slot_key,
+        # Whether that session already exists. Without it the panel invites a
+        # returning user to "open" a conversation they already had, with no trace
+        # of it -- which reads as the review having lost it.
+        "followup_open": bool(desc is not None
+                              and _followup_session_exists(slot_key)),
+    })
+
+
+def _followup_session_exists(slot_key: str) -> bool:
+    """Whether a chat session for this review is actually in the sidebar.
+
+    Read from the SLOT, never from the session map. The two are independent and
+    the map deliberately outlives the slot: closing a tab pops it from the slot
+    table but keeps its mapping so a later resume can reload the conversation. So
+    a mapping proves a session once existed, not that one exists now -- and this
+    answer decides whether the panel offers to continue a conversation or to
+    create it, which in turn decides whether the slot is handed a title and a
+    folder. Deriving it from the map made a closed session read as open, so the
+    recreate that followed omitted both and landed unfiled under the placeholder
+    title.
+
+    Reads the slot table directly because the dashboard exposes no read-only
+    existence check; absent state (tests, a bare app) answers False, which is the
+    safe direction -- it offers to create, and creating is idempotent.
+    """
+    slots = getattr(_APP_STATE.get("state"), "_slots", None)
+    if not isinstance(slots, dict):
+        return False
+    return slot_key in slots
+
+
+async def _ensure_followup_folder(state: Any) -> str:
+    """Find-or-create the folder follow-up sessions are filed under.
+
+    Through ``mutate_folders`` so find-then-create is one transaction: two tabs
+    starting a follow-up at the same moment would otherwise each miss the other's
+    folder and build a duplicate. Idempotent — an existing folder is adopted and
+    nothing is written.
+    """
+    def _create_or_adopt(folders: list[dict]) -> tuple[bool, str]:
+        for f in folders:
+            if str(f.get("name", "")).strip() != followup.FOLDER_NAME:
+                continue
+            # Re-engaging the folder clears `hidden`, matching the folder CRUD
+            # handler's own unhide-on-assign rule.
+            if f.get("hidden"):
+                f["hidden"] = False
+                return True, str(f.get("id", ""))
+            return False, str(f.get("id", ""))
+        folder = {
+            "id": uuid.uuid4().hex[:12],
+            "name": followup.FOLDER_NAME,
+            "order": len(folders),
+            "collapsed": False,
+            "hidden": False,
+            "parent_id": "",
+            "project_dir": "",
+            # Same stamp the dashboard's own folder creators write; the sidebar's
+            # ``created`` folder sort reads it.
+            "created_at": time.time(),
+        }
+        folders.append(folder)
+        return True, str(folder["id"])
+
+    try:
+        return str(await state.mutate_folders(_create_or_adopt))
+    except Exception:  # noqa: BLE001 - filing is a nicety, the session is not
+        logger.warning("code-review-sage: follow-up folder write failed",
+                       exc_info=True)
+        return ""
+
+
+def _change_title(run_id: str, change_id: str) -> str:
+    """The reviewed pull request's title, or "" when it cannot be read."""
+    try:
+        rec = results.read_result(change_id, None, run_id) or {}
+        return store.redact_text(str(rec.get("title") or ""))
+    except Exception:  # pragma: no cover - a title is cosmetic
+        logger.debug("code-review-sage: could not read change title",
+                     exc_info=True)
+        return ""
+
+
+@_require_enabled
+async def _handle_followup_start(request: web.Request) -> web.Response:
+    """POST .../followup {run_id, change_id} — prepare a session on this review.
+
+    Returns what the caller hands to ``POST /api/chat/slots``: the derived slot
+    key, the agent the review ran as, the folder to file it in, and a title. The
+    resume itself is already armed when this returns, so the slot's first turn
+    loads the reviewer's transcript.
+    """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.followup_start")
+    if owner_denied is not None:
+        return owner_denied
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    run_id = str(body.get("run_id") or "").strip()
+    change_id = str(body.get("change_id") or "").strip()
+    bad = _chat_params(run_id, change_id)
+    if bad:
+        return web.json_response(
+            {"code": bad, "error": "missing run_id or change_id"}, status=400)
+    async with _LOCK:
+        run = _find_run(run_id)
+        run_known = run is not None
+        run_live = run is not None and _is_live(run)
+    if not run_known:
+        return web.json_response(
+            {"code": followup.ERR_RUN_GONE,
+             "error": "the review this belongs to was deleted"}, status=409)
+    if run_live:
+        # A first pass can be superseded by a second one in the same run, and that
+        # retires the descriptor. Opening now would hand the user a conversation
+        # whose findings the run then replaces, with nothing saying so.
+        return web.json_response(
+            {"code": followup.ERR_RUN_LIVE,
+             "error": "this review is still running"}, status=409)
+
+    desc, reason = await asyncio.to_thread(
+        followup.resumable, run_id, change_id)
+    if desc is None:
+        # Literal-status returns rather than one computed `status=`: the
+        # error-code contract gate cannot statically verify a site whose status is
+        # a variable, so a dynamic status reads as non-compliant even when the
+        # body carries a `code`.
+        if reason == followup.ERR_TRANSCRIPT_GONE:
+            return web.json_response(
+                {"code": followup.ERR_TRANSCRIPT_GONE,
+                 "error": "the reviewer's session is no longer on disk"},
+                status=409)
+        return web.json_response(
+            {"code": followup.ERR_NO_DESCRIPTOR,
+             "error": "this review did not keep a resumable session"},
+            status=409)
+
+    state = _APP_STATE.get("state")
+    sessions = getattr(state, "sessions", None)
+    if sessions is None or not hasattr(sessions, "seed_conversation"):
+        return web.json_response(
+            {"code": "followup_unavailable",
+             "error": "sessions are not available in this context"}, status=503)
+
+    slot_key = followup.slot_key(run_id, change_id)
+    # The session-map key a dashboard slot resolves its resume from. Seeded before
+    # the slot exists on purpose: the key is derived, so the mapping can be armed
+    # first and the slot's very first turn already resumes.
+    session_key = f"dashboard:{slot_key}"
+    # A slot that already carries a mapping is left alone. Re-seeding would point
+    # a follow-up conversation back at the review's own starting transcript and
+    # discard everything discussed since.
+    mapped = await asyncio.to_thread(sessions.resumable_sid, session_key)
+    if not mapped:
+        await asyncio.to_thread(
+            sessions.seed_conversation, session_key, desc["sid"],
+            provider=desc["provider"], cwd=desc["cwd"])
+        # Read back rather than trust the write: the session map self-prunes an
+        # entry whose files are gone, so this doubles as the last check that the
+        # transcript is still there. Refusing here is the point — a slot created
+        # without a mapping resumes nothing and then answers anyway, with no idea
+        # what was reviewed.
+        mapped = await asyncio.to_thread(sessions.resumable_sid, session_key)
+    if not mapped:
+        return web.json_response(
+            {"code": followup.ERR_TRANSCRIPT_GONE,
+             "error": "the reviewer's session is no longer on disk"}, status=409)
+
+    folder_id = ""
+    if hasattr(state, "mutate_folders"):
+        folder_id = await _ensure_followup_folder(state)
+    title = followup.slot_title(
+        change_id, await asyncio.to_thread(_change_title, run_id, change_id))
+    return web.json_response({
+        "ok": True,
+        "slot_key": slot_key,
+        "agent": desc["agent"],
+        "folder_id": folder_id,
+        "title": title,
+    })
+
+
+async def _followup_sweep_loop() -> None:
+    """Age out kept transcripts forever, so they cannot accumulate unbounded."""
+    while True:
+        try:
+            await asyncio.sleep(_FOLLOWUP_SWEEP_INTERVAL)
+            dropped = await asyncio.to_thread(followup.prune)
+            if dropped:
+                logger.info(
+                    "code-review-sage: dropped %d idle review transcript(s)",
+                    dropped)
+        except asyncio.CancelledError:  # pragma: no cover - shutdown
+            raise
+        except Exception:  # pragma: no cover - never let the sweeper die
+            logger.debug("code-review-sage: transcript sweep failed",
+                         exc_info=True)
+
+
 def register_routes(app: web.Application) -> None:
     """Register the deterministic review routes on the gateway app."""
     # Self-heal: ensure the data layout (dirs + config.json with resolved_paths)
     # exists at startup. Without this, the UI gets {} from the generic config
     # endpoint and shows a perpetual "Initializing…" message because it needs
     # resolved_paths.reports to render the main view.
-    try:
-        store.ensure_layout()
-    except Exception:  # pragma: no cover - never break gateway startup
-        logger.warning("code-review-sage: ensure_layout failed at startup", exc_info=True)
+    #
+    # OFF the event loop, for the same reason as the reap below: `register_routes`
+    # is sync and `start_dashboard` is a coroutine, so anything in this body runs
+    # on the loop, and the layout pass walks each of nine directories' ancestor
+    # chain to refuse a planted link before creating it. On a network-homed or
+    # stalled data directory those walks are exactly the "synchronous filesystem
+    # walk" that freezes the gateway heartbeat.
+    #
+    # An `on_startup` hook keeps the ordering the UI depends on: aiohttp runs
+    # these hooks during runner setup, BEFORE the site accepts a connection, so
+    # the layout is in place before any request can read `resolved_paths`. The
+    # hook is what lets the walk happen in a worker thread while preserving that.
+    async def _ensure_layout_on_startup(_app: web.Application) -> None:
+        try:
+            await asyncio.to_thread(store.ensure_layout)
+        except Exception:  # pragma: no cover - never break gateway startup
+            logger.warning(
+                "code-review-sage: ensure_layout failed at startup", exc_info=True)
+
+    app.on_startup.append(_ensure_layout_on_startup)
     _load_runs()  # restore durable job status (mark orphaned 'running' as 'interrupted')
     # A run dir with no registry entry is unreachable residue (crash between the
     # two writes, or an older layout) — reap it once at startup, but OFF the event
     # loop. `register_routes` is a sync function called from `start_dashboard`,
     # which is a coroutine, so everything here runs on the loop: this reap walks
     # every run dir and deletes the unreferenced ones, and its cost grows with
-    # accumulated residue, so on a host with stale runs it stalled gateway startup.
-    # `ensure_layout` and `_load_runs` above stay inline deliberately — they are
-    # bounded, and the routes cannot answer correctly until they have run (an empty
-    # `_RUNS` or missing `resolved_paths` is what the UI renders as a perpetual
-    # "Initializing…"). Cleanup has no such ordering requirement, so it is the one
-    # that can wait.
+    # accumulated residue, so on a host with stale runs it stalls gateway startup.
+    # The layout pass above is a startup hook for the same reason.
+    #
+    # `_load_runs` is the one that stays inline, and it is the cheap one: a single
+    # `read_text` of one registry file, which returns immediately when the file is
+    # absent. What both hooks keep is the ordering the UI depends on -- aiohttp
+    # runs `on_startup` before the site accepts a connection, so a request never
+    # observes a missing `resolved_paths` or an empty `_RUNS`, which is what it
+    # would render as a perpetual "Initializing" message.
 
     async def _reap_on_startup(_app: web.Application) -> None:
         try:
@@ -2035,6 +2637,13 @@ def register_routes(app: web.Application) -> None:
             logger.debug("code-review-sage: orphan reap failed", exc_info=True)
 
     app.on_startup.append(_reap_on_startup)
+
+    async def _start_followup_sweeper(_app: web.Application) -> None:
+        task = asyncio.create_task(_followup_sweep_loop())
+        _TASKS.add(task)
+        task.add_done_callback(_TASKS.discard)
+
+    app.on_startup.append(_start_followup_sweeper)
     # Cache the dashboard state so a finished run can push a bell notification
     # from a background task (no request in scope there). Absent in tests that
     # register routes on a bare app — every read site treats it as optional.
@@ -2044,11 +2653,15 @@ def register_routes(app: web.Application) -> None:
             _APP_STATE["state"] = state
     except Exception:  # pragma: no cover - defensive
         pass
+    app.router.add_get("/api/apps/code-review-sage/chat", _handle_chat_get)
+    app.router.add_post("/api/apps/code-review-sage/followup",
+                        _handle_followup_start)
     app.router.add_post("/api/apps/code-review-sage/review", _handle_review)
     app.router.add_post("/api/apps/code-review-sage/review-repo", _handle_review_repo)
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
     app.router.add_get("/api/apps/code-review-sage/recent-repos", _handle_recent_repos)
     app.router.add_get("/api/apps/code-review-sage/my-repos", _handle_my_repos)
+    app.router.add_get("/api/apps/code-review-sage/review-queue", _handle_review_queue)
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)
@@ -2065,6 +2678,8 @@ def register_routes(app: web.Application) -> None:
         "/api/apps/code-review-sage/runs/{run_id}/archive", _handle_run_archive)
     app.router.add_post(
         "/api/apps/code-review-sage/runs/{run_id}/post", _handle_run_post)
+    app.router.add_post(
+        "/api/apps/code-review-sage/runs/{run_id}/dismiss", _handle_run_dismiss)
     app.router.add_get("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_put("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_get("/api/apps/code-review-sage/namespaces", _handle_namespaces)

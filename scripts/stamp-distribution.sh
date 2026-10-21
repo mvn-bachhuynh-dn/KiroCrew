@@ -8,23 +8,23 @@
 # the artifact and a running install cannot change it. `beacon.distribution()`
 # prefers this file and falls back to the env var.
 #
-# WHY A SHARED SCRIPT: four packaging paths need the identical file (wheel,
-# dmg, appimage, docker). Inlining the write in each one is how they drift,
+# WHY A SHARED SCRIPT: seven packaging paths need the identical file (wheel,
+# dmg, appimage, deb, rpm, nsis, docker). Inlining the write in each one is how they drift,
 # and a `dist` value that disagrees with the artifact is worse than no value,
 # because it is indistinguishable from a real population shift on the dashboard.
 #
-# Usage: stamp-distribution.sh <dmg|appimage|wheel|source|docker> [package_dir]
+# Usage: stamp-distribution.sh <dmg|appimage|deb|rpm|nsis|wheel|source|docker> [package_dir]
 set -euo pipefail
 
-DIST="${1:?usage: stamp-distribution.sh <dmg|appimage|wheel|source|docker> [package_dir]}"
+DIST="${1:?usage: stamp-distribution.sh <dmg|appimage|deb|rpm|nsis|wheel|source|docker> [package_dir]}"
 PKG_DIR="${2:-}"
 
 # Keep in sync with beacon.KNOWN_DISTRIBUTIONS. A typo here would otherwise bake
 # a value the clamp rejects, silently falling back to "source": the exact
 # failure this script exists to remove.
 case "$DIST" in
-  dmg|appimage|wheel|source|docker) ;;
-  *) echo "ERROR: unknown distribution '$DIST' (want: dmg|appimage|wheel|source|docker)" >&2
+  dmg|appimage|deb|rpm|nsis|wheel|source|docker) ;;
+  *) echo "ERROR: unknown distribution '$DIST' (want: dmg|appimage|deb|rpm|nsis|wheel|source|docker)" >&2
      exit 1 ;;
 esac
 
@@ -37,6 +37,15 @@ if [ ! -d "$PKG_DIR" ]; then
   exit 1
 fi
 
+# git tree id of website/ in the tree being packaged. Baked alongside
+# DISTRIBUTION so the dashboard bundle-freshness guard can compare it against
+# the website/ tree the served dist was built from (see
+# src/kiro_crew/dashboard/stale_bundle_guard.py). A tree id, not HEAD: a
+# backend-only commit must not make a correct bundle look stale. Empty-safe:
+# git may be unavailable in some packaging sandboxes (a staged copy is not a
+# git repo), in which case WEBSITE_TREE stays "" and the guard skips silently.
+WEBSITE_TREE="$(git -C "$PKG_DIR" rev-parse HEAD:website 2>/dev/null || true)"
+
 cat > "$PKG_DIR/_build_info.py" <<EOF
 """Build-time provenance. GENERATED - do not edit and do not commit.
 
@@ -48,6 +57,7 @@ normal case and reports "source".
 from __future__ import annotations
 
 DISTRIBUTION = "$DIST"
+WEBSITE_TREE = "$WEBSITE_TREE"
 EOF
 
-echo "Stamped distribution=$DIST -> $PKG_DIR/_build_info.py"
+echo "Stamped distribution=$DIST website_tree=${WEBSITE_TREE:-<none>} -> $PKG_DIR/_build_info.py"

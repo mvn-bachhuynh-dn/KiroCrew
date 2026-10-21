@@ -11,11 +11,13 @@ gateway side:
    recover ``{server, session_key}``; a caller that cannot name a live spool
    id gets nothing. No server names or session keys are trusted from the
    HTTP layer.
-2. **Visibility enforcement** — the target tool must declare
-   ``_meta.ui.visibility`` including ``"app"`` in the backend's ``tools/list``
-   (fetched FRESH per call — an authorization input is never cached, so a
-   server-side visibility revocation takes effect immediately). Tools without an
-   explicit visibility are model-only per SEP-1865 and are refused.
+2. **Visibility enforcement** — the target tool's ``_meta.ui.visibility`` in the
+   backend's ``tools/list`` must admit the ``"app"`` audience (fetched FRESH per
+   call — an authorization input is never cached, so a server-side visibility
+   revocation takes effect immediately). Per SEP-1865 ``visibility`` defaults to
+   ``["model", "app"]``, so a tool that declares nothing IS app-callable; only an
+   explicit declaration excluding ``"app"``, or one this host cannot parse, is
+   refused.
 3. **Argument validation** — the iframe-controlled ``arguments`` are
    validated against the tool's declared ``inputSchema`` (fail-closed; see
    :func:`kiro_crew.validation.validate_mcp_tool_arguments`) before any
@@ -36,14 +38,15 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 import logging
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.mcp_apps_render import load_spool
-from kiro_crew.mcp_caller import CallerContext
+from kiro_crew.mcp_caller import CallerContext, new_tenant_nonce
+from kiro_crew.mcp_gateway.apps import AUDIENCE_APP, visibility_allows
 from kiro_crew.sel import SecurityEventLog
 from kiro_crew.validation import ValidationError, validate_mcp_tool_arguments
 
@@ -92,18 +95,20 @@ async def _roundtrip(
     stub_uuid = f"__app_call__{uuid.uuid4().hex[:12]}"
     inbox = await backend.attach_stub(stub_uuid)
     try:
-        await backend.forward_from_stub(stub_uuid, frame, caller=caller)
+        # Own nonce per round-trip: this ephemeral stub is a distinct connection
+        # from every real one, so an unnamed app-call must not land in a chat
+        # session's per-tenant namespace on a pooled backend.
+        await backend.forward_from_stub(
+            stub_uuid, frame, caller=caller, tenant_nonce=new_tenant_nonce()
+        )
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise asyncio.TimeoutError()
             data = await asyncio.wait_for(inbox.get(), timeout=remaining)
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if isinstance(msg, dict) and msg.get("id") == frame["id"] and (
+            msg = parse_json_object_line(data)
+            if msg is not None and msg.get("id") == frame["id"] and (
                 "result" in msg or "error" in msg
             ):
                 return msg
@@ -157,19 +162,63 @@ async def _tools_by_name(
 
 
 def _tool_visible_to_app(tool: dict[str, Any]) -> bool:
-    """True iff the tool's ``_meta.ui.visibility`` explicitly includes "app".
+    """True iff an app from this server may call ``tool``.
 
-    Per SEP-1865 a tool with no declared visibility defaults to model-only,
-    so absence of ``_meta.ui.visibility`` is a DENY.
+    SEP-1865: ``visibility`` defaults to ``["model", "app"]`` when omitted, so a
+    tool that declares nothing IS app-callable. Only an explicit declaration
+    that excludes ``"app"`` — or one this host cannot parse — denies.
+
+    Delegates to :func:`visibility_allows`, the same parser the agent-listing
+    filter uses, so the two audiences cannot drift apart.
     """
-    meta = tool.get("_meta")
-    ui = meta.get("ui") if isinstance(meta, dict) else None
-    vis = ui.get("visibility") if isinstance(ui, dict) else None
-    return isinstance(vis, list) and "app" in vis
+    return visibility_allows(tool, AUDIENCE_APP).allowed
+
+
+def _agent_for_call(record: Mapping[str, Any]) -> Optional[str]:
+    """The agent that produced this spool *record*, or ``None`` when unknown.
+
+    This is the governance input, so BOTH properties below have to hold at
+    once, and the store the answer comes from is what decides whether they do.
+
+    1. It must name the agent whose call THIS is. ``backend.pool_key`` cannot:
+       the agent is not a pool dimension, so a shared backend's key names no
+       agent, and the registrant that happened to spawn it is not the caller.
+    2. The governed agent must not be able to write it. The session's own
+       transcript metadata fails this — an agent with a shell edits its own
+       ``execution_context.selection_name`` to any name it likes, blank or a
+       real agent carrying no task-bound deny profile, and the ceiling is gone.
+       The durable vouch fails property 1 in the other direction: it is written
+       only for member-bound persistent bindings, so an ordinary dashboard
+       session or a subagent has none and every callback would be refused.
+
+    The SPOOL RECORD satisfies both. ``gatewayd`` writes it at interception
+    (``Backend._fetch_and_deliver_ui``) and stamps in the agent the PRODUCING
+    STUB declared on its Register frame, which arrived over the gateway's own
+    uid socket from the stub the rewriter wrote. So the value is per call rather
+    than per session — correct for a shared backend serving several agents — and
+    it lives in the owner-only spool directory only gatewayd writes. No
+    session-side store is consulted, which is why no class of session is left
+    unanswerable.
+
+    Two answers, and ONLY two:
+
+    * A stamped agent — the agent that produced this render. Returned.
+    * An absent or empty one — ``None``, and the caller denies. A record written
+      by an older gateway, or by an interception whose stub declared no agent,
+      lands here: unknown is indistinguishable from narrow, so it refuses.
+    """
+    agent = str(record.get("agent") or "")
+    if not agent:
+        logger.warning(
+            "app-call: the spool record names no producing agent; denying "
+            "rather than governing the call against a default surface",
+        )
+        return None
+    return agent
 
 
 def _governance_denial(
-    server: str, tool_name: str, session_key: str, *, agent: str = ""
+    server: str, tool_name: str, session_key: str, *, agent: Optional[str] = ""
 ) -> Optional[str]:
     """Evaluate governance (``policy ∩ profile``) for an app-originated call.
 
@@ -179,10 +228,12 @@ def _governance_denial(
     single un-disableable ceiling across BOTH tool-invocation authorities —
     an enterprise deny that binds the model now binds an embedded app too.
 
-    ``agent`` is the producing backend's agent name: a tightly-scoped agent may
-    carry its own task-bound deny profile, and resolving without it would let
-    an app callback execute a tool the agent's own profile forbids (its ceiling
-    would be silently widened to the surface profile).
+    ``agent`` is the agent that PRODUCED this render, as
+    :func:`_agent_for_call` read it off the spool record. A tightly-scoped agent may carry
+    its own task-bound deny profile, so resolving without it would let an app
+    callback execute a tool that agent's profile forbids (its ceiling would be
+    silently widened to the surface profile). ``None`` means the resolution
+    failed, and denies: an unknown agent is indistinguishable from a narrow one.
 
     Freshness note: Plane A uses the boot-frozen ceiling on the dashboard
     process; gatewayd is a separate daemon, so the policy is loaded per call
@@ -193,6 +244,8 @@ def _governance_denial(
     from Plane A's soft fail-open, which is backstopped by the always-on deny
     floor — a floor this app-originated path does not traverse.
     """
+    if agent is None:
+        return "cannot resolve the calling session's agent"
     try:
         # circular import: platform.governance imports gateway-adjacent modules;
         # loaded per-call (also keeps the policy read fresh). Keep lazy.
@@ -283,8 +336,17 @@ async def handle_app_call(pool: Any, frame: dict[str, Any]) -> dict[str, Any]:
             server=server if isinstance(server, str) else "", tool=tool_name,
             session_key=session_key,
         )
+    # Compare BYTES, not str: ``hmac.compare_digest`` raises TypeError on a str
+    # holding any non-ASCII character, and this secret is presented by the
+    # app's iframe. A raise here escapes ``handle_app_call``, so the caller's
+    # connection drops with no reply and ``_rejected`` never runs — the probe
+    # leaves no SEL record at all. ``surrogatepass`` keeps even a lone-surrogate
+    # presentation encodable, so every malformed secret reaches the same audited
+    # deny. The dashboard sibling (``handlers/mcp_apps.py``) compares this same
+    # value the same way.
     if not isinstance(callback_secret, str) or not hmac.compare_digest(
-        callback_secret, record_secret
+        callback_secret.encode("utf-8", "surrogatepass"),
+        record_secret.encode("utf-8", "surrogatepass"),
     ):
         return _rejected(
             "invalid app callback capability", spool_id=spool_id,
@@ -353,9 +415,15 @@ async def handle_app_call(pool: Any, frame: dict[str, Any]) -> dict[str, Any]:
     # Governance ceiling (policy ∩ profile) on the canonical @server/tool ref —
     # same decision Plane A applies to model-originated MCP calls. Offloaded:
     # the evaluation reads the policy file from disk. Fail-closed inside.
+    # The agent comes off THIS record, stamped by gatewayd at interception from
+    # the producing stub's Register frame — not from the backend (pooled, so its
+    # key names no agent) and not from any session-side store (which the
+    # governed agent could write). See :func:`_agent_for_call`. Already in
+    # memory, so it costs no read of its own.
     denial = await asyncio.to_thread(
-        _governance_denial, server, tool_name, session_key,
-        agent=getattr(backend.pool_key, "agent_name", "") or "",
+        lambda: _governance_denial(
+            server, tool_name, session_key, agent=_agent_for_call(record)
+        )
     )
     if denial is not None:
         return _rejected(denial, **audit_kw)

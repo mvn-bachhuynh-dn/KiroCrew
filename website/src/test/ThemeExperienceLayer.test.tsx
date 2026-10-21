@@ -1,5 +1,8 @@
+import type React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, act } from '@testing-library/react'
+import { Provider } from 'react-redux'
+import { createTestStore } from './helpers'
+import { render as rtlRender, screen, act, type RenderOptions } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 // Controllable useTheme mock — each test sets `mockTheme` before rendering.
@@ -11,6 +14,18 @@ vi.mock('../hooks/useTheme', () => ({
 }))
 
 import ThemeExperienceLayer from '../components/ThemeExperienceLayer'
+import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, registerThemeDecorSlot, __resetThemeDecorSlot } from '../lib/themeDecorLayer'
+
+// The layer reads `instances.activeId` (it unmounts when a remote Crew is active),
+// so every mount needs a Redux Provider. Shim `render` through RTL's `wrapper`
+// option — not a hand-wrapped element — so `rerender(<ThemeExperienceLayer />)`
+// in the cases below keeps the Provider instead of dropping it.
+let testStore = createTestStore()
+const StoreWrapper = ({ children }: { children: React.ReactNode }) => (
+  <Provider store={testStore}>{children}</Provider>
+)
+const render = (ui: React.ReactElement, options: Omit<RenderOptions, 'wrapper'> = {}) =>
+  rtlRender(ui, { wrapper: StoreWrapper, ...options })
 
 function mockMatchMedia(reduced: boolean) {
   const mql = {
@@ -76,6 +91,8 @@ describe('ThemeExperienceLayer', () => {
     localStorage.clear()
     setColorTheme.mockReset()
     mockMatchMedia(false)
+    testStore = createTestStore()
+    __resetThemeDecorSlot()
   })
 
   afterEach(() => {
@@ -323,6 +340,48 @@ describe('ThemeExperienceLayer', () => {
     expect(legacy!.style.height).toBe('100%')
     expect(legacy!.style.zIndex).toBe('40')
     expect(legacy!.style.pointerEvents).toBe('none')
+  })
+
+  // ── #7377 overlays render inside the shell's decor slot, below the header ──
+  it('portals overlays into the registered decor slot and clamps zIndex below the top bar', () => {
+    const slot = document.createElement('div')
+    slot.id = THEME_DECOR_SLOT_ID
+    document.body.appendChild(slot)
+    try {
+      registerThemeDecorSlot(slot)
+      setTheme({
+        assets: {
+          overlays: [{ id: 'scan', position: 'fullscreen', zIndex: 9999, pointerEvents: false, trigger: 'continuous' }],
+          topbar: { dark: true, light: true },
+          hasAudio: false,
+          hasPersona: false,
+        },
+      })
+      const { container } = render(<ThemeExperienceLayer />)
+      const inSlot = frames(slot)
+      const inline = frames(container)
+      // The overlay lives in the slot (the shell's stacking context)...
+      expect(inSlot).toHaveLength(1)
+      expect(inSlot[0].getAttribute('src')).toMatch(/\/overlay\/scan$/)
+      // ...clamped to the derived ceiling, however much the manifest asked for.
+      expect(inSlot[0].style.zIndex).toBe(String(OVERLAY_Z_MAX))
+      // The topbar branding strip is MEANT to paint over the header, so it stays inline at the root.
+      expect(inline).toHaveLength(1)
+      expect(inline[0].getAttribute('src')).toMatch(/\/topbar\/dark$/)
+      expect(inline[0].style.zIndex).toBe('45')
+    } finally {
+      slot.remove()
+    }
+  })
+
+  it('renders overlays inline when no shell has registered a slot (onboarding, bootstrap)', () => {
+    setTheme({
+      assets: { overlays: ['stars'], hasAudio: false, hasPersona: false },
+    })
+    const { container } = render(<ThemeExperienceLayer />)
+    const fs = frames(container)
+    expect(fs).toHaveLength(1)
+    expect(fs[0].getAttribute('src')).toMatch(/\/overlay\/stars$/)
   })
 
   // ── §3.1 topbar height + hideOnMobile ──
@@ -670,6 +729,27 @@ describe('ThemeExperienceLayer', () => {
       render(<ThemeExperienceLayer />)
       await userEvent.click(screen.getByRole('button', { name: /enable experience/i }))
       expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-xyz')
+    })
+
+    it('does NOT revoke a valid grant on a render-cache Level-1 seed, then honours it once the L2 detail arrives', () => {
+      // Cold load: the render cache seeds the Level-1 projection of an L2 pack
+      // (level capped to 1, personaInfo stripped) before the server detail
+      // arrives. A valid grant for the pack's persona is stored.
+      localStorage.setItem('mc-theme-consent-bikini-bottom', 'sha-abc')
+      setTheme({ level: 1, assets: { branding: { botName: 'Bubbles' } } })
+      const { container, rerender } = render(<ThemeExperienceLayer />)
+      // The seed has no consent to read or revoke: grant intact, no re-prompt.
+      expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-abc')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(frames(container)).toHaveLength(0)
+      // Server detail lands: full L2 entry with the matching persona sha256.
+      setTheme({ assets: l2Assets({ personaInfo: persona('sha-abc') }) })
+      act(() => {
+        rerender(<ThemeExperienceLayer />)
+      })
+      expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-abc')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(frames(container).length).toBeGreaterThan(0)
     })
   })
 })

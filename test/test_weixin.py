@@ -8,7 +8,6 @@ without touching ilinkai.weixin.qq.com.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
 
@@ -24,9 +23,7 @@ from kiro_crew.weixin.client import (
     WeixinSendError,
     _base_info,
     _headers,
-    load_weixin_account,
     protocol_error_code,
-    save_weixin_account,
 )
 from kiro_crew.weixin.renderer import (
     WEIXIN_CHUNK_LIMIT,
@@ -128,26 +125,6 @@ def test_typing_ticket_cache_returns_fresh_entries():
     cache.set("u1", "ticket")
     assert cache.get("u1") == "ticket"
     assert cache.get("absent") is None
-
-
-def test_account_credentials_persist_and_round_trip(tmp_path):
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None
-    assert loaded["base_url"] == "https://x"
-    assert loaded["user_id"] == "u9"
-    assert load_weixin_account(str(tmp_path), "missing") is None
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits only")
-def test_account_credentials_are_owner_only(tmp_path):
-    """NTFS reports synthetic mode bits, so this guarantee is POSIX-checked;
-    cross-platform enforcement comes from platform_compat.restrict_to_owner."""
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-    path = tmp_path / "weixin" / "accounts" / "acct1.json"
-    assert path.stat().st_mode & 0o077 == 0
 
 
 # ── renderer ──────────────────────────────────────────────────────────────────
@@ -414,6 +391,62 @@ def test_gateway_home_follows_the_configured_data_home(tmp_path, monkeypatch):
     assert gw.data_home is paths_mod.data_home
 
 
+def test_gateway_wires_the_transport_into_the_dispatcher_before_connect(tmp_path):
+    """The config applier that pushes a reloaded ``weixin`` roster at the transport
+    resolves it through ``dispatcher.transport`` and treats a missing holder as
+    "not built yet, it will read the fresh section". That is only true while the
+    transport does not exist. Once it is constructed from the boot roster, a
+    revocation dispatched during the ``connect()`` await must find it wired, or
+    the removed user stays authorized until the next edit or a restart.
+    """
+    from types import SimpleNamespace
+
+    import kiro_crew.weixin.gateway as gw
+
+    class _Cfg:
+        class agent:
+            default_agent = "kirocrew"
+            approval_mode = "auto"
+
+        class messaging:
+            idle_reset_minutes = 0
+            daily_reset_hour = -1
+            dm_scope = "user"
+
+    class _CtxBuilder:
+        hooks = None
+
+        def build_message(self, text, is_new, session_key, **kw):
+            return (text, {})
+
+    holder_at_connect: list[object] = []
+
+    async def _connect(self):
+        # ``_dispatch`` is the dispatcher's bound handle_message; its __self__ is
+        # the dispatcher whose ``transport`` attribute the applier will read.
+        holder_at_connect.append(getattr(self._dispatch.__self__, "transport", None))
+
+    orch = SimpleNamespace(
+        _weixin_enabled=True,
+        _weixin_token="tok",
+        _weixin_account_id="acct1",
+        _weixin_home=str(tmp_path),
+        _weixin_allowed_user_ids=["friend"],
+        _approval_mode="auto",
+        _cfg=_Cfg(),
+        sessions=object(),
+        ctx_builder=_CtxBuilder(),
+        dashboard_state=None,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(gw.WeixinTransport, "connect", _connect)
+        client = asyncio.run(gw.maybe_start_weixin(orch))
+
+    assert client is not None, "the channel must have started"
+    assert len(holder_at_connect) == 1
+    assert isinstance(holder_at_connect[0], WeixinTransport)
+
+
 def test_rejected_sender_does_not_get_context_persisted(tmp_path, monkeypatch):
     """An unallowlisted stranger must not be able to mutate server-side state.
 
@@ -451,13 +484,7 @@ def test_allowed_sender_still_gets_context_persisted(tmp_path):
     assert t._ctx.get("acct1", "friend") == "ctx-keep"
 
 
-def test_options_trailer_is_stripped_from_the_end():
-    from kiro_crew.weixin.turn_renderer import _strip_options
-
-    assert _strip_options("Here you go.\n\n[OPTIONS: Yes | No]") == "Here you go."
-
-
-def test_options_stripping_never_deletes_mid_response_content():
+def test_a_mid_response_options_mention_never_deletes_the_body():
     """Regression: a non-trailing "[OPTIONS:" must not swallow the body.
 
     The hand-rolled MULTILINE|DOTALL pattern let ``.*?`` span newlines, so an
@@ -465,23 +492,20 @@ def test_options_stripping_never_deletes_mid_response_content():
     between was silently deleted from the user's reply. The shared
     OPTIONS_RE_TRAILER anchors to end-of-string instead.
     """
-    from kiro_crew.weixin.turn_renderer import _strip_options
-
     body = (
         "The dashboard renders `[OPTIONS: a | b]` as tappable chips.\n"
         "Important paragraph that must survive.\n"
         "A list: [1] first [2] second\n"
     )
-    out = _strip_options(body + "\n[OPTIONS: Keep | Discard]")
+    from kiro_crew.messaging.renderer import render_options_as_text
+    from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
+
+    out = render_options_as_text(body + "\n[OPTIONS: Keep | Discard]", WEIXIN_CAPABILITIES)
     assert "Important paragraph that must survive." in out
     assert "[1] first [2] second" in out
     assert "Keep | Discard" not in out
-
-
-def test_text_without_a_trailer_is_untouched():
-    from kiro_crew.weixin.turn_renderer import _strip_options
-
-    assert _strip_options("just an answer") == "just an answer"
+    # The trailer's own choices still reach the user, now as numbered lines.
+    assert out.endswith("1. Keep\n2. Discard")
 
 
 def test_poll_loop_backs_off_on_ret_keyed_session_expiry(tmp_path, monkeypatch):

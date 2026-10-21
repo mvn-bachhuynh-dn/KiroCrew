@@ -8,6 +8,7 @@ import pytest
 
 from kiro_crew import publish_provider as pp
 from kiro_crew.publish_provider import (
+    DEFAULT_PROVIDER,
     Capability,
     CapabilityNotSupportedError,
     CommentAnchor,
@@ -84,6 +85,29 @@ class TestCapabilityNegotiation:
             await p.delete_comment(external_id="abc", remote_id="x")
 
 
+class TestDiscoveryModelDefault:
+    def test_publish_only_provider_advertises_no_listing(self):
+        # A provider that keeps the base list_remote answers None for every
+        # scope, so advertising any scope would make the browse page request a
+        # listing that can only fail.
+        dm = MinimalProvider().discovery_model()
+        assert dm.list_mine is False
+        assert dm.list_shared_with_me is False
+        assert dm.list_public is False
+        assert dm.full_text_search is False
+
+    def test_listing_provider_keeps_the_default_scopes(self):
+        class ListingProvider(MinimalProvider):
+            async def list_remote(self, *, scope: str = "mine", page_token: str | None = None):
+                return {"artifacts": [], "next_page_token": None}  # pragma: no cover
+
+        dm = ListingProvider().discovery_model()
+        assert dm.list_mine is True
+        assert dm.list_shared_with_me is True
+        assert dm.list_public is True
+        assert dm.pull_by_id is True
+
+
 class TestListProviders:
     def test_list_registered(self):
         # In the public edition NO concrete provider is registered — the registry
@@ -97,6 +121,58 @@ class TestListProviders:
             assert len(providers) >= 1
             names = [p.name for p in providers]
             assert "minimal" in names
+        finally:
+            pp._FACTORIES.clear()
+            pp._FACTORIES.update(saved_factories)
+            reset_providers()
+
+    def test_a_provider_aliased_to_the_default_lists_once(self):
+        """One destination, one row — even though it holds two registry keys.
+
+        An edition registers its concrete name AND aliases ``DEFAULT_PROVIDER`` to
+        the same factory, so an artifact with no recorded provider resolves
+        instead of raising. Listing per key would give the picker two rows that
+        are identical down to the display name.
+        """
+        saved_factories = dict(pp._FACTORIES)
+        try:
+            pp._FACTORIES.clear()
+            register_provider("minimal", MinimalProvider)
+            register_provider(DEFAULT_PROVIDER, MinimalProvider)
+            assert [p.name for p in list_providers()] == ["minimal"]
+            # Dedupe is a listing concern: both keys must still RESOLVE, which is
+            # the whole reason the alias is registered.
+            assert isinstance(pp.get_provider("minimal"), MinimalProvider)
+            assert isinstance(pp.get_provider(DEFAULT_PROVIDER), MinimalProvider)
+        finally:
+            pp._FACTORIES.clear()
+            pp._FACTORIES.update(saved_factories)
+            reset_providers()
+
+    def test_the_default_alias_alone_still_lists_its_provider(self):
+        """A registry whose only key is the alias must not list nothing."""
+        saved_factories = dict(pp._FACTORIES)
+        try:
+            pp._FACTORIES.clear()
+            register_provider(DEFAULT_PROVIDER, MinimalProvider)
+            assert [p.name for p in list_providers()] == ["minimal"]
+        finally:
+            pp._FACTORIES.clear()
+            pp._FACTORIES.update(saved_factories)
+            reset_providers()
+
+    def test_distinct_providers_all_survive_the_dedupe(self):
+        """Collapsing is keyed on the factory, so different destinations both list."""
+
+        class SecondProvider(MinimalProvider):
+            name = "second"
+
+        saved_factories = dict(pp._FACTORIES)
+        try:
+            pp._FACTORIES.clear()
+            register_provider("minimal", MinimalProvider)
+            register_provider("second", SecondProvider)
+            assert sorted(p.name for p in list_providers()) == ["minimal", "second"]
         finally:
             pp._FACTORIES.clear()
             pp._FACTORIES.update(saved_factories)

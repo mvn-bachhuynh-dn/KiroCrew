@@ -9,19 +9,24 @@
 import { useState } from 'react'
 import { Database, FolderOpen } from 'lucide-react'
 import { api } from '../../api/client'
-import { useQueryClient } from '@tanstack/react-query'
 import { recordEvent } from '../../rum'
 import { Btn, Input, IconButton } from '../ui'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/popover'
 import RegistryManager from '../RegistryManager'
 
 import { i18nT } from '../../i18n/t'
-export default function SourcesPopover({ open, onOpenChange, onError }: {
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { useImeGuard } from '../../hooks/useImeGuard'
+export default function SourcesPopover({ open, onOpenChange, onError, onInstalled }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onError: (message: string) => void
+  // Fired after a successful Install-from-Path. The page uses it to confirm the
+  // install and steer the user to the Library tab — without it the popover just
+  // closes and a freshly-installed (disabled) app is invisible in the sidebar.
+  onInstalled?: (name: string) => void
 }) {
-  const queryClient = useQueryClient()
+  const ime = useImeGuard()
   const [installPath, setInstallPath] = useState('')
   const [installing, setInstalling] = useState(false)
 
@@ -30,10 +35,13 @@ export default function SourcesPopover({ open, onOpenChange, onError }: {
     setInstalling(true)
     try {
       const result = await api.installApp(installPath.trim())
-      recordEvent('app_install', { app: result.name || installPath.trim(), source: 'local' })
+      const installedName = result.name || installPath.trim()
+      recordEvent('app_install', { app: installedName, source: 'local' })
       setInstallPath('')
-      queryClient.invalidateQueries({ queryKey: ['apps'] })
+      // Cache invalidation (['apps'] + ['registry']) is owned by the
+      // mc:apps-changed listener in shell/appShell.tsx, for every dispatch site at once.
       window.dispatchEvent(new Event('mc:apps-changed'))
+      onInstalled?.(installedName)
       onOpenChange(false)
     } catch (e) {
       onError((e as Error)?.message || i18nT('components.appstore.sourcesPopover.install_failed'))
@@ -43,9 +51,9 @@ export default function SourcesPopover({ open, onOpenChange, onError }: {
   }
 
   return (
-    <Popover open={open} onOpenChange={onOpenChange}>
+    <Popover guideScope="menu:apps.sources" open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
-        <IconButton aria-label={i18nT('components.appstore.sourcesPopover.manage_app_sources')} title={i18nT('components.appstore.sourcesPopover.manage_app_sources')}>
+        <IconButton aria-label={i18nT('components.appstore.sourcesPopover.manage_app_sources')} title={i18nT('components.appstore.sourcesPopover.manage_app_sources')} {...uiLocation('apps.sources')}>
           <Database size={15} />
         </IconButton>
       </PopoverTrigger>
@@ -62,7 +70,7 @@ export default function SourcesPopover({ open, onOpenChange, onError }: {
               placeholder={i18nT('components.appstore.sourcesPopover.path_to_app_directory')}
               value={installPath}
               onChange={(e: React.ChangeEvent<HTMLInputElement>) => setInstallPath(e.target.value)}
-              onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => e.key === 'Enter' && handleInstall()}
+              {...ime.bindEnter({ onEnter: () => handleInstall() })}
               className="flex-1"
             />
             <Btn onClick={handleInstall} disabled={installing || !installPath.trim()}>

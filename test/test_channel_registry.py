@@ -25,7 +25,7 @@ from kiro_crew.messaging.registry import ChannelDescriptor
 
 
 class TestRegistryRoster:
-    def test_the_seven_builtin_channels_are_registered(self) -> None:
+    def test_the_nine_builtin_channels_are_registered(self) -> None:
         members = registry.governed_members(builtin_channel_descriptors())
         assert set(members) == {
             "slack",
@@ -35,17 +35,23 @@ class TestRegistryRoster:
             "wecom",
             "teams",
             "weixin",
+            "imessage",
+            "whatsapp",
+            "feishu",
         }
 
     def test_channel_type_matches_each_transport_class(self) -> None:
         """The descriptor id and the transport's channel_type must be ONE fact."""
         from kiro_crew.discord.transport import DiscordTransport
+        from kiro_crew.feishu.transport import FeishuTransport
+        from kiro_crew.imessage.transport import IMessageTransport
         from kiro_crew.slack.transport import SlackTransport
         from kiro_crew.teams.transport import TeamsTransport
         from kiro_crew.telegram.transport import TelegramTransport
         from kiro_crew.webex.transport import WebexTransport
         from kiro_crew.wecom.transport import WeComTransport
         from kiro_crew.weixin.transport import WeixinTransport
+        from kiro_crew.whatsapp.transport import WhatsAppTransport
 
         transports = {
             t.channel_type: t
@@ -57,6 +63,9 @@ class TestRegistryRoster:
                 WeComTransport,
                 TeamsTransport,
                 WeixinTransport,
+                IMessageTransport,
+                WhatsAppTransport,
+                FeishuTransport,
             )
         }
         for desc in builtin_channel_descriptors():
@@ -75,7 +84,7 @@ class TestRegistryRoster:
         by_type = {d.channel_type: d for d in descs}
         assert by_type["slack"].start is None
         assert "slack" not in {d.channel_type for d in registry.bootable(descs)}
-        assert len(registry.bootable(descs)) == 6
+        assert len(registry.bootable(descs)) == 9
 
 
 class TestRegistryBootLoop:
@@ -146,6 +155,59 @@ class TestRegistryBootLoop:
                 self._orch(), descs, {"boom": True, "ok": True}
             )
             assert handles == {"ok": "ok-client"}
+
+        asyncio.run(go())
+
+    def test_before_start_runs_per_permitted_channel_immediately_ahead_of_its_factory(
+        self,
+    ) -> None:
+        """The gateway re-hoists a channel from the watcher's current snapshot in
+        this hook. It must run once per channel that actually starts, right before
+        that channel's factory -- not once for all of them -- because the channels
+        ahead of it may have spent seconds connecting."""
+        events: list[str] = []
+
+        def make_start(name: str):
+            async def start(orch: Any) -> Any:
+                events.append(f"start:{name}")
+                return f"{name}-client"
+
+            return start
+
+        async def go() -> None:
+            descs = (
+                ChannelDescriptor("alpha", start=make_start("alpha")),
+                ChannelDescriptor("beta", start=make_start("beta")),
+                ChannelDescriptor("denied", start=make_start("denied")),
+            )
+            handles = await registry.start_channels(
+                self._orch(),
+                descs,
+                {"alpha": True, "beta": True, "denied": False},
+                before_start=lambda desc: events.append(f"hook:{desc.channel_type}"),
+            )
+            assert events == ["hook:alpha", "start:alpha", "hook:beta", "start:beta"]
+            assert handles == {"alpha": "alpha-client", "beta": "beta-client"}
+
+        asyncio.run(go())
+
+    def test_a_raising_before_start_hook_is_isolated_like_a_raising_factory(self) -> None:
+        async def ok(orch: Any) -> Any:
+            return "ok-client"
+
+        def hook(desc: ChannelDescriptor) -> None:
+            if desc.channel_type == "first":
+                raise RuntimeError("hoist exploded")
+
+        async def go() -> None:
+            descs = (
+                ChannelDescriptor("first", start=ok),
+                ChannelDescriptor("second", start=ok),
+            )
+            handles = await registry.start_channels(
+                self._orch(), descs, {"first": True, "second": True}, before_start=hook
+            )
+            assert handles == {"second": "ok-client"}
 
         asyncio.run(go())
 

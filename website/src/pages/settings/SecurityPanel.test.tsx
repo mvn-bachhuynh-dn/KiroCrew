@@ -1,9 +1,21 @@
+/**
+ * SecurityPanel (Settings → Security): the governance policy viewer and its central
+ * distribution block, the posture disclosure, and the third-party-apps trust card.
+ *
+ * Three suites split from this file cover more of the panel: the denied-commands rules
+ * and their search in SecurityPanel.deniedCommands.test.tsx, registry trust in
+ * SecurityPanel.registryTrust.test.tsx, and the inspector rail and the redaction pane in
+ * SecurityPanel.rail.test.tsx. Each keeps its own copy of the api mock below; the
+ * fixtures they share with this file are in src/test/SecurityPanelTestUtils.tsx.
+ *
+ * The trusted-apps and allow-all describes set only their own mocks and read the rail's
+ * `kirocrewConfig` and `tailnetStatus` answers from the posture describe's `beforeEach`, so
+ * they stay behind it.
+ */
 import { ApiError } from '../../api/client'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
-import { useLocation } from 'react-router-dom'
-import { renderWithProviders, createTestStore } from '../../test/helpers'
-import type { DeniedCommandsData } from '../../api/client'
+import { screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { renderWithProviders } from '../../test/helpers'
 
 /* ── api client mock ───────────────────────────────────────────────────────
  * SecurityPanel drives all its mutations through the `api` client methods.  We
@@ -31,6 +43,8 @@ vi.mock('../../api/client', () => ({
     addUserDeniedCommand: vi.fn(),
     toggleUserDeniedCommand: vi.fn(),
     deleteUserDeniedCommand: vi.fn(),
+    redactionAllowedHosts: vi.fn(),
+    redactionRevokeHost: vi.fn(),
     governancePolicy: vi.fn(),
     securityPosture: vi.fn(),
     // Read + write for the third-party-app execution toggle. Also consumed by
@@ -42,17 +56,27 @@ vi.mock('../../api/client', () => ({
     // crash on an undefined queryFn; the section's behaviour is covered in
     // SecurityPanel.tailnet.test.tsx.
     tailnetStatus: vi.fn(),
+    // Read by the rail on every mount to summarise the flagged-file-delivery
+    // section, for the same reason as `tailnetStatus` above. The section's own
+    // behaviour is covered in SecurityPanel.fileDelivery.test.tsx.
+    fileDeliveryConsent: vi.fn(),
+    revokeFileDeliveryConsent: vi.fn(),
     listTrustedApps: vi.fn(),
     trustApp: vi.fn(),
     untrustApp: vi.fn(),
     setTrustAllApps: vi.fn(),
+    // Read + the two writes behind the registry git-identity trust section.
+    listTrustedRegistries: vi.fn(),
+    grantTrustedRegistry: vi.fn(),
+    revokeTrustedRegistry: vi.fn(),
   },
 }))
 
 import { api } from '../../api/client'
-import type { GovernancePolicyData, SecurityPostureData, TrustedAppsData } from '../../api/client'
-import { SecurityPanel, trustFailureMessage } from './SecurityPanel'
+import type { GovernanceDistributionData, GovernancePolicyData, TrustedAppsData } from '../../api/client'
+import { SecurityPanel, trustFailureMessage, humaniseScopeLeaf } from './SecurityPanel'
 import { i18nT } from '../../i18n/t'
+import { TAILNET_OFF, CONSENT_NONE, snapshot, posture, govNoPolicy } from '../../test/SecurityPanelTestUtils'
 
 /** Copy is asserted through `i18nT`, not literal English.
  *
@@ -78,155 +102,6 @@ const T = {
   cancel: () => i18nT('pages.settings.securityPanel.cancel'),
 }
 
-const PINNED_DESC = 'Blocks EC2 instance termination'
-const TOGGLE_DESC = 'Blocks CloudFormation stack deletion'
-const USER_PATTERN = 'rm -rf /tmp/mine'
-
-/** A second user rule, this one carrying a `note`.
- *
- * `note` is optional on `DeniedUserRule` — rules added before the field existed,
- * and rules added without one, omit it. Keeping BOTH shapes in the one shared
- * snapshot means the present and absent branches are asserted against the same
- * render, so "renders the note" and "renders no note" cannot both pass on a row
- * that unconditionally emits the paragraph. */
-const NOTED_PATTERN = 'curl .* \\| (ba)?sh'
-const USER_NOTE = 'Fetch it, read it, then run it — never pipe a download into a shell.'
-
-/** The note field's copy keys are authored separately from this component, so
- *  resolve them the way the panel does instead of asserting literal English —
- *  the same rationale as the `T` block above. The assertion then tracks the
- *  BEHAVIOUR (this control is wired to that key) and stays green across the
- *  catalog landing, while still failing if the panel switches keys. */
-const NOTE_LABEL = () => i18nT('pages.settings.securityPanel.custom_deny_note')
-
-/** Default payload for the rail's tailnet read.
- *
- * Every `beforeEach` in this file resolves `api.tailnetStatus` with this. It must
- * RESOLVE rather than merely exist: a bare `vi.fn()` returns undefined, which
- * react-query rejects ("Query data cannot be undefined") and reports once per
- * test, since the rail reads it on mount in all of them. `off` is the right
- * default here — this file covers the rest of the panel, and the section's own
- * states are covered in SecurityPanel.tailnet.test.tsx.
- */
-const TAILNET_OFF = {
-  enabled: false,
-  governance_pinned: false,
-  host: '',
-  origin: '',
-  resolved_at: 0,
-  state: 'off',
-} as const
-
-function snapshot(overrides: Partial<DeniedCommandsData> = {}): DeniedCommandsData {
-  return {
-    builtins: [
-      {
-        id: 'aws-destructive-cfn-delete-stack',
-        pattern: 'aws.*cloudformation.*delete-stack.*',
-        category: 'aws-destructive',
-        description: TOGGLE_DESC,
-        enabled: true,
-        pinned: false,
-      },
-      {
-        id: 'aws-destructive-ec2-terminate-instances',
-        pattern: 'aws.*ec2.*terminate-instances.*',
-        category: 'aws-destructive',
-        description: PINNED_DESC,
-        enabled: true,
-        pinned: true,
-      },
-    ],
-    user_added: [
-      { id: 'user-1', pattern: USER_PATTERN, enabled: true },
-      { id: 'user-2', pattern: NOTED_PATTERN, enabled: true, note: USER_NOTE },
-    ],
-    disable_all: false,
-    effective_count: 129,
-    governance_locked: false,
-    ...overrides,
-  }
-}
-
-/** Render the panel with the denied-commands query pre-resolved.
- *
- * Built-in rules live inside per-category accordions that are COLLAPSED by
- * default, so the rows are not in the DOM until a category is expanded. After
- * the query hydrates, click "Expand all" so every rule row is present for the
- * assertions below (mirrors what a user does to reach an individual rule). */
-async function renderPanel(data: DeniedCommandsData = snapshot()) {
-  ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(data)
-  const utils = renderWithProviders(<SecurityPanel />, { route: '/?section=rules' })
-  // Wait for the async query to hydrate the category accordion, then expand all.
-  const expandAll = await screen.findByRole('button', { name: 'Expand all' })
-  fireEvent.click(expandAll)
-  await screen.findByLabelText(TOGGLE_DESC)
-  return utils
-}
-
-/** A posture snapshot with one short control (no filter box) and one long enough
- *  to trigger both the filter box and the "Show N more" truncation. */
-function posture(overrides: Partial<SecurityPostureData> = {}): SecurityPostureData {
-  const many = Array.from({ length: 30 }, (_, i) => ({
-    label: `~/.secret-${i}`,
-    detail: i === 7 ? 'Needle detail' : 'Third-party credential store',
-  }))
-  return {
-    controls: [
-      {
-        key: 'redaction_paths',
-        label: 'Output redaction',
-        unit: 'output paths',
-        summary: 'Every boundary where agent output reaches a human.',
-        source: 'src/kiro_crew/security.py',
-        count: 2,
-        items: [
-          { label: 'Dashboard live stream', detail: 'chat_runner.py — StreamRedactor' },
-          { label: 'Slack messages', detail: 'handler.py — final pass' },
-        ],
-        unavailable: false,
-      },
-      {
-        key: 'sensitive_paths',
-        label: 'Sensitive path blocking',
-        unit: 'credential paths',
-        summary: 'Paths the agent cannot read or write.',
-        source: 'src/kiro_crew/security.py',
-        count: many.length,
-        items: many,
-        unavailable: false,
-      },
-      {
-        key: 'denied_commands',
-        label: 'Denied commands',
-        unit: 'built-in rules',
-        summary: 'Destructive shell operations blocked at the gate.',
-        source: 'src/kiro_crew/security.py',
-        count: 137,
-        items: [{ label: 'Blocks stack deletion', detail: 'aws-destructive' }],
-        unavailable: false,
-      },
-    ],
-    counts: { redaction_paths: 2, sensitive_paths: 30, denied_commands: 137 },
-    ...overrides,
-  }
-}
-
-/** No-policy (standalone) governance snapshot: every scope ungoverned. */
-function govNoPolicy(overrides: Partial<GovernancePolicyData> = {}): GovernancePolicyData {
-  return {
-    version: null,
-    has_policy: false,
-    profile: null,
-    unavailable: false,
-    scopes: [
-      { scope: 'tools', archetype: 'ruleset', governed: false, source: 'ungoverned', detail: {} },
-      { scope: 'commands', archetype: 'ruleset', governed: false, source: 'ungoverned', detail: {} },
-    ],
-    ...overrides,
-  }
-}
-
 /** A governed governance snapshot exercising every archetype + a profile. */
 function govGoverned(overrides: Partial<GovernancePolicyData> = {}): GovernancePolicyData {
   return {
@@ -248,6 +123,28 @@ function govGoverned(overrides: Partial<GovernancePolicyData> = {}): GovernanceP
   }
 }
 
+/** A configured central-distribution posture.
+ *
+ * The defaults describe the state a governed fleet actually runs in — an https
+ * source, a live poller on a 15-minute interval, a warm cache, and a poll that found
+ * nothing to change — so each case below overrides only the field it is about. */
+function govDistribution(overrides: Partial<GovernanceDistributionData> = {}): GovernanceDistributionData {
+  return {
+    configured: true,
+    source_scheme: 'https',
+    refresh_interval_seconds: 900,
+    max_cache_age_seconds: 86400,
+    on_unavailable: 'fail_closed',
+    refresher_running: true,
+    cache_present: true,
+    cache_age_seconds: 120,
+    last_refresh_status: 'unchanged',
+    last_refresh_age_seconds: 30,
+    error_code: '',
+    ...overrides,
+  }
+}
+
 /** A trusted-apps snapshot: two per-app grants, blanket flag off. */
 function trusted(overrides: Partial<TrustedAppsData> = {}): TrustedAppsData {
   return {
@@ -262,315 +159,30 @@ function trusted(overrides: Partial<TrustedAppsData> = {}): TrustedAppsData {
  *  outside the app-name charset, so neither can ever admit anything. */
 const INEFFECTIVE = ['LD-App', '..']
 
-describe('SecurityPanel — denied commands', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    ;(api.toggleBuiltinDeniedCommand as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.setDeniedCommandsDisableAll as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.toggleUserDeniedCommand as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.deleteUserDeniedCommand as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
-    ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
-    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+describe('humaniseScopeLeaf', () => {
+  it('title-cases each word of a snake_case or kebab-case leaf', () => {
+    expect(humaniseScopeLeaf('external_access')).toBe('External Access')
+    expect(humaniseScopeLeaf('capability_install')).toBe('Capability Install')
+    expect(humaniseScopeLeaf('theme-persona')).toBe('Theme Persona')
+    expect(humaniseScopeLeaf('cron')).toBe('Cron')
   })
 
-  it('toggling a built-in OFF opens the confirm modal and only mutates after ack', async () => {
-    await renderPanel()
-
-    // Turning a built-in OFF must NOT mutate immediately — it opens the modal.
-    fireEvent.click(screen.getByRole('switch', { name: TOGGLE_DESC }))
-    expect(api.toggleBuiltinDeniedCommand).not.toHaveBeenCalled()
-
-    // Modal is open; the Disable button is gated on the ack checkbox.
-    const dialog = await screen.findByRole('dialog')
-    const disableBtn = within(dialog).getByRole('button', { name: 'Disable' })
-    expect(disableBtn).toBeDisabled()
-
-    // Clicking Disable while un-acked is a no-op.
-    fireEvent.click(disableBtn)
-    expect(api.toggleBuiltinDeniedCommand).not.toHaveBeenCalled()
-
-    // Ack the warning, then Disable → the mutation fires with enabled=false.
-    fireEvent.click(
-      screen.getByLabelText("I understand this weakens Kiro Crew's protection."),
-    )
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Disable' }))
-    await waitFor(() =>
-      expect(api.toggleBuiltinDeniedCommand).toHaveBeenCalledWith(
-        'aws-destructive-cfn-delete-stack',
-        false,
-      ),
-    )
-  })
-
-  it('toggling a built-in ON is immediate (no modal)', async () => {
-    await renderPanel(
-      snapshot({
-        builtins: [
-          {
-            id: 'aws-destructive-cfn-delete-stack',
-            pattern: 'aws.*cloudformation.*delete-stack.*',
-            category: 'aws-destructive',
-            description: TOGGLE_DESC,
-            enabled: false,
-            pinned: false,
-          },
-        ],
-        user_added: [],
-      }),
-    )
-
-    fireEvent.click(screen.getByRole('switch', { name: TOGGLE_DESC }))
-    await waitFor(() =>
-      expect(api.toggleBuiltinDeniedCommand).toHaveBeenCalledWith(
-        'aws-destructive-cfn-delete-stack',
-        true,
-      ),
-    )
-    // No confirm modal for enabling.
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-  })
-
-  it('pinned rows render locked and never call the mutation', async () => {
-    await renderPanel()
-
-    const pinnedToggle = screen.getByRole('switch', { name: PINNED_DESC })
-    // Pinned toggle is disabled (forced on, un-opt-out-able).
-    expect(pinnedToggle).toHaveAttribute('aria-checked', 'true')
-    fireEvent.click(pinnedToggle)
-    expect(api.toggleBuiltinDeniedCommand).not.toHaveBeenCalled()
-    // No modal opens either.
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-  })
-
-  it('disable-all stays available and functional when governance-locked', async () => {
-    // A policy pin on ONE rule sets governance_locked, but the backend keeps
-    // pinned rules enforced under disable_all — so the disable-all control must
-    // remain operable to opt every OTHER (unpinned) rule out.
-    await renderPanel(snapshot({ governance_locked: true }))
-
-    const disableAll = screen.getByRole('switch', { name: 'Disable all built-in denies' })
-    expect(disableAll).toBeEnabled()
-    expect(disableAll).toHaveAttribute('aria-checked', 'false')
-
-    // Turning it ON opens the confirm modal (same guarded flow as unlocked).
-    fireEvent.click(disableAll)
-    const dialog = await screen.findByRole('dialog')
-    fireEvent.click(
-      screen.getByLabelText("I understand this weakens Kiro Crew's protection."),
-    )
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Disable' }))
-    await waitFor(() => expect(api.setDeniedCommandsDisableAll).toHaveBeenCalledWith(true))
-  })
-
-  it('add-pattern validates the regex: invalid shows inline error, no API call', async () => {
-    await renderPanel()
-
-    const input = screen.getByLabelText('Custom deny pattern')
-    fireEvent.change(input, { target: { value: '(unclosed' } })
-    // Submit via Enter.
-    fireEvent.keyDown(input, { key: 'Enter' })
-
-    // Inline error surfaces and no API call is made.
-    await screen.findByText(/Invalid regular expression|Unterminated group|Invalid group/i)
-    expect(api.addUserDeniedCommand).not.toHaveBeenCalled()
-
-    // A valid pattern clears the error and calls the API. The note is untouched
-    // here, so it arrives as the empty string the client defaults to.
-    fireEvent.change(input, { target: { value: 'rm -rf /data' } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() =>
-      expect(api.addUserDeniedCommand).toHaveBeenCalledWith('rm -rf /data', ''),
-    )
-  })
-
-  it('add-pattern sends the typed note through to the API and clears both drafts', async () => {
-    await renderPanel()
-
-    fireEvent.change(screen.getByLabelText('Custom deny pattern'), {
-      target: { value: 'find / -delete' },
-    })
-    const note = screen.getByLabelText(NOTE_LABEL())
-    fireEvent.change(note, { target: { value: '  Scope it with -maxdepth first.  ' } })
-    // Enter on the NOTE field submits too — the note is the last thing typed, so
-    // requiring a trip back to the pattern input to commit would lose it.
-    fireEvent.keyDown(note, { key: 'Enter' })
-
-    // Trimmed: this prose is read back to the agent verbatim when the rule fires,
-    // so surrounding whitespace must not survive the submit.
-    await waitFor(() =>
-      expect(api.addUserDeniedCommand).toHaveBeenCalledWith(
-        'find / -delete',
-        'Scope it with -maxdepth first.',
-      ),
-    )
-    // Both drafts clear together. A note left behind would silently attach
-    // itself to the NEXT pattern the reader adds, mislabelling that refusal.
-    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('')
-    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue('')
-  })
-
-  it('a REJECTED add keeps both drafts so the operator can correct them', async () => {
-    // The server rejects a note carrying the refusal prefix (400). Clearing on
-    // submit rather than on success would discard text the operator then has to
-    // retype from memory -- and the rejected note is exactly the text they need
-    // in front of them to fix.
-    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error('note must not contain'),
-    )
-    await renderPanel()
-
-    const pattern = screen.getByLabelText('Custom deny pattern')
-    const note = screen.getByLabelText(NOTE_LABEL())
-    fireEvent.change(pattern, { target: { value: 'find / -delete' } })
-    fireEvent.change(note, { target: { value: 'Blocked by security policy: nope' } })
-    fireEvent.keyDown(pattern, { key: 'Enter' })
-
-    await waitFor(() => expect(api.addUserDeniedCommand).toHaveBeenCalled())
-    // Both survive the failure.
-    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('find / -delete')
-    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue(
-      'Blocked by security policy: nope',
-    )
-    // ...and the rejection is VISIBLE. Keeping the drafts without saying why would
-    // leave Add looking like it silently did nothing.
-    expect(await screen.findByText(/must not contain/i)).toBeInTheDocument()
-  })
-
-  it('a slow add does not erase drafts the operator typed while it was in flight', async () => {
-    // The inputs stay editable while an add is pending, so an operator can start
-    // the NEXT rule before the previous one resolves. Clearing unconditionally on
-    // success would erase that newer text.
-    let release!: (snap: DeniedCommandsData) => void
-    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      () => new Promise<DeniedCommandsData>(resolve => { release = resolve }),
-    )
-    await renderPanel()
-
-    const pattern = screen.getByLabelText('Custom deny pattern')
-    const note = screen.getByLabelText(NOTE_LABEL())
-    fireEvent.change(pattern, { target: { value: 'first .*' } })
-    fireEvent.change(note, { target: { value: 'first note' } })
-    fireEvent.keyDown(pattern, { key: 'Enter' })
-    await waitFor(() => expect(api.addUserDeniedCommand).toHaveBeenCalled())
-
-    // Operator moves on to the next rule while the first is still pending.
-    fireEvent.change(pattern, { target: { value: 'second .*' } })
-    fireEvent.change(note, { target: { value: 'second note' } })
-
-    release(snapshot())
-
-    // Flush the resolution INSIDE act: without this the assertions below can pass
-    // on the first poll, before React has processed onSuccess, and the test would
-    // be vacuous -- it would pass with or without the guard it exists to prove.
-    await act(async () => {
-      await Promise.resolve()
-    })
-
-    // The in-flight add resolving must not touch the newer drafts.
-    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('second .*')
-    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue('second note')
-  })
-
-  it('a note deliberately reused for the next rule is not cleared by the previous add', async () => {
-    // Partial reuse: the operator submits (A, N), then retypes only the pattern
-    // because the SAME rationale applies to the next rule. Clearing per-field
-    // would wipe N -- correct by string equality, wrong by intent. Clearing is
-    // all-or-nothing: if either field moved, neither is touched.
-    let release!: (snap: DeniedCommandsData) => void
-    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      () => new Promise<DeniedCommandsData>(resolve => { release = resolve }),
-    )
-    await renderPanel()
-
-    const pattern = screen.getByLabelText('Custom deny pattern')
-    const note = screen.getByLabelText(NOTE_LABEL())
-    fireEvent.change(pattern, { target: { value: 'first .*' } })
-    fireEvent.change(note, { target: { value: 'shared rationale' } })
-    fireEvent.keyDown(pattern, { key: 'Enter' })
-    await waitFor(() => expect(api.addUserDeniedCommand).toHaveBeenCalled())
-
-    // Only the pattern changes; the note is intentionally kept.
-    fireEvent.change(pattern, { target: { value: 'second .*' } })
-
-    release(snapshot())
-    await act(async () => {
-      await Promise.resolve()
-    })
-
-    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('second .*')
-    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue('shared rationale')
-  })
-
-  it('add-pattern with an untouched note sends an empty string, not undefined', async () => {
-    await renderPanel()
-
-    const input = screen.getByLabelText('Custom deny pattern')
-    fireEvent.change(input, { target: { value: 'shutdown -h now' } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-
-    // The note is optional to the READER, but the argument is not optional on the
-    // wire: the client posts whatever it is handed, and `undefined` would drop
-    // the field from the body instead of stating "no note". Assert the exact
-    // empty string rather than an arity-free match, so a regression to
-    // `addUserDeniedCommand(pattern)` fails here.
-    await waitFor(() =>
-      expect(api.addUserDeniedCommand).toHaveBeenCalledWith('shutdown -h now', ''),
-    )
-  })
-
-  it('a user rule with a note renders it under its own pattern', async () => {
-    await renderPanel()
-
-    // Scoped to the row: the note explains one specific pattern, so "somewhere
-    // on the card" is not the claim being made.
-    const noted = screen.getByText(NOTED_PATTERN).parentElement!
-    expect(within(noted).getByText(USER_NOTE)).toBeInTheDocument()
-  })
-
-  it('a user rule without a note renders no note paragraph', async () => {
-    await renderPanel()
-
-    // `user-1` carries no note, so the optional slot must emit nothing at all —
-    // an empty <p> would still claim vertical space under the pattern.
-    expect(screen.getByText(USER_PATTERN).parentElement!.querySelector('p')).toBeNull()
-    // Paired with the noted rule from the SAME render, so this cannot pass by the
-    // panel having stopped rendering notes altogether.
-    expect(screen.getByText(NOTED_PATTERN).parentElement!.querySelector('p')).not.toBeNull()
-  })
-
-  it('delete is only available on user rows', async () => {
-    await renderPanel()
-
-    // The delete affordance targets the user pattern specifically.
-    const del = screen.getByLabelText(`Delete pattern ${USER_PATTERN}`)
-    fireEvent.click(del)
-    await waitFor(() =>
-      expect(api.deleteUserDeniedCommand).toHaveBeenCalledWith('user-1'),
-    )
-    // Built-in rows have no delete affordance.
-    expect(screen.queryByLabelText(`Delete pattern ${TOGGLE_DESC}`)).not.toBeInTheDocument()
-  })
-
-  it('chevron reveals the built-in pattern text', async () => {
-    await renderPanel()
-
-    // Pattern is hidden until the row is expanded.
-    expect(screen.queryByText('aws.*cloudformation.*delete-stack.*')).not.toBeInTheDocument()
-    const showButtons = screen.getAllByLabelText('Show pattern')
-    fireEvent.click(showButtons[0])
-    expect(screen.getByText('aws.*cloudformation.*delete-stack.*')).toBeInTheDocument()
+  it('does not emit stray or doubled spaces from odd separators', () => {
+    // A leading/trailing/doubled separator is an operator-authored identifier we
+    // do not control, and the panel renders the result verbatim.
+    expect(humaniseScopeLeaf('_leading')).toBe('Leading')
+    expect(humaniseScopeLeaf('trailing_')).toBe('Trailing')
+    expect(humaniseScopeLeaf('double__sep')).toBe('Double Sep')
+    expect(humaniseScopeLeaf('')).toBe('')
   })
 })
 
-describe('SecurityPanel — governance policy viewer', () => {
-  beforeEach(() => {
+describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() => {
     vi.clearAllMocks()
     ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
     ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   it('shows the standalone "no enterprise policy" state when has_policy is false', async () => {
@@ -583,6 +195,53 @@ describe('SecurityPanel — governance policy viewer', () => {
     ).toBeInTheDocument()
     // No governed rows are rendered in standalone mode.
     expect(screen.queryByText('policy ∩ profile')).not.toBeInTheDocument()
+  })
+
+  it('humanises the label of a companion-registered scope the core has no key for', async () => {
+    // A scope registered through `register_scope` by an edition reaches this panel
+    // (the snapshot endpoint iterates SCOPE_CATALOG) but can never have an i18n
+    // key, because the core does not know it exists. Governed-scope leaves are
+    // snake_case, so the raw fallback rendered `External_access` mid-panel.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        scopes: [
+          {
+            scope: 'capabilities.external_access',
+            archetype: 'capability',
+            governed: true,
+            source: 'policy',
+            detail: { enabled: true, inner: { registry_hosts: { mode: 'allow', allow_count: 2, deny_count: 0 } } },
+          },
+        ],
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('External Access')).toBeInTheDocument()
+    expect(screen.queryByText('External_access')).not.toBeInTheDocument()
+  })
+
+  it('names a pinned social-share ceiling after the menu entry it withdraws', async () => {
+    // A user whose "Share as image" entry vanished reads THIS row to learn why;
+    // the humanised leaf ("Social Share") would not connect to the feature they
+    // lost, and would render in English in every locale.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        scopes: [
+          {
+            scope: 'capabilities.social_share',
+            archetype: 'capability',
+            governed: true,
+            source: 'policy',
+            detail: { enabled: false, inner: {} },
+          },
+        ],
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Share as image')).toBeInTheDocument()
+    expect(screen.queryByText('Social Share')).not.toBeInTheDocument()
   })
 
   it('renders governed + ungoverned rows with effective state and source', async () => {
@@ -692,6 +351,293 @@ describe('SecurityPanel — governance policy viewer', () => {
       screen.queryByText(/A surface with its own profile can allow what the host cannot/),
     ).not.toBeInTheDocument()
   })
+
+  it('shows a warning banner naming the unusable profiles', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: ['host'] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/policy fallback ceiling/)).toBeInTheDocument()
+    expect(screen.getByText(/Affected: host\./)).toBeInTheDocument()
+    // The remedy is only useful if it says WHERE the file is.
+    expect(screen.getByText(/profiles folder of your Kiro Crew data home/)).toBeInTheDocument()
+    // Causes and the restart caveat live on the demoted line, not in the body.
+    expect(screen.getByText(/extends a profile that is missing/)).toBeInTheDocument()
+  })
+
+  it('names every unusable profile, not just the host one', async () => {
+    // The reason the contract is a list: a broken sibling surface deny-alls
+    // itself just as silently, and a host-only boolean could not report it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: ['cron', 'subagent'] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/Affected: cron, subagent\./)).toBeInTheDocument()
+  })
+
+  it('does not show fallback banner when fallback_profiles is empty', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: [] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('does not show fallback banner when fallback_profiles is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('lists unknown companion scopes per affected profile', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        unknown_profile_scopes: {
+          host: ['capabilities.board', 'capabilities.channels'],
+          cron: ['capabilities.board'],
+        },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    // One row per profile stem, each naming its own skipped scopes.
+    expect(screen.getByText('host')).toBeInTheDocument()
+    expect(screen.getByText('cron')).toBeInTheDocument()
+    // Joined via fmtList (Intl.ListFormat unit type), same contract as the
+    // fallback banner: en joins with ', ', zh with 、 and no spaces.
+    expect(screen.getByText('capabilities.board, capabilities.channels')).toBeInTheDocument()
+    // Rows are sorted with compareText: the fixture feeds insertion order
+    // host→cron, so an unsorted render would show host first. Node.compareDocumentPosition
+    // pins the DOM order the comparator produces.
+    const cron = screen.getByText('cron')
+    const host = screen.getByText('host')
+    expect(cron.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // The explanation is a tooltip, not body copy: it must NOT be in the
+    // document until the InfoTip is opened.
+    expect(screen.queryByText(/companion edition/)).not.toBeInTheDocument()
+  })
+
+  it('explains companion scopes in the InfoTip on demand', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    const block = (await screen.findByText('Profile scopes not in this build')).parentElement!
+    fireEvent.click(within(block).getByRole('button', { name: /more information/i }))
+    expect(
+      await screen.findByText(/this build does not register.*no effect in this build/),
+    ).toBeInTheDocument()
+  })
+
+  it('renders unknown scopes stacked with the fallback banner they are siblings of', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        fallback_profiles: ['cron'],
+        unknown_profile_scopes: { host: ['capabilities.board'] },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // Both sibling diagnostics render together — one must not suppress the other.
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText('Profile scopes not in this build')).toBeInTheDocument()
+  })
+
+  it('shows unknown scopes even with no policy and no host profile', async () => {
+    // The payload aggregates EVERY loaded profile, so a standalone install with
+    // only a companion-edition subagent.json is a valid producer state. The
+    // no-policy card must yield to the diagnostic rather than swallow it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ unknown_profile_scopes: { subagent: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    expect(screen.getByText('subagent')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is an empty object', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: {} }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no row for a profile whose scope list is empty', async () => {
+    // The producer contract says an empty list cannot happen; the filter makes
+    // the UI true independent of it — no badge with nothing after it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: [] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+})
+
+describe('SecurityPanel — central policy distribution', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
+    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
+  })
+
+  it('reports the transport, the poller, the cache age and the last refresh', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ distribution: govDistribution() }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Central policy distribution')).toBeInTheDocument()
+    // The SCHEME, never the URL: the producer withholds the endpoint, so a test that
+    // ever finds one here is reporting a leak of the fleet's control plane.
+    expect(screen.getByText('Source: https')).toBeInTheDocument()
+    // Durations go through fmtDuration, so assert the copy plus the magnitude rather
+    // than a unit spelling that is locale-owned.
+    expect(screen.getByText(/Refreshed every/).textContent).toMatch(/15/)
+    expect(screen.getByText(/Cached copy is/).textContent).toMatch(/2/)
+    expect(screen.getByText('Last refresh found no change')).toBeInTheDocument()
+    // A governed host has its ceiling, so the pending caveat must stay off.
+    expect(screen.queryByText(/enterprise ceiling restricts the host surface/)).not.toBeInTheDocument()
+  })
+
+  // The trap this block exists to close: `has_policy: false` + `profile: null` is
+  // BOTH "standalone, nothing governs this machine" and "centrally governed, the
+  // first fetch has not landed". Rendering the reassuring card for the second is
+  // telling an operator their ceiling is off when it is merely late.
+  it('does not claim "no enterprise policy" on a host whose first fetch has not landed', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({
+        distribution: govDistribution({
+          cache_present: false,
+          cache_age_seconds: null,
+          last_refresh_status: '',
+          last_refresh_age_seconds: null,
+        }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Central policy distribution')).toBeInTheDocument()
+    expect(screen.getByText(/enterprise ceiling restricts the host surface/)).toBeInTheDocument()
+    // Not merely supplemented — the reassurance must be GONE.
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+    // And the scope rows render in its place, so the page still says what is enforced.
+    expect(screen.getAllByText('Not restricted').length).toBeGreaterThan(0)
+  })
+
+  it('names the cache age when the copy is days old', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        distribution: govDistribution({
+          cache_age_seconds: 3 * 86400,
+          last_refresh_status: 'unreachable',
+          last_refresh_age_seconds: 60,
+        }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // dropZero is what keeps three days from rendering as "3d 0h 0m".
+    const cache = await screen.findByText(/Cached copy is/)
+    expect(cache.textContent).toMatch(/3\s* ?d/)
+    expect(cache.textContent).not.toMatch(/0/)
+    expect(screen.getByText('Source was unreachable on the last refresh')).toBeInTheDocument()
+  })
+
+  it('reports a misconfigured declaration even though it is not "configured"', async () => {
+    // The producer answers `configured: false` with an error code: the fleet DID
+    // point this host somewhere, the pins just do not parse. Gating the block on
+    // `configured` alone would drop the one state that most needs saying.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ distribution: { configured: false, error_code: 'misconfigured' } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Distribution settings could not be read')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+    // Nothing is known about the transport or the cache, so no badge claims one.
+    expect(screen.queryByText(/Source:/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Cached copy/)).not.toBeInTheDocument()
+  })
+
+  it('survives the unavailable short-circuit that hides every other governance fact', async () => {
+    // `unavailable` collapses the whole viewer to one soft notice, but the fail-safe
+    // snapshot still carries the distribution posture — and a stopped poller plus an
+    // unreachable source is exactly what an operator needs at that moment.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({
+        unavailable: true,
+        distribution: govDistribution({ refresher_running: false, last_refresh_status: 'unreachable' }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText(/Governance status is temporarily unavailable/)).toBeInTheDocument()
+    expect(screen.getByText('Central policy distribution')).toBeInTheDocument()
+    expect(screen.getByText(/Background refresh is not running/)).toBeInTheDocument()
+    expect(screen.getByText('Source was unreachable on the last refresh')).toBeInTheDocument()
+    // The pending caveat must NOT fire here: the fail-safe snapshot reports
+    // `has_policy: false` because it could not resolve the ceiling, not because there
+    // is none, so reading it as pending would announce an unrestricted host surface on
+    // a machine whose ceiling is installed and enforcing.
+    expect(screen.queryByText(/enterprise ceiling restricts the host surface/)).not.toBeInTheDocument()
+  })
+
+  it('says a boot-only fetch is boot-only rather than calling the poller stopped', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        distribution: govDistribution({ refresh_interval_seconds: 0, refresher_running: false }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fetched at startup only')).toBeInTheDocument()
+    expect(screen.queryByText('Background refresh is not running')).not.toBeInTheDocument()
+  })
+
+  it('renders no block, and no empty section, when the payload omits distribution', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('No enterprise policy in effect')).toBeInTheDocument()
+    expect(screen.queryByText('Central policy distribution')).not.toBeInTheDocument()
+  })
+
+  it('renders no block when a build without the feature reports configured: false', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ distribution: { configured: false } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('No enterprise policy in effect')).toBeInTheDocument()
+    expect(screen.queryByText('Central policy distribution')).not.toBeInTheDocument()
+  })
 })
 
 describe('SecurityPanel — posture disclosure', () => {
@@ -702,6 +648,7 @@ describe('SecurityPanel — posture disclosure', () => {
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
     ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   it('renders a pill per control using the server-derived count and unit', async () => {
@@ -1290,344 +1237,5 @@ describe('SecurityPanel — allow-all toggle inherits #1414 semantics', () => {
     renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
     expect(await screen.findByText(/could not read the current setting/i)).toBeInTheDocument()
     expect(screen.queryByRole('switch', { name: /trust every third-party app/i })).toBeNull()
-  })
-})
-
-describe('SecurityPanel — inspector rail', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
-    ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
-    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
-  })
-
-  /** Every rail row, in DOM order. */
-  function railRows() {
-    return screen.getAllByRole('option')
-  }
-
-  /** Echoes the ROUTER's query string. MemoryRouter never touches
-   *  window.location, so asserting on that would silently pass forever. */
-  function SearchProbe() {
-    return <div data-testid="search">{useLocation().search}</div>
-  }
-
-  it('renders one row per section and selects the first when the URL names none', async () => {
-    renderWithProviders(<SecurityPanel />)
-
-    const rows = railRows()
-    expect(rows.map(r => r.textContent)).toEqual([
-      expect.stringContaining('Live Security Posture'),
-      expect.stringContaining('YOLO (auto-approve)'),
-      expect.stringContaining('Denied Commands'),
-      expect.stringContaining('Tailnet origin'),
-      expect.stringContaining('Third-party apps'),
-      expect.stringContaining('Defense-in-Depth Architecture'),
-      expect.stringContaining('Governance Policy'),
-      expect.stringContaining('Documentation'),
-    ])
-    expect(rows[0]).toHaveAttribute('aria-selected', 'true')
-    // ...and exactly one row is selected, so the rail never reads as two panes.
-    expect(rows.filter(r => r.getAttribute('aria-selected') === 'true')).toHaveLength(1)
-  })
-
-  it('mounts ONLY the selected section', async () => {
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture' })
-    await screen.findByText('30 credential paths')
-
-    // The rule table, the ceiling viewer and the docs links all belong to other
-    // sections: keeping them unmounted is the point of the rail (the built-in
-    // table is 137 rows) and is what makes each pane a screenful.
-    expect(screen.queryByRole('button', { name: 'Expand all' })).not.toBeInTheDocument()
-    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Security deep dive' })).not.toBeInTheDocument()
-  })
-
-  it('choosing a section swaps the pane and records it in the URL', async () => {
-    renderWithProviders(<><SecurityPanel /><SearchProbe /></>, { route: '/?section=posture' })
-    await screen.findByText('30 credential paths')
-
-    fireEvent.click(screen.getByRole('option', { name: /Denied Commands/ }))
-
-    // The rules pane is now mounted...
-    expect(await screen.findByRole('button', { name: 'Expand all' })).toBeInTheDocument()
-    // ...the posture pane is gone...
-    expect(screen.queryByText('30 credential paths')).not.toBeInTheDocument()
-    // ...and the choice is a deep link, so the section survives a reload and can
-    // be targeted by a command-palette result.
-    expect(screen.getByTestId('search')).toHaveTextContent('section=rules')
-  })
-
-  it('an unreadable third-party-apps value gets NO rail summary, rather than reading "Off"', async () => {
-    // Same rule the card itself follows: a failed read is not "off". A rail badge
-    // saying "Off" while third-party code is in fact admitted would be a false
-    // reassurance in the most glanceable place on the page.
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('nope'))
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture' })
-
-    const row = screen.getByRole('option', { name: /Third-party apps/ })
-    await waitFor(() => {
-      expect(row).toHaveTextContent('Third-party apps')
-      expect(row).not.toHaveTextContent('Blocked')
-      expect(row).not.toHaveTextContent('Allowed')
-    })
-  })
-
-  it('summarises an active grant by WHEN IT ENDS, not by repeating the label', async () => {
-    // The state that is currently weakening the install outranks the setting —
-    // but echoing the section's own label made the rail's most important row
-    // read "YOLO (auto-approve)" twice, stacked. The expiry is the useful fact.
-    const store = createTestStore({
-      dashboard: { status: { yolo: true, yolo_until_shutdown: true } } as never,
-    })
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
-
-    const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
-    expect(row).toHaveTextContent('Until restart')
-    // The label appears once, not twice.
-    expect(row.textContent!.match(/YOLO \(auto-approve\)/g)).toHaveLength(1)
-  })
-
-  it('falls back to a bare active marker when no expiry is known', async () => {
-    const store = createTestStore({ dashboard: { status: { yolo: true } } as never })
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
-
-    expect(screen.getByRole('option', { name: /YOLO \(auto-approve\)/ }))
-      .toHaveTextContent('Active now')
-  })
-
-  it('falls back to the active marker rather than "Until —" for an unparseable expiry', async () => {
-    // The backend sends ISO-or-empty, so this guards the field's shape rather
-    // than a live path: formatting an unparseable value yields an em-dash
-    // placeholder, and "Until —" would assert a live grant while withholding
-    // the expiry that makes the assertion actionable.
-    const store = createTestStore({
-      dashboard: { status: { yolo: true, yolo_expires_at: 'not-a-timestamp' } } as never,
-    })
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
-
-    const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
-    expect(row).toHaveTextContent('Active now')
-    expect(row).not.toHaveTextContent('—')
-  })
-
-  it('shows a same-day expiry as a bare clock time, without seconds', async () => {
-    // The row is an 11px line that truncates, so "11:40:00 AM" spends three
-    // characters on precision no reader acts on. Clock pinned so the assertion
-    // does not depend on the day the suite happens to run.
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-08-07T12:00:00Z'))
-    try {
-      const store = createTestStore({
-        dashboard: {
-          status: { yolo: true, yolo_expires_at: '2026-08-07T18:40:00Z' },
-        } as never,
-      })
-      renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
-
-      const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
-      expect(row).toHaveTextContent('Until 6:40 PM')
-      expect(row).not.toHaveTextContent('6:40:00')
-      // The label still appears once, not twice.
-      expect(row.textContent!.match(/YOLO \(auto-approve\)/g)).toHaveLength(1)
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('names the day when the expiry is not today, so it cannot read as already past', async () => {
-    // The offered durations reach 24h. A bare "Until 8:00 AM" on a grant that
-    // ends tomorrow morning reads as a time already gone by — on a security row
-    // that means believing a live grant has expired.
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-08-07T20:00:00Z'))
-    try {
-      const store = createTestStore({
-        dashboard: {
-          status: { yolo: true, yolo_expires_at: '2026-08-08T08:00:00Z' },
-        } as never,
-      })
-      renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
-
-      const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
-      // Saturday 2026-08-08 — the weekday disambiguates it from today.
-      expect(row).toHaveTextContent('Sat')
-      expect(row).toHaveTextContent('8:00 AM')
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-})
-
-describe('SecurityPanel — rule search', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
-    ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
-    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
-  })
-
-  const SEARCH = 'Search rules, patterns, categories…'
-
-  async function renderRules() {
-    renderWithProviders(<SecurityPanel />, { route: '/?section=rules' })
-    return screen.findByLabelText(SEARCH)
-  }
-
-  it('matches on description and reveals the hit without expanding anything', async () => {
-    const box = await renderRules()
-    // Categories are collapsed on arrival, so the rule row is not in the DOM yet.
-    expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument()
-
-    fireEvent.change(box, { target: { value: 'cloudformation' } })
-
-    // A filter whose hits stay folded away is a filter that did nothing.
-    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
-    expect(screen.queryByLabelText(PINNED_DESC)).not.toBeInTheDocument()
-  })
-
-  it('matches on the pattern text, not just the description', async () => {
-    const box = await renderRules()
-    fireEvent.change(box, { target: { value: 'terminate-instances' } })
-
-    expect(await screen.findByLabelText(PINNED_DESC)).toBeInTheDocument()
-    expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument()
-  })
-
-  it('a category-name match keeps the whole category', async () => {
-    const box = await renderRules()
-    fireEvent.change(box, { target: { value: 'aws destr' } })
-
-    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
-    expect(screen.getByLabelText(PINNED_DESC)).toBeInTheDocument()
-  })
-
-  it('the category badge keeps the SHIPPED denominator while filtered', async () => {
-    // The load-bearing assertion of this feature: a filter must never make the
-    // gate read as smaller than it is. Showing "1/1" for a single hit inside a
-    // 2-rule category would tell the reader a rule is not enforced.
-    const box = await renderRules()
-    expect(await screen.findByText('2/2')).toBeInTheDocument()
-
-    fireEvent.change(box, { target: { value: 'cloudformation' } })
-
-    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
-    expect(screen.getByText('2/2')).toBeInTheDocument()
-    expect(screen.queryByText('1/1')).not.toBeInTheDocument()
-    // The match count is reported as a ratio against the shipped total instead.
-    expect(screen.getByText(/1 \/ 2 rules/)).toBeInTheDocument()
-  })
-
-  it('says when the filter is what emptied the custom-pattern card', async () => {
-    // Otherwise an empty Card B reads as "you have no custom patterns" while one
-    // is configured and enforced.
-    const box = await renderRules()
-    expect(await screen.findByText(USER_PATTERN)).toBeInTheDocument()
-
-    fireEvent.change(box, { target: { value: 'cloudformation' } })
-
-    expect(screen.queryByText(USER_PATTERN)).not.toBeInTheDocument()
-    expect(
-      screen.getByText('Your custom patterns are hidden by the current filter.'),
-    ).toBeInTheDocument()
-  })
-
-  it('reports a miss instead of an empty list', async () => {
-    const box = await renderRules()
-    fireEvent.change(box, { target: { value: 'zzzz' } })
-
-    expect(await screen.findByText('No rules match “zzzz”.')).toBeInTheDocument()
-  })
-
-  it('clearing the filter restores the collapsed accordion state', async () => {
-    // The filter force-opens its hits; clearing it must hand the accordion back
-    // to whatever the user had, not leave every category expanded.
-    const box = await renderRules()
-    fireEvent.change(box, { target: { value: 'cloudformation' } })
-    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
-
-    fireEvent.change(box, { target: { value: '' } })
-
-    await waitFor(() => expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument())
-  })
-})
-
-describe('SecurityPanel — review-round regressions', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
-    ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
-    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
-  })
-
-  const SEARCH = 'Search rules, patterns, categories…'
-
-  it('keeps a half-typed deny pattern when the reader switches section and back', async () => {
-    // The rules pane unmounts when another section is selected, so the draft is
-    // held by the shell. Local state here would silently discard a pattern the
-    // user was still typing — a regression against the old single-scroll panel,
-    // where this input never unmounted.
-    renderWithProviders(<SecurityPanel />, { route: '/?section=rules' })
-
-    const input = await screen.findByLabelText('Custom deny pattern')
-    fireEvent.change(input, { target: { value: 'rm -rf /important' } })
-
-    // Leave for another section...
-    fireEvent.click(screen.getByRole('option', { name: /Live Security Posture/ }))
-    expect(screen.queryByLabelText('Custom deny pattern')).not.toBeInTheDocument()
-
-    // ...and come back.
-    fireEvent.click(screen.getByRole('option', { name: /Denied Commands/ }))
-    expect(await screen.findByLabelText('Custom deny pattern')).toHaveValue('rm -rf /important')
-  })
-
-  it('reports NO approval summary until the status payload lands', async () => {
-    // `dashboard.status` is `StatusData | null` and starts as null, so an
-    // `=== undefined` guard never fires. Claiming the reassuring "Interactive"
-    // before the payload arrives would assert a security state we cannot know —
-    // on an install where auto-approve may be active.
-    const store = createTestStore({ dashboard: { status: null } as never })
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
-
-    const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
-    expect(row).not.toHaveTextContent('Interactive')
-  })
-
-  it('drops the expand/collapse controls while filtering, instead of leaving them inert', async () => {
-    // Matches render open regardless of the accordion state, so both controls
-    // and the per-category chevron would record state the user cannot see apply.
-    renderWithProviders(<SecurityPanel />, { route: '/?section=rules' })
-    const box = await screen.findByLabelText(SEARCH)
-
-    expect(screen.getByRole('button', { name: 'Expand all' })).toBeInTheDocument()
-
-    fireEvent.change(box, { target: { value: 'cloudformation' } })
-
-    await waitFor(() => {
-      expect(screen.queryByRole('button', { name: 'Expand all' })).not.toBeInTheDocument()
-    })
-    expect(screen.queryByRole('button', { name: 'Collapse all' })).not.toBeInTheDocument()
-    // ...and the category header is no longer an expand/collapse button either.
-    expect(screen.queryByRole('button', { name: /category rules/ })).not.toBeInTheDocument()
-  })
-
-  it('exposes the rail groups to assistive tech instead of hiding the headers', async () => {
-    // The headers carry the yours-vs-enforced split that the rail exists to
-    // convey; aria-hidden headers left screen-reader users with seven flat
-    // options. listbox > group > option is the ARIA-valid way to keep it.
-    renderWithProviders(<SecurityPanel />, { route: '/?section=posture' })
-
-    for (const name of ['Status', 'Your settings', 'Enforced', 'Reference']) {
-      expect(screen.getByRole('group', { name })).toBeInTheDocument()
-    }
-    // The listbox keeps exactly one accessible name — naming the wrapper too
-    // made a screen reader announce it twice.
-    expect(screen.getAllByRole('listbox', { name: 'Security sections' })).toHaveLength(1)
   })
 })

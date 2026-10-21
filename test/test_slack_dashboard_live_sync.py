@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
-import sys
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -24,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from chat_test_helpers import _make_state
+from chat_test_helpers import _make_state, drain_background_tasks
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN
 from kiro_crew.dashboard.channel_slots import refresh_channel_window, surface_channel_session
@@ -32,9 +31,6 @@ from kiro_crew.history import ConversationLog, transcript_sort_key
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.slack import transport_dispatch
 
-_test_dir = Path(__file__).parent
-if str(_test_dir) not in sys.path:  # pragma: no cover
-    sys.path.insert(0, str(_test_dir))
 _golden = importlib.import_module("test_slack_golden_transcript")
 
 FakeSessions = _golden.FakeSessions
@@ -172,6 +168,7 @@ class TestCTheMirrorIsResolvableInbound:
         async with TestClient(TestServer(self._app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/slack-link", json={})
             assert resp.status == 200
+            await drain_background_tasks(state)
 
         # The inbound Slack path resolves a thread through get_linked_slot. The
         # old hand-assignment left this index empty, so a reply in the mirrored
@@ -264,7 +261,11 @@ class TestDTheQuestionIsRecordedBeforeTheAnswer:
     @pytest.fixture(autouse=True)
     def _quiet_agents(self, monkeypatch):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 

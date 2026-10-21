@@ -6,18 +6,35 @@ import React from 'react'
 
 const mockDispatch = vi.fn(() => ({ unwrap: () => Promise.resolve() }))
 const mockSwitchSlot = vi.fn((key: string) => ({ type: 'chat/switchSlot', payload: key }))
+const mockAddSlotOptimistic = vi.fn((slot: { key: string }) => ({ type: 'dashboard/addSlotOptimistic', payload: slot }))
+let mockSlots: { key: string }[] = []
 
 vi.mock('../store', () => ({
   useAppDispatch: () => mockDispatch,
+  useAppStore: () => ({ getState: () => ({ dashboard: { slots: mockSlots, closingSlots: {} } }) }),
 }))
 
 vi.mock('../store/chatSlice', () => ({
   switchSlot: (key: string) => mockSwitchSlot(key),
 }))
 
+vi.mock('../store/dashboardSlice', () => ({
+  addSlotOptimistic: (slot: { key: string }) => mockAddSlotOptimistic(slot),
+  fetchSlots: () => ({ type: 'dashboard/fetchSlots' }),
+}))
+
 vi.mock('../pages/ChatPage', () => ({
-  default: (props: { embedded?: boolean }) => (
-    <div data-testid="chat-page" data-embedded={props.embedded ? 'true' : 'false'}>
+  default: (props: {
+    embedded?: boolean
+    embedMode?: 'chat' | 'sessions'
+    noUrlSync?: boolean
+  }) => (
+    <div
+      data-testid="chat-page"
+      data-embedded={props.embedded ? 'true' : 'false'}
+      data-embed-mode={props.embedMode ?? 'unset'}
+      data-no-url-sync={props.noUrlSync === undefined ? 'unset' : String(props.noUrlSync)}
+    >
       ChatPage
     </div>
   ),
@@ -33,20 +50,44 @@ beforeEach(() => {
   vi.clearAllMocks()
   // Re-assign after restoreAllMocks clears the implementations
   mockDispatch.mockReturnValue({ unwrap: () => Promise.resolve() })
+  mockSlots = []
 })
 
 describe('ChatPanel', () => {
+  it('adds a slot missing from the slot list before switching to it', () => {
+    render(<ChatPanel slotKey="my-slot-123" />)
+    expect(mockAddSlotOptimistic).toHaveBeenCalledWith(expect.objectContaining({ key: 'my-slot-123' }))
+    expect(mockAddSlotOptimistic.mock.invocationCallOrder[0]).toBeLessThan(mockSwitchSlot.mock.invocationCallOrder[0])
+  })
+
+  it('does not add a slot the slot list already has', () => {
+    mockSlots = [{ key: 'my-slot-123' }]
+    render(<ChatPanel slotKey="my-slot-123" />)
+    expect(mockAddSlotOptimistic).not.toHaveBeenCalled()
+    expect(mockSwitchSlot).toHaveBeenCalledWith('my-slot-123')
+  })
+
   it('dispatches switchSlot with provided slotKey on mount', () => {
     render(<ChatPanel slotKey="my-slot-123" />)
     expect(mockSwitchSlot).toHaveBeenCalledWith('my-slot-123')
     expect(mockDispatch).toHaveBeenCalled()
   })
 
-  it('renders ChatPage with embedded prop', () => {
+  it('renders ChatPage with embedded prop and preserves the default mode', () => {
     render(<ChatPanel slotKey="my-slot-123" />)
     const chatPage = screen.getByTestId('chat-page')
     expect(chatPage).toBeInTheDocument()
     expect(chatPage.getAttribute('data-embedded')).toBe('true')
+    expect(chatPage.getAttribute('data-embed-mode')).toBe('unset')
+    expect(chatPage.getAttribute('data-no-url-sync')).toBe('unset')
+  })
+
+  it('maps conversationOnly to the native chat embed without URL sync', () => {
+    render(<ChatPanel slotKey="my-slot-123" conversationOnly />)
+    const chatPage = screen.getByTestId('chat-page')
+    expect(chatPage.getAttribute('data-embedded')).toBe('true')
+    expect(chatPage.getAttribute('data-embed-mode')).toBe('chat')
+    expect(chatPage.getAttribute('data-no-url-sync')).toBe('true')
   })
 
   it('does not re-dispatch when slotKey stays the same on rerender', () => {

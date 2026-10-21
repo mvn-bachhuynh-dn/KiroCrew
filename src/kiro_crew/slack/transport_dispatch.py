@@ -17,38 +17,82 @@ unaffected (they don't go through events.py Slack dispatch).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any, cast
 
+from kiro_crew import runtime_death
+from kiro_crew.agent_sdk.drivers.acp_vocab import is_user_worded_failure
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.dashboard.chat_utils import (
     expire_slack_options,
+    mint_options_token,
     remember_slack_options,
 )
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.llm_helpers import save_conversation_turn_off_loop
+from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.messaging import auto_title, turn_ceiling
+from kiro_crew.messaging.dispatch import (
+    admit_inbound_callback,
+    build_directive_consumer,
+    charge_turn_failure,
+    consume_reinjection,
+    driver_turn_landed,
+    rearm_reinjection,
+    rollback_skill_bodies,
+)
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
-from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
+from kiro_crew.messaging.link import SLACK_NAMESPACE, canonical_key
+from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.platform import current_context
+from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
+from kiro_crew.session_allocation import SessionClosingError
+from kiro_crew.slack.format import escape_mrkdwn
 from kiro_crew.slack.handler import (
     _get_default_agent,
     _hydrate_conv_flags,
+    _hydrate_conv_header,
     _hydrate_thread_overrides,
     _is_slack_restricted,
+    _maybe_auto_title_slack,
     _should_auto_approve_spawn,
     _thread_agents,
     get_dashboard_state,
     get_orch_cfg,
     is_slack_session_trusted,
+    is_thread_temporary,
     maybe_apply_privacy_modifiers,
     maybe_handle_keyword_command,
     maybe_route_linked_thread,
+    track_background_task,
 )
-from kiro_crew.slack.renderer import SlackApprovalDecider, SlackRenderer
+from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER
+from kiro_crew.slack.renderer import SlackApprovalDecider
+from kiro_crew.slack.renderer import SlackApprovalDecider as _APPROVAL_REGISTRY
+from kiro_crew.slack.renderer import SlackRenderer, _display_safe
+from kiro_crew.slack.thread_parent import (
+    ThreadParent,
+    fetch_thread_parent,
+    has_prior_turns,
+    is_cron_owned,
+    is_slack_born,
+    parent_prompt_text,
+    record_thread_parent,
+)
+from kiro_crew.slack.thread_replies import (
+    ThreadReplies,
+    has_noted_turn,
+    note_turn,
+    replies_since_last_turn,
+)
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.stats import Stats
 
 if TYPE_CHECKING:
@@ -72,6 +116,49 @@ logger = logging.getLogger(__name__)
 #: Mirrors the native path's fallback (``handler.py``: ``_get_default_agent()
 #: or "kirocrew"``) and the many ``agent="kirocrew"`` call sites.
 _DEFAULT_KIROCREW_AGENT = "kirocrew"
+
+#: Generic reply for a failed transport turn whose error text is not meant for
+#: the user (see ``_transport_error_text``).
+_TRANSPORT_ERROR_TEXT = "🔧 Something went wrong (transport path). Please try again."
+
+#: Longest error detail posted to Slack, the cap the native path applies to its
+#: ``UnknownMemoryStore`` refusal.
+_TRANSPORT_ERROR_DETAIL_MAX_CHARS = 1000
+
+
+def _redacted_error_detail(exc: BaseException) -> str:
+    """``str(exc)`` redacted, truncated and made inert as Slack markup.
+
+    Redaction runs before truncation so a cut can never leave the head of a
+    credential or path that the full-string passes would have matched. The
+    credential scan reads what Slack DISPLAYS as well as the bytes
+    (``_display_safe``): ``AKIA*<rest>*`` matches no pattern as written, yet
+    Slack renders the emphasis away and shows an intact key. The text
+    comes from outside Kiro Crew (a provider error can echo arbitrary input), so
+    Slack's entity characters are escaped last: ``<!channel>`` or ``<@U…>`` in it
+    must show as text, not notify anyone. Escaping after the cut means the cut can
+    never split an escape sequence.
+    """
+    detail = _display_safe(redact_local_paths(redact(str(exc)))[0])
+    return escape_mrkdwn(detail[:_TRANSPORT_ERROR_DETAIL_MAX_CHARS])
+
+
+def _transport_error_text(exc: BaseException) -> str:
+    """User-facing reply for a failed transport turn.
+
+    A classified backend ``AcpError`` (see ``is_user_worded_failure``) carries a
+    user-readable reason, for example a usage limit that retrying cannot fix, so
+    that reason is shown under the same ``❌`` prefix the native path uses. The
+    message can still quote a host path or a credential from the backend, so it
+    goes through the same redaction and length cap as the ``UnknownMemoryStore``
+    refusal. Every other failure, including an unclassified ``AcpError``, keeps
+    the generic retry text, because its message is internal detail.
+    """
+    if isinstance(exc, UnknownMemoryStore):
+        return _redacted_error_detail(exc)
+    if is_user_worded_failure(exc):
+        return f"❌ {_redacted_error_detail(exc)}"
+    return _TRANSPORT_ERROR_TEXT
 
 
 async def _refresh_dashboard_tab(session_key: str) -> None:
@@ -107,6 +194,39 @@ async def _refresh_dashboard_tab(session_key: str) -> None:
         )
 
 
+def flat_dm_session_key(channel: str, thread_ts: str | None, *, enabled: bool) -> str | None:
+    """The channel-scoped session key a direct message belongs to.
+
+    Slack gives every top-level message its own timestamp, and the Slack session
+    key is derived from it, so each plain reply in a DM starts a session that has
+    none of the conversation's transcript. With ``slack.dm_single_session`` on, a
+    1:1 DM is instead treated as ONE flat conversation keyed by the channel:
+    ``slack:<channel_id>``.
+
+    A threaded reply inside that DM keys the same way, on purpose. In a 1:1 DM a
+    thread is a layout habit rather than a new topic, so splitting it off leaves
+    the branch with none of the conversation it is replying to. Only the SESSION
+    merges: the reply is still posted where it was addressed -- channel root for
+    a top-level message, back into the thread for a threaded one -- which is the
+    caller's ``post_thread_ts`` decision, not this key's.
+
+    Keeping the ``slack:`` namespace with a single scope segment is deliberate.
+    It is the same two-segment shape the thread keys already use, so everything
+    that treats a Slack key as opaque -- or that reverse-derives from it -- keeps
+    working; a four-segment DM bucket would not (``parse_session_key`` rejects
+    two-segment Slack keys by design, and callers rely on that).
+
+    Returns None -- meaning "key it by its own timestamp", the historical
+    behavior -- when the feature is off or the channel is not a 1:1 DM. Only
+    ``D`` ids qualify: a group channel's threads are a deliberate scope boundary,
+    and an ``mpim`` is shared with other people, so neither may collapse into one
+    conversation.
+    """
+    if not enabled or not channel.startswith("D"):
+        return None
+    return f"{SLACK_NAMESPACE}:{channel}"
+
+
 async def handle_message_transport(
     slack: SlackClientOps,
     sessions: SessionManager,
@@ -127,20 +247,53 @@ async def handle_message_transport(
     show_thinking: bool = True,
     consolidator: HistoryConsolidator | None = None,
     user_display_name: str | None = None,
+    gateway: Any | None = None,
+    from_trusted_bot: bool = False,
+    dm_single_session: bool = False,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
+    spool_text: str | None = None,
+    spool_attachments: int = 0,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
 
+    ``start_priority``: as for ``handler.handle_message`` (rule:
+    ``kiro_crew.start_priority``).
+
+    ``spool_text`` / ``spool_attachments``: as for ``handler.handle_message`` --
+    the pre-ingestion message the shutdown spool records instead of *text*.
+
     This replaces handle_message when the feature flag is on. It uses
     TurnDriver + SlackRenderer instead of the inline stream loop.
+
+    ``gateway`` is the orchestrator that owns this dispatch (when the caller
+    has one): its ``dashboard_state`` attribute supplies the live gateway
+    state to the session-directive consumer, so a monitor directive on a
+    dashboard-owned thread can resolve the slot instead of failing closed on
+    the sessions-backed stand-in.
     """
     Stats().inc_message_received()
     _t0 = time.monotonic()
+    inbound_text = text if spool_text is None else spool_text
     # Same key discipline as native handle_message: reply_ts is the bare Slack
     # thread timestamp (posting + thread-index key); session_key is the
     # canonical namespaced form (registry, conversation log, thread overrides
     # shared with handler.py module dicts).
     reply_ts = thread_ts or msg_ts
     session_key = canonical_key(reply_ts)
+
+    # Where the CONVERSATION is posted, which a flat DM separates from reply_ts:
+    # None means channel root. reply_ts keeps its thread-index meaning either way
+    # (it is still a real Slack timestamp, and still what the reverse index and
+    # the reaction target are keyed by), so only the posting half moves.
+    post_thread_ts: str | None = reply_ts
+    _flat_key = flat_dm_session_key(channel, thread_ts, enabled=dm_single_session)
+    if _flat_key:
+        session_key = _flat_key
+        # Only a TOP-LEVEL message moves to channel root. A threaded reply keeps
+        # answering inside its thread -- the session merged, the layout did not,
+        # and answering at root would strand the reply away from the question.
+        if thread_ts is None:
+            post_thread_ts = None
 
     # ── Resolve the thread to its OWNING session (mirrors native handle_message) ──
     # canonical_key above is purely syntactic: it namespaces the bare thread ts
@@ -154,7 +307,7 @@ async def handle_message_transport(
     # still the Slack timestamp we post and react to.
     linked_session_key: str | None = None
 
-    def _resolve_thread_owner(stage: str) -> None:
+    async def _resolve_thread_owner(stage: str) -> None:
         """Re-read which session owns this thread, and route this turn there.
 
         Ownership is RE-READ at each decision point rather than cached, because
@@ -168,29 +321,54 @@ async def handle_message_transport(
         an in-memory dict read off the thread index.
         """
         nonlocal session_key, linked_session_key
-        owner = sessions.get_session_for_thread(reply_ts)
-        if not owner:
+        while True:
+            owner = sessions.get_session_for_thread(reply_ts)
+            # A flat DM ignores a SELF-DERIVED owner. ``slack:<reply_ts>`` is the
+            # per-thread session this feature exists to stop splitting off, and a
+            # thread claimed before the flag was turned on (owner == that key), or
+            # never claimed at all (owner None, candidate falls back to it), would
+            # otherwise pull the turn back out of the merged conversation. Keep the
+            # channel-scoped ``_flat_key`` already in ``session_key`` and register
+            # no thread link. Any OTHER owner is a real binding elsewhere (a
+            # dashboard send-to-Slack), which still wins through the loop below.
+            if _flat_key and (owner is None or owner == canonical_key(reply_ts)):
+                # Pin ``session_key`` back to ``_flat_key`` and do not reroute.
+                # The reset is not redundant: an EARLIER _resolve_thread_owner
+                # call in this turn may have moved session_key to a real
+                # dashboard owner, and if that binding is later revoked (owner is
+                # now None or the self-derived ``slack:<reply_ts>`` key) this
+                # branch must not leave the turn pointing at the stale dashboard
+                # session -- otherwise its context would be posted to Slack.
+                # ``linked_session_key`` still mirrors the CURRENT thread-owner
+                # reading (``owner``), because the pre-acquisition stability loop
+                # compares it against a fresh ``get_session_for_thread(reply_ts)``
+                # to decide it may proceed -- forcing it to None would never equal
+                # that reading and spin forever. The self-link write downstream is
+                # separately gated on ``not _flat_key``, so a flat DM still
+                # registers no thread link.
+                session_key = _flat_key
+                linked_session_key = owner
+                return
+            candidate_key = owner or canonical_key(reply_ts)
+            if candidate_key != session_key:
+                await _hydrate_thread_overrides(candidate_key, conversation_log)
+                await _hydrate_conv_header(sessions, candidate_key)
+                # The worker reads may yield to a new thread owner. Resolve that
+                # owner before publishing either routing key.
+                if sessions.get_session_for_thread(reply_ts) != owner:
+                    continue
+                _hydrate_conv_flags(sessions, candidate_key)
+                logger.info(
+                    "🔗 Slack thread %s owned by %s (at %s) — routing there",
+                    session_key,
+                    candidate_key,
+                    stage,
+                )
+                session_key = candidate_key
+            linked_session_key = owner
             return
-        if owner != session_key:
-            logger.info(
-                "🔗 Slack thread %s owned by %s (at %s) — routing there",
-                session_key,
-                owner,
-                stage,
-            )
-            session_key = owner
-            # Durable privacy state is keyed BY SESSION, and the hydration at
-            # entry ran for the previous key. Re-hydrate for the new owner in
-            # the same breath as the reroute -- otherwise _is_slack_restricted()
-            # consults an unpopulated flag map, and an incognito or temporary
-            # session's turn gets persisted to disk. Keeping this inside the
-            # helper makes it structurally impossible to reroute without it.
-            # Both helpers guard repeated I/O per session, so this is cheap.
-            _hydrate_thread_overrides(session_key, conversation_log)
-            _hydrate_conv_flags(sessions, session_key)
-        linked_session_key = owner
 
-    _resolve_thread_owner("inbound")
+    await _resolve_thread_owner("inbound")
 
     # Inbound channels-governance gate (off-loop), same as native handle_message:
     # a ``channels`` policy that denies ``slack`` drops the message before any
@@ -210,8 +388,41 @@ async def handle_message_transport(
     # get logged before the durable flag was reloaded. Native hydrates right
     # after session_key, so we match it. Idempotent:
     # _hydrate_thread_overrides guards repeated I/O per session.
-    _hydrate_thread_overrides(session_key, conversation_log)
+    await _hydrate_thread_overrides(session_key, conversation_log)
+    await _hydrate_conv_header(sessions, session_key)
+    await _resolve_thread_owner("post-hydration")
     _hydrate_conv_flags(sessions, session_key)
+
+    inbound_route = InboundRoute(
+        conversation_id=channel,
+        text=inbound_text,
+        user_id=user_id,
+        thread_id=reply_ts,
+        message_id=msg_ts,
+        attachments_dropped=spool_attachments,
+    )
+    if not await admit_inbound_callback(
+        sessions,
+        channel_type="slack",
+        route=inbound_route,
+        restricted=_is_slack_restricted(session_key),
+    ):
+        return
+
+    # Resolve the agent early so ALL persist paths can forward it — including
+    # the hook auto-reply below, whose write CREATES the session file when a
+    # hook answers the first message in a thread (the metadata header records
+    # the agent only on the creating append, so a missed site pins the session
+    # to "default" forever). Mirrors native handle_message, which resolves
+    # _agent right after hydration for exactly this reason. Re-resolved again
+    # at session acquisition below, after the late ownership re-resolution can
+    # move session_key.
+    _agent = (
+        _thread_agents.get(session_key)
+        or agent_override
+        or _get_default_agent()
+        or _DEFAULT_KIROCREW_AGENT
+    )
 
     # Entry marker: lets operators confirm the NEW transport path handled a
     # message (grep gateway.log for "transport_dispatch: handling"). Fires for
@@ -233,7 +444,7 @@ async def handle_message_transport(
     if context_builder:
         hook_result = context_builder.hooks.on_message(text)
         if hook_result.action == HOOK_REPLY:
-            await slack.post_message(channel, hook_result.text, reply_ts)
+            await slack.post_message(channel, hook_result.text, post_thread_ts)
             if conversation_log and not _is_slack_restricted(session_key):
                 await save_conversation_turn_off_loop(
                     conversation_log,
@@ -242,6 +453,7 @@ async def handle_message_transport(
                     hook_result.text,
                     source_thread=session_key,
                     source_user=user_id,
+                    agent=_agent,
                 )
             return
 
@@ -252,10 +464,10 @@ async def handle_message_transport(
         # importing the OSS SSO stub directly — keeps the CPP boundary intact
         # and returns the real SSO line under the enterprise companion context.
         mw = await current_context().identity.status_line(prefix=" · sso")
-        await slack.post_message(channel, Stats().summary() + mw, reply_ts)
+        await slack.post_message(channel, Stats().summary() + mw, post_thread_ts)
         return
     if _lower == "ping":
-        await slack.post_message(channel, "pong", reply_ts)
+        await slack.post_message(channel, "pong", post_thread_ts)
         return
 
     # ── !temporary / !incognito privacy modifiers (shared with native) ──
@@ -267,10 +479,22 @@ async def handle_message_transport(
     # unconditionally (handler.py), so acting on a key that went stale while
     # governance and the hook path awaited would overwrite a dashboard binding
     # created in that window and misroute every later reply in this thread.
-    _resolve_thread_owner("pre-privacy")
+    await _resolve_thread_owner("pre-privacy")
     _cmd_text = re.sub(r"^<@[A-Z0-9]+(?:\|[^>]*)?>\s*", "", text.strip())
+    # post_thread_ts, not reply_ts: it is None for a top-level flat DM, so the
+    # confirmation lands where the modifier was typed. link_thread is separate --
+    # a flat DM's session is keyed by the channel, so it registers no thread even
+    # when the modifier arrives inside one.
     text, _cmd_text, _only_modifier = await maybe_apply_privacy_modifiers(
-        text, _cmd_text, session_key, user_id, channel, slack, sessions, reply_ts
+        text,
+        _cmd_text,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        sessions,
+        post_thread_ts or "",
+        not _flat_key,
     )
     if _only_modifier:
         # Message was nothing but the modifier(s) — no LLM turn.
@@ -327,6 +551,22 @@ async def handle_message_transport(
     client: LLMProvider | None = None
     _acquired = False
     renderer: SlackRenderer | None = None
+    # Hoisted above the try deliberately: the failure path reads both to decide
+    # whether partial assistant output still needs rescuing, and the turn can
+    # die anywhere inside the try — including before the points inside it that
+    # assign them — which would make the except branch raise NameError while
+    # handling the original error.
+    _logged_user_turn = False
+    _stamped_turn = False
+    # Post-compaction re-injection bookkeeping for the finally: whether this
+    # turn consumed the one-shot flag, and whether it landed (recorded success).
+    _needs_reinjection = False
+    _turn_landed = False
+    # The turn's driver, for the finally: it records whether the backend
+    # compacted the session, on every exit path.
+    driver: TurnDriver | None = None
+    # This turn's thread-replies read; its watermark moves in the finally.
+    _thread_replies: ThreadReplies | None = None
 
     try:
         # ── Fire the ack reaction + working status IMMEDIATELY, before the
@@ -344,12 +584,18 @@ async def handle_message_transport(
         renderer = SlackRenderer(
             slack,
             channel,
-            reply_ts,
+            post_thread_ts,
             react_ts=msg_ts,
             reactions_enabled=reactions_enabled,
             show_thinking=show_thinking,
             decider=decider,
             user_id=user_id,
+            # The restricted-session ceiling on shipping local bytes, the same
+            # signal that denies artifact registration: a conversation the user
+            # marked temporary or incognito must not upload files into a Slack
+            # channel, where they persist for everyone who can read it. Defaulting
+            # this True while nothing passed it meant the ceiling did not exist.
+            uploads_allowed=not _is_slack_restricted(session_key),
         )
         await renderer.on_turn_start()
 
@@ -369,7 +615,17 @@ async def handle_message_transport(
         # session_key. A change that lands DURING get_or_create is not handled
         # here: the turn stays in whoever owned the thread at acquisition, and
         # the self-link guard below keeps the index uncorrupted either way.
-        _resolve_thread_owner("pre-acquisition")
+        while True:
+            await _resolve_thread_owner("pre-acquisition")
+            owner_before_memory = linked_session_key
+            try:
+                _memory_store = await session_store_for_turn(context_builder, session_key)
+            except UnknownMemoryStore:
+                if sessions.get_session_for_thread(reply_ts) != owner_before_memory:
+                    continue
+                raise
+            if sessions.get_session_for_thread(reply_ts) == owner_before_memory:
+                break
         if decider is not None:
             # The decider was constructed with the pre-reroute key, and that key
             # is what maps a human's Trust click back to a session. Leaving it
@@ -377,7 +633,10 @@ async def handle_message_transport(
             # renderer and driver hold, so re-pointing it here is sufficient.
             decider.session_key = session_key
 
-        # Resolve the kiro-cli agent. Thread override (set via !agent), then the
+        # Re-resolve the kiro-cli agent: the early resolution above serves the
+        # pre-acquisition persist paths (hook auto-reply), but the ownership
+        # re-resolution just above can move session_key, and a !agent override
+        # may have landed since. Thread override (set via !agent), then the
         # per-channel override (slack.channels.<id>.agent), then the configured
         # default win; otherwise fall back to the canonical "kirocrew" agent so
         # the session loads kirocrew-core (spawn_run) rather than kiro-cli's bare
@@ -390,9 +649,23 @@ async def handle_message_transport(
             or _DEFAULT_KIROCREW_AGENT
         )
         client, is_new, resumed = await sessions.get_or_create(
-            session_key, agent=_agent, channel_id=channel
+            session_key, agent=_agent, channel_id=channel, start_priority=start_priority
         )
         _acquired = True
+        # Authorize the outbound-image root, which only exists once the provider
+        # does. Unauthorized, `_upload_root` stays empty and `_uploads_enabled()`
+        # is permanently False, so the whole extract-and-upload path is dead while
+        # `files_outbound=True` advertises it: an agent that writes
+        # `![chart](/tmp/chart.png)` ships the raw path as text. The root is the
+        # provider's own resolved cwd, which is what bounds extraction to files
+        # the session may read. Mirrors the Discord dispatcher. The runtime's own
+        # `$KIROCREW_SCRATCH` goes beside it: that is where the agent is told to
+        # stage screenshots, and it is never under the cwd. Read defensively, like
+        # the other channels: a client without it must cost the scratch root,
+        # never the turn.
+        renderer.authorize_upload_root(
+            client.cwd, scratch_root=str(getattr(client, "work_scratch_dir", None) or "")
+        )
         # Expire AGAIN, now that the turn is serialized. The pass above (just
         # before the turn machinery) runs before `get_or_create` waits its turn,
         # so two messages arriving together both clear the control while it is
@@ -408,16 +681,29 @@ async def handle_message_transport(
         )
         if is_new:
             await sessions.set_channel(session_key, channel)
-        if not linked_session_key and not sessions.get_session_for_thread(reply_ts):
-            # Two conditions, deliberately. The first is the routing decision
-            # made at the top of this function. The second is a FRESH read,
-            # because that decision is many awaits old by now -- inbound
-            # governance, the hook path and session acquisition all yield -- and
-            # a dashboard send-to-Slack landing in that window would claim this
-            # thread after we looked. Self-linking on the stale value would
-            # overwrite that newer binding and send every later reply to the
-            # wrong session. Only claim a thread that is STILL unclaimed; the
-            # turn itself continues on the session we already acquired.
+        if (
+            not _flat_key
+            and not linked_session_key
+            and not sessions.get_session_for_thread(reply_ts)
+        ):
+            # Three conditions, deliberately. The first excludes a flat DM: its
+            # session is keyed by the channel, not by a thread, so binding it to
+            # a thread would hand the dashboard mirror one thread to post into
+            # while the conversation spans the whole DM -- and with several
+            # threads the scalar slack_thread_ts would just keep flipping to
+            # whichever spoke last. Routing needs no claim here anyway: the flat
+            # key is DERIVED from the channel, so it is recomputed rather than
+            # looked up. The channel binding it does need is set_channel above.
+            #
+            # The second is the routing decision made at the top of this
+            # function. The third is a FRESH read, because that decision is many
+            # awaits old by now -- inbound governance, the hook path and session
+            # acquisition all yield -- and a dashboard send-to-Slack landing in
+            # that window would claim this thread after we looked. Self-linking
+            # on the stale value would overwrite that newer binding and send
+            # every later reply to the wrong session. Only claim a thread that is
+            # STILL unclaimed; the turn itself continues on the session we
+            # already acquired.
             #
             # reply_ts (not session_key) is the true Slack timestamp -- storing
             # the namespaced key as slack_thread_ts would corrupt reply routing.
@@ -425,6 +711,58 @@ async def handle_message_transport(
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await publish_turn_identity(sessions, session_key)
+
+        # ── Thread parent, for a Slack-born session opened inside a thread ──
+        # A reply in a thread this conversation did not start -- the owner
+        # answering an agent's DM, a reply under a cron post -- otherwise opens a
+        # session knowing only the reply. Read once, on a fresh session with no
+        # prior turns; recorded BEFORE the receipt row below so the transcript
+        # shows it above the reply. A cron-owned thread reads it for the prompt
+        # only, on any fresh session. See ``slack/thread_parent.py``.
+        _thread_parent: ThreadParent | None = None
+        # One transcript read serves the parent and the thread-replies checks.
+        _prior: bool | None = None
+        _slack_born = is_slack_born(session_key)
+        if (
+            is_new
+            and not resumed
+            and thread_ts
+            and thread_ts != msg_ts
+            and (
+                is_cron_owned(session_key)
+                or (
+                    _slack_born
+                    and not (_prior := await has_prior_turns(conversation_log, session_key))
+                )
+            )
+        ):
+            _record_parent = bool(
+                conversation_log and _slack_born and not _is_slack_restricted(session_key)
+            )
+            _thread_parent = await fetch_thread_parent(
+                slack, channel, thread_ts, with_author=_record_parent
+            )
+            if _thread_parent is not None and _record_parent:
+                assert conversation_log is not None
+                await record_thread_parent(
+                    conversation_log, session_key, _thread_parent, agent=_agent
+                )
+
+        # ── Thread replies since this conversation's last turn in the thread ──
+        # Read BEFORE the receipt row below, which would otherwise count as a
+        # prior turn. Context only: who gets answered was decided above.
+        if context_builder and thread_ts and thread_ts != msg_ts:
+            if _prior is None and not has_noted_turn(session_key, thread_ts):
+                _prior = await has_prior_turns(conversation_log, session_key)
+            _first_turn = not has_noted_turn(session_key, thread_ts) and not _prior
+            _thread_replies = await replies_since_last_turn(
+                slack,
+                channel,
+                thread_ts,
+                msg_ts,
+                session_key=session_key,
+                first_turn=_first_turn,
+            )
 
         # ── Conversation log: the user's turn, at RECEIPT ──
         # Recorded BEFORE the turn runs rather than alongside the reply
@@ -438,12 +776,10 @@ async def handle_message_transport(
         #
         # Slack-restricted (incognito / temporary) sessions are skipped at BOTH
         # write points, so a restricted session still persists nothing. Note
-        # this is a skip-at-each-write guarantee, not parity with the old
-        # single write: because Slack events dispatch concurrently, an
-        # `!incognito` that lands mid-turn used to suppress the whole turn
-        # (both rows were still unwritten), and can now only suppress the
-        # reply -- the question is already durable.
-        _logged_user_turn = False
+        # this is a skip-at-each-write guarantee, not a single-write one:
+        # because Slack events dispatch concurrently, an `!incognito` that
+        # lands mid-turn suppresses only the reply -- the question row is
+        # already durable by then.
         if conversation_log and not _is_slack_restricted(session_key):
             try:
                 # Off the loop deliberately. ``ConversationLog.append`` takes a
@@ -465,6 +801,12 @@ async def handle_message_transport(
                     text,
                     source_thread=session_key,
                     source_user=user_id,
+                    # This is the write that creates the session file, and the
+                    # metadata header records the agent only when the creating
+                    # append supplies it — omit it and the dashboard forever
+                    # shows this session as "default" even though the turn ran
+                    # under ``_agent`` (see ConversationLog.append docstring).
+                    agent=_agent,
                 )
                 _logged_user_turn = True
             except Exception:
@@ -478,6 +820,16 @@ async def handle_message_transport(
 
         # ── Build message with context ──
         if context_builder:
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``_agent``: the values above are kiro agent names, a
+            # namespace disjoint from ``cfg.agents``, so a store derived from one
+            # resolves to ``default`` for exactly the crew that configured
+            # otherwise. Its private tier was validated and prepared before
+            # provider acquisition; an unavailable member store refuses the turn.
+            # A compaction drops session-start context. Read-and-clear the
+            # one-shot flag so this turn re-injects that context exactly once;
+            # the finally re-arms it if this turn never lands.
+            _needs_reinjection = consume_reinjection(sessions, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 context_builder.build_message,
@@ -487,9 +839,29 @@ async def handle_message_transport(
                 channel_id=channel,
                 thread_ts=thread_ts or msg_ts,
                 agent=_agent,
+                memory_store=_memory_store,
                 resumed=resumed,
+                needs_reinjection=_needs_reinjection,
                 user_display_name=user_display_name,
+                # Temporary mode reads NO memory, and that is the half the
+                # write-side ``_is_slack_restricted`` gates cannot cover:
+                # refusing to WRITE still leaves yesterday's memories and
+                # lessons in today's prompt, which is exactly what
+                # ``NOTICE_TEMPORARY`` tells the user will not happen. The
+                # predicate is the temporary-only one on purpose -- incognito
+                # deliberately still reads, which is the documented difference
+                # between the two modes.
+                blocks_reads=is_thread_temporary(session_key),
                 runtime_source="slack",
+                context_provider=client,
+                thread_parent_text=(
+                    parent_prompt_text(_thread_parent) if _thread_parent is not None else None
+                ),
+                thread_replies_text=_thread_replies.text if _thread_replies else None,
+                # The user's row already landed at receipt above. Without this the
+                # history fallback replays it as the thread's history, ahead of
+                # the same text as the current request.
+                exclude_last_n=1 if _logged_user_turn else 0,
             )
         else:
             full_message = text
@@ -509,10 +881,7 @@ async def handle_message_transport(
                 getattr(event, "title", "") or "",
                 session_key=session_key,
                 agent=_agent or "",
-                tool_kind=getattr(event, "tool_kind", "") or "",
-                raw_params=getattr(event, "raw_tool_params", None),
-                command=getattr(event, "shell_command", None),
-                is_shell=bool(getattr(event, "is_shell", False)),
+                **hook_gate_kwargs(event),
             )
             if result.action == TOOL_DENY:
                 return "deny"
@@ -528,8 +897,10 @@ async def handle_message_transport(
             decider=decider,
             # Preserve native handle_message's auto_approve_subagent_spawn hook:
             # auto-approve spawn_run when the context builder's hook is enabled,
-            # regardless of the interactive ladder.
-            auto_approve_tool=lambda title: _should_auto_approve_spawn(context_builder, title),
+            # regardless of the interactive ladder. The predicate takes the
+            # permission EVENT so identity comes from event.tool_name/is_shell,
+            # never the model-authored title.
+            auto_approve_tool=lambda event: _should_auto_approve_spawn(context_builder, event),
             # Per-session Trust (set via the Trust button) auto-approves all
             # subsequent tools for THIS session, mirroring native. Checked per
             # permission request so a mid-turn Trust click takes effect for the
@@ -538,21 +909,131 @@ async def handle_message_transport(
             # PreToolUse deny/auto gate (runs before the ladder in TurnDriver;
             # a DENY is un-overridable by auto/trust/YOLO).
             tool_gate=_tool_gate,
+            # Session-directive consumer: monitor_start / autonudge_stop / ...
+            # return a marker the driver decodes; apply it against THIS turn's
+            # session key. ``gateway`` (when the caller passed one) carries the
+            # live ``dashboard_state``; without it the consumer falls back to
+            # its sessions-backed authorizer stand-in (dashboard-only
+            # directives stay refused either way).
+            directive_consumer=build_directive_consumer(
+                session_key=session_key, sessions=sessions, dispatcher=gateway
+            ),
+            audit_session_key=session_key,
+            audit_agent=_agent or "kirocrew",
+            closing_gate=turn_ceiling.gate(session_key, lambda: sessions.begin_turn(session_key)),
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
         # different session, which makes any control this turn posts stale the
         # instant it lands — compared after the run below.
         _pre_run_owner = sessions.get_session_for_thread(reply_ts) or session_key
+
+        # Persisting-and-stamping is handed to the renderer because the token has
+        # to be inside the footer it is about to post, and the footer is posted
+        # from inside the run below. Only the renderer knows the final text; only
+        # we know the conversation and its transcript, so we pass in the operation
+        # rather than the state.
+
+        async def _persist_and_stamp(final_text: str) -> str | None:
+            nonlocal _stamped_turn
+            if not conversation_log or _is_slack_restricted(session_key):
+                return None
+            _log = conversation_log
+            if _logged_user_turn:
+                # The user's question was made durable before the run, so only
+                # the reply is outstanding. Read the row back inside the same hold
+                # that wrote it, so the stamp names this reply and not whatever a
+                # later writer appends.
+                def _append_and_read() -> str | None:
+                    with _log.atomic_appends(session_key):
+                        _log.append(
+                            session_key,
+                            "assistant",
+                            final_text,
+                            source_thread=session_key,
+                            source_user=user_id,
+                            agent=_agent,
+                        )
+                        return _log.last_row_ts(session_key)
+
+                row_ts = await asyncio.to_thread(_append_and_read)
+            else:
+                row_ts = await save_conversation_turn_off_loop(
+                    _log,
+                    session_key,
+                    text,
+                    final_text,
+                    source_thread=session_key,
+                    source_user=user_id,
+                    # This branch runs exactly when the user-turn receipt write
+                    # failed, so THIS write is the one that creates the session
+                    # file — without the agent the metadata header pins the
+                    # session to "default" forever (same reasoning as the
+                    # receipt write above).
+                    agent=_agent,
+                )
+            _stamped_turn = True
+            # The asker is the conversation that RAN this turn. Resolving the
+            # thread's owner here would name whoever took it over mid-turn -- a
+            # session that never asked the question.
+            return mint_options_token(
+                cast("DashboardState | None", get_dashboard_state()),
+                session_key,
+                row_ts,
+            )
+
+        renderer.stamp_options = _persist_and_stamp
         accumulated = await driver.run(full_message)
 
         # ── Post-turn bookkeeping ──
-        # The turn already succeeded (we have `accumulated`), so record success
-        # first and isolate the non-critical bookkeeping below — a failure in
+        # The turn ended without raising (we have `accumulated`), so book its
+        # verdict first and isolate the non-critical bookkeeping below — a failure in
         # context-usage accounting or conversation logging must NOT fall through
         # to the outer except and double-record the turn as a failure.
-        sessions.record_success(session_key)
-        Stats().inc_message_success()
+        _unfinished = getattr(driver, "unfinished_turn", False) is True
+        if _unfinished:
+            # The handle ended a turn the backend never finished; the driver
+            # already followed the partial text with the timeout notice. The
+            # runtime still reads alive, so book a failure and reset the session
+            # (keeping the conversation), as the shared channel dispatcher and
+            # Telegram's do, or the next message waits on it again. The reset runs
+            # while this turn holds its permit, like the breaker reset the except
+            # branch below can make; the release in the ``finally`` sees that the
+            # permit died with the reset session and leaves a successor's alone.
+            logger.warning(
+                "transport_dispatch: the turn for %s ended unfinished; resetting the session",
+                session_key,
+            )
+            # At its threshold the breaker resets the session inside
+            # record_failure and answers True. A same-key message can claim a
+            # successor while that reset is awaited, so a second reset here
+            # would end the successor mid-turn: reset only when it did not.
+            breaker_reset = await sessions.record_failure(session_key)
+            if breaker_reset is not True:
+                try:
+                    await sessions.reset(session_key)
+                except Exception:
+                    logger.warning(
+                        "transport_dispatch: session reset after an unfinished turn "
+                        "failed session=%s",
+                        session_key,
+                        exc_info=True,
+                    )
+        else:
+            sessions.record_success(session_key)
+            # Beside the counter it stands in for: a landed turn clears the
+            # shared-death streak exactly as it clears the consecutive-failure
+            # count, so the streak stays a consecutive run rather than a lifetime
+            # total whose bound is permanently tripped.
+            runtime_death.clear_shared_deaths(session_key)
+        # The prompt (with any re-injected context) reached the model and the
+        # turn completed, so the finally must NOT restore the one-shot flag --
+        # unless the user cancelled it, which discards that prompt.
+        _turn_landed = driver_turn_landed(driver)
+        if _unfinished:
+            Stats().inc_message_failed()
+        else:
+            Stats().inc_message_success()
 
         # Remember this turn's OPTIONS control, if it posted one, so the next
         # turn on this thread can strike it through.
@@ -597,7 +1078,11 @@ async def handle_message_transport(
             )
 
         try:
-            sessions.check_context_usage(session_key, client)
+            # Not for an unfinished turn: its runtime was just reset, so the
+            # reading is moot, and a compaction it fired would land on whatever
+            # holds the key now. The except branch below skips this check too.
+            if not _unfinished:
+                sessions.check_context_usage(session_key, client)
         except Exception:
             logger.warning(
                 "transport_dispatch: check_context_usage failed session=%s",
@@ -624,7 +1109,13 @@ async def handle_message_transport(
         # so a turn is never persisted reply-only.
         try:
             if conversation_log and not _is_slack_restricted(session_key):
-                if _logged_user_turn:
+                # Skipped only when the stamp above already wrote this turn (an
+                # options turn). Every other completion -- and any turn whose stamp
+                # failed -- still persists here, so no path ends up writing the
+                # turn twice and none ends up not writing it at all.
+                if _stamped_turn:
+                    pass
+                elif _logged_user_turn:
                     if accumulated:
                         # Same off-loop reasoning as the receipt write above.
                         await asyncio.to_thread(
@@ -634,6 +1125,7 @@ async def handle_message_transport(
                             accumulated,
                             source_thread=session_key,
                             source_user=user_id,
+                            agent=_agent,
                         )
                 else:
                     await save_conversation_turn_off_loop(
@@ -643,11 +1135,68 @@ async def handle_message_transport(
                         accumulated,
                         source_thread=session_key,
                         source_user=user_id,
+                        agent=_agent,
                     )
                 await _refresh_dashboard_tab(session_key)
         except Exception:
             logger.warning(
                 "transport_dispatch: save_conversation_turn failed session=%s",
+                session_key,
+                exc_info=True,
+            )
+
+        # ── Auto-title the conversation (fire-and-forget) ──
+        # The native loop has always titled a thread after its first successful
+        # turn, and this path never did — while ``messaging.use_transport``
+        # defaults True, so on a default install NO Slack session got a generated
+        # title and every surface fell back to a deterministic truncation. Same
+        # claim tracker as native (``auto_title.try_claim`` is check-and-mark in
+        # one step), so a session cannot be titled twice when both paths are live.
+        #
+        # Requires ``accumulated``: a turn that produced no text has nothing to
+        # name, and titling it would spend a background turn to be told SKIP.
+        # Skipped for a restricted session, which persists nothing to title.
+        # Isolated like every other bookkeeping step here, so a failure to even
+        # SPAWN the task never re-records this successful turn as a failure.
+        try:
+            if (
+                accumulated
+                and not _is_slack_restricted(session_key)
+                # Cheap synchronous peek before the pin's thread hop, because
+                # ``try_claim`` below tests this very membership: once a key is
+                # claimed or titled the claim cannot be taken again, so the pin
+                # would be read and then discarded on every later message of every
+                # already-named conversation.
+                and not auto_title.is_titled(session_key)
+            ):
+                # Pin BEFORE claiming, and both before scheduling. The pin read
+                # suspends on a thread, so claiming first would hold the claim
+                # across that await with nothing scheduled yet to release it, and a
+                # cancellation there would strand it -- the claim is process-wide,
+                # so this key could not be named again until the gateway restarts.
+                # The pin still precedes ``create_task``, which is what closes the
+                # scheduling-tick window: read inside the task, one tick is enough
+                # for a delete plus a re-message on this thread to pin the
+                # replacement.
+                _title_pin = await auto_title.pin_record(conversation_log, session_key)
+                if auto_title.try_claim(session_key):
+                    track_background_task(
+                        asyncio.create_task(
+                            _maybe_auto_title_slack(
+                                slack,
+                                sessions,
+                                channel,
+                                session_key,
+                                conversation_log,
+                                text,
+                                accumulated,
+                                pin=_title_pin,
+                            )
+                        )
+                    )
+        except Exception:
+            logger.warning(
+                "transport_dispatch: auto-title dispatch failed session=%s",
                 session_key,
                 exc_info=True,
             )
@@ -670,24 +1219,235 @@ async def handle_message_transport(
                 exc_info=True,
             )
 
-    except Exception:
+    except TurnCeilingExceeded as exc:
+        # At the conversation's turn ceiling, so no turn opened. Unlike the
+        # shutdown branch below this is NOT spooled -- the spool replays a message
+        # our restart dropped, and this one was refused on purpose -- and it is
+        # not charged to the circuit breaker. The notice goes into the thread,
+        # because a refusal the user cannot see is the silence this guard exists
+        # to remove.
+        logger.warning("Slack turn ceiling reached for %s -- conversation paused", session_key)
+        await turn_ceiling.render_refusal(renderer, exc)
+        with contextlib.suppress(Exception):
+            await slack.set_thread_status(channel, reply_ts, "")
+    except SessionClosingError:
+        # Shutdown began between the claim and the dispatch, so no turn opened.
+        # Mirrors the native handler's own gate: clear the thread status and
+        # return quietly. Deliberately NOT the generic branch below -- a restart
+        # is not a session fault (record_failure counts toward tripping the
+        # circuit breaker on a session that never misbehaved), is not a failed
+        # message, and does not warrant an error posted into the thread.
+        logger.info("Aborting Slack dispatch for %s — gateway is shutting down", session_key)
+        if not _is_slack_restricted(session_key):
+            await spool_refused_turn(
+                channel_type="slack",
+                route=InboundRoute(
+                    conversation_id=channel,
+                    text=inbound_text,
+                    user_id=user_id,
+                    thread_id=reply_ts,
+                    message_id=msg_ts,
+                    attachments_dropped=spool_attachments,
+                ),
+            )
+        with contextlib.suppress(Exception):
+            await slack.set_thread_status(channel, reply_ts, "")
+    except asyncio.CancelledError:
+        # A mid-turn cancellation (per-turn deadline, shutdown, or session
+        # supersession) can land on an await after the model completed.
+        # ``except Exception`` below does NOT catch a ``CancelledError`` (a
+        # ``BaseException``), so without this the cancellation would reach the
+        # ``finally`` teardown with NO verdict booked. When the renderer did not
+        # finalize its delivery, an answer-carrying send was cancelled (most
+        # narrowly the OPTIONS footer, whose choices ride only in that footer), so
+        # the reader did not get the answer: book a failure rather than leave an
+        # unrecorded verdict hole. A finalized turn keeps its normal accounting.
+        # Then re-raise: a cancellation must always propagate.
+        if client and _acquired and renderer is not None and not renderer.turn_finalized:
+            with contextlib.suppress(Exception):
+                await sessions.record_failure(session_key)
+                Stats().inc_message_failed()
+        raise
+    except Exception as exc:
         logger.exception("transport_dispatch: error handling message")
         Stats().inc_message_failed()
         if client and _acquired:
-            await sessions.record_failure(session_key)
-        # Post error to Slack so user knows something went wrong
-        try:
-            await slack.post_message(
-                channel, "🔧 Something went wrong (transport path). Please try again.", reply_ts
+            # A dying runtime reaches this generic handler as one more exception,
+            # so without the attribution question every tenant of one process
+            # charges its own breaker for a single process event. ``client`` is
+            # the provider THIS turn acquired, never a lookup made while handling
+            # the failure.
+            await charge_turn_failure(
+                sessions,
+                session_key,
+                exc=exc,
+                provider=client,
+                channel_type="slack",
             )
+        # ── Rescue partial progress ──
+        # A transient backend fault (the "died before streaming started" class,
+        # a dropped stream) leaves the user row on disk and everything the model
+        # already produced in memory only. Nothing persisted it, so each retry
+        # re-read a transcript that ended at the question and started over: a
+        # 28-minute outage on 2026-09-02 burned five identical attempts that each
+        # re-derived the same ticket ids before dying again.
+        #
+        # Persisting the partial reply makes the next attempt resume — it reads
+        # what was already established instead of rediscovering it. Guarded so
+        # this can never make the failure worse:
+        #   * ``_stamped_turn`` — the reply already landed via the OPTIONS stamp,
+        #     so writing again would duplicate the turn.
+        #   * ``renderer.turn_finalized`` — the turn already ENDED normally. A
+        #     fault raised after the stream finished (a footer post that fails,
+        #     say) unwinds through this same branch, and stamping that complete
+        #     reply as cut off would tell the next turn to resume finished work.
+        #     Safe to read here: ``close()`` also sets the flag, but from the
+        #     ``finally`` below, which runs after this decision is made.
+        #   * ``_logged_user_turn`` — the rescue runs ONLY when the user row is
+        #     confirmed on disk. When the receipt append raised, whether the row
+        #     landed is unknowable from here: ``ConversationLog.append`` writes
+        #     the row and only then invalidates caches and calls
+        #     ``_maybe_rotate``, whose own guard covers just the ``stat`` — so a
+        #     rotation fault on an oversized transcript raises with the row
+        #     already durable, while a lock timeout raises with nothing written.
+        #     Writing both rows there would duplicate the question; writing the
+        #     assistant row alone would orphan the answer. Neither is honest, so
+        #     the rescue no-ops and the retry starts from the question. Same rule
+        #     the delivery ledger applies
+        #     to an unacknowledged send: when an outcome is unconfirmable, record
+        #     nothing.
+        #   * ``_is_slack_restricted`` — incognito/temporary sessions persist
+        #     nothing, same as both success-path writes.
+        #   * off-loop ``to_thread``, because ``append`` takes a cross-process
+        #     flock and ON the loop it single-shots and drops the row.
+        #   * its own try/except: a disk failure here must not replace the real
+        #     exception in the log with a bookkeeping one.
+        # Persist only what Slack CONFIRMED it showed. ``SlackRenderer`` batches on
+        # an edit throttle, so the text the model has produced runs routinely ahead
+        # of the text the user has seen; a rescue that persisted the former would
+        # record unseen output as established fact, and the retry would build on
+        # something that was never on screen. ``delivered_text`` is the renderer's
+        # delivery ledger — advanced only where Slack acknowledged the append — so
+        # it is the honest source here.
+        #
+        # This is the only rescue in the codebase, on purpose — and the reason is
+        # confirmable delivery, not an absence of mid-turn sending. Renderers on
+        # the shared ``messaging/dispatch.drive_turn`` path DO emit during a turn
+        # (``telegram`` live-edits per chunk, ``wecom`` pushes stream frames,
+        # ``webex`` rides the buffer tail on a status frame), but none of them can
+        # say afterwards which bytes the user actually retained: those frames are
+        # throttled, replaced wholesale, or truncated. Slack is the one renderer
+        # that keeps a per-append record of what the API acknowledged, so it is
+        # the one place a rescue can persist shown text rather than produced text.
+        # A throttled flush can be holding a trailing word back so a timer tick
+        # cannot tear one in half. That hold is released by ``on_done`` or at a
+        # ``wait`` boundary -- neither of which a dying turn reaches -- so it is
+        # released here, before the ledger is read, or the rescued transcript
+        # would end one word short of what the model established.
+        if renderer is not None:
+            await renderer.release_held_word()
+        _shown = renderer.delivered_text if renderer is not None else ""
+        # ``strip`` decides EMPTINESS only. What gets persisted is ``_shown``
+        # verbatim: leading indentation is content in a transcript — a fenced block
+        # or a nested list loses its structure if the margin is trimmed — and the
+        # success-path write does not trim it either.
+        if (
+            _shown.strip()
+            and _logged_user_turn
+            and not _stamped_turn
+            and renderer is not None
+            and not renderer.turn_finalized
+            and conversation_log
+            and not _is_slack_restricted(session_key)
+        ):
+            try:
+                await asyncio.to_thread(
+                    conversation_log.append,
+                    session_key,
+                    "assistant",
+                    _shown + PARTIAL_TURN_MARKER,
+                    source_thread=session_key,
+                    source_user=user_id,
+                )
+                logger.info(
+                    "transport_dispatch: rescued %d chars of partial reply session=%s",
+                    len(_shown),
+                    session_key,
+                )
+            except Exception:
+                logger.warning(
+                    "transport_dispatch: partial-reply rescue failed session=%s",
+                    session_key,
+                    exc_info=True,
+                )
+        # Post error to Slack so user knows something went wrong. The error
+        # MESSAGE is suppressed for trusted-bot messages: in a mutual-mesh
+        # setup (A trusts B, B trusts A) an error reply is itself a
+        # bot-authored event the peer admits, so replying would open an
+        # unbounded error-reply ping-pong. Mirrors the native path's guard in
+        # handler_runtime/delivery.py (from_trusted_bot and _had_error). The thread STATUS is
+        # cleared unconditionally — skipping it would leave a stale "working"
+        # status pinned to the thread forever.
+        if from_trusted_bot:
+            logger.info(
+                "Suppressing transport error reply to trusted bot message (echo-loop guard)"
+            )
+        else:
+            try:
+                await slack.post_message(channel, _transport_error_text(exc), post_thread_ts)
+            except Exception:
+                pass
+        try:
             await slack.set_thread_status(channel, reply_ts, "")
         except Exception:
             pass
     finally:
+        # An approval window the driver never awaited -- the blocks went out and
+        # the turn then ended before the decider -- has no wait of its own to close
+        # it, so a later click would resolve a future nobody reads while the user
+        # is told their decision was applied.
+        #
+        # ``_APPROVAL_REGISTRY`` is ``SlackApprovalDecider`` under a second name.
+        # Reservations are class state, so the sweep has to reach the class holding
+        # them, and the construction name above is a seam callers and tests
+        # substitute to observe the decider a turn builds. Sweeping through that
+        # name aims at the substitute: it raises on a plain function, and on a
+        # stand-in class it clears an empty registry and leaves the real window
+        # armed past the end of its turn.
+        _APPROVAL_REGISTRY.discard_session(session_key)
+        # A turn that consumed the post-compaction flag but never landed
+        # discarded the prompt carrying the re-injected context, and a backend
+        # that compacted the session during the turn dropped it; either way the
+        # flag is set so the next turn re-injects it.
+        rearm_reinjection(
+            sessions,
+            session_key,
+            consumed=_needs_reinjection,
+            landed=_turn_landed,
+            compacted=getattr(driver, "compaction_completed", False) is True,
+        )
+        # The replies watermark moves only past a turn that landed after a good
+        # read; a cancelled or failed turn discarded the prompt that carried them.
+        if _turn_landed and _thread_replies is not None and _thread_replies.read_ok:
+            note_turn(session_key, thread_ts or msg_ts, msg_ts)
+        rollback_skill_bodies(context_builder, session_key, landed=_turn_landed)
         # Guarantee renderer teardown even if TurnDriver.run() raised before
         # on_done: cancels the 30s tool-elapsed timer so it can't survive the
         # turn and keep hitting append_task against a dead stream.
+        #
+        # Teardown is best-effort and must NEVER prevent the release below: the
+        # semaphore is keyed by SESSION, so a close() that raises here would
+        # wedge every later message in that conversation (and its queue drain)
+        # until the gateway restarts, not merely lose this turn. Same guard as
+        # Discord's dispatcher and the shared pipeline.
         if renderer is not None:
-            await renderer.close()
+            try:
+                await renderer.close()
+            except Exception:
+                logger.warning(
+                    "Slack: renderer.close failed session=%s",
+                    session_key,
+                    exc_info=True,
+                )
         if _acquired:
             sessions.release(session_key)

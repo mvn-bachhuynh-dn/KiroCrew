@@ -1,869 +1,62 @@
 """Kiro usage handlers — local session analytics + kiro-cli billing."""
 
+# This module is the usage handlers' facade: routes, callers across the gateway and tests
+# import and patch every usage name through it, as
+# ``kiro_crew.dashboard.handlers.usage.<name>``. A read of a name an owner holds is served
+# from that owner, and a write -- ``monkeypatch.setattr``, ``mock.patch`` -- reaches every
+# module holding it (:mod:`kiro_crew._facade_mirror`). Owners never import this module. It
+# keeps the usage routes, the model a turn is recorded under, and the token-record writer
+# (the one module of the family that imports ``TurnUsage``). New work goes to the owner of
+# its responsibility:
+#
+#   ``usage_store`` -- the shard store, the reporting window, slot categories, row readers
+#   ``usage_spend`` -- a slot's spend, the per-day credits, one slot's per-turn usage
+#   ``usage_context`` -- context-window occupancy and a session's context trace
+#   ``usage_cost`` -- the Telemetry panel's spend breakdown
+#   ``usage_history`` -- the Usage page's per-day token history
+#   ``usage_sessions`` -- the Usage page's kiro-cli session activity and its cached parse
+
 from __future__ import annotations
 
 import asyncio
 import getpass
+import importlib as _importlib
 import json
 import logging
 import math
-import re
+import sys as _sys
 import time
-from collections import Counter
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from kiro_crew import model_registry
+from kiro_crew import _facade_mirror
 from kiro_crew.acp.types import TurnUsage
-from kiro_crew.config.paths import data_home, kiro_sessions_dir
-from kiro_crew.context_blocks import USER_LABEL
-from kiro_crew.hooks import validate_file_path
-from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.dashboard.handlers.usage_sessions import _CACHE_TTL, _usage_sessions_snapshot
+from kiro_crew.dashboard.handlers.usage_store import (  # noqa: F401 - usage_series reads these per row
+    _coerce_int,
+    _parse_row_day,
+    _parse_row_ts,
+    _shard_path_for,
+    _shards_in_window,
+    _usage_number,
+)
+from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.metrics.turns import (
+    OUTCOME_UNCLASSIFIED,
+    emit_turn_duration,
+    emit_turn_usage,
+    turn_outcome,
+)
+from kiro_crew.owner_only_files import owner_only_opener_for
 
 logger = logging.getLogger(__name__)
-
-# Data-home paths are resolved per call, never captured at import.
-#
-# ``config_dir()`` / ``kiro_sessions_dir()`` read ``KIROCREW_HOME`` on every
-# call, so binding their result to a module constant freezes whatever the home
-# happened to be when this module was first imported. That breaks three things:
-# pod isolation (a pod sets ``KIROCREW_HOME`` for its own process), the one-time
-# ``~/.kirocrew`` -> ``~/.kiro/crew`` migration (deliberately lazy), and test
-# isolation -- the autouse ``_isolate_kirocrew_home`` fixture runs *after*
-# collection has already imported this module, so it silently cannot reach a
-# frozen constant.
-#
-# The module-level name is kept as an explicit ``None`` override hook so callers
-# that already patch it (tests, tooling) keep working; ``None`` means "resolve
-# from the live home". This mirrors ``instances/registry.py``.
-_SESSIONS_DIR: Path | None = None
-
-
-def _sessions_dir() -> Path:
-    """Kiro sessions directory, resolved against the live data home."""
-    return _SESSIONS_DIR if _SESSIONS_DIR is not None else kiro_sessions_dir()
 
 
 _CACHE: dict[str, Any] = {}
 _CACHE_TS: float = 0.0
-_CACHE_TTL = 120  # 2 min
-_CACHE_LOCK = asyncio.Lock()
-
-# Cache for the raw _parse_sessions() result, used by api_usage's
-# claude_code/bedrock branch (api_kiro_usage has its own _CACHE of the full
-# response). _parse_sessions does a full iterdir + per-file stat + line-by-line
-# json.loads of every in-window shard, so it is both TTL-cached (120s) and run
-# off the event loop. _SESSIONS_CACHE_LOCK collapses concurrent cold-cache
-# requests into a single parse (mirrors api_kiro_usage's _CACHE_LOCK).
-# None = unpopulated. A sentinel (not truthiness) so a valid-but-empty parse
-# result ({}) is still cached and served from the fast path, rather than
-# re-parsing on every call.
-_SESSIONS_CACHE: dict[str, Any] | None = None
-_SESSIONS_CACHE_TS: float = 0.0
-_SESSIONS_CACHE_LOCK = asyncio.Lock()
-
-# Cache for _parse_token_history — shards are append-only so we key the
-# cache on a tuple of (filename, mtime, size) for every shard in the
-# 30-day window. Any append to any shard changes the key, invalidating
-# the cache exactly when needed. A 2 min TTL is also enforced as a
-# safety net for clock skew and manual file edits.
-_TOKEN_CACHE: dict[str, Any] = {}
-_TOKEN_CACHE_KEY: tuple[tuple[str, float, int], ...] | None = None
-_TOKEN_CACHE_TS: float = 0.0
-_TOKEN_CACHE_TTL = 120  # 2 min
-# See the _SESSIONS_DIR note above: resolved per call, ``None`` = live home.
-_TOKEN_USAGE_DIR: Path | None = None
-_TOKEN_HISTORY_DAYS = 30
-
-
-def _token_usage_dir() -> Path:
-    """Per-turn usage shard directory, resolved against the live data home."""
-    if _TOKEN_USAGE_DIR is not None:
-        return _TOKEN_USAGE_DIR
-    return data_home() / "usage" / "tokens"
-
-
-def _shard_path_for(ts: datetime) -> Path:
-    """Return the daily shard path for the local-day component of ``ts``.
-
-    Shards are partitioned by the user's local date so the file boundary
-    matches the day boundary the dashboard chart renders against.
-    """
-    return _token_usage_dir() / f"{ts.astimezone().strftime('%Y-%m-%d')}.jsonl"
-
-
-def _shards_in_window(days: int) -> list[Path]:
-    """Return shards whose date falls inside the last ``days`` days.
-
-    The directory listing is cheap (≤31 entries) and we filter by filename
-    rather than statting each file, so this stays well under a millisecond
-    even on years-old installs.
-    """
-    paths: list[Path] = []
-    shard_dir = _token_usage_dir()
-    if not shard_dir.exists():
-        return paths
-    cutoff_date = (datetime.now().astimezone() - timedelta(days=days)).date()
-    for p in shard_dir.iterdir():
-        if not p.is_file() or p.suffix != ".jsonl":
-            continue
-        try:
-            shard_date = datetime.strptime(p.stem, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if shard_date >= cutoff_date:
-            paths.append(p)
-    return paths
-
-
-#: Window (in days) that the spend tab and the sessions table both sum over.
-#: This is the single source of truth: ``cost_breakdown`` defaults to it, and
-#: ``slot_spend`` uses it, so the two surfaces are arithmetically incapable of
-#: reporting different totals for the same session.
-SPEND_WINDOW_DAYS = 7
-
-# Bare dashboard slot key: chat-<seq>-<epoch>. The shard's ``slot`` field uses
-# this shape (without a ``dashboard:`` prefix), while the session manager keys
-# are ``dashboard:chat-<seq>-<epoch>``. Normalization aligns them.
-_BARE_CHAT_SLOT_RE = re.compile(r"^chat-\d+-\d+$")
-
-# ── per-slot spend (shared by the Sessions table and Spend tab) ────────────
-
-
-def spend_key_for_slot(slot: str) -> str:
-    """The key a slot's spend is filed under in :func:`slot_spend`'s result.
-
-    One owner for this rule. Shards record a bare dashboard slot key
-    (``chat-69-1785905004``) while sessions are addressed as
-    ``dashboard:chat-69-…``; a caller that re-derived the prefix would be a second
-    owner, and a second owner of an identity rule is exactly how the spend join
-    and the session list drifted apart before.
-    """
-    return f"dashboard:{slot}" if _BARE_CHAT_SLOT_RE.match(slot) else slot
-
-
-_SLOT_SPEND_CACHE: dict[str, dict[str, float]] = {}
-_SLOT_SPEND_CACHE_SIG: tuple[object, ...] = ()
-_SLOT_SPEND_CACHE_AT: float = 0.0
-
-# The shard signature alone cannot key this cache. The result also depends on
-# ``cutoff = now - days*86400``, which moves continuously, so on an idle machine
-# (no shard write) a row that ages PAST the cutoff would keep being counted
-# until some shard changed -- up to a day, since ``_shards_in_window`` only
-# re-picks the shard set when the date rolls. A short TTL bounds that drift to
-# seconds against a 7-day window while still sparing the 5s poll a re-read.
-_SLOT_SPEND_TTL_S = 60.0
-
-
-def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
-    """Per-session spend over the last *days*: ``{session_key: {"credits", "turns"}}``.
-
-    This is the ONE aggregation path that both the Sessions table and the Spend
-    tab's per-conversation view must go through. It uses the same per-row
-    ``ts_epoch`` cutoff as :func:`cost_breakdown`, so a row inside the boundary
-    shard but older than the cutoff is NOT counted; and it normalizes bare
-    dashboard slot keys (``chat-69-1785905004``) to the full session key form
-    (``dashboard:chat-69-1785905004``) so a direct lookup by session key works.
-
-    Cached against shard size + mtime AND a short TTL, so polling every few
-    seconds does not re-read the window while the moving cutoff still takes
-    effect. Safe to call from a thread (the offloaded sampling thread in
-    session_memory).
-    """
-    global _SLOT_SPEND_CACHE, _SLOT_SPEND_CACHE_SIG, _SLOT_SPEND_CACHE_AT
-
-    now = time.time()
-    paths = _shards_in_window(days)
-    sig: tuple[object, ...] = tuple(
-        (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths if p.exists()
-    )
-    if (
-        sig == _SLOT_SPEND_CACHE_SIG
-        and _SLOT_SPEND_CACHE_SIG
-        and now - _SLOT_SPEND_CACHE_AT < _SLOT_SPEND_TTL_S
-    ):
-        return _SLOT_SPEND_CACHE
-
-    cutoff = now - (days * 86400)
-    out: dict[str, dict[str, float]] = {}
-
-    for path in paths:
-        try:
-            with path.open() as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
-                        continue
-                    # Per-row timestamp cutoff: the shard file date is a coarse
-                    # filter (a shard can span midnight), so rows older than the
-                    # cutoff must still be excluded individually.
-                    ts_raw = str(obj.get("ts") or "")
-                    try:
-                        ts_str = (
-                            ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        )
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < cutoff:
-                        continue
-                    slot = str(obj.get("slot") or "")
-                    if not slot or not is_session_slot(slot):
-                        continue
-                    credits = obj.get("credits")
-                    if not isinstance(credits, (int, float)) or not math.isfinite(credits):
-                        continue
-                    # Normalize bare dashboard keys to the full session-key form.
-                    key = spend_key_for_slot(slot)
-                    cur = out.setdefault(key, {"credits": 0.0, "turns": 0.0})
-                    cur["credits"] += float(credits)
-                    cur["turns"] += 1
-        except (OSError, UnicodeDecodeError):
-            continue
-
-    _SLOT_SPEND_CACHE, _SLOT_SPEND_CACHE_SIG = out, sig
-    _SLOT_SPEND_CACHE_AT = now
-    return out
-
-
-# A payload backstop, not a top-N: the panel lists sessions for the user to
-# browse, sort and group, so cutting it to the "hottest" few hid most of them
-# behind a number they could not reach. Measured over a 7d window this is 260
-# sessions across all categories, which ships comfortably; the cap only exists
-# so an account with thousands does not send all of them on every poll.
-_CONTEXT_TOP_SESSIONS = 500
-# Fingerprint + TTL cache, same contract as _TOKEN_CACHE: the Telemetry panel
-# polls every 5s, and the shards are append-only, so (name, mtime, size) over
-# the window invalidates exactly when a turn lands.
-# Rough characters-per-token for English prose, used ONLY to express the
-# un-instrumented remainder (kiro-cli's base prompt + tool catalogue + steering)
-# in the same unit as KiroCrew's own exactly-counted blocks. Never applied to
-# those blocks themselves, and every surface that shows the derived number
-# labels it as an estimate.
-_EST_CHARS_PER_TOKEN = 4.0
-
-_CONTEXT_CACHE: dict[str, Any] | None = None
-_CONTEXT_CACHE_KEY: tuple[Any, ...] | None = None
-_CONTEXT_CACHE_TS: float = 0.0
-_CONTEXT_CACHE_TTL = 30.0
-
-_COST_CACHE: dict[str, Any] | None = None
-_COST_CACHE_KEY: tuple[Any, ...] | None = None
-_COST_CACHE_TS: float = 0.0
-_COST_CACHE_TTL = 30.0
-# A payload backstop, not a display choice: the panel polls every few seconds,
-# so an account with thousands of sessions should not ship all of them on every
-# refetch. The shown/total pair travels with the list either way, so truncation
-# is stated rather than implied.
-_COST_TOP_CONVOS = 500
-#: Keys that are not a session at all, and so are not rows.
-#:
-#: A subagent is a FRAGMENT of another session's turn, not a session with its own
-#: lifecycle — nobody starts one, resumes one, or goes to look at one. It also
-#: cannot be attributed: a `subagent:*` usage row carries no field pointing back
-#: at the session that spawned it, so it cannot even be nested under its parent.
-#: Ranking 218 of them beside 34 real sessions buried the list in work the user
-#: never held.
-#:
-#: These rows are dropped at the point the row is READ, so their credits leave
-#: the window total, the deltas and every breakdown together. That is deliberate:
-#: filtering at the grouping step instead would leave the money in the total with
-#: no row that could explain it, and no two views would agree. The consequence is
-#: that these totals are the totals of the sessions the panel LISTS, not of the
-#: account — stated in `docs/system-specs/modules/metrics.md` and pinned by
-#: `test_a_subagent_is_not_a_session_and_reaches_no_figure`.
-_NON_SESSION_CHANNELS = frozenset({"subagent"})
-
-# Channels that ARE sessions but run without a person on the other end.
-#
-# A cron tick, the heartbeat and the task runner each have their own lifecycle —
-# something scheduled them and they live and die on their own — so they are
-# sessions, and they belong in a list keyed by session. They collapse to one `bg`
-# category so they read as background work rather than as conversations.
-#
-# `other` and `unknown` are deliberately NOT here. `telemetry_channel_of` returns
-# `other` for a key shape it does not recognise and `unknown` for an absent slot,
-# so folding them in would bury every new surface under background — which is the
-# precise failure this set is a DENYLIST to avoid. Membership is "background by
-# nature", not "not recognised": an unclassified session stays visible under its
-# own category, where it can be reported and fixed.
-_BACKGROUND_CHANNELS = frozenset(
-    {
-        "cron",
-        "heartbeat",
-        "taskrunner",
-        "workflow_pool",
-        "background",
-        "secretary",
-    }
-)
-
-#: The one category that can be opened from the dashboard. Kept separate from
-#: the category list because "is a session" and "has a route" are different
-#: questions — a Telegram thread is a first-class session with nowhere for a
-#: dashboard link to go, which is exactly the bug the old "titled -> link it"
-#: rule shipped.
-NAVIGABLE_CATEGORY = "dashboard"
-
-
-_LEGACY_TELEMETRY_SURFACES = {"task_runner": "taskrunner"}
-
-
-def _canonical_telemetry_surface(surface: str) -> str:
-    """Return the operational telemetry spelling used for new and stored rows.
-
-    The alias keeps historical token shards comparable with current writes;
-    artifact use-case labels are a separate schema and are not normalized here.
-    """
-    return _LEGACY_TELEMETRY_SURFACES.get(surface, surface)
-
-
-def is_session_slot(slot: str) -> bool:
-    """Whether *slot* is a session in its own right, and so earns a row."""
-    return bool(slot) and telemetry_channel_of(slot) not in _NON_SESSION_CHANNELS
-
-
-def session_category(slot: str) -> str:
-    """Classify *slot* into the session taxonomy the panel groups by.
-
-    Returns ``bg`` for a session that runs unattended, otherwise the transport it
-    came from (``dashboard``, ``telegram``, ``slack``, …). Built on
-    :func:`telemetry_channel_of` rather than matching key shapes here: that is
-    the one place that knows every session-key form, so a surface it learns
-    about is classified consistently for metrics and for this panel.
-
-    A DENYLIST decides what is background, deliberately. If a new transport is
-    added and ``_BACKGROUND_CHANNELS`` is not updated, the session shows up under
-    its own new category — visible, reportable, fixable — whereas an allowlist of
-    "real" transports would silently file it as background and bury it.
-    """
-    channel = telemetry_channel_of(slot) if slot else "unknown"
-    return "bg" if channel in _BACKGROUND_CHANNELS else channel
-
-
-# Below this, a per-turn growth slope is noise rather than a trend.
-_COST_MIN_GROWTH_TURNS = 6
-# Occupancy at which the runtime compacts, so the projection has a real target.
-_COMPACTION_PCT = 90.0
-# A turn-to-turn occupancy fall this large is a compaction, not measurement
-# jitter, and so ends the segment a growth slope may be fitted on. Occupancy
-# does drift down by a fraction of a point between turns (what counts toward
-# `context_used` varies), which is why the threshold is not simply "any fall".
-_COMPACTION_DROP_PCT = 1.0
-
-
-def context_occupancy(days: int = 14) -> dict[str, Any]:
-    """Aggregate per-turn context-window occupancy from the token row store.
-
-    ``persist_token_record`` writes ``context_used`` / ``context_window`` on
-    every turn across all nine dispatch surfaces; this is their read side,
-    surfacing the session-death early warning those fields exist for.
-
-    Occupancy is a per-turn ratio, so it is aggregated here rather than in the
-    OTEL pipeline: the useful question is "which SESSION is close to its
-    window", and slot keys are unbounded-cardinality labels that do not belong
-    on a metric. Returns the turn-level percentile spread plus the hottest
-    sessions by peak occupancy, newest first on ties.
-
-    Rows predating the field, or any row whose window is missing/zero, are
-    skipped — an unknown window cannot yield a ratio, and defaulting one would
-    invent a number.
-    """
-    per_session: dict[str, dict[str, Any]] = {}
-    pcts: list[float] = []
-    cutoff = time.time() - (days * 86400)
-
-    shard_paths = _shards_in_window(days)
-    try:
-        cache_key: tuple[Any, ...] | None = (
-            days,
-            tuple(sorted((str(p), p.stat().st_mtime, p.stat().st_size) for p in shard_paths)),
-        )
-    except OSError:
-        cache_key = None
-    now = time.time()
-    if (
-        cache_key is not None
-        and _CONTEXT_CACHE_KEY == cache_key
-        and _CONTEXT_CACHE is not None
-        and (now - _CONTEXT_CACHE_TS) < _CONTEXT_CACHE_TTL
-    ):
-        return _CONTEXT_CACHE
-
-    for shard_path in shard_paths:
-        try:
-            with shard_path.open() as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
-                        continue
-                    used = _coerce_int(obj.get("context_used"))
-                    window = _coerce_int(obj.get("context_window"))
-                    if used <= 0 or window <= 0:
-                        continue
-                    ts_epoch = 0.0
-                    ts_raw = obj.get("ts") or ""
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < cutoff:
-                        continue
-                    slot = str(obj.get("slot") or "unknown")
-                    # Before the percentile sample, not after: the spread and the
-                    # session list have to describe the same population, or the
-                    # p90 on the card disagrees with every row beneath it.
-                    if not is_session_slot(slot):
-                        continue
-                    p = (used / window) * 100.0
-                    pcts.append(p)
-                    cur = per_session.get(slot)
-                    if cur is None:
-                        cur = {
-                            "slot": slot,
-                            "category": session_category(slot),
-                            "turns": 0,
-                            "peak_pct": 0.0,
-                            "used": 0,
-                            "window": window,
-                            "agent": "",
-                            "model": "",
-                            "surface": "",
-                            "ts": "",
-                            "_ts_epoch": 0.0,
-                        }
-                        per_session[slot] = cur
-                    cur["turns"] = int(cur["turns"]) + 1
-                    if p > float(cur["peak_pct"]):
-                        cur["peak_pct"] = p
-                    # Identity + absolute numbers describe the LATEST turn, so a
-                    # session that switched model or agent mid-life is reported
-                    # as what it is now, not what it once was.
-                    if ts_epoch >= float(cur["_ts_epoch"]):
-                        cur.update(
-                            {
-                                "_ts_epoch": ts_epoch,
-                                "ts": str(ts_raw),
-                                "used": used,
-                                "window": window,
-                                "agent": str(obj.get("agent") or ""),
-                                "model": str(obj.get("model") or ""),
-                                "surface": _canonical_telemetry_surface(
-                                    str(obj.get("surface") or "")
-                                ),
-                            }
-                        )
-        except (OSError, UnicodeDecodeError):
-            continue
-
-    def _store(result: dict[str, Any]) -> dict[str, Any]:
-        global _CONTEXT_CACHE, _CONTEXT_CACHE_KEY, _CONTEXT_CACHE_TS
-        if cache_key is not None:
-            _CONTEXT_CACHE, _CONTEXT_CACHE_KEY, _CONTEXT_CACHE_TS = result, cache_key, now
-        return result
-
-    if not pcts:
-        return _store({"turns": 0, "sessions": [], "window_days": days})
-
-    pcts.sort()
-
-    def _q(q: float) -> float:
-        # Nearest-rank on the sorted samples: these are exact per-turn values,
-        # not histogram buckets, so no interpolation is warranted.
-        idx = min(len(pcts) - 1, max(0, math.ceil(q * len(pcts)) - 1))
-        return round(pcts[idx], 1)
-
-    sessions = sorted(
-        per_session.values(),
-        key=lambda s: (float(s["peak_pct"]), float(s["_ts_epoch"])),
-        reverse=True,
-    )[:_CONTEXT_TOP_SESSIONS]
-    for s in sessions:
-        s.pop("_ts_epoch", None)
-        s["peak_pct"] = round(float(s["peak_pct"]), 1)
-
-    return _store(
-        {
-            "turns": len(pcts),
-            "p50_pct": _q(0.50),
-            "p90_pct": _q(0.90),
-            "max_pct": round(pcts[-1], 1),
-            "sessions": sessions,
-            "window_days": days,
-        }
-    )
-
-
-def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
-    """Per-turn injection breakdown for one session, newest shard last.
-
-    Reads the ``ctx_blocks`` / ``phase`` fields ``persist_token_record`` writes
-    each turn and returns them in chronological order, plus per-block totals.
-
-    Kept out of the OTEL pipeline for the same reason as
-    :func:`context_occupancy`: this is per-session, per-turn detail, and slot
-    keys are unbounded-cardinality labels that must not become metric labels.
-    The bounded half (block label -> size, aggregated) is what belongs on a
-    metric; this is the drill-down.
-
-    Rows written before this field existed simply carry no ``ctx_blocks`` and
-    are skipped, so the trace starts where the recording does rather than
-    inventing zeros for history.
-
-    ``estimated_other_chars`` is the remainder of the model's context that
-    KiroCrew did NOT inject — kiro-cli's own base prompt, its tool catalogue and
-    its steering files. It is an ESTIMATE and labelled as one everywhere it is
-    surfaced: the provider reports occupancy in tokens while every KiroCrew
-    block here is counted in exact characters, so the two can only be compared
-    through :data:`_EST_CHARS_PER_TOKEN`. Zero when occupancy is unknown or the
-    subtraction would go negative.
-    """
-    turns: list[dict[str, Any]] = []
-    totals: dict[str, int] = {}
-    for shard_path in _shards_in_window(days):
-        try:
-            with shard_path.open() as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
-                        continue
-                    if str(obj.get("slot") or "") != slot:
-                        continue
-                    raw = obj.get("ctx_blocks")
-                    if not isinstance(raw, dict) or not raw:
-                        continue
-                    blocks = {
-                        str(k): _coerce_int(v) for k, v in raw.items() if _coerce_int(v) > 0
-                    }
-                    if not blocks:
-                        continue
-                    for label, size in blocks.items():
-                        totals[label] = totals.get(label, 0) + size
-                    turns.append(
-                        {
-                            "ts": str(obj.get("ts") or ""),
-                            "phase": str(obj.get("phase") or ""),
-                            "blocks": blocks,
-                            "total_chars": sum(blocks.values()),
-                            "context_used": _coerce_int(obj.get("context_used")),
-                            "context_window": _coerce_int(obj.get("context_window")),
-                            "model": str(obj.get("model") or ""),
-                        }
-                    )
-        except (OSError, UnicodeDecodeError):
-            continue
-
-    turns.sort(key=lambda t: str(t["ts"]))
-    injected = sum(totals.values())
-    # Occupancy is per-turn cumulative, so the largest reading in the session is
-    # the closest thing to "how full did this window get".
-    peak_used = max((int(t["context_used"]) for t in turns), default=0)
-    estimated_other = 0
-    if peak_used > 0:
-        estimated_other = max(0, int(peak_used * _EST_CHARS_PER_TOKEN) - injected)
-    return {
-        "slot": slot,
-        "turns": turns,
-        "totals": totals,
-        "injected_chars": injected,
-        "user_chars": totals.get(USER_LABEL, 0),
-        "estimated_other_chars": estimated_other,
-        "peak_context_used": peak_used,
-        "context_window": next(
-            (int(t["context_window"]) for t in reversed(turns) if t["context_window"]), 0
-        ),
-        "window_days": days,
-    }
-
-
-def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
-    """Aggregate per-turn spend from the token row store into a cost view.
-
-    Answers "what did the last *days* cost, compared with the *days* before it,
-    and what drove the difference". ``credits`` is the only billing dimension the
-    acp provider populates -- input/output/cache/cost come back hard zero -- so
-    it is the unit here, with ``context_used`` as the second real signal.
-
-    Three deliberate shapes:
-
-    * **Every** model is reported, never a top-N slice. A truncated list hides a
-      model switch, which on real data moved the bill far more than usage volume
-      did, and a single-user store is small enough to render complete.
-    * ``channel`` is derived from the session key, NOT read from the row's
-      ``surface`` field. Historical rows can carry a wrong but non-empty value
-      such as ``dashboard`` for a Telegram turn, and the token-row schema has no
-      version or writer marker that distinguishes them from trustworthy rows.
-      The key therefore remains authoritative until the store gains such a
-      boundary; a surface-first fallback would silently misattribute history.
-    * Context bands are absolute token counts rather than occupancy ratios:
-      spend tracks how many tokens get re-sent, and window sizes differ per
-      model, so a ratio would average incomparable populations.
-    """
-    now = time.time()
-    cutoff = now - (days * 86400)
-    prior_cutoff = now - (2 * days * 86400)
-
-    shard_paths = _shards_in_window(2 * days)
-    try:
-        cache_key: tuple[Any, ...] | None = (
-            days,
-            tuple(sorted((str(p), p.stat().st_mtime, p.stat().st_size) for p in shard_paths)),
-        )
-    except OSError:
-        cache_key = None
-    if (
-        cache_key is not None
-        and _COST_CACHE_KEY == cache_key
-        and _COST_CACHE is not None
-        and (now - _COST_CACHE_TS) < _COST_CACHE_TTL
-    ):
-        return _COST_CACHE
-
-    def _blank() -> dict[str, Any]:
-        return {"credits": 0.0, "turns": 0}
-
-    cur_tot, prev_tot = _blank(), _blank()
-    by_model: dict[str, dict[str, Any]] = {}
-    by_channel: dict[str, dict[str, Any]] = {}
-    prev_model: dict[str, float] = {}
-    prev_channel: dict[str, float] = {}
-    bands: dict[int, list[float]] = {}
-    convos: dict[str, dict[str, Any]] = {}
-    by_category: dict[str, dict[str, Any]] = {}
-    prev_category: dict[str, float] = {}
-    priciest: dict[str, Any] = {"credits": 0.0, "slot": "", "ts": ""}
-
-    for shard_path in shard_paths:
-        try:
-            with shard_path.open() as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
-                        continue
-                    ts_raw = str(obj.get("ts") or "")
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < prior_cutoff:
-                        continue
-
-                    credits = float(obj.get("credits") or 0.0)
-                    # Shards written before the persist-side guard can already
-                    # hold `NaN` / `Infinity` — `json.loads` accepts those bare
-                    # tokens even though they are not valid JSON. Letting one
-                    # through would poison every total it touches and make
-                    # `web.json_response` emit a body no browser can parse, so
-                    # the row is dropped rather than counted as free.
-                    if not math.isfinite(credits):
-                        continue
-                    model = str(obj.get("model") or "unknown")
-                    slot = str(obj.get("slot") or "")
-
-                    # Dropped here, before ANY accumulator sees it, so every
-                    # figure on the page is computed over one population. A
-                    # subagent is a fragment of another session's turn rather
-                    # than a session, and it carries no field pointing back at
-                    # the session that spawned it, so it can be neither listed
-                    # nor attributed. Filtering at the grouping step instead
-                    # would leave it in the totals and force a reconciling
-                    # footnote for money with no row.
-                    if slot and not is_session_slot(slot):
-                        continue
-
-                    if ts_epoch < cutoff:
-                        prev_tot["credits"] += credits
-                        prev_tot["turns"] = int(prev_tot["turns"]) + 1
-                        prev_model[model] = prev_model.get(model, 0.0) + credits
-                        ch = telemetry_channel_of(slot or None)
-                        prev_channel[ch] = prev_channel.get(ch, 0.0) + credits
-                        cat = session_category(slot)
-                        prev_category[cat] = prev_category.get(cat, 0.0) + credits
-                        continue
-
-                    cur_tot["credits"] += credits
-                    cur_tot["turns"] = int(cur_tot["turns"]) + 1
-                    if credits > float(priciest["credits"]):
-                        priciest = {"credits": credits, "slot": slot, "ts": ts_raw}
-
-                    for bucket, name in ((by_model, model),
-                                         (by_channel, telemetry_channel_of(slot or None)),
-                                         (by_category, session_category(slot))):
-                        e = bucket.setdefault(name, {"name": name, "credits": 0.0, "turns": 0})
-                        e["credits"] = float(e["credits"]) + credits
-                        e["turns"] = int(e["turns"]) + 1
-
-                    used = _coerce_int(obj.get("context_used"))
-                    if used > 0 and credits > 0:
-                        bands.setdefault(min(used // 200_000, 5), []).append(credits)
-
-                    if slot:
-                        c = convos.setdefault(
-                            slot,
-                            {"slot": slot, "credits": 0.0, "turns": 0, "peak_pct": 0.0,
-                             "first_ts": ts_epoch, "last_ts": ts_epoch, "_occ": []},
-                        )
-                        c["credits"] = float(c["credits"]) + credits
-                        c["turns"] = int(c["turns"]) + 1
-                        c["first_ts"] = min(float(c["first_ts"]), ts_epoch)
-                        c["last_ts"] = max(float(c["last_ts"]), ts_epoch)
-                        window = _coerce_int(obj.get("context_window"))
-                        if used > 0 and window > 0:
-                            pct = used / window * 100.0
-                            c["peak_pct"] = max(float(c["peak_pct"]), pct)
-                            c["_occ"].append((ts_epoch, pct))
-        except (OSError, UnicodeDecodeError):
-            continue
-
-    def _store(result: dict[str, Any]) -> dict[str, Any]:
-        global _COST_CACHE, _COST_CACHE_KEY, _COST_CACHE_TS
-        if cache_key is not None:
-            _COST_CACHE, _COST_CACHE_KEY, _COST_CACHE_TS = result, cache_key, now
-        return result
-
-    def _per_turn(e: dict[str, Any]) -> float:
-        t = int(e["turns"])
-        return round(float(e["credits"]) / t, 1) if t else 0.0
-
-    total = float(cur_tot["credits"])
-
-    def _rank(bucket: dict[str, dict[str, Any]], deltas: dict[str, float] | None
-              ) -> list[dict[str, Any]]:
-        out = []
-        for e in sorted(bucket.values(), key=lambda x: -float(x["credits"])):
-            row = {
-                "name": e["name"],
-                "credits": round(float(e["credits"]), 1),
-                "turns": int(e["turns"]),
-                "per_turn": _per_turn(e),
-                "share_pct": round(float(e["credits"]) / total * 100, 1) if total else 0.0,
-            }
-            if deltas is not None:
-                was = deltas.get(str(e["name"]), 0.0)
-                # A model with no prior spend has no percentage to report; the
-                # frontend renders that as "new" rather than a fake infinity.
-                row["delta_pct"] = (
-                    round((float(e["credits"]) - was) / was * 100, 0) if was > 0 else None
-                )
-            out.append(row)
-        return out
-
-    band_rows = []
-    for idx in sorted(bands):
-        vals = bands[idx]
-        lo = idx * 200_000
-        band_rows.append(
-            {
-                "label": f"{lo // 1000}k–{(lo + 200_000) // 1000}k" if idx < 5 else "1M+",
-                "turns": len(vals),
-                "mean_credits": round(sum(vals) / len(vals), 1),
-            }
-        )
-
-    convo_rows = []
-    for c in sorted(convos.values(), key=lambda x: -float(x["credits"]))[:_COST_TOP_CONVOS]:
-        occ = sorted(c.pop("_occ"))
-        growth: float | None = None
-        to_90: int | None = None
-        # Fit the slope only on the stretch since the last compaction, never
-        # across the whole window. Occupancy is sawtooth, not monotonic: a
-        # compaction drops it back to near-empty, and 7 of the 8 top-spending
-        # conversations measured carry between one and four such drops. A secant
-        # from the first turn to the last therefore spans discontinuities and is
-        # dragged down by every reset, which understates the live growth rate by
-        # ~47x on real data (one 104-turn conversation projected 795 turns of
-        # headroom while its current segment was climbing at 4%/turn, i.e. ~17
-        # turns from compaction). Erring toward "plenty of room left" is the
-        # damaging direction for a figure whose whole purpose is a warning.
-        seg = occ
-        for i in range(1, len(occ)):
-            if occ[i][1] < occ[i - 1][1] - _COMPACTION_DROP_PCT:
-                seg = occ[i:]
-        # A slope needs enough points in the CURRENT segment, not merely enough
-        # turns in the window: a long conversation freshly past a compaction
-        # knows nothing about its new trajectory yet, and withholding is the
-        # honest answer rather than projecting from two or three points.
-        if len(seg) >= _COST_MIN_GROWTH_TURNS:
-            rate = (seg[-1][1] - seg[0][1]) / (len(seg) - 1)
-            if rate > 0:
-                growth = round(rate, 2)
-                remaining = _COMPACTION_PCT - seg[-1][1]
-                to_90 = int(remaining / rate) if remaining > 0 else 0
-        convo_rows.append(
-            {
-                "slot": c["slot"],
-                # The session taxonomy the panel groups by: `bg` for machine
-                # work, otherwise the transport it came from. The frontend needs
-                # it for two things — the category chip, and linkability, since
-                # only a dashboard session has a route to open. Deriving either
-                # from the key shape in the frontend would put a second,
-                # drifting copy of session-key knowledge there.
-                "category": session_category(c["slot"]),
-                # The unollapsed label underneath the category, so a `bg` row
-                # still says whether it was a subagent, a cron or the heartbeat
-                # instead of becoming an anonymous lump.
-                "channel": telemetry_channel_of(c["slot"]),
-                "credits": round(float(c["credits"]), 1),
-                "turns": int(c["turns"]),
-                "peak_pct": round(float(c["peak_pct"]), 1),
-                "span_days": round((float(c["last_ts"]) - float(c["first_ts"])) / 86400, 1),
-                # A closed conversation has no stored title, so the frontend
-                # labels it by start date -- eight rows all reading "untitled"
-                # cannot be told apart, which defeats the ranking.
-                "first_ts": round(float(c["first_ts"]), 3),
-                "growth_pct_per_turn": growth,
-                "turns_to_compaction": to_90,
-            }
-        )
-
-    prev_credits = float(prev_tot["credits"])
-    return _store(
-        {
-            "window_days": days,
-            "credits": round(total, 1),
-            "turns": int(cur_tot["turns"]),
-            "per_turn": _per_turn(cur_tot),
-            "prior_credits": round(prev_credits, 1),
-            "prior_turns": int(prev_tot["turns"]),
-            "prior_per_turn": _per_turn(prev_tot),
-            "delta_pct": (
-                round((total - prev_credits) / prev_credits * 100, 0)
-                if prev_credits > 0
-                else None
-            ),
-            "priciest": {
-                "credits": round(float(priciest["credits"]), 1),
-                "slot": priciest["slot"],
-                "ts": priciest["ts"],
-            },
-            "by_model": _rank(by_model, prev_model),
-            "by_channel": _rank(by_channel, prev_channel),
-            "by_category": _rank(by_category, prev_category),
-            "context_bands": band_rows,
-            "conversations": convo_rows,
-            "conversation_count": len(convos),
-            # The one category with a route. Sent rather than duplicated in
-            # the frontend so a change here cannot leave a dead link there.
-            "navigable_category": NAVIGABLE_CATEGORY,
-        }
-    )
+_CACHE_LOCK = LoopBoundLock()
 
 
 def read_context_tokens(source: object) -> tuple[int, int]:
@@ -887,34 +80,65 @@ def read_context_tokens(source: object) -> tuple[int, int]:
         return (0, 0)
 
 
+# Runaway guard for :func:`_wrapper_chain`, NOT a depth limit. The walk follows
+# the four documented holder attributes and stops at objects it has already
+# seen, so a real provider stack — a handful of wrappers around one handle and
+# one runtime — is exhausted long before this. What the bound exists for is a
+# source that SYNTHESIZES attributes: a ``MagicMock`` answers every ``getattr``
+# with a fresh child, so without a bound the walk would never end. It is sized
+# so that no plausible wrapper depth can reach it: a wrapper layer carrying all
+# four holders costs three nodes on the way down, so this admits twenty-plus
+# stacked layers, an order of magnitude past anything a session accumulates.
+_WRAPPER_CHAIN_MAX_NODES = 64
+
+# Holder attributes, in the order they are followed. ``_runtime`` is LAST on
+# purpose — see :func:`_wrapper_chain`.
+_WRAPPER_HOLDERS: tuple[str, ...] = ("client", "_client", "_handle", "_runtime")
+
+
 def _wrapper_chain(source: object) -> list[object]:
     """Collect *source* and the provider/client/handle wrappers nested under it.
 
     ``providers/acp.py`` keeps its inner object on ``_client`` (also exposed as
     ``client``), ``acp/session_provider.py`` keeps the session handle on
     ``_handle``, and both the handle and the provider keep the spawned CLI
-    runtime on ``_runtime`` (``session_handle.py:215``, ``session_provider.py:61``)
-    — and these nest, because ``providers/acp.py:610`` assigns an
+    runtime on ``_runtime`` (``session_handle_class.py`` ``__init__``, ``session_provider.py:61``)
+    — and these nest, because ``providers/acp_runtime_start.py`` assigns an
     ``AcpSessionProvider`` to ``_client`` (the ``-> AcpClient`` annotation there
     carries a ``type: ignore``). A default Kiro turn therefore hides its resolved
     state two levels down, at ``provider.client._handle``, so probing a fixed
-    depth misses it. Breadth-first with a node cap and an identity-based visited
-    set, so a wrapper that points back at itself terminates.
+    depth misses it.
+
+    Depth-first along the holder attributes, with an identity-based visited set
+    so a wrapper that points back at itself (or two wrappers that share a
+    runtime) terminates. Depth-first, not breadth-first, because the model state
+    sits at the BOTTOM of the holder chain while every wrapper layer above it —
+    a fallback wrapper, session sharing, a subagent companion, a channel-linked
+    session — carries siblings that hold nothing. A breadth-first walk with a
+    node budget spends that budget on the siblings and, a few layers down,
+    stops short of the ``_model`` node; ``_resolve_model`` then persists a blank
+    and the credits land in the read-time ``unknown`` bucket. Following the
+    chain downward first reaches the handle regardless of how many layers are
+    stacked on top; :data:`_WRAPPER_CHAIN_MAX_NODES` is a runaway guard for
+    attribute-synthesizing sources, not a depth limit.
 
     ``_runtime`` is traversed **last** deliberately. It is the only holder of
     ``_agent`` for the session-provider shape (``runtime.py:273``), but it also
     carries the process-level ``--model`` argument (``runtime.py:280``); visiting
-    it after ``_handle`` keeps session-level model state ahead of process-level
-    state when :func:`read_effective_model` falls through to ``_model``.
+    it after the whole ``_handle`` subtree keeps session-level model state ahead
+    of process-level state when :func:`read_effective_model` falls through to
+    ``_model``.
     """
     chain: list[object] = []
+    # A stack: the LAST entry is visited next, so children are pushed in
+    # reverse holder order to come off in holder order.
     pending: list[object] = [source]
-    while pending and len(chain) < 8:
-        node = pending.pop(0)
+    while pending and len(chain) < _WRAPPER_CHAIN_MAX_NODES:
+        node = pending.pop()
         if node is None or any(seen is node for seen in chain):
             continue
         chain.append(node)
-        for holder in ("client", "_client", "_handle", "_runtime"):
+        for holder in reversed(_WRAPPER_HOLDERS):
             inner = getattr(node, holder, None)
             if inner is not None and not isinstance(inner, (str, bytes, int)):
                 pending.append(inner)
@@ -925,11 +149,11 @@ def read_effective_agent(source: object) -> str:
     """Return the agent id that actually served the turn, or ``""``.
 
     The slot's ``agent`` is an alias that ``resolve_agent_bindings()`` maps to a
-    concrete kiro agent before dispatch (``chat_runner.py:2392`` resolves it and
-    :2408 passes the result into ``get_or_create``), so a slot set to ``default``
-    can be served by ``kirocrew``. Recording the alias would attribute the turn
+    concrete kiro agent before dispatch (``dashboard/chat_turn/turn_admission.py``'s
+    ``_turn_admit`` resolves it and passes the result into ``get_or_create``), so a slot
+    set to ``default`` can be served by ``kirocrew``. Recording the alias would attribute the turn
     to an agent that never ran. ``AcpClient`` stores what it was constructed with
-    on ``_agent`` (``acp/client.py:1270``), which is that resolved value — the
+    on ``_agent`` (``acp/client_class.py``, ``__init__``), which is that resolved value — the
     same "what actually ran" precedence used for the model. Never raises.
     """
     try:
@@ -969,11 +193,7 @@ def read_effective_model(source: object) -> str:
         for attr in ("_resolved_model_id", "_model"):
             for node in chain:
                 candidate = getattr(node, attr, "")
-                if (
-                    isinstance(candidate, str)
-                    and candidate
-                    and candidate.strip().lower() != "auto"
-                ):
+                if isinstance(candidate, str) and candidate and candidate.strip().lower() != "auto":
                     return candidate
     except Exception:
         pass
@@ -981,21 +201,52 @@ def read_effective_model(source: object) -> str:
 
 
 def _source_requests_auto(source: object) -> bool:
-    """Whether the provider chain still reports Auto as its model request.
+    """Whether the provider chain reports Auto, as a request or from the backend.
 
     This is deliberately separate from :func:`read_effective_model`: ``auto``
     is not a resolved model id, but it is useful attribution when a completed
-    turn has no more specific id from the backend. A blank request does not
-    prove Auto was selected, so it remains blank in the row store.
+    turn has no more specific id from the backend. Two signals count: a
+    ``_model`` request of ``auto``, and a ``_resolved_model_id`` of ``auto``.
+    The second is what a session on the default model holds: the start path
+    never calls ``set_model`` for it, so ``_model`` stays ``""``, while
+    ``session/new`` stores the backend's ``currentModelId`` (``auto``) as the
+    resolved id. That is the backend saying Auto served the session. A blank
+    ``_model`` with a blank or missing ``_resolved_model_id`` proves nothing
+    was selected, so it remains blank in the row store.
     """
     try:
         return any(
-            isinstance(candidate := getattr(node, "_model", ""), str)
+            isinstance(candidate := getattr(node, attr, ""), str)
             and candidate.strip().lower() == "auto"
             for node in _wrapper_chain(source)
+            for attr in ("_model", "_resolved_model_id")
         )
     except Exception:
         return False
+
+
+def read_turn_model(source: object) -> str:
+    """Return what served the turn: a resolved id, ``"auto"``, or ``""``.
+
+    :func:`read_effective_model` alone collapses two different situations into
+    ``""``: a turn whose model the provider never reported, and a turn the user
+    deliberately handed to Auto. They read identically to a consumer, so a
+    display surface that omits a blank model shows nothing for an Auto turn and
+    an absent model becomes indistinguishable from a missing measurement.
+
+    ``"auto"`` is not a model id and is never presented as one — it is the
+    honest answer to "who chose", which is all the backend discloses when
+    Auto routes a turn (the ACP per-turn metadata frame carries context and
+    metering only). Callers that need a concrete id for a pricing or window
+    lookup must keep using :func:`read_effective_model`. ``"auto"`` comes back
+    when the chain requests Auto or the backend reported ``auto`` as the
+    resolved id (a session left on the default model); a chain with neither
+    stays ``""``. Never raises.
+    """
+    resolved = read_effective_model(source)
+    if resolved:
+        return resolved
+    return "auto" if _source_requests_auto(source) else ""
 
 
 def _resolve_model(model: str, model_source: object) -> str:
@@ -1010,24 +261,12 @@ def _resolve_model(model: str, model_source: object) -> str:
     requested = (model or "").strip().lower()
     if requested not in ("", "auto"):
         return model
-    resolved = read_effective_model(model_source) if model_source is not None else ""
+    resolved = read_turn_model(model_source) if model_source is not None else ""
     if resolved:
         return resolved
-    if requested == "auto" or _source_requests_auto(model_source):
-        return "auto"
-    return ""
-
-
-def _coerce_int(value: Any) -> int:
-    """Coerce ``value`` to ``int``, defaulting to 0 for non-numeric input.
-
-    Keeps the emitted record JSON-serializable even if a caller passes a
-    non-numeric context value.
-    """
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+    # An explicit Auto request stands on its own: the caller named it, so it is
+    # recorded even when the provider chain no longer reports it.
+    return "auto" if requested == "auto" else ""
 
 
 def _build_token_record(
@@ -1042,10 +281,17 @@ def _build_token_record(
     context_used: int = 0,
     context_window: int = 0,
     elapsed_ms: int = 0,
-    ctx_blocks: dict[str, int] | None = None,
-    phase: str = "",
+    app: str = "",
 ) -> dict[str, Any]:
     """Build the JSONL token-usage record dict (no I/O).
+
+    ``app`` stamps the OWNING app on the row when the turn ran on an app-owned
+    slot. Ownership recorded at write time is what survives the slot: a live
+    ``_app`` check at read time both leaks on slot-name reuse (a recreated slot
+    would vouch for the previous owner's rows) and denies an app its own
+    completed sessions. Empty for dashboard/user slots, and absent from rows
+    written before the field existed — an app caller sees neither, which is
+    the deny-by-default answer for ownership that was never recorded.
 
     ``surface`` tags the dispatch origin (``dashboard``, ``cron``, ``subagent``,
     …) and ``agent`` the agent id resolved for the turn. ``context_used`` /
@@ -1075,10 +321,18 @@ def _build_token_record(
         credits = float(getattr(u, "credits", 0.0))
     except (TypeError, ValueError):
         credits = 0.0
+    # Turn stop reason, read off the EVENT (AcpEvent carries it; a bare
+    # TurnUsage from provider_last_turn_usage does not — recorded as "").
+    # Free-form per-row (this store has no cardinality limit, unlike OTel
+    # attrs), so watchdog outcomes (STOP_REASON_TOOL_STALL / _STALE_RECOVER)
+    # can be joined against the row's ``agent`` field retroactively — this is
+    # where per-agent stall analysis happens, deliberately NOT on metric attrs.
+    _stop = getattr(event, "stop_reason", "")
     return {
         "_type": "tokens",
         "ts": now.isoformat(),
         "slot": slot_key,
+        "app": app,
         "provider": provider or "",
         "model": model or "",
         "input": getattr(u, "input_tokens", 0),
@@ -1096,15 +350,10 @@ def _build_token_record(
         "agent": agent or "",
         "context_used": _coerce_int(context_used),
         "context_window": _coerce_int(context_window),
-        # Per-turn injection breakdown: block label -> characters, from
-        # kiro_crew.context_blocks.split_blocks. Sizes are characters (exact and
-        # tokenizer-independent). ``phase`` separates the one-off session-start
-        # injection from the much smaller per-turn one so a reader never pools
-        # the two populations into one meaningless percentile.
-        "ctx_blocks": {
-            str(k): _coerce_int(v) for k, v in (ctx_blocks or {}).items() if _coerce_int(v) > 0
-        },
-        "phase": phase or "",
+        # Additive: the turn's terminal stop reason ("" when the producer has
+        # none). str-coerced so a non-string on a test double / legacy event
+        # can't break json.dumps.
+        "stop_reason": _stop if isinstance(_stop, str) else "",
     }
 
 
@@ -1120,13 +369,73 @@ def _finite_only(record: dict[str, Any]) -> dict[str, Any]:
     is exactly what a bad one looks like, so the check cannot be a type check.
     """
     return {
-        k: (0.0 if isinstance(v, float) and not math.isfinite(v) else v)
-        for k, v in record.items()
+        k: (0.0 if isinstance(v, float) and not math.isfinite(v) else v) for k, v in record.items()
     }
+
+
+# The record fields that make a row billed: the same six dimensions
+# ``llm_helpers.usage_has_billing`` reads off a ``TurnUsage``, by their record
+# names. A claude-seam turn bills in tokens with ``cost`` still 0 (cost is a
+# session-cumulative delta that lands only when a cost frame arrives) and
+# credits stay 0 off the kiro path, so a credits-and-cost check alone would
+# stay silent for exactly the token-billed rows.
+_BILLED_RECORD_FIELDS: tuple[str, ...] = (
+    "credits",
+    "cost",
+    "input",
+    "output",
+    "cache_create",
+    "cache_read",
+)
+
+
+def _record_is_billed(record: dict[str, Any]) -> bool:
+    """Whether a BUILT record carries any billing dimension, non-finite aside.
+
+    Mirrors ``llm_helpers.usage_has_billing`` over the record's own fields
+    (:data:`_BILLED_RECORD_FIELDS`), so the write site judges the row it is
+    about to persist rather than the event it was built from. A non-finite
+    value is a corrupt measurement, handled by :func:`_write_token_record`'s
+    own sanitizer, not a charge.
+    """
+    for key in _BILLED_RECORD_FIELDS:
+        value = record.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value) and value != 0:
+            return True
+    return False
+
+
+def _warn_unattributed_billing(record: dict[str, Any]) -> None:
+    """Log — loudly — a billed row about to be persisted with no model.
+
+    Read time renders a blank ``model`` as ``unknown`` (``cost_breakdown``).
+    Left as the only signal, that bucket is where an attribution failure is
+    discovered weeks later, once it is large enough to notice, not where and
+    when it happens. The row is still persisted — the charge is real and
+    dropping it would understate spend — and the failure goes on record at the
+    moment of writing, naming the slot, surface and provider so the dispatch
+    path that lost the model can be found, and the billed dimensions so the
+    size of the loss is on record too. Nothing else: the row's other fields
+    are per-turn telemetry and do not belong in a log line.
+    """
+    if str(record.get("model") or "") or not _record_is_billed(record):
+        return
+    logger.warning(
+        "usage row: model attribution failed for a billed turn; persisting with a blank "
+        "model (read time renders it as 'unknown'). slot=%s surface=%s provider=%s "
+        "credits=%s cost=%s tokens=%s",
+        record.get("slot", ""),
+        record.get("surface", ""),
+        record.get("provider", ""),
+        record.get("credits", 0),
+        record.get("cost", 0),
+        {k: record.get(k, 0) for k in ("input", "output", "cache_create", "cache_read")},
+    )
 
 
 def _write_token_record(record: dict[str, Any], now: datetime) -> None:
     """Append a prebuilt token record to today's shard (blocking I/O)."""
+    _warn_unattributed_billing(record)
     shard_path = _shard_path_for(now)
     parent = shard_path.parent
     # mkdir only when missing — the dir is created once per day, not per turn.
@@ -1154,12 +463,11 @@ def _write_token_record(record: dict[str, Any], now: datetime) -> None:
         if not non_finite:
             raise
         logger.warning(
-            "token usage: replaced non-finite value(s) with 0.0 before persisting; "
-            "fields=%s",
+            "usage row: replaced non-finite value(s) with 0.0 before persisting; " "fields=%s",
             ",".join(non_finite),
         )
         line = json.dumps(_finite_only(record), allow_nan=False)
-    with open(shard_path, "a", encoding="utf-8") as f:
+    with open(shard_path, "a", encoding="utf-8", opener=owner_only_opener_for(shard_path)) as f:
         f.write(line + "\n")
 
 
@@ -1174,12 +482,18 @@ def persist_token_record(
     context_used: int = 0,
     context_window: int = 0,
     elapsed_ms: int = 0,
-    ctx_blocks: dict[str, int] | None = None,
-    phase: str = "",
+    app: str = "",
     model_source: object = None,
 ) -> None:
     """Append a token usage record to today's shard under
     ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` (synchronous).
+
+    Has NO caller today, and unlike :func:`persist_token_record_async` it does
+    not emit ``kirocrew.turn.duration``. A future direct caller of this variant
+    would therefore write a usage row for a turn that appears in no latency or
+    fault-rate reading — silently reopening the gap the async variant's emit
+    closed. If you reach for this for a real per-turn path, emit there too (or
+    call the async variant).
 
     The ``provider`` field tags the source LLM backend (acp,
     claude_code, bedrock) so the dashboard chart can filter by provider.
@@ -1214,8 +528,7 @@ def persist_token_record(
                 context_used=context_used,
                 context_window=context_window,
                 elapsed_ms=elapsed_ms,
-                ctx_blocks=ctx_blocks,
-                phase=phase,
+                app=app,
             ),
             now,
         )
@@ -1234,9 +547,9 @@ async def persist_token_record_async(
     context_used: int = 0,
     context_window: int = 0,
     elapsed_ms: int = 0,
-    ctx_blocks: dict[str, int] | None = None,
-    phase: str = "",
+    app: str = "",
     model_source: object = None,
+    emit_metric: bool = True,
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
 
@@ -1247,6 +560,32 @@ async def persist_token_record_async(
     See :func:`persist_token_record` for the ``surface`` / ``agent`` /
     ``context_used`` / ``context_window`` / ``elapsed_ms`` / ``model_source``
     fields.
+
+    ALSO emits the per-turn OTEL family — ``kirocrew.turn.duration`` plus the
+    turn's usage (``kirocrew.turn.tokens`` and whichever of
+    ``kirocrew.turn.credits`` / ``kirocrew.turn.cost_usd`` the backend billed in)
+    — and this is the only place that does. Being the one call every dispatch
+    surface already makes once per turn is exactly why: an emit sited in
+    ``chat_runner`` beside the dashboard turn loop leaves cron, heartbeat, memory
+    consolidation, subagents, task-runner steps, workflow stages and every
+    messaging channel absent from turn latency and fault rate entirely — and
+    absent does not read as absent, it reads as healthy. See
+    :mod:`kiro_crew.metrics.turns`.
+
+    Every sample reuses the BUILT record's own fields — ``duration_ms``, the
+    token counts, ``credits``/``cost``, and the RESOLVED ``model``/``provider`` —
+    so the row store and the metrics cannot disagree about one turn, the property
+    the record builder's docstring already claims and now enforces by
+    construction rather than by two call sites being handed the same variables.
+
+    ``emit_metric=False`` says the CALLER owns this turn's samples. The
+    dashboard passes it because its persist call sits behind a
+    ``usage_has_billing`` gate: a turn that timed out having billed nothing
+    writes no row, and letting the row's absence swallow the samples would drop
+    exactly the faults ``fault_rate`` exists to count. It emits unconditionally
+    itself instead, which is also how its ``stall_exhausted`` refinement reaches
+    the histogram. Do NOT set this without emitting — the turn then goes
+    unrecorded, which reads as a healthy gap rather than a missing one.
     """
     try:
         model = _resolve_model(model, model_source)
@@ -1262,389 +601,70 @@ async def persist_token_record_async(
             context_used=context_used,
             context_window=context_window,
             elapsed_ms=elapsed_ms,
-            ctx_blocks=ctx_blocks,
-            phase=phase,
+            app=app,
         )
+        # Before the offloaded write: a file-write failure must not cost the
+        # latency sample, which needs nothing from disk.
+        if emit_metric:
+            _emit_turn_histogram(record, slot_key, event)
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
 
 
-def _parse_token_history() -> dict[str, Any]:
-    """Parse token usage from the daily-sharded usage directory.
+def _emit_turn_histogram(
+    record: dict,
+    slot_key: str,
+    event: object,
+) -> None:
+    """Emit this turn's OTEL samples from a built record.
 
-    Reads ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` shards. Only shards
-    inside the 30-day window are opened, so read cost stays O(window)
-    regardless of total history.
+    ``kirocrew.turn.duration`` plus the turn's usage family
+    (``kirocrew.turn.tokens`` and whichever of ``kirocrew.turn.credits`` /
+    ``kirocrew.turn.cost_usd`` the backend billed in). Split out so the emit is
+    one statement in the persist path and can be asserted directly by a test
+    without writing a row.
 
-    Each daily entry includes a ``providers`` map and a ``models`` map so
-    the dashboard chart can offer provider/model filters.
+    Reads every value off the RECORD rather than recomputing from
+    ``event``/``elapsed_ms``: the builder already applies the
+    provider-reported-wins-else-wall-clock rule for the duration and already
+    coerces the usage fields, so duplicating either here is how the row store and
+    the metrics would come to disagree about one turn. ``model`` and ``provider``
+    come from the same place for the same reason — the record's ``model`` is the
+    RESOLVED one (``_resolve_model``), so the attribute names the model that ran
+    rather than the alias the caller asked for.
 
-    The result is cached on a tuple of (filename, mtime, size) for every
-    shard in the window. Any append to any shard changes the key, so we
-    re-parse exactly when needed. A 2 min TTL is also enforced as a safety
-    net for clock skew and manual edits.
+    An ABSENT ``stop_reason`` attribute and a ``None``/empty one mean different
+    things and must not collapse. A bare ``TurnUsage`` has no such attribute and
+    cannot say how its turn ended (``unclassified``); an ``LLMEvent`` whose
+    ``stop_reason`` is ``None`` is reporting a CLEAN turn, which is what the acp
+    path leaves on a normal completion. The distinction lives here rather than in
+    ``turn_outcome`` because only this layer can see whether the attribute exists
+    at all — and it must not be resolved by a default: labelling the bare-usage
+    case ``ok`` claims successes nobody observed, while labelling it ``unknown``
+    puts it in ``telemetry._TERMINAL_FAULT_OUTCOMES`` and invents a fault for
+    every clean background turn.
     """
-    global _TOKEN_CACHE, _TOKEN_CACHE_KEY, _TOKEN_CACHE_TS
-
-    shard_paths = _shards_in_window(_TOKEN_HISTORY_DAYS)
-    if not shard_paths:
-        # Drop any stale cache so we don't serve old data after manual deletion.
-        _TOKEN_CACHE = {}
-        _TOKEN_CACHE_KEY = None
-        return {}
-
-    # Fast path: serve cached result if no shard has changed since last parse
-    # AND we're inside the TTL window.
-    cache_key: tuple[tuple[str, float, int], ...] | None
-    try:
-        cache_key = tuple(
-            sorted((str(p), p.stat().st_mtime, p.stat().st_size) for p in shard_paths)
-        )
-    except OSError:
-        cache_key = None
-    now = time.time()
-    if (
-        cache_key is not None
-        and _TOKEN_CACHE_KEY == cache_key
-        and (now - _TOKEN_CACHE_TS) < _TOKEN_CACHE_TTL
-        and _TOKEN_CACHE
-    ):
-        return _TOKEN_CACHE
-
-    cutoff = time.time() - (_TOKEN_HISTORY_DAYS * 86400)
-    daily_input: Counter = Counter()
-    daily_output: Counter = Counter()
-    daily_cache_create: Counter = Counter()
-    daily_cache_read: Counter = Counter()
-    daily_cost: dict[str, float] = {}
-    # Per-model per-day breakdown: {day: {model: {input, output, cache_create, cache_read, cost}}}
-    daily_models: dict[str, dict[str, dict[str, float]]] = {}
-    # Per-provider per-day breakdown (same shape).
-    daily_providers: dict[str, dict[str, dict[str, float]]] = {}
-    # Per-day provider × model cross-tab: {day: {provider: {model: bucket}}}
-    # Required so the chart can show accurate values when both filters are set
-    daily_pm: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
-    # Per-day list of {provider, model} pairs so the frontend can build
-    # cascading filter options.
-    seen_providers: set[str] = set()
-    seen_models: set[str] = set()
-    # Map of {provider: set[model]} so the frontend can cascade the model
-    # dropdown off the selected provider and prevent invalid pairings.
-    seen_provider_models: dict[str, set[str]] = {}
-
-    for shard_path in shard_paths:
-        try:
-            with shard_path.open() as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
-                        continue
-                    day = None
-                    if "ts" in obj:
-                        try:
-                            ts_str = obj["ts"]
-                            if ts_str.endswith("Z"):
-                                ts_str = ts_str[:-1] + "+00:00"
-                            ts_dt = datetime.fromisoformat(ts_str)
-                            if ts_dt.timestamp() < cutoff:
-                                continue
-                            day = ts_dt.astimezone().strftime("%Y-%m-%d")
-                        except (ValueError, TypeError, AttributeError):
-                            pass
-                    if not day:
-                        continue
-                    inp = obj.get("input", 0)
-                    out = obj.get("output", 0)
-                    cc = obj.get("cache_create", 0)
-                    cr = obj.get("cache_read", 0)
-                    cost = obj.get("cost", 0.0)
-                    daily_input[day] += inp
-                    daily_output[day] += out
-                    daily_cache_create[day] += cc
-                    daily_cache_read[day] += cr
-                    daily_cost[day] = daily_cost.get(day, 0.0) + cost
-                    provider = obj.get("provider", "")
-                    # Per-model aggregation. For claude_code records, canonicalize
-                    # the stored model string so pre/post-migration records (raw
-                    # provider id vs canonical key) aggregate into ONE bucket.
-                    # canonicalize_for_provider no-ops for other providers, so
-                    # opencode/kiro model namespaces are never rewritten.
-                    model = model_registry.canonicalize_for_provider(obj.get("model", ""), provider)
-                    if model:
-                        seen_models.add(model)
-                        if day not in daily_models:
-                            daily_models[day] = {}
-                        if model not in daily_models[day]:
-                            daily_models[day][model] = {
-                                "input": 0,
-                                "output": 0,
-                                "cache_create": 0,
-                                "cache_read": 0,
-                                "cost_usd": 0.0,
-                            }
-                        m = daily_models[day][model]
-                        m["input"] += inp
-                        m["output"] += out
-                        m["cache_create"] += cc
-                        m["cache_read"] += cr
-                        m["cost_usd"] += cost
-                    # Per-provider aggregation
-                    if provider:
-                        seen_providers.add(provider)
-                        if day not in daily_providers:
-                            daily_providers[day] = {}
-                        if provider not in daily_providers[day]:
-                            daily_providers[day][provider] = {
-                                "input": 0,
-                                "output": 0,
-                                "cache_create": 0,
-                                "cache_read": 0,
-                                "cost_usd": 0.0,
-                            }
-                        p = daily_providers[day][provider]
-                        p["input"] += inp
-                        p["output"] += out
-                        p["cache_create"] += cc
-                        p["cache_read"] += cr
-                        p["cost_usd"] += cost
-                    # Provider × model pairing (only count combos that actually
-                    # appear together in a record so the frontend can scope its
-                    # model dropdown to the selected provider).
-                    if provider and model:
-                        seen_provider_models.setdefault(provider, set()).add(model)
-                        pm_day = daily_pm.setdefault(day, {})
-                        pm_prov = pm_day.setdefault(provider, {})
-                        pm_bucket = pm_prov.setdefault(
-                            model,
-                            {
-                                "input": 0,
-                                "output": 0,
-                                "cache_create": 0,
-                                "cache_read": 0,
-                                "cost_usd": 0.0,
-                            },
-                        )
-                        pm_bucket["input"] += inp
-                        pm_bucket["output"] += out
-                        pm_bucket["cache_create"] += cc
-                        pm_bucket["cache_read"] += cr
-                        pm_bucket["cost_usd"] += cost
-        except (OSError, UnicodeDecodeError):
-            # Skip a corrupt or unreadable shard rather than failing the
-            # whole parse — the rest of the window is still useful.
-            continue
-
-    total_input = sum(daily_input.values())
-    total_output = sum(daily_output.values())
-    total_cache_create = sum(daily_cache_create.values())
-    total_cache_read = sum(daily_cache_read.values())
-
-    # Build daily token history
-    all_days = sorted(set(daily_input.keys()) | set(daily_output.keys()))
-    daily_history = []
-    for d in all_days:
-        entry: dict[str, Any] = {
-            "date": d,
-            "input": daily_input[d],
-            "output": daily_output[d],
-            "cache_create": daily_cache_create[d],
-            "cache_read": daily_cache_read[d],
-            "cost_usd": round(daily_cost.get(d, 0.0), 6),
-        }
-        if d in daily_models:
-            entry["models"] = {
-                k: {**v, "cost_usd": round(v["cost_usd"], 6)}
-                for k, v in sorted(daily_models[d].items())
-            }
-        if d in daily_providers:
-            entry["providers"] = {
-                k: {**v, "cost_usd": round(v["cost_usd"], 6)}
-                for k, v in sorted(daily_providers[d].items())
-            }
-        if d in daily_pm:
-            entry["provider_models"] = {
-                p: {
-                    m: {**v, "cost_usd": round(v["cost_usd"], 6)}
-                    for m, v in sorted(models_for_p.items())
-                }
-                for p, models_for_p in sorted(daily_pm[d].items())
-            }
-        daily_history.append(entry)
-
-    result = {
-        "total_input": total_input,
-        "total_output": total_output,
-        "cache_creation": total_cache_create,
-        "cache_read": total_cache_read,
-        "total": total_input + total_output + total_cache_create + total_cache_read,
-        "cost_usd": round(sum(daily_cost.values()), 6),
-        "daily_history": daily_history,
-        "providers": sorted(seen_providers),
-        "models": sorted(seen_models),
-        "provider_models": {p: sorted(ms) for p, ms in sorted(seen_provider_models.items())},
-    }
-    if cache_key is not None:
-        _TOKEN_CACHE = result
-        _TOKEN_CACHE_KEY = cache_key
-        _TOKEN_CACHE_TS = now
-    return result
-
-
-def _parse_sessions() -> dict:
-    """Parse local kiro session files for usage analytics."""
-    sessions_dir = _sessions_dir()
-    if not sessions_dir.exists():
-        return {"error": "No sessions directory"}
-
-    cutoff = time.time() - (30 * 86400)
-    daily: Counter = Counter()
-    daily_msgs: Counter = Counter()
-    daily_tools: Counter = Counter()
-    total_sessions = 0
-    total_msgs = 0
-    total_tools = 0
-    all_time_sessions = 0
-    now_dt = datetime.now()
-    today_str = now_dt.strftime("%Y-%m-%d")
-
-    try:
-        entries = list(sessions_dir.iterdir())
-    except OSError as exc:
-        return {"error": f"Cannot read sessions directory: {exc}"}
-
-    for f in entries:
-        if f.suffix != ".jsonl":
-            continue
-        # Validate path through hooks.py (resolves symlinks, checks sensitive)
-        resolved_str = validate_file_path(str(f))
-        if resolved_str is None:
-            continue
-        resolved = Path(resolved_str)
-        try:
-            mtime = resolved.stat().st_mtime
-        except OSError:
-            continue
-        all_time_sessions += 1
-        if mtime < cutoff:
-            continue
-
-        day = None  # derive from first JSONL entry's timestamp
-        msgs = 0
-        tools = 0
-        try:
-            with resolved.open() as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    if day is None and "timestamp" in obj:
-                        try:
-                            ts_str = obj["timestamp"]
-                            if ts_str.endswith("Z"):
-                                ts_str = ts_str[:-1] + "+00:00"
-                            day = datetime.fromisoformat(ts_str).astimezone().strftime("%Y-%m-%d")
-                        except (ValueError, TypeError, AttributeError):
-                            pass
-                    kind = obj.get("kind", "")
-                    if kind in ("Prompt", "AssistantMessage"):
-                        msgs += 1
-                    elif kind == "ToolResults":
-                        tools += 1
-        except (OSError, UnicodeDecodeError):
-            continue
-
-        if day is None:
-            day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
-
-        daily[day] += 1
-        total_sessions += 1
-        daily_msgs[day] += msgs
-        daily_tools[day] += tools
-        total_msgs += msgs
-        total_tools += tools
-
-    # Build daily history sorted by date
-    all_days = sorted(set(daily.keys()))
-    history = []
-    for d in all_days:
-        history.append(
-            {
-                "date": d,
-                "sessions": daily[d],
-                "messages": daily_msgs[d],
-                "tool_calls": daily_tools[d],
-            }
-        )
-
-    # Compute period summaries
-    week_start = (now_dt - timedelta(days=now_dt.weekday())).strftime("%Y-%m-%d")
-    month_start = now_dt.strftime("%Y-%m-01")
-
-    today = [h for h in history if h["date"] == today_str]
-    week = [h for h in history if h["date"] >= week_start]
-    month = [h for h in history if h["date"] >= month_start]
-
-    return {
-        "total_sessions": total_sessions,
-        "total_messages": total_msgs,
-        "total_tool_calls": total_tools,
-        "all_time_sessions": all_time_sessions,
-        "daily_history": history,
-        "today": {
-            "sessions": sum(h["sessions"] for h in today),
-            "messages": sum(h["messages"] for h in today),
-            "tool_calls": sum(h["tool_calls"] for h in today),
-        },
-        "this_week": {
-            "sessions": sum(h["sessions"] for h in week),
-            "messages": sum(h["messages"] for h in week),
-            "tool_calls": sum(h["tool_calls"] for h in week),
-        },
-        "this_month": {
-            "sessions": sum(h["sessions"] for h in month),
-            "messages": sum(h["messages"] for h in month),
-            "tool_calls": sum(h["tool_calls"] for h in month),
-        },
-        "avg_msgs_per_session": round(total_msgs / max(total_sessions, 1), 1),
-        "avg_tools_per_session": round(total_tools / max(total_sessions, 1), 1),
-    }
-
-
-async def _cached_parse_sessions() -> dict:
-    """Run _parse_sessions() off the event loop with a 120s TTL cache.
-
-    Both usage endpoints call this so neither blocks the aiohttp loop on the
-    iterdir + per-file stat + json.loads scan, and a burst of polls reuses one
-    parse. Returns {} when there is no sessions directory (the common case for
-    claude_code/bedrock, where ~/.kiro/sessions/cli is kiro-cli's own store).
-    """
-    global _SESSIONS_CACHE, _SESSIONS_CACHE_TS
-    now = time.time()
-    # Fast path — lock-free read (double-checked locking, like api_kiro_usage).
-    # `is not None` (not truthiness) so a valid-but-empty {} parse is still a hit.
-    if now - _SESSIONS_CACHE_TS < _CACHE_TTL and _SESSIONS_CACHE is not None:
-        return _SESSIONS_CACHE
-    if not _sessions_dir().exists():
-        return {}
-    async with _SESSIONS_CACHE_LOCK:
-        # Re-check: a concurrent request may have refreshed while we waited, so
-        # a burst of cold-cache polls collapses into a single parse.
-        now = time.time()
-        if now - _SESSIONS_CACHE_TS < _CACHE_TTL and _SESSIONS_CACHE is not None:
-            return _SESSIONS_CACHE
-        loop = asyncio.get_running_loop()
-        sessions = await loop.run_in_executor(None, _parse_sessions)
-        if isinstance(sessions, dict) and "error" not in sessions:
-            _SESSIONS_CACHE = sessions
-            _SESSIONS_CACHE_TS = time.time()
-    return sessions
+    _MISSING = object()
+    stop = getattr(event, "stop_reason", _MISSING)
+    outcome = OUTCOME_UNCLASSIFIED if stop is _MISSING else turn_outcome(stop)  # type: ignore[arg-type]  # noqa: E501
+    model = str(record.get("model") or "")
+    provider = str(record.get("provider") or "")
+    emit_turn_duration(
+        record.get("duration_ms"),
+        session_key=slot_key,
+        outcome=outcome,
+        model=model,
+        provider=provider,
+    )
+    emit_turn_usage(
+        input_tokens=record.get("input"),
+        output_tokens=record.get("output"),
+        credits=record.get("credits"),
+        cost_usd=record.get("cost"),
+        model=model,
+        provider=provider,
+    )
 
 
 def get_usage_cache() -> dict:
@@ -1675,10 +695,7 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
             return web.json_response(_CACHE)
 
         username = getpass.getuser()
-
-        # Parse local sessions (runs in thread to avoid blocking)
-        loop = asyncio.get_running_loop()
-        sessions = await loop.run_in_executor(None, _parse_sessions)
+        sessions, refreshing = await _usage_sessions_snapshot()
 
         # Get billing from existing usage cache
         billing: dict = {}
@@ -1702,11 +719,14 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
             "username": username,
             "sessions": sessions,
             "billing": billing,
+            "refreshing": refreshing,
         }
 
         if "error" in sessions:
             response["error"] = sessions["error"]
-        else:
+        elif not refreshing:
+            # A partial response must never enter the two-minute full-response
+            # cache or the frontend's fast poll would keep reading the placeholder.
             _CACHE = response
             _CACHE_TS = time.time()
 
@@ -1716,3 +736,105 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
 async def api_usage(request: web.Request) -> web.Response:
     """GET /api/usage — usage stats for the kiro-cli (KiroACP) provider."""
     return await api_kiro_usage(request)
+
+
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.dashboard.handlers.usage_store",
+    "kiro_crew.dashboard.handlers.usage_spend",
+    "kiro_crew.dashboard.handlers.usage_context",
+    "kiro_crew.dashboard.handlers.usage_cost",
+    "kiro_crew.dashboard.handlers.usage_history",
+    "kiro_crew.dashboard.handlers.usage_sessions",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.dashboard.handlers.usage_context import (  # noqa: F401
+        _CONTEXT_CACHE,
+        _CONTEXT_CACHE_KEY,
+        _CONTEXT_CACHE_TS,
+        _CONTEXT_CACHE_TTL,
+        _CONTEXT_TOP_SESSIONS,
+        _row_iso,
+        context_occupancy,
+        context_trace,
+    )
+    from kiro_crew.dashboard.handlers.usage_cost import (  # noqa: F401
+        _COMPACTION_DROP_PCT,
+        _COMPACTION_PCT,
+        _COST_CACHE,
+        _COST_CACHE_KEY,
+        _COST_CACHE_TS,
+        _COST_CACHE_TTL,
+        _COST_MIN_GROWTH_TURNS,
+        _COST_TOP_CONVOS,
+        cost_breakdown,
+    )
+    from kiro_crew.dashboard.handlers.usage_history import (  # noqa: F401
+        _TOKEN_CACHE,
+        _TOKEN_CACHE_KEY,
+        _TOKEN_CACHE_TS,
+        _TOKEN_CACHE_TTL,
+        _TOKEN_HISTORY_DAYS,
+        _parse_token_history,
+    )
+    from kiro_crew.dashboard.handlers.usage_sessions import (  # noqa: F401
+        _SESSIONS_CACHE,
+        _SESSIONS_CACHE_LOCK,
+        _SESSIONS_CACHE_TS,
+        _USAGE_SESSION_REFRESH_TASK,
+        _USAGE_SESSION_WAIT_SECONDS,
+        _cached_parse_sessions,
+        _empty_session_summary,
+        _parse_sessions,
+    )
+    from kiro_crew.dashboard.handlers.usage_spend import (  # noqa: F401
+        _BARE_CHAT_SLOT_RE,
+        _SLOT_SPEND_CACHE,
+        _SLOT_SPEND_CACHE_AT,
+        _SLOT_SPEND_CACHE_SIG,
+        _SLOT_SPEND_TTL_S,
+        TURN_USAGE_FIELDS,
+        daily_credits,
+        slot_spend,
+        slot_turn_usage,
+        spend_key_for_slot,
+    )
+    from kiro_crew.dashboard.handlers.usage_store import (  # noqa: F401
+        _BACKGROUND_CHANNELS,
+        _LEGACY_TELEMETRY_SURFACES,
+        _MIN_ROLLING_DAYS,
+        _NON_SESSION_CHANNELS,
+        _SESSIONS_DIR,
+        _SESSIONS_HISTORY_DAYS,
+        _TOKEN_USAGE_DIR,
+        MAX_WINDOW_DAYS,
+        NAVIGABLE_CATEGORY,
+        SPEND_WINDOW_DAYS,
+        TimeWindow,
+        _canonical_telemetry_surface,
+        _parse_bound,
+        _parse_row_dt,
+        _sessions_dir,
+        _token_usage_dir,
+        is_session_slot,
+        resolve_window,
+        session_category,
+    )
+
+if TYPE_CHECKING:  # names it serves from outside the family, from their homes
+    from kiro_crew import model_registry  # noqa: F401
+    from kiro_crew.config.paths import data_home, kiro_sessions_dir  # noqa: F401
+    from kiro_crew.constants import crew_log_enabled, env_file_display  # noqa: F401
+    from kiro_crew.context_blocks import USER_LABEL  # noqa: F401
+    from kiro_crew.hooks import validate_file_path  # noqa: F401
+    from kiro_crew.jsonl_util import bounded_records  # noqa: F401
+    from kiro_crew.messaging.link import telemetry_channel_of  # noqa: F401

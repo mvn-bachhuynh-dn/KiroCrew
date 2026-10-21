@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import logging
 import re
+from functools import partial
 from typing import Callable, NamedTuple
 
-from kiro_crew.constants import OPTIONS_RE_LINE
+from kiro_crew.constants import OPTIONS_RE_LINE, relocate_glued_tail_marker
+from kiro_crew.messaging.display_safety import (
+    DISPLAY_SETTLING_PASSES,
+    SLACK_MARKDOWN_LINK,
+    redact_for_display,
+    redacted_rendering,
+    redacted_without_markup,
+    settled_display_form,
+    slack_mrkdwn_reading,
+    strip_ansi,
+)
+from kiro_crew.messaging.renderer import cap_choices, format_overflow
 from kiro_crew.platform.context import redact_via_context
 
 logger = logging.getLogger(__name__)
@@ -15,10 +27,26 @@ SLACK_MAX_TEXT = 39_000
 
 # [OPTIONS: choice1 | choice2 | ...] — the marker ends a LINE here, so use the
 # MULTILINE/single-line canonical parser. Defined once in constants.py (shared
-# with dashboard/state.py and the renderer surfaces) so the ReDoS-hardened
+# with dashboard/state_parts/slot_transcript.py and the renderer surfaces) so the ReDoS-hardened
 # grammar can never drift between copies; see OPTIONS_RE_LINE for the full
 # rationale. Per-choice whitespace is stripped by extract_options().
 _OPTIONS_RE = OPTIONS_RE_LINE
+
+
+#: The kirocrew-core ``wait`` tool as each transport spells it: direct MCP, the
+#: pooled gateway namespacing, and the ``mcp__<server>__<tool>`` form. Enumerated
+#: rather than suffix-matched so a third-party server's own ``wait`` tool
+#: (``third-party___wait``) never rolls the stream over.
+WAIT_IDENTITIES = frozenset(["wait", "kirocrew-core___wait", "mcp__kirocrew-core__wait"])
+
+
+def is_wait_identity(tool_name: str) -> bool:
+    """True when a tool's programmatic name is the kirocrew-core ``wait`` tool,
+    in any of the spellings in :data:`WAIT_IDENTITIES`. A single underscore is
+    not a separator, so ``wait_for_ci`` stays a different tool, and a foreign
+    server's ``wait`` is a different tool too."""
+    return (tool_name or "").strip().lower() in WAIT_IDENTITIES
+
 
 # Action ID prefix for OPTIONS buttons
 OPTIONS_ACTION_PREFIX = "options_choice_"
@@ -36,17 +64,29 @@ SUBAGENT_ACK_ACTION_PREFIX = "subagent_ack_"
 # Action ID for link-to-dashboard button
 LINK_DASHBOARD_ACTION = "mc_link_dashboard"
 
+# Action ID on the send_message "Open session" deep-link button. A URL button
+# opens its link directly, so it needs no server work — but Slack still delivers
+# a block_actions event for it, so the interaction router (slack.interactions.
+# dispatch) declares this id and acks it as a no-op instead of routing the click
+# through the tool-approval fallthrough. Produced by dashboard.handlers.messaging.
+SESSION_LINK_ACTION = "open_session_link"
+
 
 def extract_options(text: str) -> tuple[str, list[str]]:
-    """Extract OPTIONS choices from LLM response and strip the tag.
+    """Extract OPTIONS choices and remove the marker span from the response.
 
-    Returns (cleaned_text, choices). If no OPTIONS found, choices is empty.
+    Text before and after the marker is kept, matching the other readers of
+    ``OPTIONS_RE_LINE``. Returns (cleaned_text, choices). If no OPTIONS is found,
+    choices is empty.
     """
+    text = relocate_glued_tail_marker(text)
     m = _OPTIONS_RE.search(text)
     if not m:
         return text, []
-    choices = [c.strip() for c in m.group(1).split("|") if c.strip()]
-    cleaned = text[: m.start()].rstrip()
+    choices = [c.strip() for c in m.group("labels").split("|") if c.strip()]
+    before = text[: m.start()].rstrip()
+    after = text[m.end() :].strip()
+    cleaned = before + ("\n" + after if after else "") if before else after
     return cleaned, choices
 
 
@@ -82,9 +122,32 @@ def build_options_blocks(
     choices: list[str],
     *,
     redactor: Callable[[str], str] | None = None,
+    staleness_token: str | None = None,
 ) -> list[dict]:
-    """Build Slack Block Kit checkboxes + Send button for multi-select OPTIONS."""
-    safe = _redact_choices(choices[:10], redactor)  # checkboxes support up to 10
+    """Build Slack Block Kit checkboxes + Send button for multi-select OPTIONS.
+
+    This is the single chokepoint for every Slack producer of OPTIONS blocks
+    (renderer footer, legacy handler, cron delivery, subagent footer,
+    send_message, dashboard mirror), so the ``max_buttons`` cap lives HERE:
+    the first ``SLACK_CAPABILITIES.max_buttons`` choices render as checkbox
+    options (the platform caps a checkboxes element at 10) and any overflow
+    degrades to a numbered context block the user can answer by typing.
+    Overflow is redacted like the widget labels — same LLM-authored text,
+    same wire.
+
+    *staleness_token* rides on the actions block's ``block_id``, which Slack
+    echoes back on every click and also uses to key ``state.values``. That is
+    what lets a click be judged against the conversation it was asked in without
+    the gateway remembering anything: see
+    :func:`kiro_crew.slack.outbound.encode_options_token`. Omitting it posts a
+    control that cannot be proven stale, so clicks on it are honoured.
+    """
+    # Circular import: slack/transport.py imports SLACK_MSG_LIMIT from this
+    # module at top level, so the capabilities object must be imported lazily.
+    from kiro_crew.slack.transport import SLACK_CAPABILITIES
+
+    kept, overflow = cap_choices(choices, SLACK_CAPABILITIES)
+    safe = _redact_choices(kept, redactor)
     options = [
         {
             "text": {"type": "plain_text", "text": choice[:75]},
@@ -92,24 +155,70 @@ def build_options_blocks(
         }
         for choice in safe
     ]
-    return [
-        {
-            "type": "actions",
-            "elements": [
+    actions: dict = {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "checkboxes",
+                "action_id": OPTIONS_CHECKBOXES_ACTION,
+                "options": options,
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Send"},
+                "action_id": OPTIONS_SUBMIT_ACTION,
+                "style": "primary",
+            },
+        ],
+    }
+    if staleness_token:
+        actions["block_id"] = staleness_token
+    blocks: list[dict] = [actions]
+    if overflow:
+        # Chunk instead of slicing: a single [:2900] would re-create the
+        # silent data loss this cap exists to remove, one layer down. Slack
+        # caps a context mrkdwn element at ~3000 chars; pack WHOLE numbered
+        # lines (never split a choice mid-line) into up to three blocks.
+        # BOUNDED: Slack rejects messages over 50 blocks outright — an
+        # unbounded loop would make a pathological trailer delete the whole
+        # footer. When even three blocks overflow, the tail is dropped with
+        # a VISIBLE count marker; never silent.
+        lines = format_overflow(_redact_choices(overflow, redactor), start=len(safe)).split("\n")
+        packed: list[str] = []
+        shown = 0
+        for line in lines:
+            if packed and len(packed[-1]) + 1 + len(line) <= 2900:
+                packed[-1] += "\n" + line
+            elif len(packed) < 3:
+                # A single absurd choice can exceed a whole block: truncate
+                # WITH a visible marker (the widget path truncates labels at
+                # [:75] similarly, but there the ellipsis is implied by the
+                # platform; here we own the rendering).
+                packed.append(line if len(line) <= 2900 else line[:2899] + "…")
+            else:
+                break
+            shown += 1
+        for piece in packed:
+            blocks.append(
                 {
-                    "type": "checkboxes",
-                    "action_id": OPTIONS_CHECKBOXES_ACTION,
-                    "options": options,
-                },
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": piece}],
+                }
+            )
+        omitted = len(overflow) - shown
+        if omitted > 0:
+            blocks.append(
                 {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Send"},
-                    "action_id": OPTIONS_SUBMIT_ACTION,
-                    "style": "primary",
-                },
-            ],
-        },
-    ]
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"_…{omitted} more choices omitted (list too long)_",
+                        }
+                    ],
+                }
+            )
+    return blocks
 
 
 def escape_mrkdwn(text: str) -> str:
@@ -149,12 +258,20 @@ def build_options_selected_blocks(
     *,
     redactor: Callable[[str], str] | None = None,
 ) -> list[dict]:
-    """Render OPTIONS as static text with selected choices highlighted."""
+    """Render OPTIONS as static text with selected choices highlighted.
+
+    Input arrives re-derived from the rendered message's blocks, so it is
+    already ≤ the cap; the shared ``cap_choices`` keeps the two paths driven
+    by one value so they cannot drift.
+    """
+    from kiro_crew.slack.transport import SLACK_CAPABILITIES  # circular (see above)
+
     if isinstance(selected_indices, int):
         selected_indices = [selected_indices]
     selected_set = set(selected_indices)
+    kept, _ = cap_choices(choices, SLACK_CAPABILITIES)
     parts = []
-    for i, choice in enumerate(_redact_choices(choices[:10], redactor)):
+    for i, choice in enumerate(_redact_choices(kept, redactor)):
         # Slice THEN escape -- the opposite order from redaction above, and for
         # the mirror-image reason. Redaction runs before slicing because a cut
         # can leave a credential prefix its regex no longer matches; escaping
@@ -333,8 +450,23 @@ def to_slack_mrkdwn(text: str, *, keep_tables: bool = False, in_code: bool = Fal
 
 # ── Inline conversions (outside code blocks) ──
 
-# Markdown link [text](url) → Slack <url|text>
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Markdown link [text](url) → Slack <url|text>. The lookbehind holds IMAGE
+# syntax out of the rewrite: Slack mrkdwn has no image form, so converting
+# ``![alt](dest)`` yields a stray ``!`` plus a clickable link to a destination
+# Slack cannot open — a local screenshot path is not even reachable from its
+# servers. Images pass through raw instead, as they do on Discord, until the
+# outbound upload path claims them.
+#
+# The destination may hold balanced parentheses (``.../Python_(programming_language)``):
+# one that ends at the first ``)`` links a page that does not exist. See
+# :func:`kiro_crew.constants.md_link_destination`, which the display-safety screen
+# uses too, so the screen collapses exactly the links this renders. The label
+# class is the screen's as well: a label holding ``[`` or a line break is one the
+# screen leaves raw, so linking it here would join a key the screen scanned as
+# split (``AKIA[IOSF...[z](u)`` reads ``AKIAIOSF...`` once the url is hidden).
+# A destination containing ``|`` changes the displayed label because Slack splits
+# native links at the first pipe, while ``>`` closes the native link early.
+_LINK_RE = SLACK_MARKDOWN_LINK
 # Headings: # text → *text*
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 # Horizontal rule: --- or *** or ___ (3+ chars)
@@ -410,17 +542,6 @@ def _convert_tables(text: str) -> str:
 
     _flush_table()
     return "\n".join(result)
-
-
-def strip_ansi(text: str) -> str:
-    """Remove SGR colour escapes.
-
-    Public because redaction call sites need it: this strip can *reassemble* a
-    credential that escape sequences had broken up, so a caller that redacts
-    around a conversion has to normalise with the SAME function first, or the
-    secret slips through the regex and is put back together afterwards.
-    """
-    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 # ── Mermaid → text ──
@@ -556,78 +677,98 @@ def split_message(text: str, limit: int = SLACK_MSG_LIMIT) -> list[str]:
     return parts
 
 
-_EMPHASIS_RUN = re.compile(r"[*_~`]+")
-# ``[label](url)`` (Markdown) and ``<url|label>`` (Slack mrkdwn). Both DISPLAY only
-# the label, so the url is invisible to a reader and the label joins whatever
-# surrounds it -- which makes them a splitter, exactly like ``**``.
-#
-# The opening delimiter is excluded from every inner class (no ``[`` inside the
-# Markdown label, no ``<`` inside the Slack one). That is not cosmetic: with ``[``
-# allowed, input like ``[[[[[[...`` makes each start position consume the whole
-# remaining string before failing to find ``]``, so the scan is quadratic in the
-# length of attacker-supplied text (CodeQL ``py/polynomial-redos``). Excluding it
-# makes a failed start fail immediately, which matters because this runs on every
-# outbound message. A label containing a literal ``[`` is simply not collapsed --
-# safe, since the fallback is to scan the text as written.
-_MD_LINK = re.compile(r"\[([^\[\]\n]*)\]\(([^()\n]*)\)")
-_SLACK_LINK = re.compile(r"<([^<>|\n]*)\|([^<>\n]*)>")
+def _slack_client_display(text: str) -> str:
+    """Return the text Slack displays after parsing converted mrkdwn."""
+    return slack_mrkdwn_reading(text)
 
 
-def _canonicalize_display(text: str) -> str:
-    """Reduce *text* to what Slack will actually SHOW a reader.
+def _settled_slack_emission(text: str, redactor: Callable[[str], str]) -> str:
+    """Return *text* unchanged unless its literal or Slack reading needs redaction.
 
-    Two families of markup, one property: Slack removes them at render time, so a
-    credential broken across them is whole on screen while every literal scan sees
-    it broken.
-
-    * **links** collapse to their label -- ``[AKIA](https://x)REST`` displays as
-      the joined key, with the url nowhere in sight;
-    * **emphasis / code delimiters** vanish -- ``AKIA**REST**`` likewise.
-
-    Links are reduced FIRST: a url can itself contain ``_`` or ``~``, and dropping
-    those before the url is removed would corrupt the label boundaries.
+    A block dirty only as written keeps its markup. ``_convert_tables`` renders a
+    data row as ``*<header>:* <cell>``, writing the ``:`` a named-credential
+    pattern needs after a ``SecretAccessKey`` header, and that match is in the
+    bytes alone: the Slack reading of the redacted block scans clean, so the
+    literal redaction is what gets posted, native links and emphasis intact.
+    Settling it to its own reading instead would consume every delimiter pair and
+    collapse every ``<url|label>`` in the block to its label. Only a key the Slack
+    reading joins is answered with the settled display form, at the cost of the
+    block's markup. Literal redaction repeats to a bounded fixed point, because
+    the redactor is not assumed idempotent. The Slack reading is scanned over the
+    whole block, as Slack shows it; the form settled and posted is the reading
+    outside every redaction tag (:func:`redacted_rendering`), so a tag the
+    literal pass wrote keeps its bytes and its count.
     """
-    out = _MD_LINK.sub(r"\1", text)
-    out = _SLACK_LINK.sub(r"\2", out)
-    return _EMPHASIS_RUN.sub("", out)
+    for _ in range(DISPLAY_SETTLING_PASSES):
+        literal_safe = redactor(text)
+        displayed = _slack_client_display(literal_safe)
+        if redactor(displayed) != displayed:
+            return settled_display_form(
+                redacted_rendering(literal_safe, _slack_client_display, redactor),
+                redactor,
+                reading=_slack_client_display,
+            )
+        if literal_safe == text:
+            return text
+        text = literal_safe
+    return redacted_without_markup(text, redactor, reading=_slack_client_display)
 
 
-def redact_for_display(text: str, redactor: Callable[[str], str]) -> tuple[str, bool]:
-    """Redact *text* against what Slack will actually DISPLAY, not just the bytes.
+def _settled_pieces(
+    text: str,
+    limit: int,
+    redactor: Callable[[str], str],
+    cut: Callable[[str, int], list[str]],
+) -> list[str]:
+    """Cut settled *text* to *limit* so that every piece posted is settled too.
 
-    Two normalisations, for the same underlying reason: a transformation applied
-    *after* the scan can reassemble a credential the scanner saw as broken.
-
-    1. **ANSI escapes** -- stripped outright, because they are display noise with
-       no meaning to preserve.
-    2. **Link markup and emphasis/code delimiters** -- these DO carry meaning, so
-       they cannot simply be deleted. Instead the canonical (display) form is
-       scanned as well. Neither ``AKIA**<rest>**`` nor ``[AKIA](https://x)<rest>``
-       matches a credential pattern as written, yet Slack renders the markup away
-       and shows the reader an intact key.
-
-    When the canonical form reveals a secret that the literal form hid, the
-    canonical text is emitted -- so the message loses that markup. That is
-    deliberate and one-directional: formatting is worth less than a credential, and
-    the downgrade only happens on a message that actually contains one.
-
-    Returns:
-        ``(safe_text, redacted)``. ``redacted`` is True when the redactor changed
-        anything, by either route -- callers that already published the text rely
-        on it to go back and replace what is visible.
+    A cut works on the bytes, and a cut inside a native link or an emphasis pair
+    changes what Slack shows on each side of it: the side without the opening
+    ``<`` is no link, so a ``*...*`` pair its url carried is read as bold, and a
+    key written around that pair is joined on screen although the whole text read
+    clean. So each piece is settled as it will be posted. Text the cut leaves
+    whole is returned as it came, since the caller settled it. A piece the settle
+    changed is cut again, because a redaction tag can outgrow the markup it
+    replaced, and the new pieces are settled in turn. A piece the settle leaves
+    alone is posted as cut, so keyless text costs one scan per piece and keeps
+    every byte. The passes are bounded; a piece still changing at the bound is
+    emitted without its markup, which leaves a cut nothing to pair, and cut once
+    more to the limit.
     """
-    stripped = strip_ansi(text or "")
-    safe = redactor(stripped)
-    changed = safe != stripped
+    pieces = cut(text, limit)
+    if pieces == [text]:
+        return pieces
+    for _ in range(DISPLAY_SETTLING_PASSES):
+        settled = [_settled_slack_emission(piece, redactor) for piece in pieces]
+        if settled == pieces:
+            return pieces
+        pieces = [fitted for piece in settled for fitted in cut(piece, limit)]
+    return [
+        fitted
+        for piece in pieces
+        for fitted in cut(
+            redacted_without_markup(piece, redactor, reading=_slack_client_display), limit
+        )
+    ]
 
-    canonical = _canonicalize_display(safe)
-    if canonical != safe:
-        canonical_safe = redactor(canonical)
-        if canonical_safe != canonical:
-            # The markup was hiding a credential from the scan. Emit the canonical,
-            # redacted form: losing formatting beats leaking the key.
-            return canonical_safe, True
-    return safe, changed
+
+def _truncated(text: str, limit: int, total: int | None = None) -> list[str]:
+    """*text* as one message within *limit*, its overflow cut and announced.
+
+    *total* is the length the notice reports, the reply's own when the caller
+    re-cuts a settled piece of it: a piece grown by a redaction tag is cut again,
+    and the notice it carries is dropped with the tail and written anew, so it
+    names the reply's length rather than the intermediate's.
+    """
+    if len(text) <= limit:
+        return [text]
+    cut = text[:limit].rfind("\n")
+    if cut <= 0:
+        cut = limit
+    notice = f"\n\n_…truncated ({len(text) if total is None else total} chars total)_"
+    # Charge the notice against the ceiling so the result really fits.
+    cut = max(1, min(cut, limit - len(notice)))
+    return [text[:cut] + notice]
 
 
 def _render_blocks(
@@ -639,7 +780,8 @@ def _render_blocks(
 ) -> tuple[list[str], bool]:
     """THE ordering core, shared by both public render forms.
 
-    ``strip_ansi -> redact -> pre-split -> convert -> redact``, once. The two
+    ``strip_ansi -> redact -> pre-split -> convert -> redact -> display -> redact``,
+    once. The two
     public forms differ only in how they ASSEMBLE the result (separate posts vs
     one joined message) and in which pre-splitter they need; the security-critical
     part -- the order these steps run in -- lives here so an ordering fix cannot
@@ -694,9 +836,8 @@ def _render_blocks(
     # prose. A fenced region can exceed the block size, so no cut point avoids it.
     in_code = False
     for block in blocks:
-        out.append(
-            _redact(to_slack_mrkdwn(block, keep_tables=resolved_keep_tables, in_code=in_code))
-        )
+        converted = to_slack_mrkdwn(block, keep_tables=resolved_keep_tables, in_code=in_code)
+        out.append(_settled_slack_emission(converted, _redact))
         in_code = ends_inside_code_fence(block, in_code)
     return out, changed
 
@@ -726,18 +867,20 @@ def render_for_slack(
 
     The pipeline that holds is therefore::
 
-        strip_ansi -> redact -> pre-split -> convert -> redact -> split
+        strip_ansi -> redact -> pre-split -> convert -> redact -> display -> redact -> split
 
     Normalising first means the first redaction sees the credential whole while
     the text is still one piece. Pre-splitting below ``SLACK_MAX_TEXT`` means
     conversion never reaches its own truncation, so neither the tail nor a
     secret is cut there; blocks are halved against the limit so a conversion
     that *grows* text (table and mermaid rewriting) still cannot reach it.
-    Redaction runs a second time on each converted block because conversion can
-    still reorder or drop characters (inline markup, link rewriting) in ways
-    that reveal a secret only afterwards — redacting on both sides of the
-    transform is what makes the guarantee independent of what conversion does to
-    the bytes.
+    Each converted block is scanned literally and as Slack displays its mrkdwn,
+    because conversion can reorder or drop delimiters in ways that reveal a
+    secret only after Slack renders the bytes. A display-only match emits the
+    redacted display form, sacrificing formatting rather than exposing the
+    credential. The final split is settled the same way, because a cut inside a
+    native link or an emphasis pair changes what Slack shows of each side: every
+    posted part is scanned as posted (:func:`_settled_pieces`).
 
     When — and only when — the pre-split produces more than one block, tables are
     left as raw markdown. ``_convert_tables`` keys a table's labels off the first
@@ -800,7 +943,8 @@ def render_for_slack(
     body_limit = max(1, limit - len(prefix) - len(safe_header))
     parts: list[str] = []
     for converted in converted_blocks:
-        parts.extend(f"{prefix}{part}" for part in split_message(converted, limit=body_limit))
+        settled_parts = _settled_pieces(converted, body_limit, redactor, cut=split_message)
+        parts.extend(f"{prefix}{part}" for part in settled_parts)
     if safe_header:
         parts[0] = safe_header + parts[0]
     return parts
@@ -872,7 +1016,7 @@ def render_one_for_slack(
     self-truncation by pre-splitting, so a credential can neither be reassembled
     by the ANSI strip nor cut in half before the regex runs. What cannot be
     preserved is the tail: a single message has nowhere to put it. So the
-    overflow is cut HERE, after both redaction passes, and announced -- rather
+    overflow is cut HERE, after every redaction scan, and announced -- rather
     than being silently dropped inside a conversion the caller cannot see.
 
     Args:
@@ -909,15 +1053,23 @@ def render_one_for_slack(
         return SlackRender("", changed)
 
     # Joined with "" because _lossless_blocks kept every boundary character in the
-    # block it came from, so the pre-split is invisible in the result.
+    # block it came from, so the pre-split is invisible in the result. Settle the
+    # assembled message too: conversion can leave a credential split across two
+    # block outputs even when each block is clean by itself.
     rendered = "".join(converted_blocks)
+    settled = _settled_slack_emission(rendered, redactor)
+    if settled != rendered:
+        changed = True
+    rendered = settled
 
+    # The overflow cut is a cut like any other: the prefix it keeps can end inside
+    # a native link, so the kept text is settled as it is posted. Only a settle
+    # that changed the cut text counts as redaction; the cut itself is not one.
+    # Every re-cut announces the reply's own length, not the settled piece's.
     if len(rendered) > limit:
-        cut = rendered[:limit].rfind("\n")
-        if cut <= 0:
-            cut = limit
-        notice = f"\n\n_…truncated ({len(rendered)} chars total)_"
-        # Charge the notice against the ceiling so the result really fits.
-        cut = max(1, min(cut, limit - len(notice)))
-        rendered = rendered[:cut] + notice
+        cut_to_limit = partial(_truncated, total=len(rendered))
+        truncated = cut_to_limit(rendered, limit)[0]
+        rendered = _settled_pieces(rendered, limit, redactor, cut=cut_to_limit)[0]
+        if rendered != truncated:
+            changed = True
     return SlackRender(rendered, changed)

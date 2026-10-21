@@ -10,54 +10,63 @@ real kiro-cli process, so we lock the deterministic invariant that guarantees
 it instead: the agent name passed to ``get_or_create`` is non-empty and
 resolves to the canonical ``"kirocrew"`` agent when no thread override /
 ``default_agent`` is configured, and a thread override still wins.
+
+What a turn leaves behind once it ends (the agent recorded in the session
+metadata, the auto-title, the error reply held back for a trusted bot and the
+partial-reply rescue) is covered in
+``test_slack_transport_dispatch_turn_outcomes.py``, and the one-session-per-DM
+key and its wiring in ``test_slack_transport_dispatch_flat_dm.py``. The
+message timestamp and the capturing session and context-builder stand-ins these
+files share live in ``slack_transport_dispatch_helpers.py``, which also binds the
+golden-transcript fakes from ``test_slack_golden_transcript``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import sys
-from pathlib import Path
+from unittest.mock import AsyncMock
 
+import pytest
+from slack_transport_dispatch_helpers import (
+    _MSG_TS,
+    FakeSessions,
+    RecordingSlackClient,
+    ScriptedProvider,
+    _CapturingCtxBuilder,
+    _CapturingSessions,
+    make_event,
+)
+
+from kiro_crew.acp.client import (
+    AcpError,
+    AcpProcessDied,
+    AcpPromptBusy,
+    AcpRegistrationRateLimited,
+    AcpTimeoutError,
+    _raise_acp_error,
+)
 from kiro_crew.acp.types import (
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
+    STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
+    STOP_REASON_STALE_RECOVER,
 )
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.slack import handler as slack_handler
 from kiro_crew.slack import transport_dispatch
 
-# Reuse the golden module's fakes without triggering the stdlib 'test' collision.
-_test_dir = Path(__file__).parent
-if str(_test_dir) not in sys.path:  # pragma: no cover
-    sys.path.insert(0, str(_test_dir))
-_golden = importlib.import_module("test_slack_golden_transcript")
 
-FakeSessions = _golden.FakeSessions
-RecordingSlackClient = _golden.RecordingSlackClient
-ScriptedProvider = _golden.ScriptedProvider
-make_event = _golden.make_event
-
-_MSG_TS = "1700000000.000100"
-
-
-class _CapturingSessions(FakeSessions):
-    """FakeSessions that records the ``agent`` passed to get_or_create."""
-
-    def __init__(self, provider):
-        super().__init__(provider)
-        self.agents: list = []
-
-    async def get_or_create(self, session_key, agent=None, channel_id=None):
-        self.agents.append(agent)
-        return await super().get_or_create(session_key, agent=agent, channel_id=channel_id)
-
-
-def _run_transport(monkeypatch, thread_agent=None, agent_override=None):
+def _run_transport(monkeypatch, thread_agent=None, agent_override=None, **extra):
     # Empty configured default -> exercises the canonical-agent fallback.
     monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
-    monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+    monkeypatch.setattr(
+        transport_dispatch,
+        "_hydrate_thread_overrides",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
 
     thread_map: dict = {}
@@ -89,6 +98,7 @@ def _run_transport(monkeypatch, thread_agent=None, agent_override=None):
             context_builder=None,
             conversation_log=None,
             agent_override=agent_override,
+            **extra,
         )
     )
     return sessions
@@ -118,7 +128,7 @@ class TestTransportAgentResolution:
         assert sessions.agents == ["kirocrew-research"]
 
     def test_channels_deny_drops_transport_message_before_session(self, monkeypatch, tmp_path):
-        # HIGH (GPT round-8): a channels policy that denies slack must stop
+        # A channels policy that denies slack must stop
         # handle_message_transport BEFORE it acquires a session — removing the gate
         # would let a denied transport message start a turn. Regression-locks the
         # transport call site (distinct from the native handle_message gate).
@@ -147,6 +157,131 @@ class TestTransportAgentResolution:
             ), "denied slack transport message must not acquire a session"
         finally:
             gp.reset_store()
+
+
+class TestTransportAdmissionSpool:
+    def test_session_closing_spools_the_unopened_slack_turn(self, monkeypatch):
+        from kiro_crew.session_allocation import SessionClosingError
+
+        async def reject_turn(*_args, **_kwargs):
+            raise SessionClosingError("automatic update owns admission")
+
+        spool = AsyncMock()
+        monkeypatch.setattr(_CapturingSessions, "get_or_create", reject_turn)
+        monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
+        monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: False)
+
+        sessions = _run_transport(monkeypatch)
+
+        spool.assert_awaited_once()
+        assert spool.await_args.kwargs["channel_type"] == "slack"
+        route = spool.await_args.kwargs["route"]
+        assert route.conversation_id == "C1"
+        assert route.text == "hello"
+        assert route.user_id == "U_OWNER"
+        assert route.thread_id == _MSG_TS
+        assert route.message_id == _MSG_TS
+        assert route.attachments_dropped == 0
+        assert sessions.agents == []
+
+    @pytest.mark.parametrize("site", ["admission", "dispatch"])
+    def test_spool_records_the_pre_ingestion_message(self, monkeypatch, site):
+        """The ingested *text* inlines temp paths and file contents.
+
+        Both refusal points -- the admission gate and a SessionClosingError at
+        dispatch -- must record what the user sent and how many files it had,
+        never the turn's prompt.
+        """
+        from kiro_crew.session_allocation import SessionClosingError
+
+        routes: list = []
+        if site == "admission":
+
+            async def refuse(_sessions, *, channel_type, route, restricted=False):
+                routes.append(route)
+                return False
+
+            monkeypatch.setattr(transport_dispatch, "admit_inbound_callback", refuse)
+        else:
+
+            async def reject_turn(*_args, **_kwargs):
+                raise SessionClosingError("automatic update owns admission")
+
+            async def spool(*, channel_type, route):
+                routes.append(route)
+
+            monkeypatch.setattr(_CapturingSessions, "get_or_create", reject_turn)
+            monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
+            monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: False)
+
+        _run_transport(monkeypatch, spool_text="look at this", spool_attachments=2)
+
+        assert len(routes) == 1
+        assert routes[0].text == "look at this"
+        assert routes[0].attachments_dropped == 2
+
+    @pytest.mark.parametrize(
+        ("extra", "text", "dropped"),
+        [
+            ({"spool_text": "look at this", "spool_attachments": 2}, "look at this", 2),
+            # No pre-ingestion capture (interaction re-dispatch): text as is.
+            ({}, "approve the plan", 0),
+        ],
+    )
+    def test_native_admission_spools_the_pre_ingestion_message(
+        self, monkeypatch, extra, text, dropped
+    ):
+        turn_text = (
+            "hello\n/tmp/kiro-attach-dead.png\n\n[File: notes.txt]\nbody"
+            if extra
+            else "approve the plan"
+        )
+        routes: list = []
+
+        async def refuse(_sessions, *, channel_type, route, restricted=False):
+            routes.append(route)
+            return False
+
+        monkeypatch.setattr(slack_handler, "admit_inbound_callback", refuse)
+        monkeypatch.setattr(
+            slack_handler, "channel_inbound_permitted", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(slack_handler, "_hydrate_thread_overrides", AsyncMock())
+        monkeypatch.setattr(slack_handler, "_hydrate_conv_header", AsyncMock())
+        monkeypatch.setattr(slack_handler, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(slack_handler, "_is_slack_restricted", lambda _key: False)
+
+        asyncio.run(
+            slack_handler.handle_message(
+                RecordingSlackClient(),
+                _CapturingSessions(ScriptedProvider([])),
+                "C1",
+                turn_text,
+                None,
+                _MSG_TS,
+                "U_OWNER",
+                **extra,
+            )
+        )
+
+        assert len(routes) == 1
+        assert routes[0].text == text
+        assert routes[0].attachments_dropped == dropped
+
+    def test_session_closing_does_not_spool_restricted_slack_turn(self, monkeypatch):
+        from kiro_crew.session_allocation import SessionClosingError
+
+        async def reject_turn(*_args, **_kwargs):
+            raise SessionClosingError("automatic update owns admission")
+
+        spool = AsyncMock()
+        monkeypatch.setattr(_CapturingSessions, "get_or_create", reject_turn)
+        monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
+        monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: True)
+
+        _run_transport(monkeypatch)
+
+        spool.assert_not_awaited()
 
 
 class TestTransportBookkeepingIsolation:
@@ -178,7 +313,11 @@ class TestTransportBookkeepingIsolation:
 
         monkeypatch.setattr(transport_dispatch, "sel", _sel_factory)
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -206,6 +345,113 @@ class TestTransportBookkeepingIsolation:
         )
         # Turn recorded success once; the audit failure was swallowed.
         assert calls == {"success": 1, "failure": 0}
+
+
+class _VerdictSessions(FakeSessions):
+    """Books the turn's verdict, its resets and its context check in one ledger.
+
+    ``breaker_trips`` makes ``record_failure`` answer as the real breaker does at
+    its threshold: it resets the session itself and returns True. Each reset ends
+    the runtime that is live, and a same-key message claims a successor while the
+    reset is awaited.
+    """
+
+    def __init__(self, provider, *, breaker_trips=False):
+        super().__init__(provider)
+        self.breaker_trips = breaker_trips
+        self.ledger: list[str] = []
+        self.runtimes = ["first"]
+        self.killed: list[str] = []
+
+    def record_success(self, session_key):
+        self.ledger.append("success")
+
+    async def record_failure(self, session_key):
+        self.ledger.append("failure")
+        if self.breaker_trips:
+            await self.reset(session_key)
+            return True
+        return False
+
+    async def reset(self, session_key):
+        self.ledger.append("reset")
+        self.killed.append(self.runtimes[-1])
+        self.runtimes.append(f"successor {len(self.runtimes)}")
+
+    def check_context_usage(self, key, provider):
+        self.ledger.append("context_check")
+        return 0.0
+
+
+class TestTransportUnfinishedTurn:
+    """A turn the backend never finished is a failure on this path too, and resets.
+
+    ``TurnDriver.run`` follows the partial text with the notice that the next
+    message starts the agent again, on every path that drives it. This dispatcher
+    makes that true: it books a failure and resets the session, once.
+    """
+
+    def _run(self, monkeypatch, stop_reason, *, breaker_trips=False):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+        slack = RecordingSlackClient()
+        sessions = _VerdictSessions(
+            ScriptedProvider(
+                [
+                    make_event(EVENT_TEXT_CHUNK, text="half an answer"),
+                    make_event(EVENT_COMPLETE, stop_reason=stop_reason),
+                ]
+            ),
+            breaker_trips=breaker_trips,
+        )
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=slack,
+                sessions=sessions,
+                channel="C1",
+                text="hello",
+                thread_ts=None,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=None,
+                conversation_log=None,
+            )
+        )
+        return sessions, slack
+
+    @pytest.mark.parametrize("stop_reason", ["timeout", STOP_REASON_STALE_RECOVER])
+    def test_an_unfinished_turn_is_a_failure_and_resets_the_session(self, monkeypatch, stop_reason):
+        sessions, slack = self._run(monkeypatch, stop_reason)
+        shown = "\n".join(str(v) for (_m, kw) in slack.transcript for v in kw.values())
+        assert "did not finish its answer" in shown, shown
+        # No success, one failure, one reset, and no context check on the runtime
+        # the reset replaced.
+        assert sessions.ledger == ["failure", "reset"]
+        assert sessions.killed == ["first"]
+
+    @pytest.mark.parametrize("stop_reason", ["timeout", STOP_REASON_STALE_RECOVER])
+    def test_at_the_breaker_threshold_an_unfinished_turn_resets_once(
+        self, monkeypatch, stop_reason
+    ):
+        """The failure that trips the breaker resets the session inside
+        ``record_failure``. A successor a same-key message started during that reset
+        is the live runtime afterwards, so the turn must not reset it again."""
+        sessions, _slack = self._run(monkeypatch, stop_reason, breaker_trips=True)
+        assert "failure" in sessions.ledger and "success" not in sessions.ledger, sessions.ledger
+        killed = sessions.killed
+        assert killed == ["first"], f"the dispatcher reset again after the breaker did: {killed}"
+        assert sessions.ledger == ["failure", "reset"]
+
+    def test_a_finished_turn_is_a_success_and_keeps_the_session(self, monkeypatch):
+        sessions, _slack = self._run(monkeypatch, STOP_REASON_END_TURN)
+        assert sessions.ledger == ["success", "context_check"]
+        assert sessions.killed == []
 
 
 # ── Keyword commands on the transport path (spawn/run/cron/sessions) ──
@@ -251,7 +497,11 @@ def _run_transport_text(
     through to the normal LLM turn.
     """
     monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-    monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+    monkeypatch.setattr(
+        transport_dispatch,
+        "_hydrate_thread_overrides",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
     monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -285,6 +535,211 @@ def _run_transport_text(
 
 def _posts(slack):
     return [kw["text"] for (m, kw) in slack.transcript if m == "post_message"]
+
+
+def test_member_memory_refusal_redacts_before_posting(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    private_path = "/home/alice/.kiro/crew/memory_stores/member-one/memory.db"
+    credential = "AKIAIOSFODNN7EXAMPLE"
+    failure = UnknownMemoryStore(f"memory_unavailable: cannot open {private_path}; {credential}")
+    monkeypatch.setattr(
+        transport_dispatch, "session_store_for_turn", AsyncMock(side_effect=failure)
+    )
+    slack, sessions = _run_transport_text(monkeypatch, "hello there")
+    posted = "\n".join(_posts(slack))
+    assert "memory_unavailable:" in posted
+    assert private_path not in posted and "alice" not in posted
+    assert credential not in posted
+    assert sessions.agents == []
+
+
+def _classified_acp_error(data: str) -> AcpError:
+    """An ``AcpError`` built the way the ACP client builds one from an error frame."""
+    try:
+        _raise_acp_error({"code": -32603, "message": "Internal error", "data": data})
+    except AcpError as exc:
+        return exc
+    raise AssertionError("_raise_acp_error did not raise")
+
+
+def test_classified_acp_error_reaches_the_user(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    failure = _classified_acp_error("The monthly usage limit has been reached.")
+    monkeypatch.setattr(
+        transport_dispatch, "session_store_for_turn", AsyncMock(side_effect=failure)
+    )
+    slack, _sessions = _run_transport_text(monkeypatch, "hello there")
+    assert f"❌ {failure}" in _posts(slack)
+
+
+def test_classified_acp_error_is_redacted_on_the_wire(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    private_path = "/Users/alice/secret/x"
+    failure = _classified_acp_error(
+        f"The monthly usage limit has been reached. cannot read {private_path}"
+    )
+    assert failure.user_worded and private_path in str(failure)
+    monkeypatch.setattr(
+        transport_dispatch, "session_store_for_turn", AsyncMock(side_effect=failure)
+    )
+    slack, _sessions = _run_transport_text(monkeypatch, "hello there")
+    posted = "\n".join(_posts(slack))
+    assert "❌ The monthly usage limit has been reached. cannot read " in posted
+    assert private_path not in posted and "alice" not in posted
+
+
+class TestTransportErrorText:
+    """The reply posted when a transport turn raises.
+
+    A classified backend ``AcpError`` (e.g. a usage limit) reaches the user as its
+    own redacted, length-capped reason; everything else keeps the generic text.
+    """
+
+    def test_classified_acp_error_shows_its_reason(self):
+        err = _classified_acp_error("The monthly usage limit has been reached.")
+        assert err.usage_limit
+        assert transport_dispatch._transport_error_text(err) == f"❌ {err}"
+        assert "monthly usage limit" in str(err)
+
+    def test_prompt_busy_shows_its_reason(self):
+        err = _classified_acp_error("Prompt already in progress")
+        assert isinstance(err, AcpPromptBusy)
+        assert transport_dispatch._transport_error_text(err) == f"❌ {err}"
+
+    def test_prompt_busy_with_provider_text_keeps_the_generic_reply(self):
+        # Busy named only in ``message``: the formatter's curated busy branch
+        # reads ``data``, so the text is the fallback's provider passthrough.
+        try:
+            _raise_acp_error(
+                {
+                    "code": -32603,
+                    "message": "Prompt already in progress",
+                    "data": "provider raw text <!here> secret-ish",
+                }
+            )
+        except AcpPromptBusy as exc:
+            err = exc
+        else:
+            raise AssertionError("_raise_acp_error did not raise AcpPromptBusy")
+        assert not err.user_worded
+        assert (
+            transport_dispatch._transport_error_text(err)
+            == transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    def test_classified_acp_error_is_redacted_before_posting(self):
+        private_path = "/Users/alice/secret/x"
+        credential = "AKIAIOSFODNN7EXAMPLE"
+        err = AcpError(
+            f"Backend refused: cannot read {private_path}; key {credential}",
+            transient=False,
+            user_worded=True,
+        )
+        text = transport_dispatch._transport_error_text(err)
+        assert text.startswith("❌ Backend refused: cannot read ")
+        assert private_path not in text and "alice" not in text
+        assert credential not in text
+
+    @pytest.mark.parametrize("split", ["AKIA*{}*", "AKIA**{}**", "AKIA_{}_", "AKIA`{}`"])
+    def test_a_key_split_by_display_markup_is_redacted(self, split):
+        rest = "IOSFODNN7EXAMPLE"
+        err = _classified_acp_error(
+            "The monthly usage limit has been reached. key " + split.format(rest)
+        )
+        assert err.user_worded and rest in str(err)
+        text = transport_dispatch._transport_error_text(err)
+        assert text.startswith("❌ The monthly usage limit has been reached.")
+        assert rest not in text
+
+    def test_classified_acp_error_is_truncated(self):
+        cap = transport_dispatch._TRANSPORT_ERROR_DETAIL_MAX_CHARS
+        err = _classified_acp_error("The monthly usage limit has been reached. " + "x" * cap)
+        assert err.user_worded and len(str(err)) > cap
+        assert transport_dispatch._transport_error_text(err) == "❌ " + str(err)[:cap]
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "ACP process exited (code=1): Traceback (most recent call last) ...",
+            "Shutdown in progress",
+        ],
+    )
+    def test_unclassified_acp_error_keeps_generic_text(self, message):
+        assert transport_dispatch._transport_error_text(AcpError(message)) == (
+            transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    def test_timeout_keeps_generic_text(self):
+        assert transport_dispatch._transport_error_text(AcpTimeoutError("t")) == (
+            transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    def test_process_died_keeps_generic_text(self):
+        assert transport_dispatch._transport_error_text(AcpProcessDied("d")) == (
+            transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    def test_rate_limited_process_death_keeps_generic_text(self):
+        err = AcpRegistrationRateLimited("registration throttled")
+        assert err.transient is True
+        assert transport_dispatch._transport_error_text(err) == (
+            transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            {"code": -32603, "message": "Internal error", "data": {"provider": {"raw": 1}}},
+            {"code": -32603, "message": "Internal error"},
+            {"code": -32000, "message": "Something odd", "data": None},
+            {"code": -32603, "message": "Internal error", "data": "upstream: at /srv/app.py:3"},
+        ],
+        ids=["unrecognised-data", "no-data", "other-code", "provider-passthrough"],
+    )
+    def test_fallback_wording_keeps_generic_text(self, frame):
+        """The formatter's fallback shows the provider's own text or the raw error
+        dict. It carries ``transient=False`` like a curated message, so the gate
+        must key on ``user_worded`` or this text would reach the channel."""
+        try:
+            _raise_acp_error(frame)
+        except AcpError as err:
+            assert err.transient is False and not err.user_worded
+            assert transport_dispatch._transport_error_text(err) == (
+                transport_dispatch._TRANSPORT_ERROR_TEXT
+            )
+        else:
+            raise AssertionError("_raise_acp_error did not raise")
+
+    def test_retryable_error_keeps_generic_text(self):
+        """A worded but retryable failure (throttling) keeps the generic reply, as
+        the Telegram transport does."""
+        err = _classified_acp_error("ThrottlingException: Rate exceeded")
+        assert err.transient is True and err.user_worded
+        assert transport_dispatch._transport_error_text(err) == (
+            transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    def test_non_acp_fault_keeps_generic_text(self):
+        assert transport_dispatch._transport_error_text(RuntimeError("internal detail")) == (
+            transport_dispatch._TRANSPORT_ERROR_TEXT
+        )
+
+    def test_slack_markup_in_the_reason_cannot_notify_anyone(self):
+        """A provider error can echo arbitrary text; ``<!channel>`` or ``<@U…>`` in
+        it must reach Slack as inert text, not a channel-wide or user ping."""
+        text = transport_dispatch._transport_error_text(
+            _classified_acp_error(
+                "The monthly usage limit has been reached. <!channel> ping <@U0VICTIM> & more"
+            )
+        )
+        assert "<!channel>" not in text and "<@U0VICTIM>" not in text
+        assert "&lt;!channel&gt;" in text and "&lt;@U0VICTIM&gt;" in text
+        assert "&amp; more" in text
 
 
 class TestTransportKeywordCommands:
@@ -399,7 +854,11 @@ class TestTransportPrivacyModifiers:
                 return text, {}
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -443,7 +902,11 @@ class TestTransportReactionsEnabled:
 
     def _run(self, monkeypatch, reactions_enabled):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
         slack = RecordingSlackClient()
@@ -490,29 +953,14 @@ class _RecordingConsolidator:
         self.calls.append(key)
 
 
-class _CapturingCtxBuilder:
-    """Records build_message kwargs; hooks.on_message is passthrough by default."""
-
-    def __init__(self, hook_result=None):
-        self.captured: dict = {}
-
-        class _Hooks:
-            def on_message(self, text):
-                from kiro_crew.hooks import HookResult
-
-                return hook_result or HookResult.passthrough()
-
-        self.hooks = _Hooks()
-
-    def build_message(self, text, is_new, session_key, **kw):
-        self.captured = kw
-        return text, {}
-
-
 class TestTransportNativeParity:
     def _prep(self, monkeypatch):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -593,6 +1041,238 @@ class TestTransportNativeParity:
         assert cb.captured.get("user_display_name") == "Alice"
 
 
+def _arm_reinjection(sessions) -> dict:
+    """Give the session stand-in the real manager's one-shot flag surface."""
+    ledger: dict = {"consumed": [], "marks": 0, "armed": True}
+
+    def _consume(key):
+        ledger["consumed"].append(key)
+        was = ledger["armed"]
+        ledger["armed"] = False
+        return was
+
+    def _mark(key):
+        ledger["marks"] += 1
+        ledger["armed"] = True
+
+    sessions.consume_needs_reinjection = _consume
+    sessions.mark_needs_reinjection = _mark
+    return ledger
+
+
+class TestTransportCompactionReinjection:
+    """The transport turn loop is its own copy, so it must consume the flag itself.
+
+    ``session_compaction`` marks ``needs_reinjection`` after an in-place compaction
+    dropped the session-start context. A turn loop that does not read it runs
+    every turn after ``/compact`` without the skills index or the response-preferences
+    block.
+    """
+
+    def _prep(self, monkeypatch):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+
+    def _run(self, sessions, cb):
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=RecordingSlackClient(),
+                sessions=sessions,
+                channel="C1",
+                text="hi",
+                thread_ts=None,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=cb,
+                conversation_log=None,
+            )
+        )
+
+    def _provider(self):
+        return ScriptedProvider(
+            [
+                make_event(EVENT_TEXT_CHUNK, text="hi"),
+                make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+            ]
+        )
+
+    def test_a_compacted_session_forwards_the_flag_to_build_message(self, monkeypatch):
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(self._provider())
+        ledger = _arm_reinjection(sessions)
+        self._run(sessions, cb)
+        assert ledger["consumed"] == [canonical_key(_MSG_TS)]
+        assert cb.captured.get("needs_reinjection") is True
+        # Landed: consumed exactly once, and NOT put back.
+        assert ledger["marks"] == 0 and ledger["armed"] is False
+
+    def test_a_session_stand_in_without_the_flag_gets_the_false_default(self, monkeypatch):
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(self._provider())
+        assert not hasattr(sessions, "consume_needs_reinjection")
+        self._run(sessions, cb)
+        assert cb.captured.get("needs_reinjection") is False
+
+    def test_a_cancelled_consuming_turn_puts_the_flag_back(self, monkeypatch):
+        # A /stop completes the turn normally with stop_reason "cancelled", and
+        # the backend drops that turn from its transcript -- the re-injected
+        # context goes with it, so the flag must come back like a raised turn.
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(
+            ScriptedProvider([make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_CANCELLED)])
+        )
+        ledger = _arm_reinjection(sessions)
+        self._run(sessions, cb)
+        assert cb.captured.get("needs_reinjection") is True
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+    def test_a_failed_consuming_turn_puts_the_flag_back(self, monkeypatch):
+        # The flag is cleared BEFORE build_message; a driver fault on that very
+        # turn discards the prompt carrying the re-injected context. Without the
+        # re-arm the session runs without it until the NEXT compaction -- the
+        # contract the dashboard runner keeps in its finally, applied here.
+        self._prep(monkeypatch)
+
+        class _DyingDriver:
+            def __init__(self, *a, **k):
+                pass
+
+            async def run(self, message):
+                raise RuntimeError("backend died before streaming")
+
+        monkeypatch.setattr(transport_dispatch, "TurnDriver", _DyingDriver)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(self._provider())
+        ledger = _arm_reinjection(sessions)
+        failures: list = []
+
+        async def _record_failure(key):
+            failures.append(key)
+
+        sessions.record_failure = _record_failure
+        self._run(sessions, cb)
+        assert cb.captured.get("needs_reinjection") is True
+        assert failures == [canonical_key(_MSG_TS)]
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+    @pytest.mark.parametrize(("status", "marks"), [("completed", 1), ("failed", 0)])
+    def test_a_backend_compaction_arms_the_flag_for_the_next_turn(self, monkeypatch, status, marks):
+        # The backend compacted its own window mid-turn: the session-start context
+        # is gone even though this turn landed, so the next turn must send it.
+        self._prep(monkeypatch)
+        sessions = _CapturingSessions(
+            ScriptedProvider(
+                [
+                    make_event(EVENT_TEXT_CHUNK, text="hi"),
+                    make_event(EVENT_COMPACTION_STATUS, text=status),
+                    make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+                ]
+            )
+        )
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+        self._run(sessions, _CapturingCtxBuilder())
+        assert ledger["marks"] == marks and ledger["armed"] is bool(marks)
+
+    def test_a_backend_compaction_arms_the_flag_when_the_turn_then_dies(self, monkeypatch):
+        self._prep(monkeypatch)
+
+        class _CompactThenDie(ScriptedProvider):
+            async def stream(self, message):
+                self.stream_calls += 1
+                yield make_event(EVENT_COMPACTION_STATUS, text="completed")
+                raise RuntimeError("backend died after compacting")
+
+        sessions = _CapturingSessions(_CompactThenDie([]))
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+
+        async def _record_failure(key):
+            return None
+
+        sessions.record_failure = _record_failure
+        self._run(sessions, _CapturingCtxBuilder())
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+
+class TestTransportTemporaryBlocksMemoryReads:
+    """``!temporary`` must block memory READS on the DEFAULT transport path.
+
+    ``messaging.use_transport`` defaults True, so this is the live path, and the
+    shared ``NOTICE_TEMPORARY`` promises the thread "won't read or save memory".
+    The write half is covered by the ``_is_slack_restricted`` gates; the read half
+    is one kwarg, and omitting it leaves memories and lessons in the prompt of a
+    thread the user was told reads nothing.
+    """
+
+    _KEY = canonical_key(_MSG_TS)
+
+    def _prep(self, monkeypatch):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+
+    def _dispatch(self, monkeypatch):
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        provider = ScriptedProvider(
+            [
+                make_event(EVENT_TEXT_CHUNK, text="hi"),
+                make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+            ]
+        )
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=RecordingSlackClient(),
+                sessions=_CapturingSessions(provider),
+                channel="C1",
+                text="what did we decide yesterday",
+                thread_ts=None,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=cb,
+                conversation_log=None,
+            )
+        )
+        return cb
+
+    def test_a_temporary_thread_blocks_memory_reads(self, monkeypatch):
+        _handler._mark_temporary(self._KEY)
+        try:
+            cb = self._dispatch(monkeypatch)
+        finally:
+            _handler._thread_temporary.pop(self._KEY, None)
+        assert cb.captured["blocks_reads"] is True
+
+    def test_an_incognito_thread_still_reads_memory(self, monkeypatch):
+        """The predicate is temporary-only, never the combined restricted one.
+
+        Incognito is documented as reading memory and refusing only to write, so
+        widening this to ``_is_slack_restricted`` would silently take memory away
+        from a mode that is supposed to keep it.
+        """
+        _handler._mark_incognito(self._KEY)
+        try:
+            cb = self._dispatch(monkeypatch)
+        finally:
+            _handler._thread_incognito.pop(self._KEY, None)
+        assert cb.captured["blocks_reads"] is False
+
+
 class TestTransportStatusIdentitySeam:
     """The `status` shortcut must use the platform identity seam
     (current_context().identity.status_line) — the CPP boundary native
@@ -646,7 +1326,11 @@ class TestTransportToolGateWiring:
         from kiro_crew.hooks import HookResult, ToolHookResult
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -723,7 +1407,11 @@ class TestHydrationBeforeHook:
             _handler._thread_incognito[session_key] = None
 
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", _fake_hydrate)
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
 
         saved: list = []
 

@@ -14,9 +14,9 @@ const mockConfirm = vi.fn(() => true)
 Object.defineProperty(window, 'confirm', { writable: true, value: mockConfirm })
 
 const seedTags = [
-  { id: 'planned', name: 'Planned', color: '#6b7280', order: 0, status: true },
-  { id: 'todo', name: 'ToDo', color: '#3b82f6', order: 1, status: true },
-  { id: 'done', name: 'Done', color: '#10b981', order: 4, status: true },
+  { id: 'planned', name: 'Planned', color: '#6b7280', order: 0, status: true, agent_provenanced: true, agent: 'none' },
+  { id: 'todo', name: 'ToDo', color: '#3b82f6', order: 1, status: true, agent_provenanced: true, agent: 'none' },
+  { id: 'done', name: 'Done', color: '#10b981', order: 4, status: true, agent_provenanced: true, agent: 'none' },
 ]
 
 const baseSlots = [
@@ -71,7 +71,15 @@ function makeMockBackend() {
       http.get('/api/chat/tags', () => HttpResponse.json(state.tags)),
       http.post('/api/chat/tags', async ({ request }) => {
         const body = await request.json() as { name: string; color?: string; status?: boolean }
-        const tag = { id: `t${nextTagId++}`, name: body.name, color: body.color || '#6b7280', order: state.tags.length, status: !!body.status }
+        const tag = {
+          id: `t${nextTagId++}`,
+          name: body.name,
+          color: body.color || '#6b7280',
+          order: state.tags.length,
+          status: !!body.status,
+          agent_provenanced: true,
+          agent: 'none',
+        }
         state.tags.push(tag)
         return HttpResponse.json(tag, { status: 201 })
       }),
@@ -98,6 +106,8 @@ function makeMockBackend() {
           mode: body.mode || 'any',
           order: state.columns.length,
           include_untagged: !!body.include_untagged,
+          source: body.source || 'tags',
+          state_key: body.state_key || '',
         }
         state.columns.push(col)
         return HttpResponse.json(col, { status: 201 })
@@ -229,7 +239,7 @@ describe('ChatSidebar tag/column UI', () => {
     expect(within(screen.getByTestId('column-c2')).getAllByText('Done').length).toBeGreaterThan(0)
   })
 
-  it('clicking board-toggle menuitem in orphan state (enabled, no cols) creates default column', async () => {
+  it('clicking board-toggle menuitem in orphan state (enabled, no cols) seeds the state lanes', async () => {
     backend.state.columns = []
     localStorage.setItem('mc-chat-config', JSON.stringify({ tagColumnsEnabled: true }))
     const user = userEvent.setup()
@@ -238,10 +248,13 @@ describe('ChatSidebar tag/column UI', () => {
     // Orphan state (enabled but no columns) shows "Switch to board view"
     const menuitem = await screen.findByRole('menuitem', { name: /Switch to board view/ })
     await user.click(menuitem)
-    // Config stays enabled, but a default column is now created
+    // Config stays enabled, and the board is populated with the four derived
+    // lanes rather than one unnamed match-all column.
     const cfg = JSON.parse(localStorage.getItem('mc-chat-config') || '{}')
     expect(cfg.tagColumnsEnabled).toBe(true)
-    await waitFor(() => expect(backend.state.columns.length).toBe(1))
+    await waitFor(() => expect(backend.state.columns.length).toBe(4))
+    expect(backend.state.columns.map((c: { state_key?: string }) => c.state_key))
+      .toEqual(['needs_approval', 'waiting', 'working', 'idle'])
   })
 
   it('column header buttons all have aria-labels (icon-buttons-need-labels)', async () => {

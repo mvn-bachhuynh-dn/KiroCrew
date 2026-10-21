@@ -1,15 +1,28 @@
-"""Tests for kiro_crew.apps.backend — backend process management."""
+"""Tests for kiro_crew.apps.backend — backend process management.
+
+The spawn environment, the post-startup health watch, the MCP reconcile and the
+enablement gate on promotion and undo live in ``test_app_backend_spawn_env.py``,
+``test_app_backend_health_watch.py``, ``test_app_backend_mcp_reconcile.py`` and
+``test_app_backend_promotion_gate.py``; shared fixtures and fakes in
+``app_backend_helpers.py``.
+"""
 from __future__ import annotations
 
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from app_backend_helpers import app_env_fixture  # noqa: F401
+from app_backend_helpers import _make_app_with_backend
+from test_update_provider import _UNALLOCATABLE_PID
 
+from conftest import requires_symlinks
 from kiro_crew.apps.backend import (
     AppProcess,
     PortUnavailableError,
@@ -21,6 +34,52 @@ from kiro_crew.apps.backend import (
     stop_app_backend,
 )
 from kiro_crew.apps.manager import APP_MANIFEST_FILENAME, install_app
+
+
+def _own_probe_sel(probe_home: str):
+    """Give ``_sandbox_can_spawn`` a synchronous SEL bound under *probe_home*, or None.
+
+    Returns the instance the probe now owns, or ``None`` when the process already
+    held a singleton -- one the operator's code constructed (a ``base_dir``
+    instance from a sibling module, say) is not the probe's to replace or retire,
+    and ``wrap_argv()`` will simply append to it. If construction fails, the
+    probe clears the partially published singleton before propagating the error.
+
+    ``sync=True`` is the whole point: the probe's denial audit is then written
+    INLINE on this thread and NO writer thread is ever started, so nothing can
+    outlive the ``with TemporaryDirectory()`` holding a reference to the
+    directory it is about to remove. The earlier shape retired an async instance
+    after the fact with ``flush()`` + shutdown sentinel + ``join(timeout=5)``,
+    and a join that times out leaves a daemon thread whose next ``_flush_batch``
+    re-creates the deleted home -- the leak this exists to close, one race away.
+    """
+    from kiro_crew.sel import SecurityEventLog
+
+    if SecurityEventLog._instance is not None:
+        return None
+    try:
+        return SecurityEventLog(Path(probe_home), sync=True)
+    except BaseException:
+        # ``__new__`` publishes the singleton before ``_init_locked`` finishes,
+        # so failed initialization can leave this probe's half-built instance.
+        SecurityEventLog._instance = None
+        SecurityEventLog._initialized = False
+        raise
+
+
+def _retire_probe_sel(owned) -> None:
+    """Clear the class slots for the instance ``_own_probe_sel`` returned.
+
+    Nothing to flush or join: a ``sync=True`` instance has no queue and no
+    thread. Clearing the slots lets the first test's ``sel()`` rebuild under
+    the session floor's redirected default dir (``_isolate_sel_default_dir``).
+    """
+    from kiro_crew.sel import SecurityEventLog
+
+    if owned is None or SecurityEventLog._instance is not owned:
+        return
+    SecurityEventLog._instance = None
+    SecurityEventLog._initialized = False
 
 
 def _sandbox_can_spawn() -> bool:
@@ -36,23 +95,65 @@ def _sandbox_can_spawn() -> bool:
     probe: a spawn can fail for reasons a capability probe cannot see, and
     reusing wrap_argv() means this check can never drift from
     start_app_backend().
+
+    The probe runs under an EMPTY ``KIROCREW_HOME``. It is evaluated at
+    collection, before the per-test isolation fixture pins the data home, so a
+    bare ``wrap_argv()`` here reads the OPERATOR's real ``~/.kiro/crew/config.json``
+    -- and on a Windows or macOS developer machine that file routinely carries
+    ``agent.sandbox_allow_unsandboxed_exec=true`` (the only way Kiro Crew runs
+    there). That made the probe answer "can spawn" for a host with no sandbox
+    backend at all, and every test it gates then failed closed under the
+    fixture's default config, while CI (no operator config) skipped them. The
+    gate must observe what the tests will observe: the default config.
+
+    The probe also OWNS the Security Event Log ``wrap_argv()`` writes to. On a
+    host with no sandbox backend the call fail-closes and records a ``denied``
+    audit through ``sel()`` -- a process SINGLETON whose ``_dir`` is bound once,
+    here from ``empty_home``. Left to construct itself that instance would be
+    ASYNC, and (a) its writer thread keeps the chain lock / log open long enough
+    on Windows that ``TemporaryDirectory`` cannot remove ``empty_home`` -- the
+    failure lands in the bare ``except`` below and the directory leaks at the
+    TEMP root, one per xdist worker, holding a ``security_events.jsonl`` and a
+    ``trust/sel_hmac.key`` -- and (b) it outlives the probe: the rootdir
+    ``_isolate_sel_default_dir`` floor only resets the singleton at the first
+    test's setup, and any write on the lingering thread ``mkdir``s the deleted
+    home back into existence. MEASURED: five full runs each left ten such
+    directories. So the probe constructs the singleton itself, ``sync=True``
+    (inline writes, no thread), and clears it before the directory goes.
     """
     try:
         from kiro_crew import sandbox as _sb
 
-        argv, cleanup = _sb.wrap_argv([sys.executable, "-c", "pass"], mode="standard")
+        with tempfile.TemporaryDirectory() as empty_home:
+            saved = os.environ.get("KIROCREW_HOME")
+            os.environ["KIROCREW_HOME"] = empty_home
+            owned = None
+            cleanup = None
+            try:
+                owned = _own_probe_sel(empty_home)
+                argv, cleanup = _sb.wrap_argv([sys.executable, "-c", "pass"], mode="standard")
+            finally:
+                if saved is None:
+                    os.environ.pop("KIROCREW_HOME", None)
+                else:
+                    os.environ["KIROCREW_HOME"] = saved
+                _retire_probe_sel(owned)
+            try:
+                # cwd=empty_home: a child inherits pytest's CWD (the checkout)
+                # unless told otherwise, so the probe child runs from the same
+                # throwaway directory the rest of the probe already owns.
+                return (
+                    subprocess.run(argv, capture_output=True, timeout=15, cwd=empty_home).returncode
+                    == 0
+                )
+            finally:
+                if cleanup:
+                    try:
+                        os.unlink(cleanup)
+                    except OSError:
+                        pass
     except Exception:  # noqa: BLE001 — any probe failure => treat as "can't spawn"
         return False
-    try:
-        return subprocess.run(argv, capture_output=True, timeout=15).returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
-    finally:
-        if cleanup:
-            try:
-                os.unlink(cleanup)
-            except OSError:
-                pass
 
 
 # Evaluated once per worker at collection; the two lifecycle tests below need a
@@ -64,106 +165,17 @@ _needs_sandbox_spawn = pytest.mark.skipif(
 )
 
 
-def _make_app_with_backend(tmp_path, name="backend-app"):
-    src = tmp_path / "source" / name
-    src.mkdir(parents=True)
-    manifest = {
-        "name": name,
-        "version": "1.0.0",
-        "displayName": "Backend App",
-        "description": "App with a backend",
-        "author": "tester",
-        "backend": {
-            "entryPoint": "backend/server.py",
-            "port": "auto",
-            "healthCheck": "/health",
-        },
-    }
-    (src / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
-    # Create a minimal backend that starts an HTTP server
-    (src / "backend").mkdir()
-    (src / "backend" / "server.py").write_text(
-        'import http.server, os, sys\n'
-        'port = int(os.environ.get("PORT", 9100))\n'
-        'class H(http.server.BaseHTTPRequestHandler):\n'
-        '    def do_GET(self):\n'
-        '        self.send_response(200)\n'
-        '        self.end_headers()\n'
-        '        self.wfile.write(b"ok")\n'
-        '    def log_message(self, *a): pass\n'
-        'http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()\n'
-    )
-    return src
-
-
-@pytest.fixture()
-def app_env(tmp_path, monkeypatch, worker_id):
-    home = tmp_path / "kirocrew-home"
-    home.mkdir()
-    monkeypatch.setenv("KIROCREW_HOME", str(home))
-    # These tests exercise admitted backend process mechanics.
-    (home / "config.json").write_text(
-        json.dumps({"agent": {"apps_allow_third_party": True}}), encoding="utf-8"
-    )
-    import kiro_crew.apps.backend as bmod
-
-    # Under xdist (-n auto) each worker runs in its OWN process with its own
-    # _allocated_ports dict, so two workers both auto-allocate 9100 and the real
-    # servers collide (EADDRINUSE). Give each worker a DISJOINT port window so
-    # parallel real-spawn tests never contend. (Production is single-process; this
-    # only matters for the test harness.)
-    if worker_id and worker_id != "master":
-        try:
-            idx = int(worker_id.replace("gw", "")) if worker_id.startswith("gw") else 0
-        except ValueError:
-            idx = 0
-        base = 9100 + idx * 20
-        monkeypatch.setattr(bmod, "_MIN_PORT", base)
-        monkeypatch.setattr(bmod, "_MAX_PORT", base + 20)
-
-    def _reap() -> None:
-        # KILL any spawned backend processes, not just clear the tracking dicts — a
-        # test that spawns a real server and doesn't stop it would otherwise leave the
-        # process holding its port, so the next test's auto-allocated port collides
-        # (EADDRINUSE). Before the spawn survival-check this leak was silently tolerated
-        # (the colliding spawn was reported as 'started' anyway); now it's caught, so the
-        # fixture must clean up properly. Use stop_app_backend → it killpg's the whole
-        # process group (the sandbox wraps the child, so a plain terminate misses it).
-        import socket as _sock
-        ports = [getattr(ap, "port", 0) for ap in bmod._processes.values()]
-        for name in list(bmod._processes.keys()):
-            try:
-                bmod.stop_app_backend(name)
-            except Exception:  # noqa: BLE001
-                pass
-        bmod._processes.clear()
-        bmod._allocated_ports.clear()
-        # Wait for each killed server's port to actually be released so the next test's
-        # auto-allocation can't re-pick a still-occupied port (EADDRINUSE).
-        for port in ports:
-            if not port:
-                continue
-            for _ in range(50):  # up to ~5s
-                s = _sock.socket()
-                try:
-                    s.bind(("127.0.0.1", port))
-                    s.close()
-                    break
-                except OSError:
-                    s.close()
-                    time.sleep(0.1)
-
-    _reap()       # clean slate before the test
-    yield home
-    _reap()       # and reap anything the test left running
-
-
 class TestPortAllocation:
-    def test_find_free_port(self):
-        port = _find_free_port()
-        assert 9100 <= port <= 9200
+    def test_find_free_port(self, app_env):
+        import kiro_crew.apps.backend as bmod
 
-    def test_concurrent_allocation_never_hands_out_the_same_port(self, monkeypatch):
+        port = _find_free_port()
+        # Bounds read off the module, not the 9100/9200 literals: ``app_env`` gives
+        # each xdist worker a DISJOINT window, so a hardcoded range would fail on
+        # every worker but gw0.
+        assert bmod._MIN_PORT <= port <= bmod._MAX_PORT
+
+    def test_concurrent_allocation_never_hands_out_the_same_port(self, app_env, monkeypatch):
         """Parallel boot spawns must not collide on one auto-allocated port.
 
         Boot starts app backends concurrently, so two apps can select a port at
@@ -203,6 +215,194 @@ class TestPortAllocation:
                     bmod._allocated_ports.pop(f"racer-{i}", None)
 
 
+def _drive_spawn_to_publication(monkeypatch, name, *, wrap_marks_sandbox):
+    """Run ``start_app_backend`` to a published record, stubbing the spawn seams.
+
+    ``wrap_marks_sandbox`` chooses whether the stub ``wrap_argv`` returns a
+    launcher cleanup path alongside its wrapped argv or None with an unchanged argv.
+    On Linux that cleanup path identifies the generated forking namespace launcher.
+    Everything after the Popen boundary is faked so the body reaches publication.
+    """
+    import kiro_crew.apps.backend as bmod
+
+    def _wrap(argv, **k):
+        if wrap_marks_sandbox:
+            return (["/run/kirocrew_sandbox_1.py", *argv], "/run/kirocrew_sandbox_1.py")
+        return (list(argv), None)
+
+    class _AliveProc:
+        # The fixture's teardown hands this to the REAL ``stop_app_backend`` kill
+        # path, so the pid must be one no live process can own.
+        pid = _UNALLOCATABLE_PID
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(bmod, "_app_enabled_state", lambda n: True)
+    monkeypatch.setattr(bmod, "wrap_argv", _wrap)
+    monkeypatch.setattr(bmod, "cgroup_scope_argv", lambda argv: argv)
+    monkeypatch.setattr(bmod, "popen_limited", lambda *a, **k: _AliveProc())
+    monkeypatch.setattr(bmod, "_survived_spawn", lambda proc, port: True)
+    monkeypatch.setattr(bmod, "_record_app_pid", lambda *a, **k: "ST-4242")
+    monkeypatch.setattr(bmod, "_start_health_supervisor", lambda ap, hc: None)
+    bmod.start_app_backend(name)
+    return bmod._processes.get(name)
+
+
+def test_spawn_sets_forking_launcher_true_for_the_namespace_launcher_wrap(
+    tmp_path, app_env, monkeypatch
+):
+    """The spawn path identifies the forking launcher from its cleanup path.
+
+    On Linux a non-null cleanup path names the generated namespace launcher, so the
+    published record carries ``forking_sandbox_launcher=True`` and
+    ``running_spawned_backend_pids`` will widen to the launcher's forked server child.
+    The predicate is ``IS_LINUX and cleanup_path is not None``; on a non-Linux host
+    the seatbelt profile's cleanup path does not mark a forking launcher, so the flag
+    stays False -- which is what this asserts against the live platform.
+    """
+    from kiro_crew import platform_compat
+
+    src = tmp_path / "source" / "ns-app"
+    src.mkdir(parents=True)
+    (src / APP_MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "name": "ns-app",
+                "version": "1.0.0",
+                "displayName": "NS",
+                "description": "namespace launcher",
+                "backend": {"entryPoint": "server.py", "healthCheck": "/health"},
+            }
+        )
+    )
+    (src / "server.py").write_text("import time\ntime.sleep(30)\n")
+    install_app(src)
+
+    ap = _drive_spawn_to_publication(monkeypatch, "ns-app", wrap_marks_sandbox=True)
+    assert ap is not None, "the spawn never published a record"
+    assert ap.forking_sandbox_launcher is platform_compat.IS_LINUX
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the namespace launcher is POSIX-only: rendering it reads os.getuid",
+)
+@pytest.mark.parametrize("tier", ["strict", "standard", "cc"])
+def test_the_namespace_launcher_forks_once_and_its_parent_only_waits(tier):
+    """Pins the launcher shape that ``forking_sandbox_launcher`` relies on.
+
+    For a record marked ``forking_sandbox_launcher``,
+    ``running_spawned_backend_pids`` claims the Popen root's direct children,
+    because the generated namespace launcher forks exactly once, its child execs
+    the server, and its parent only waits for that child. A launcher that gained
+    or lost a fork layer would make that claim over- or under-reach with no other
+    test turning red, so revisit the children claim in
+    ``apps/backend_runtime/tracking.py`` before changing this shape.
+    """
+    import ast
+
+    from kiro_crew import sandbox
+
+    tree = ast.parse(sandbox._build_launcher_script(tier))
+    called = [ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    process_makers = {
+        c
+        for c in called
+        if c.startswith(("os.fork", "os.spawn", "os.posix_spawn", "os.exec", "subprocess."))
+        or c in ("os.system", "os.popen")
+    }
+    assert process_makers == {"os.fork", "os.execvp"}
+    assert called.count("os.fork") == 1
+
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    parent = next(
+        n for n in ast.walk(main) if isinstance(n, ast.If) and ast.unparse(n.test) == "pid > 0"
+    )
+    parent_calls = {
+        ast.unparse(c.func) for s in parent.body for c in ast.walk(s) if isinstance(c, ast.Call)
+    }
+    assert "os.waitpid" in parent_calls
+    assert not parent_calls & process_makers
+    assert ast.unparse(parent.body[-1]).startswith("sys.exit(")
+    # The child carries on past the parent's branch: its exec is reached through
+    # ``run_child``, whose last statement is ``exec_agent``, the one ``os.execvp``.
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    child = main.body[main.body.index(parent) + 1 :]
+    child_calls = {
+        ast.unparse(c.func) for s in child for c in ast.walk(s) if isinstance(c, ast.Call)
+    }
+    assert "run_child" in child_calls and not child_calls & process_makers
+    assert ast.unparse(functions["run_child"].body[-1]) == "exec_agent(launch, argv)"
+    exec_calls = {
+        ast.unparse(c.func) for c in ast.walk(functions["exec_agent"]) if isinstance(c, ast.Call)
+    }
+    assert "os.execvp" in exec_calls
+
+
+def test_spawn_sets_forking_launcher_false_for_a_noop_wrap(
+    tmp_path, app_env, monkeypatch
+):
+    """MUTATION TARGET: an unconfined (no-op wrap) spawn leaves the flag False.
+
+    When ``wrap_argv`` returns the argv unchanged -- an unconfined host -- the root IS
+    the server, so the record must NOT be marked and no children are ever claimed.
+    """
+    src = tmp_path / "source" / "plain-app"
+    src.mkdir(parents=True)
+    (src / APP_MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "name": "plain-app",
+                "version": "1.0.0",
+                "displayName": "Plain",
+                "description": "no sandbox",
+                "backend": {"entryPoint": "server.py", "healthCheck": "/health"},
+            }
+        )
+    )
+    (src / "server.py").write_text("import time\ntime.sleep(30)\n")
+    install_app(src)
+
+    ap = _drive_spawn_to_publication(monkeypatch, "plain-app", wrap_marks_sandbox=False)
+    assert ap is not None, "the spawn never published a record"
+    assert ap.forking_sandbox_launcher is False
+
+
+def test_an_app_entry_point_named_like_the_launcher_does_not_set_the_forking_flag(
+    tmp_path, app_env, monkeypatch
+):
+    """An app-controlled entry-point name cannot confer ownership of its children."""
+    from kiro_crew import platform_compat, sandbox
+    from kiro_crew.apps.backend import running_spawned_backend_pids
+
+    src = tmp_path / "source" / "launcher-named-app"
+    src.mkdir(parents=True)
+    entry_point = "kirocrew_sandbox_main.py"
+    (src / APP_MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "name": "launcher-named-app",
+                "version": "1.0.0",
+                "displayName": "Launcher-named app",
+                "description": "no sandbox",
+                "backend": {"entryPoint": entry_point, "healthCheck": "/health"},
+            }
+        )
+    )
+    (src / entry_point).write_text("import time\ntime.sleep(30)\n")
+    install_app(src)
+
+    ap = _drive_spawn_to_publication(monkeypatch, "launcher-named-app", wrap_marks_sandbox=False)
+    assert ap is not None, "the spawn never published a record"
+    assert ap.forking_sandbox_launcher is False
+    assert sandbox.wrapped_by_crew_sandbox([sys.executable, str(src / entry_point)]) is True
+    monkeypatch.setattr(
+        platform_compat, "_proc_children", lambda pid: [ap.pid + 1] if pid == ap.pid else []
+    )
+    assert running_spawned_backend_pids() == {ap.pid}
+
+
 class TestFixedAndAutoPortIsolation:
     def test_boot_preclaims_fixed_ports_before_any_spawn(self, monkeypatch):
         """A declared fixed port must not be lost to a concurrent auto-port app.
@@ -212,6 +412,11 @@ class TestFixedAndAutoPortIsolation:
         refused even though other ports were free — an enabled backend left down.
         """
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         fixed = bmod._MIN_PORT + 3
         manifests = {
@@ -250,6 +455,11 @@ class TestFixedAndAutoPortIsolation:
         """Pre-claiming is best-effort: it must never itself fail boot."""
         import kiro_crew.apps.backend as bmod
 
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+
         manifests = {
             "no-manifest": None,
             "bad-port": SimpleNamespace(backend=SimpleNamespace(port="not-a-number")),
@@ -268,13 +478,18 @@ class TestFixedAndAutoPortIsolation:
     def test_a_fixed_port_app_claims_it_before_binding(self, tmp_path, app_env, monkeypatch):
         """The SPAWN PATH must claim a fixed manifest port, not just record it later.
 
-        Boot spawns concurrently, and a fixed-port app used to record its port only
+        Boot spawns concurrently, and a fixed-port app that records its port only
         AFTER binding. An auto-port app selecting inside that window could be handed
         the same number, so one of the two children would die of EADDRINUSE and its
         backend would stay unavailable. Asserted at the real seam: the port must
         already be reserved by the time the spawn body runs.
         """
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         # Stub the OS sandbox: these tests are about PORT bookkeeping, and
         # wrap_argv() fail-closes before that code on hosts without a backend
@@ -319,6 +534,11 @@ class TestFixedAndAutoPortIsolation:
         that port — and a gateway retrying a broken app would leak one per attempt.
         """
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         # Stub the OS sandbox: these tests are about PORT bookkeeping, and
         # wrap_argv() fail-closes before that code on hosts without a backend
@@ -410,17 +630,30 @@ def _slow_never_owns(port, pid):
     return False
 
 
+def _frozen_spawn_time() -> SimpleNamespace:
+    """Keep poll-count scenarios independent of host wall-clock scheduling."""
+    return SimpleNamespace(
+        monotonic=lambda: 0.0,
+        sleep=lambda _seconds: None,
+    )
+
+
 class TestBootSpawnLatency:
     def test_survival_check_exits_early_for_a_healthy_child(self, monkeypatch):
         """A living child must not cost the full survival window.
 
-        The poll used to sleep its whole ~1.6s budget on the happy path and only
+        The poll would sleep its whole ~1.6s budget on the happy path and only
         break when the child DIED, so every app added ~1.6s of dead time to boot.
         It must return as soon as the child is confirmed alive.
         """
         import time as real_time
 
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         # OUR child owns the listener — the very bind whose failure this guards.
         monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
@@ -449,7 +682,14 @@ class TestBootSpawnLatency:
         """
         import kiro_crew.apps.backend as bmod
 
-        monkeypatch.setattr(bmod.time, "sleep", lambda s: None)
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+
+        monkeypatch.setattr(bmod, "time", _frozen_spawn_time())
+        monkeypatch.setattr(bmod.platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
         monkeypatch.setattr(bmod, "_spawn_owns_listener", lambda port, pid: False)
 
         class _DiesLate:
@@ -474,8 +714,15 @@ class TestBootSpawnLatency:
         """
         import kiro_crew.apps.backend as bmod
 
-        monkeypatch.setattr(bmod.time, "sleep", lambda s: None)
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+
+        monkeypatch.setattr(bmod, "time", _frozen_spawn_time())
         # Something is listening, but it is not our child (nor its descendant).
+        monkeypatch.setattr(bmod.platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
         monkeypatch.setattr(bmod, "_listening_pids", lambda port: [99999])
         monkeypatch.setattr(bmod, "_pid_is_self_or_descendant_of", lambda pid, ancestor: False)
 
@@ -500,20 +747,34 @@ class TestBootSpawnLatency:
         """
         import kiro_crew.apps.backend as bmod
 
-        monkeypatch.setattr(bmod.time, "sleep", lambda s: None)
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+
+        monkeypatch.setattr(bmod, "time", _frozen_spawn_time())
+        monkeypatch.setattr(bmod.platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
         monkeypatch.setattr(bmod, "_listening_pids", lambda port: [4243])
         monkeypatch.setattr(
-            bmod, "_pid_is_self_or_descendant_of",
+            bmod,
+            "_pid_is_self_or_descendant_of",
             lambda pid, ancestor: pid == 4243 and ancestor == 4242,
         )
 
-        class _Alive:
+        class _DiesAfterBind:
             pid = 4242
 
-            def poll(self) -> None:
-                return None
+            def __init__(self) -> None:
+                self.calls = 0
 
-        assert bmod._survived_spawn(_Alive(), 9100) is True
+            def poll(self):
+                self.calls += 1
+                return None if self.calls == 1 else 1
+
+        proc = _DiesAfterBind()
+        assert bmod._survived_spawn(proc, 9100) is True
+        assert proc.calls == 1
 
     def test_failure_path_never_exceeds_the_original_budget(self):
         """The ownership probe must not stretch the wait it is embedded in.
@@ -570,6 +831,11 @@ class TestBootSpawnLatency:
 
         import kiro_crew.apps.backend as bmod
 
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+
         monkeypatch.setattr(
             bmod.platform_compat, "listening_pid_tool_available", lambda: False
         )
@@ -592,13 +858,18 @@ class TestBootSpawnLatency:
     def test_boot_starts_app_backends_concurrently(self, monkeypatch):
         """Boot must not serialize per-app spawn latency.
 
-        N apps used to cost N x the survival window because each spawn ran to
+        N apps would cost N x the survival window because each spawn ran to
         completion before the next began. With 4 apps that is ~6.4s of pure boot
         latency on the happy path.
         """
         import threading
 
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         names = [f"par-app-{i}" for i in range(4)]
         concurrent = threading.Barrier(len(names), timeout=10)
@@ -616,6 +887,11 @@ class TestBootSpawnLatency:
     def test_concurrent_boot_isolates_a_single_app_failure(self, monkeypatch):
         """One app's spawn failure must never take down the others (or boot)."""
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         def _fake_start(app_name: str):
             if app_name == "bad-app":
@@ -743,6 +1019,7 @@ class TestBackendLifecycle:
         result = start_app_backend("bad-entry")
         assert result is None
 
+    @requires_symlinks
     def test_backend_entrypoint_escapes_app_root(self, tmp_path, app_env, caplog):
         # The boot path (start_installed_backends) spawns persisted manifests
         # WITHOUT re-running validate(), so a manifest whose backend.entryPoint
@@ -965,6 +1242,11 @@ class TestBackendLifecycle:
         # respawns onto the same doomed port forever (the crash-loop we hit). The spawn
         # verifies the child survived its bind; an immediate exit → None + cleared state.
         import kiro_crew.apps.backend as bmod
+
+        # These exercise promotion logic, not enablement: their app names are
+        # fabricated and so are not in installed.json. The real gate is pinned by
+        # TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
 
         # Widen the survival-check grace window for this test only. The boom.py child
         # exits immediately ONCE it runs, but under heavy pytest-xdist parallelism
@@ -1223,222 +1505,3 @@ class TestShellDispatch:
         manifest = get_app_manifest(name)
         assert manifest is not None
         assert bmod._start_app_backend_body(name, manifest) is None
-
-
-class TestBootAdmissionRevet:
-    """start_enabled_app_backends re-vets admission at boot (KiroCrew parity).
-
-    An app enabled before a policy tightened (banned / now-unsigned) must NOT
-    keep running across restarts, but builtins (origin == "builtin") are exempt
-    so trusted first-party apps still boot under require_signature.
-    """
-
-    def _boot_env(self, monkeypatch):
-        import kiro_crew.apps.backend as bmod
-
-        monkeypatch.setattr(bmod, "_reap_stale_app_backends", lambda: 0)
-        started: list[str] = []
-
-        def _fake_start(name):
-            started.append(name)
-            return None  # no real spawn; skip the health-gate branch
-
-        monkeypatch.setattr(bmod, "start_app_backend", _fake_start)
-        monkeypatch.setattr(bmod, "get_app_manifest", lambda name: None)
-        return bmod, started
-
-    def test_banned_third_party_skipped_at_boot(self, tmp_path, app_env, monkeypatch):
-        bmod, started = self._boot_env(monkeypatch)
-        (app_env / "app_admission.json").write_text(
-            json.dumps({"mode": "enforce", "banned": ["evil-app"]})
-        )
-        apps = [{
-            "name": "evil-app", "enabled": True, "origin": "registry",
-            "manifest": {"backend": {"entryPoint": "server.py"}},
-        }]
-        monkeypatch.setattr(bmod, "list_apps", lambda: apps)
-        result = bmod.start_enabled_app_backends()
-        assert "evil-app" not in result
-        assert "evil-app" not in started
-
-    def test_builtin_still_boots_under_require_signature(self, tmp_path, app_env, monkeypatch):
-        bmod, started = self._boot_env(monkeypatch)
-        (app_env / "app_admission.json").write_text(
-            json.dumps({
-                "mode": "enforce", "require_signature": True,
-                "approved": [], "trust_keys": {},
-            })
-        )
-        apps = [{
-            "name": "core-builtin", "enabled": True, "origin": "builtin",
-            "manifest": {"backend": {"entryPoint": "server.py"}},
-        }]
-        monkeypatch.setattr(bmod, "list_apps", lambda: apps)
-        bmod.start_enabled_app_backends()
-        # Builtin is exempt from the gate — start_app_backend was invoked for it.
-        assert "core-builtin" in started
-
-    def test_spawn_exception_isolated_and_boot_continues(self, tmp_path, app_env, monkeypatch):
-        """A per-app spawn failure (e.g. sandbox.wrap_argv fail-closing on macOS 26
-        where sandbox-exec is gone) must NOT crash the whole gateway — the loop logs,
-        skips the failing app, and still boots the healthy one."""
-        import kiro_crew.apps.backend as bmod
-
-        monkeypatch.setattr(bmod, "_reap_stale_app_backends", lambda: 0)
-        monkeypatch.setattr(bmod, "get_app_manifest", lambda name: None)
-        started: list[str] = []
-
-        def _fake_start(name):
-            if name == "boom-app":
-                raise RuntimeError(
-                    "Sandbox backend unavailable and allow_unsandboxed_exec is not set."
-                )
-            started.append(name)
-            return None
-
-        monkeypatch.setattr(bmod, "start_app_backend", _fake_start)
-        apps = [
-            {"name": "boom-app", "enabled": True, "origin": "builtin",
-             "manifest": {"backend": {"entryPoint": "server.py"}}},
-            {"name": "ok-app", "enabled": True, "origin": "builtin",
-             "manifest": {"backend": {"entryPoint": "server.py"}}},
-        ]
-        monkeypatch.setattr(bmod, "list_apps", lambda: apps)
-        # Must not raise despite boom-app's spawn raising.
-        result = bmod.start_enabled_app_backends()
-        # boom-app was skipped; ok-app still got its spawn attempt.
-        assert "boom-app" not in started
-        assert "ok-app" in started
-        assert "boom-app" not in result
-
-
-class _FakeHealthResp:
-    """Minimal urlopen() stand-in: a 200 response usable as a context manager."""
-
-    status = 200
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-class TestHealthGatedMcpRegistration:
-    """Health-gated MCP registration (review + review-bot race finding).
-
-    The health-check loop must register an app's MCP servers ONLY when the backend is
-    still tracked and healthy, and scrub them when it never becomes healthy — never write
-    a dead-URL entry (the kiro-cli outage shape)."""
-
-    def _fast_health(self, bmod, monkeypatch):
-        # Make the loop iterate instantly.
-        monkeypatch.setattr(bmod, "_HEALTH_CHECK_INTERVAL", 0)
-        monkeypatch.setattr(bmod, "_HEALTH_CHECK_RETRIES", 3)
-
-    def test_registers_when_healthy_and_still_tracked(self, monkeypatch):
-        import kiro_crew.apps.backend as bmod
-        self._fast_health(bmod, monkeypatch)
-        calls = []
-        monkeypatch.setattr(bmod, "_gate_mcp_registration",
-                            lambda name, port, *, healthy: calls.append((name, port, healthy)))
-
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *a, **k: _FakeHealthResp())
-
-        with bmod._lock:
-            bmod._processes["hg-app"] = AppProcess(app_name="hg-app", port=9150, healthy=False)
-        try:
-            bmod._health_check_loop("hg-app", 9150, "/health")
-            assert calls == [("hg-app", 9150, True)]  # registered exactly once, healthy
-            assert bmod._processes["hg-app"].healthy is True
-        finally:
-            with bmod._lock:
-                bmod._processes.clear()
-
-    def test_does_not_register_if_stopped_mid_healthcheck(self, monkeypatch):
-        # review-bot race finding: app removed from _processes between the poll and the lock →
-        # must NOT register MCP for a now-dead backend.
-        import kiro_crew.apps.backend as bmod
-        self._fast_health(bmod, monkeypatch)
-        calls = []
-        monkeypatch.setattr(bmod, "_gate_mcp_registration",
-                            lambda name, port, *, healthy: calls.append((name, port, healthy)))
-
-        # urlopen "succeeds" but the app is NOT in _processes (stopped mid-check).
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *a, **k: _FakeHealthResp())
-        with bmod._lock:
-            bmod._processes.clear()  # ensure absent
-
-        bmod._health_check_loop("gone-app", 9151, "/health")
-        assert calls == []  # never registered — no dead-URL entry written
-
-    def test_scrubs_when_never_healthy(self, monkeypatch):
-        import kiro_crew.apps.backend as bmod
-        self._fast_health(bmod, monkeypatch)
-        calls = []
-        monkeypatch.setattr(bmod, "_gate_mcp_registration",
-                            lambda name, port, *, healthy: calls.append((name, port, healthy)))
-
-        def _boom(*a, **k):
-            raise OSError("connection refused")
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", _boom)
-
-        with bmod._lock:
-            bmod._processes["sick-app"] = AppProcess(app_name="sick-app", port=9152, healthy=False)
-        try:
-            bmod._health_check_loop("sick-app", 9152, "/health")
-            # Never healthy → scrub (healthy=False), never register.
-            assert calls == [("sick-app", 9152, False)]
-        finally:
-            with bmod._lock:
-                bmod._processes.clear()
-
-
-# =============================================================================
-# KIROCREW_DEVFLEET_REPO forwarding (silent-empty-fleet fix)
-# =============================================================================
-
-
-def test_devfleet_repo_survives_the_app_backend_env_allowlist(monkeypatch):
-    """The documented dev-fleet repo override must be ABLE to reach the backend.
-
-    The dev-fleet backend runs as a separate process started with
-    ``apps.registry.minimal_env()``, which passes only a fixed safe-key set.
-    ``KIROCREW_DEVFLEET_REPO`` is dev-fleet's highest-priority repo discovery
-    hint, but until it is added to the explicit platform extras the allowlist
-    strips it — the operator sets the documented override, the backend never
-    sees it, and the fleet silently renders empty (the remaining hints are
-    ``KIROCREW_PROJECT_DIR``, which packaged installs point at the app bundle
-    with no ``.git``, and a hardcoded ``~/kirocrew`` fallback).
-    """
-    from pathlib import Path
-
-    import kiro_crew.apps.backend as bmod
-    from kiro_crew.apps.registry import minimal_env
-
-    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/opt/checkouts/kirocrew")
-    # The generic allowlist does NOT carry it — that is the trap this guards.
-    assert "KIROCREW_DEVFLEET_REPO" not in minimal_env()
-
-    # apps/backend.py must therefore add it to the explicit platform extras
-    # (same mechanism that carries KIROCREW_PROJECT_DIR and the
-    # KIROCREW_DEVFLEET_BIN_* trusted-binary overrides).
-    body = Path(bmod.__file__).read_text()
-    assert '_platform_extra["KIROCREW_DEVFLEET_REPO"]' in body, \
-        "the KIROCREW_DEVFLEET_REPO override no longer reaches app backends"
-
-
-def test_devfleet_repo_env_wins_repo_discovery(monkeypatch, tmp_path):
-    """dev-fleet honors the forwarded override ahead of every other hint."""
-    from kiro_crew.apps.builtins.dev_fleet import server as dfmod
-
-    proj = tmp_path / "proj"
-    (proj / ".git").mkdir(parents=True)
-    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/opt/checkouts/kirocrew")
-    monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
-    assert dfmod._default_main_repo() == "/opt/checkouts/kirocrew"
-
-    # Without the override the chain falls through to PROJECT_DIR (with .git),
-    # and then to the ~/kirocrew fallback — the packaged-install trap.
-    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO")
-    assert dfmod._default_main_repo() == str(proj)

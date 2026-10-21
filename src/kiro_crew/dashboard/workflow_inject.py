@@ -18,7 +18,14 @@ import re
 from typing import Any, Callable, Optional
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    append_and_surface,
+    load_window_off_loop,
+    note_crew_log_class,
+    row_mid,
+)
 from kiro_crew.history import append_if_absent_off_loop
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -70,7 +77,8 @@ def _summarize(snapshot: dict) -> str:
             lines.extend(f"- `{p}`" for p in artifacts[:20])
             if len(artifacts) > 20:
                 lines.append(f"- … and {len(artifacts) - 20} more")
-    elif snapshot.get("error"):
+    # A returned result does not imply that its durable checkpoint succeeded.
+    if snapshot.get("error"):
         lines.append(f"\nError: {snapshot['error']}")
     # A failed run is not necessarily an empty one: every agent call that completed
     # before the ceiling / cancel / crash is preserved on the record. Say so
@@ -83,6 +91,13 @@ def _summarize(snapshot: dict) -> str:
             f"\n{partial_count} agent result(s) finished before the run ended and were "
             f"preserved — read them with `workflow_result('{run_id}')` under "
             "`partial_results` (keyed by agent call index)."
+        )
+    result_count = snapshot.get("agent_result_count") or 0
+    if result_count:
+        lines.append(
+            f"\n{result_count} agent call result(s) recorded — read `agent_results` with "
+            f"workflow_result('{run_id}'). Finished means the workflow function returned; "
+            "required artifacts are not verified by this status."
         )
     if error_count:
         lines.append(f"{error_count} agent call(s) failed; each reason is under `agent_errors`.")
@@ -151,29 +166,58 @@ def inject_workflow_result(
 
         # 2. Fall back to a dedicated workflow slot only if the chat is gone.
         if slot is None:
+            if snapshot.get("memory_mode", "persistent") != "persistent":
+                return False
+            # Never adopt an app-owned slot under the run's key: linking it would
+            # hand the app the originating session's transcript.
+            if app_holds_gateway_key(state, f"workflow-{run_id}", "workflow.inject_result"):
+                return False
             slot = state.get_or_create_slot(name=f"workflow-{run_id}")
             if not getattr(slot, "linked_session_key", ""):
                 slot.linked_session_key = session_key
+                # A reused ``workflow-<run_id>`` slot object can still hold the
+                # PRIOR run's in-memory dismissed set. Leaving it in place while
+                # the slot now links a DIFFERENT transcript would let the next
+                # union-save fold those foreign tombstones into the newly-linked
+                # transcript and suppress unrelated links there — the same silent,
+                # permanent cross-transcript corruption the cron bind path clears
+                # against. Empty the set and mark it dismissed-unhydrated so the
+                # union carries only the linked transcript's own on-disk line; a
+                # later readable restore replaces it authoritatively.
+                slot._dismissed_source_links = set()
+                slot.invalidate_source_links()
+                slot._dismissed_hydrated = False
+                note_crew_log_class(state, slot)
             slot.title = f"Workflow: {snapshot.get('name') or run_id}"
 
         # Dedup: don't double-inject the same result on a re-fire.
         already = any(m.get("content") == msg for m in getattr(slot, "messages", []))
         if not already:
-            slot.append("assistant", msg, "msg msg-a")
-            # Live: surface it in the open chat without a reload (mirrors how a
-            # normal assistant turn is pushed). slot.append already broadcasts via
-            # _pending flush, but an explicit chat_message guarantees the live UI
-            # renders it into the originating conversation immediately.
-            try:
-                state.broadcast_ws(
-                    "chat_message",
-                    {"slot": slot.key, "role": "assistant", "content": msg, "kind": "workflow_result"},
+            # Carry the window copy's minted ``meta.mid`` (read off the append's
+            # return via ``row_mid``) onto the durable copy below: one logical
+            # message, one identity, so the bounded-read identity walk
+            # recognises the persisted row instead of re-appending the
+            # injection. append_and_surface delivers the live copy through
+            # exactly one identity-carrying door — an unconditional explicit
+            # frame here carries no ``meta.mid``, so the client renders the same
+            # result twice whenever append's own broadcast also fires.
+            window_mid = row_mid(
+                append_and_surface(
+                    state,
+                    slot,
+                    "assistant",
+                    msg,
+                    "msg msg-a",
+                    meta={"kind": "workflow_result"},
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            )
             # Persist so a follow-up chat turn has the result as context.
             try:
-                if state.conversation_log is not None:
+                if (
+                    state.conversation_log is not None
+                    and snapshot.get("memory_mode", "persistent") == "persistent"
+                    and getattr(slot, "memory_mode", "persistent") == "persistent"
+                ):
                     # inject_workflow_result runs on the event loop (invoked from
                     # the workflow runner's on_done inside an asyncio task), so
                     # offload the lock-backed disk append to a worker thread —
@@ -190,7 +234,7 @@ def inject_workflow_result(
                     # under the SAME per-session lock the slot save takes, so the
                     # write collapses to a no-op when the save already landed it.
                     append_if_absent_off_loop(
-                        state.conversation_log, session_key, "assistant", msg
+                        state.conversation_log, session_key, "assistant", msg, mid=window_mid
                     )
             except Exception:  # noqa: BLE001
                 pass
@@ -211,4 +255,122 @@ def inject_workflow_result(
             pass
         return True
     except Exception:  # noqa: BLE001 - injection is best-effort
+        return False
+
+
+def _seed_turn_timeout(slot: Any, meta: Optional[dict]) -> None:
+    """Give a fresh slot linked to an existing transcript that transcript's turn time limit.
+
+    *meta* is the transcript's readable metadata line, or ``None`` when it could
+    not be read. Unread, the slot holds no limit of its own and is marked
+    unhydrated, so its saves carry the on-disk value forward instead of
+    replacing it with "follow the global".
+    """
+    from kiro_crew.dashboard.slot_persistence.metadata_codec import _validate_turn_timeout_secs
+
+    if meta is None:
+        slot.turn_timeout_secs = None
+        slot._turn_timeout_hydrated = False
+        return
+    slot.turn_timeout_secs = _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    slot._turn_timeout_hydrated = True
+
+
+async def inject_bound_workflow_result(
+    state: DashboardState, run_id: str, snapshot: dict, *, on_injected=None
+) -> bool:
+    """Deliver using the run's captured identity without reselecting its memory."""
+    import asyncio
+
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+    from kiro_crew.execution_context import (
+        bind_session_execution,
+        execution_from_record,
+        member_config_for_id,
+        read_session_execution,
+    )
+
+    try:
+        # The delivery appends to the originating tab's rows. A tab restored as a
+        # sidebar row loads its window first, with the read off the loop; every
+        # lookup below reads the slot again after this await.
+        origin = snapshot.get("session_key", "")
+        getter = getattr(state, "get_slot", None)
+        if isinstance(origin, str) and origin and callable(getter):
+            live = getter(_slot_key_from_session(origin))
+            if live is not None:
+                await load_window_off_loop(live)
+        execution = execution_from_record(snapshot, required=False)
+        if execution is None:
+            if snapshot.get("memory_store") or snapshot.get("member_id"):
+                return False
+            return inject_workflow_result(state, run_id, snapshot, on_injected=on_injected)
+        origin = snapshot.get("session_key", "")
+        if not isinstance(origin, str) or not origin:
+            return False
+        # Capture the live target before awaiting config/metadata I/O. Recheck
+        # that same slot after the await rather than selecting another member.
+        slot = state.get_slot(_slot_key_from_session(origin))
+        if slot is not None:
+            admitted = await asyncio.to_thread(read_session_execution, origin)
+            if (
+                state.get_slot(slot.key) is not slot
+                or effective_session_key(slot) != origin
+                or admitted is None
+                or admitted.store != execution.store
+                or getattr(slot, "memory_store", "") != execution.store.legacy_name
+            ):
+                return False
+            if getattr(slot, "memory_mode", "persistent") != execution.memory_mode:
+                return False
+        else:
+            if execution.memory_mode != "persistent":
+                return False
+            agent = execution.template_id
+            if execution.member_id is not None:
+                config = await asyncio.to_thread(KiroCrewConfig.load)
+                agent, _ = member_config_for_id(config, execution.member_id)
+            fallback_name = f"workflow-{run_id}"
+            slot = state.get_slot(fallback_name)
+            if slot is not None and (
+                getattr(slot, "linked_session_key", "") != origin
+                or getattr(slot, "memory_store", "") != execution.store.legacy_name
+                or getattr(slot, "memory_mode", "persistent") != execution.memory_mode
+            ):
+                return False
+            # Bind the original identity when the parent is absent.
+            # The new visible slot inherits it before any provider can start.
+            await asyncio.to_thread(bind_session_execution, origin, execution)
+            # The transcript's own turn time limit is read before a fresh slot
+            # exists, so the slot never saves "follow the global" over it.
+            limit_meta: dict = {}
+            limit_readable = False
+            log = getattr(state, "conversation_log", None)
+            if slot is None and log is not None:
+                try:
+                    limit_meta, limit_readable = await asyncio.to_thread(
+                        log.get_metadata_status, origin
+                    )
+                except Exception:  # noqa: BLE001 - an unread limit stays deferred below
+                    limit_meta, limit_readable = {}, False
+            if (
+                state.get_slot(_slot_key_from_session(origin)) is not None
+                or state.get_slot(fallback_name) is not slot
+            ):
+                return False
+            if slot is None:
+                slot = state.get_or_create_slot(
+                    name=fallback_name,
+                    agent=agent,
+                    linked_session_key=origin,
+                    memory_mode=execution.memory_mode,
+                )
+                slot.memory_store = execution.store.legacy_name
+                _seed_turn_timeout(slot, limit_meta if limit_readable else None)
+            on_injected = None
+        delivered = dict(snapshot)
+        delivered["memory_mode"] = execution.memory_mode
+        return inject_workflow_result(state, run_id, delivered, on_injected=on_injected)
+    except (OSError, ValueError, RuntimeError):
         return False

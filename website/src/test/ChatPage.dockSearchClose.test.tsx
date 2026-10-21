@@ -16,7 +16,7 @@
  * props) with the find pane open and asserts the find input disappears and the
  * target panel appears.
  *
- * Uses the REAL usePanelState / useDiffPanel / useMessageSearch hooks so the
+ * Uses the REAL useMessageSearch hook so the
  * single-dock precedence + close-on-open wiring is exercised end to end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -56,8 +56,8 @@ vi.mock('../components/DiffPanel', async () => {
 })
 
 // Everything else ChatPage pulls in that is irrelevant to dock/search wiring.
-// NOTE: usePanelState / useDiffPanel / useMessageSearch are intentionally NOT
-// mocked — the test exercises the real hooks. DetailPanel + SearchBar are also
+// NOTE: useMessageSearch is intentionally NOT
+// mocked — the test exercises the real hook. DetailPanel + SearchBar are also
 // real so the find pane and diff pane actually mount/unmount.
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
 // The real message list uses a custom virtualizer (useVirtualChat) driven by
@@ -73,11 +73,14 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         index,
         mounted: true,
         data,
+      farmIsMeasured: () => true,
+      farmRecord: () => true,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(),
+      retainRange: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -117,7 +120,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -135,13 +139,24 @@ Object.defineProperty(window, 'matchMedia', {
     addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
   })),
 })
-globalThis.fetch = vi.fn().mockResolvedValue({
+// The file-read stub. Re-installed in `beforeEach` below as well: the MSW
+// server in integration/setup.ts patches `globalThis.fetch` in `beforeAll`,
+// which runs AFTER this module-level assignment, so without the re-install the
+// read lands on the mock server's 501 catch-all — and a failed read no longer
+// opens a tab (it reports through the pane notice), so the panel never shows.
+const fileReadStub = () => vi.fn().mockResolvedValue({
   ok: true, status: 200,
+  // A real Response always carries headers, and the read path asks this one
+  // whether the file is binary. Using the platform's own Headers keeps the mock
+  // Response-shaped rather than growing a bespoke getter per field read.
+  headers: new Headers(),
   text: () => Promise.resolve('file content'),
   json: () => Promise.resolve({}),
 }) as never
+globalThis.fetch = fileReadStub()
 
-import ChatPage, { virtualKeyFor, turnLeadKey } from '../pages/ChatPage'
+import ChatPage from '../pages/ChatPage'
+import { virtualKeyFor, turnLeadKey } from '../pages/chat/ChatPageMessageContent'
 import type { DisplayItem } from '../pages/chat/types'
 import type { ChatMessage } from '../types'
 
@@ -152,16 +167,20 @@ const ASSISTANT_MSG = {
   meta: { file_changes: [{ path: '/f.txt', status: 'modified' }] },
 }
 
-const renderChatPage = () => {
+const renderChatPage = ({ withWorker = false } = {}) => {
   const slot = { key: 'chat-1', title: 'chat-1', messages: 1, running: false, mode: '', created: '', last_ts: '' }
-  apiMocks.chatSlots = vi.fn().mockResolvedValue([slot])
+  // A subagent slot the active chat spawned makes the Dashboard dock
+  // `relevant` (useCommandCenter scopes more than one slot to this root).
+  const worker = { key: 'worker-1', title: 'worker', messages: 0, running: true, mode: '', created: '', last_ts: '', created_by: 'chat-1' }
+  const slots = withWorker ? [slot, worker] : [slot]
+  apiMocks.chatSlots = vi.fn().mockResolvedValue(slots)
   // On mount ChatPage loads the active slot's detail; return the seeded
   // message so the post-mount reconcile keeps it (an empty list would wipe it).
   apiMocks.chatSlotDetail = vi.fn().mockResolvedValue({ messages: [ASSISTANT_MSG], has_more: false, total: 1 })
   const store = createTestStore({
     dashboard: {
       status: { platform: 'darwin' }, connected: false,
-      slots: [slot], approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
+      slots, approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
       unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -211,6 +230,7 @@ const openFind = () => {
 describe('ChatPage – opening a dock panel closes the find pane', () => {
   beforeEach(() => {
     Object.keys(apiMocks).forEach(k => delete apiMocks[k])
+    globalThis.fetch = fileReadStub()
   })
 
   it('Ctrl+F opens the find pane', async () => {
@@ -254,6 +274,14 @@ describe('ChatPage – opening a dock panel closes the find pane', () => {
       expect(screen.getByTestId('md-panel')).toBeTruthy()
       expect(screen.queryByPlaceholderText(FIND_PLACEHOLDER)).toBeNull()
     })
+  })
+
+  it('draws no status-tile HUD above the composer', async () => {
+    localStorage.clear()
+    renderChatPage({ withWorker: true })
+    // A worker makes a team, which is exactly what used to raise the tiles.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    expect(screen.queryByTestId('command-center-dock')).toBeNull()
   })
 })
 
@@ -305,11 +333,79 @@ describe('virtualKeyFor — #253 stability extended to the virtualizer/HeightCac
 
   it('a turn led by a group inherits the group key (stable across regroup)', () => {
     const msgKey = makeMsgKey()
-    const grp: DisplayItem = { kind: 'group', msgs: [{ role: 'tool', content: '🔧 a', cls: '' }], startIdx: 9 } as never
+    const grp: DisplayItem = { kind: 'group', msgs: [{ role: 'tool', content: '🔧 a', cls: '', ts: 'g1' }], startIdx: 9 } as never
     const asGroup = virtualKeyFor(grp, 9, msgKey)
     const asTurn = virtualKeyFor(turnOf([grp]), 9, msgKey)
     expect(asTurn).toBe(asGroup)
-    expect(asGroup).toBe('grp-9')
+    // Keyed on the FIRST MESSAGE's identity, never the array index.
+    expect(asGroup).toBe('grp-g1')
+  })
+
+  it('a group key is UNCHANGED by a prepend (indices renumber, identity does not)', () => {
+    const msgKey = makeMsgKey()
+    // DISTINCT objects for before/after, carrying equal identity fields — so
+    // this pins "keyed on the first message's ts", and would fail for an
+    // implementation keyed on object identity or a per-object minted id.
+    const mkMsgs = (): ChatMessage[] => [
+      { role: 'tool', content: '🔧 grep', cls: '', ts: 'p1' },
+      { role: 'tool', content: '🔧 cat', cls: '', ts: 'p2' },
+    ]
+    // Before: the group starts at message index 4.
+    const before: DisplayItem = { kind: 'group', msgs: mkMsgs(), startIdx: 4 } as never
+    // After: a history backfill prepends 50 older messages — every index
+    // shifts, and the store rebuild hands React NEW message objects with the
+    // same identities.
+    const after: DisplayItem = { kind: 'group', msgs: mkMsgs(), startIdx: 54 } as never
+    const keyBefore = virtualKeyFor(before, 4, msgKey)
+    const keyAfter = virtualKeyFor(after, 54, msgKey)
+    // Same row identity → HeightCache entry, DOM node, and any group-led
+    // scroll anchor survive the prepend instead of going unfindable.
+    expect(keyAfter).toBe(keyBefore)
+    // And a DIFFERENT group at the old position must not steal the key.
+    const usurper: DisplayItem = {
+      kind: 'group',
+      msgs: [{ role: 'tool', content: '🔧 ls', cls: '', ts: 'q1' }],
+      startIdx: 4,
+    } as never
+    expect(virtualKeyFor(usurper, 4, msgKey)).not.toBe(keyBefore)
+  })
+
+  it('two sibling groups whose leads share a coarse-clock ts get DISTINCT keys (mid tie-break)', () => {
+    const msgKey = makeMsgKey()
+    // The reducer explicitly supports distinct rows stamped in the same OS
+    // tick (see isRedeliveredMessage in transcript.ts under store/chat) — row
+    // identity is meta.mid. The index key this change replaces was unique by
+    // construction; the mid tie-break keeps that property so sibling groups
+    // never alias each other's HeightCache entry or React key.
+    const a: DisplayItem = {
+      kind: 'group',
+      msgs: [{ role: 'tool', content: '🔧 grep', cls: '', ts: 'tick-7', meta: { mid: 'm-1' } }],
+      startIdx: 2,
+    } as never
+    const b: DisplayItem = {
+      kind: 'group',
+      msgs: [{ role: 'tool', content: '🔧 cat', cls: '', ts: 'tick-7', meta: { mid: 'm-2' } }],
+      startIdx: 5,
+    } as never
+    expect(virtualKeyFor(a, 2, msgKey)).not.toBe(virtualKeyFor(b, 5, msgKey))
+    // A locally-minted row without a mid keeps the plain identity key (the
+    // uniqueness it had before), and does not collide with the mid-suffixed form.
+    const local: DisplayItem = {
+      kind: 'group',
+      msgs: [{ role: 'tool', content: '🔧 ls', cls: '', ts: 'tick-7' }],
+      startIdx: 8,
+    } as never
+    const localKey = virtualKeyFor(local, 8, msgKey)
+    expect(localKey).toBe('grp-tick-7')
+    expect(localKey).not.toBe(virtualKeyFor(a, 2, msgKey))
+  })
+
+  it('turnLeadKey is total: an empty group degrades to the index instead of throwing', () => {
+    const msgKey = makeMsgKey()
+    // Unreachable from both producers (they emit only under `if (group.length)`)
+    // but the type allows `[]` and turnLeadKey is a public export.
+    const empty = { kind: 'group', msgs: [], startIdx: 3 } as never
+    expect(turnLeadKey(empty, msgKey)).toBe('grp-idx-3')
   })
 
   it('a ts-less message keys on a stable minted id, NOT the array index', () => {

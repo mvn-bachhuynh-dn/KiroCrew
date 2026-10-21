@@ -41,6 +41,8 @@ sparingly: it is unscoped and silences the whole line.
 from __future__ import annotations
 
 import bisect
+import gc
+import importlib.util
 import math
 import os
 import re
@@ -55,11 +57,18 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Self-test timing budget for the growth-ratio check. It divides two measured
 # durations, so it is only as trustworthy as the smaller one: pair each baseline
 # with its own doubled sample and keep the least noisy RATIO, then refuse to
-# judge one whose baseline is too small to measure. The floor sits above the
-# ~15.625ms granularity Windows reports process CPU time at, so a coarse clock
-# cannot on its own manufacture a regression.
+# judge one whose baseline is too small to measure.
+#
+# The floor is set in TICKS of the coarsest clock this runs under: Windows
+# reports process CPU time in ~15.625ms steps. A baseline of T ticks can read
+# one tick short while its doubled sample reads one tick long, so a perfectly
+# linear scan can report (2T+1)/(T-1) -- 5.0x at T=2 (a 0.031s baseline on a
+# slow runner is exactly two ticks), and still 3.0x at T=4. Only
+# above 4 ticks can quantisation alone not reach the 3.0x bound; 8 ticks
+# (125ms) caps it at 2.43x and leaves the rest of the headroom for real noise.
 _PERF_ATTEMPTS = 5
-_PERF_MIN_BASE_SECS = 0.020
+_PERF_TICK_SECS = 0.015625
+_PERF_MIN_BASE_SECS = 8 * _PERF_TICK_SECS
 
 # Baseline workloads, tried in order until one produces a measurable baseline.
 # A single fixed size cannot serve both ends of the hardware range: 20k costs a
@@ -71,8 +80,9 @@ _PERF_MIN_BASE_SECS = 0.020
 # Escalating is close to free because a REGRESSED scan never reaches it: its
 # baseline is ~25x the linear one, so it clears the floor at the first size and
 # is judged there. Only linear scans -- the fast case -- ever pay for a larger
-# size, and a slow runner clears the floor at 20k and pays nothing at all.
-_PERF_BASE_SIZES = (20_000, 50_000, 120_000)
+# size. The size is chosen by ONE probe scan per size, and only the chosen size
+# pays for every attempt, so escalating costs a probe, not a full measurement.
+_PERF_BASE_SIZES = (20_000, 50_000, 120_000, 300_000)
 
 # ---------------------------------------------------------------------------
 # What counts as a misspelling
@@ -206,7 +216,8 @@ SKIP_DIRS = (
     "website/node_modules/",
     "site/node_modules/",
     "temp-screenshots/",
-    # AGENTS.md excludes _vendor/ from every linter, and it holds native libraries
+    # docs/system-specs/common/code-style.md excludes _vendor/ from every linter,
+    # and it holds native libraries
     # whose suffixes (`.0`, `.dylib`) no extension list will ever fully enumerate.
     "src/kiro_crew/_vendor/",
 )
@@ -217,6 +228,8 @@ SKIP_SUFFIXES = (
     ".jpeg",
     ".gif",
     ".webp",
+    ".tiff",
+    ".bmp",
     ".ico",
     ".icns",
     ".woff",
@@ -224,6 +237,7 @@ SKIP_SUFFIXES = (
     ".ttf",
     ".otf",
     ".mp4",
+    ".webm",
     ".pdf",
     ".zip",
     ".gz",
@@ -244,15 +258,20 @@ SKIP_PATHS = (
 # Generated artifacts. Counted by the whole-tree report, never enforced.
 #
 # The locale catalogs are machine-translated and carry ~85 joined spellings each;
-# `tips_catalog.json` is derived from `src/kiro_crew/docs/*.md`. Both are JSON, so
-# neither offers a line the `brand-ok` comment could sit on, and both re-emit their
-# lines wholesale when regenerated or re-indented — which would fail a PR on text its
-# author neither wrote nor can correct where the error points. Their sources stay
-# enforced (`en.json`, `en.manual.json`, and the docs), so coverage is unchanged and
-# a fix there is what reaches the artifact.
+# `tips_catalog.json` is derived from `src/kiro_crew/docs/*.md`, and
+# `settings-registry.generated.json` from `website/src/pages/settings/**` via
+# `npm run gen:settings`, and `ui-index.generated.json` from the dashboard source
+# and those catalogs via `npm run gen:ui`. All are JSON, so none offers a line the
+# `brand-ok` comment could sit on, and all re-emit their lines wholesale when regenerated or re-indented
+# — which would fail a PR on text its author neither wrote nor can correct where the
+# error points. Their sources stay enforced (`en.json`, `en.manual.json`, the docs,
+# and the settings panels), so coverage is unchanged and a fix there is what reaches
+# the artifact.
 GENERATED_PATHS = (
     re.compile(r"^website/src/i18n/locales/(?!en\.json$|en\.manual\.json$)[\w-]+\.json$"),
     re.compile(r"^src/kiro_crew/data/tips_catalog\.json$"),
+    re.compile(r"^src/kiro_crew/docs/settings-registry\.generated\.json$"),
+    re.compile(r"^src/kiro_crew/docs/ui-index\.generated\.json$"),
 )
 
 
@@ -460,67 +479,58 @@ def tracked_files() -> list[str]:
     return [p for p in git(["ls-files"]).splitlines() if in_scope(p)]
 
 
-def diff_base(base: str) -> str:
-    """The commit to measure against.
+_SCOPE_MODULE = None
 
-    ``merge-base`` is the honest divergence point, but a shallow CI clone fetches
-    the base commit as its own tip with no shared history, so it often has none.
-    The base tip is then the fallback.
+
+def _scope():
+    """The shared diff plumbing (see ``scripts/ratchet_scope.py``).
+
+    Loaded by path, not imported: ``scripts/`` is not a package, so a plain
+    import would resolve only by accident of ``sys.path[0]`` — and not at all
+    when a test loads this gate by path. Shared because the env-base gates
+    (this one, ``check_harness_parity.py``, ``check_focus_cue.py``) and the
+    merge-ref ratchets must agree on what a change added; a private copy per
+    gate is how they would come to disagree. Loaded lazily so the explicit-file
+    and ``--test`` modes, which never touch git, do not require it.
     """
-    try:
-        return git(["merge-base", base, "HEAD"]).strip()
-    except subprocess.CalledProcessError:
-        return base
+    global _SCOPE_MODULE
+    if _SCOPE_MODULE is None:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ratchet_scope.py")
+        spec = importlib.util.spec_from_file_location("ratchet_scope", script)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"cannot load {script}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCOPE_MODULE = module
+    return _SCOPE_MODULE
+
+
+def diff_base(base: str) -> str:
+    """The commit to measure against (see ``ratchet_scope.resolve_base``)."""
+    return _scope().resolve_base(base)
 
 
 def changed_paths(frm: str) -> list[str]:
-    """In-scope paths this change touches.
-
-    ``-z`` is what makes this trustworthy: without it git quotes any path holding
-    a non-ASCII or unusual byte (``"b/docs/\\346\\227\\245.md"``), and a parser
-    reading ``+++ b/`` lines then silently drops that file — a gate that skips a
-    changed file is worse than no gate.
-    """
+    """In-scope paths this change touches (``ratchet_scope.changed_paths_at``)."""
     try:
-        out = git(["diff", "--name-only", "-z", "--diff-filter=d", frm])
+        paths = _scope().changed_paths_at(frm)
     except subprocess.CalledProcessError as exc:
         raise SystemExit(
             f"::error::brand gate: cannot diff against {frm} — the base commit is not "
             f"present. Fetch it before running, or unset BRAND_BASE_REF to report "
             f"whole-tree counts without enforcing.\n{exc.stderr}"
         )
-    return [p for p in out.split("\0") if p and enforced(p)]
+    return [p for p in paths if enforced(p)]
 
 
 def added_lines(frm: str, path: str) -> set[int]:
     """1-based line numbers this change adds to ``path``.
 
-    The diff runs base-to-**working-tree**. CI checks out a clean tree, so that is
-    the same as base-to-``HEAD`` there; locally it means the gate sees edits that
-    are not committed yet, which is the only form in which a local run is useful.
-    A brand-new *untracked* file is the one gap, and it is caught on the commit
-    that tracks it.
-
-    ``--text`` forces hunks even for a path that ``.gitattributes`` marks
-    ``-diff``: git would otherwise report only "Binary files differ", leaving
-    nothing to scan and passing the file silently. ``in_scope`` has already
-    dropped the genuinely binary suffixes.
+    Delegates to ``ratchet_scope.added_lines_at``: base-to-working-tree (a
+    local run sees uncommitted edits), ``--text`` so a ``-diff`` gitattribute
+    cannot hide a file, and a pure deletion contributes nothing.
     """
-    diff = git(["diff", "--unified=0", "--no-color", "--text", frm, "--", path])
-    added: set[int] = set()
-    for raw in diff.splitlines():
-        if not raw.startswith("@@"):
-            continue
-        # `@@ -old,count +new,count @@` — the `+` side is the post-image, and a
-        # missing count means exactly one line. A pure deletion reports `+n,0`,
-        # which correctly contributes nothing.
-        m = re.search(r"\+(\d+)(?:,(\d+))?", raw)
-        if not m:
-            continue
-        start = int(m.group(1))
-        count = int(m.group(2)) if m.group(2) is not None else 1
-        added.update(range(start, start + count))
-    return added
+    return _scope().added_lines_at(frm, path)
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +565,27 @@ PROBES: tuple[tuple[str, str, bool], ...] = (
     ("data-dir", "state lives under ~/.kiro/crew/workspace", False),
     ("suppressed", "correct = 'KiroCrew'  # brand-ok: dictionary fixture", False),
 )
+
+
+def _timed_scan(count: int) -> tuple[float, int]:
+    """CPU time and hit count for one line of *count* brand names.
+
+    The collector is paused for the timed region: the doubled line allocates
+    twice the objects, so a collection lands on it more often than on the
+    baseline and inflates the ratio for reasons that have nothing to do with
+    the scan.
+    """
+    line = "!KiroCrew" * count
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        began = time.process_time()
+        hits = len(list(scan_line("big.md", 1, line, in_code=False)))
+        return time.process_time() - began, hits
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def self_test() -> int:
@@ -663,9 +694,7 @@ def self_test() -> int:
         found: tuple[int, int] = (0, 0)
 
         def once(count: int) -> tuple[float, int]:
-            began = time.process_time()
-            hits = len(list(scan_line("big.md", 1, "!KiroCrew" * count, in_code=False)))
-            return time.process_time() - began, hits
+            return _timed_scan(count)
 
         for _ in range(_PERF_ATTEMPTS):
             base_time, base_hits = once(base)
@@ -678,13 +707,19 @@ def self_test() -> int:
                 best, best_pair = candidate, (base_time, doubled_time)
         return (0.0 if best is math.inf else best), best_pair[0], found[0], found[1]
 
-    # Grow the workload until the baseline is big enough to divide. `ratio_of`
-    # is only called again when the previous size came in under the floor, so
-    # the common cases cost exactly one call.
+    # One probe scan per size picks where to start; a size whose MEASURED baseline
+    # still lands under the floor (it can read a tick below its probe) moves on
+    # to the next size, so only the largest size can ever go unjudged. A
+    # regressed scan clears the floor at the first size.
+    start = len(_PERF_BASE_SIZES) - 1
+    for i, size in enumerate(_PERF_BASE_SIZES):
+        if _timed_scan(size)[0] >= _PERF_MIN_BASE_SECS:
+            start = i
+            break
     base_count = 0
     ratio = base_time = 0.0
     base_found = doubled_found = 0
-    for base_count in _PERF_BASE_SIZES:
+    for base_count in _PERF_BASE_SIZES[start:]:
         ratio, base_time, base_found, doubled_found = ratio_of(base_count)
         if base_time >= _PERF_MIN_BASE_SECS:
             break

@@ -21,9 +21,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
+from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew import webhooks
 from kiro_crew.dashboard.handlers import hooks as H
+
+
+def _as_owner(req):
+    """Give *req* the owner claims the mint route's gate reads. Returns *req*.
+
+    ``api_webhook_token_create`` is owner-gated
+    (``handlers._shared.require_owner_dashboard_request``), and the predicate
+    reads ``state.owner_id`` plus the claims the token-auth middleware publishes.
+    ``owner_id == ""`` with the signed local bootstrap subject ``local-app`` is
+    the standalone-local shape, the same one
+    ``test/dashboard_owner_helpers.NoConfiguredOwner`` encodes for the fixtures
+    that go through a ``TestClient``. The gate's own denial behaviour is covered
+    in ``test_webhooks_api.TestTokenMintIsOwnerOnly``; these tests are about
+    signing, so they present an owner and stay on their own subject.
+    """
+    state = MagicMock()
+    state.owner_id = ""
+    req.app["state"] = state
+    req["user"] = "local-app"
+    req["app"] = ""
+    return req
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +77,7 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(H, "_HOOK_STORE_PATH", Path(tmp_path) / "hooks.json")
     monkeypatch.setattr(H, "_sel", lambda: MagicMock())
     monkeypatch.setattr(H, "_legacy_hook_token", lambda: "")
+    monkeypatch.setattr(H, "_installed_agent_names", lambda: {"kirocrew"})
     webhooks._reset_auth_throttle()
     webhooks._reset_signature_replay()
     yield Path(tmp_path)
@@ -97,6 +120,21 @@ def _hook_request(
     # request.json() instead of the raw bytes it verified will show up here.
     req.json = AsyncMock(return_value={"message": "PARSED-FROM-JSON-NOT-RAW"})
     return req
+
+
+def _json_post(path: str, body: dict):
+    """A dashboard POST carrying *body* as a real JSON stream.
+
+    The token routes read through ``read_bounded_json``, which checks the
+    declared media type and drains ``request.content``.
+    """
+    raw = json.dumps(body).encode("utf-8")
+    return make_mocked_request(
+        "POST",
+        path,
+        headers={"Content-Type": "application/json", "Content-Length": str(len(raw))},
+        payload=BodyStreamPayload(raw),
+    )
 
 
 async def _payload(resp):
@@ -622,9 +660,7 @@ class TestReadEndpointNeverLeaksTheSecret:
 
     @pytest.mark.asyncio
     async def test_create_returns_the_secret_once_next_to_the_token(self, wired):
-        req = make_mocked_request("POST", "/api/webhooks/tokens")
-        req.app["state"] = MagicMock()
-        req.json = AsyncMock(return_value={"label": "Review Bot"})
+        req = _as_owner(_json_post("/api/webhooks/tokens", {"label": "Review Bot", "agent": "kirocrew"}))
         resp = await H.api_webhook_token_create(req)
         assert resp.status == 201
         data = json.loads(resp.body.decode("utf-8"))
@@ -641,11 +677,11 @@ class TestReadEndpointNeverLeaksTheSecret:
 
     @pytest.mark.asyncio
     async def test_create_can_opt_out_of_signing(self, wired):
-        req = make_mocked_request("POST", "/api/webhooks/tokens")
-        req.app["state"] = MagicMock()
-        req.json = AsyncMock(
-            return_value={"label": "CI runner", "require_signature": False}
-        )
+        req = _as_owner(_json_post("/api/webhooks/tokens", {
+                "label": "CI runner",
+                "require_signature": False,
+                "agent": "kirocrew",
+            }))
         resp = await H.api_webhook_token_create(req)
         assert resp.status == 201
         data = json.loads(resp.body.decode("utf-8"))
@@ -654,11 +690,7 @@ class TestReadEndpointNeverLeaksTheSecret:
 
     @pytest.mark.asyncio
     async def test_create_rejects_non_boolean_require_signature(self, wired):
-        req = make_mocked_request("POST", "/api/webhooks/tokens")
-        req.app["state"] = MagicMock()
-        req.json = AsyncMock(
-            return_value={"label": "CI runner", "require_signature": "false"}
-        )
+        req = _as_owner(_json_post("/api/webhooks/tokens", {"label": "CI runner", "require_signature": "false"}))
         resp = await H.api_webhook_token_create(req)
         assert resp.status == 400
         assert "boolean" in json.loads(resp.body.decode("utf-8"))["error"]

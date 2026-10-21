@@ -106,6 +106,8 @@ def _make_slot():
     slot.key = "test-slot"
     slot.agent = ""
     slot.task = None
+    slot.running = False
+    slot.turn_running = False
     slot.event = asyncio.Event()
     slot._pending = []
 
@@ -117,6 +119,42 @@ def _make_slot():
 
     slot.drain = drain
     return slot
+
+
+@pytest.mark.asyncio
+async def test_named_slot_refuses_while_stage_controller_runs():
+    """The controller keeps a slot busy between its stage-turn tasks."""
+    slot = _make_slot()
+    slot.task = None
+    slot.running = True
+    slot.turn_running = True
+    state = _make_state(slot)
+    request = _make_request(
+        {
+            "id": "test-slot",
+            "model": "vanellope",
+            "messages": [{"role": "user", "content": "do not interleave"}],
+            "stream": False,
+        },
+        state,
+    )
+
+    async def fake_run_chat(_state, _slot, _prompt, **_kwargs):
+        slot._pending.append({"role": "assistant", "content": "interleaved"})
+        slot._pending.append({"cls": "done"})
+        slot.event.set()
+
+    with patch(
+        "kiro_crew.dashboard.openai_compat._run_chat", side_effect=fake_run_chat
+    ) as run_chat:
+        response = await api_completions(request)
+
+    assert response.status == 409
+    response_body = json.loads(response.body)
+    assert response_body["error"]["type"] == "slot_busy"
+    assert response_body["error"]["code"] == "slot_busy"
+    assert response_body["code"] == "slot_busy"
+    run_chat.assert_not_called()
 
 
 def _make_state(slot):
@@ -186,7 +224,10 @@ class TestApiCompletionsBlocking:
         request = _make_request(body, state)
 
         # Simulate the assistant responding then done
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
+            assert _kwargs["_directive_user_origin"] is True
+            # No app claim, so no actor is named and the turn reads as the person's.
+            assert _kwargs["_turn_actor"] == ""
             slot._pending.append({"role": "assistant", "content": "hey there"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -235,7 +276,7 @@ class TestSlotTargeting:
         }
         request = _make_request(body, state)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -259,7 +300,7 @@ class TestSlotTargeting:
         }
         request = _make_request(body, state)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -285,7 +326,7 @@ class TestAgentMapping:
         }
         request = _make_request(body, state)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "done"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -328,7 +369,7 @@ class TestStreamingResponse:
         mock_resp.content_type = None
         mock_resp.headers = {}
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "1 2 3"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -364,7 +405,7 @@ class TestStreamingResponse:
         mock_resp.content_type = None
         mock_resp.headers = {}
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "system", "content": "ignored"})
             slot._pending.append({"role": "assistant", "content": ""})  # empty, skipped
             slot._pending.append({"role": "assistant", "content": "hello"})
@@ -398,7 +439,7 @@ class TestStreamingResponse:
         mock_resp.content_type = None
         mock_resp.headers = {}
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -430,7 +471,7 @@ class TestStreamingResponse:
         mock_resp.content_type = None
         mock_resp.headers = {}
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -461,7 +502,7 @@ class TestStreamingResponse:
         mock_resp.content_type = None
         mock_resp.headers = {}
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "x" * 300})
             slot.event.set()
 
@@ -508,7 +549,7 @@ class TestBlockingEdgeCases:
         }
         request = _make_request(body, state)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "tool", "content": "tool output"})
             slot._pending.append({"role": "assistant", "content": "result"})
             slot._pending.append({"cls": "done"})
@@ -575,7 +616,7 @@ class TestRemainingCoverage:
 
         mock_resp.write = AsyncMock(side_effect=fake_write)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             # Don't set event immediately — let the wait timeout once
             pass
 
@@ -618,7 +659,7 @@ class TestRemainingCoverage:
         request = _make_request(body, state)
         call_count = [0]
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             pass  # Don't deliver immediately
 
         original_wait_for = asyncio.wait_for
@@ -663,7 +704,7 @@ class TestRemainingCoverage:
         mock_resp.content_type = None
         mock_resp.headers = {}
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "x" * 300})
             slot.event.set()
 
@@ -732,7 +773,14 @@ class TestAppKitOwnership:
         }
         request = _make_request(body, state, app="app-A")
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
+            assert _kwargs["_directive_user_origin"] is False
+            # And the actor SAYS so. Without this the turn reaches the runner as
+            # `_crew_log_actor == "user"` -- the resolver's fallback -- and every
+            # consumer that asks "is a human watching this turn" is told yes,
+            # including the model-routing gate, which then spends the owner's
+            # tier map on a turn nobody typed.
+            assert _kwargs["_turn_actor"] == "app"
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -756,7 +804,7 @@ class TestAppKitOwnership:
         }
         request = _make_request(body, state, app="")
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -851,7 +899,7 @@ class TestUnsupportedRoles:
         }
         request = _make_request(body, state)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "ok"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -882,7 +930,7 @@ class TestAgentMismatchFix:
         }
         request = _make_request(body, state)
 
-        async def fake_run_chat(s, sl, prompt):
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
             slot._pending.append({"role": "assistant", "content": "continued"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -909,6 +957,36 @@ class TestAgentMismatchFix:
         resp = await api_completions(request)
         assert resp.status == 409
 
+    async def test_a_remote_bound_slot_is_refused_before_any_mutation(self):
+        """A remote-bound slot targeted by id must 409, not hang the collector.
+
+        The turn runs on a peer and streams over the dashboard WebSocket; this
+        endpoint's collector reads only local rows, so reaching the local dispatch
+        chokepoint would append the prompt, emit a WS-only ``chat_done``, and leave
+        this HTTP caller waiting forever on a turn the peer never received.
+        The refusal must fire BEFORE the prompt is appended.
+        """
+        slot = _make_slot()
+        slot.agent = "vanellope"
+        slot.executor = "remote"  # bound to a connected crew
+        state = _make_state(slot)
+
+        body = {
+            "id": "test-slot",
+            "model": "vanellope",  # matches slot.agent, so this is not a mismatch 409
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        }
+        request = _make_request(body, state)
+
+        resp = await api_completions(request)
+
+        assert resp.status == 409
+        assert json.loads(resp.body)["code"] == "relay_archive_read_only"
+        # No unsent turn recorded and no dispatch: refused ahead of the mutation.
+        slot.append.assert_not_called()
+        assert slot.task is None
+
     async def test_null_model_returns_400(self):
         """model=null (None in JSON) returns 400."""
         slot = _make_slot()
@@ -923,3 +1001,50 @@ class TestAgentMismatchFix:
 
         resp = await api_completions(request)
         assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_a_stream_write_the_client_never_drains_aborts_the_connection(monkeypatch):
+    slot = _make_slot()
+    state = _make_state(slot)
+    body = {
+        "model": "vanellope",
+        "messages": [{"role": "user", "content": "count"}],
+        "stream": True,
+    }
+    request = _make_request(body, state)
+    request.transport = MagicMock()
+    never_read = asyncio.Event()  # the client never takes the bytes
+
+    async def parked_write(data):
+        await asyncio.wait_for(never_read.wait(), timeout=30)
+
+    mock_resp = MagicMock()
+    mock_resp.prepare = AsyncMock()
+    mock_resp.write = AsyncMock(side_effect=parked_write)
+    mock_resp.content_type = None
+    mock_resp.headers = {}
+
+    async def fake_run_chat(s, sl, prompt, **_kwargs):
+        slot._pending.append({"role": "assistant", "content": "1 2 3"})
+        slot._pending.append({"cls": "done"})
+        slot.event.set()
+
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.chat_handlers._SSE_WRITE_DEADLINE_SECS", 0.1, raising=False
+    )
+    with (
+        patch("kiro_crew.dashboard.openai_compat._run_chat", side_effect=fake_run_chat),
+        patch("kiro_crew.dashboard.openai_compat.web.StreamResponse", return_value=mock_resp),
+    ):
+        task = asyncio.ensure_future(api_completions(request))
+        finished, _ = await asyncio.wait({task}, timeout=10)
+        if not finished:
+            task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=30)
+
+    assert finished, (
+        "a stream write the client never drains keeps the request open after 10 s; "
+        "the connection is never aborted"
+    )
+    request.transport.abort.assert_called_once_with()

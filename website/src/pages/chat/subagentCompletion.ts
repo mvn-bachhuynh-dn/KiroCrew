@@ -9,14 +9,30 @@
  * the batch digest that replaces N per-agent turns once a wave exceeds the
  * digest chunk size.
  *
+ * The header facts a card needs — outcome, tallies, chunk index, agent id — are
+ * stamped as structured fields on the message's `meta.subagentCompletion` at
+ * composition time (gateway._subagent_done, subagent.py). This module reads
+ * those first (`fromMeta`); the header regexes below are a LEGACY-SCROLLBACK
+ * fallback for rows persisted before the meta was stamped. That inversion is
+ * the point of #1792: a reword of the gateway's prose can no longer silently
+ * break card rendering, because no live consumer parses the prose — the regexes
+ * only run when the structured meta is absent.
+ *
  * Kept separate from SubagentCompletionCard so the transcript grouping pass can
  * ask "does this render as a card?" without pulling a React component (and its
  * markdown renderer) into a pure module.
  */
 import type { ChatMessage } from '../../types'
+import { normalizeModelKey } from '../../lib/model'
+import { canonicalKey } from '../../providers/modelRegistry'
 
 const SINGLE_PREFIX = '[Subagent completion event]'
 const BATCH_PREFIX = '[Subagent batch completion event]'
+
+/** Key under `message.meta` where the gateway stamps the structured header
+ *  facts. Mirrors `SUBAGENT_COMPLETION_META_KEY` in src/kiro_crew/constants.py —
+ *  the two names are one wire contract and must stay in lockstep. */
+const META_KEY = 'subagentCompletion'
 
 /** True when `content` opens with either sub-agent completion marker. Prefix-only:
  *  callers here classify a QUEUED entry, where nothing is being rendered yet and
@@ -26,22 +42,23 @@ export function hasSubagentCompletionPrefix(content: string): boolean {
 }
 
 /**
- * Per-agent header. Five shapes reach the transcript, and the glyph is the only
+ * Per-agent header. Six shapes reach the transcript, and the glyph is the only
  * element common to all of them:
  *
  *     Agent `53e3e5eb` (kirocrew) completed ✅
  *     Agent `53e3e5eb` ❌
- *     Agent `53e3e5eb` ⚠️ orphaned by gateway restart
+ *     Agent `53e3e5eb` ✅ finished before gateway restart
+ *     Agent `53e3e5eb` ⚠️ cut off mid-turn by gateway restart
  *     Agent `53e3e5eb` ❌ lost to gateway restart
  *     Agent `53e3e5eb` ❌ delivery timed out
  *
- * The last three are composed by the restart-recovery and delivery-timeout paths
+ * The last four are composed by the restart-recovery and delivery-timeout paths
  * in subagent.py, which put the glyph MID-line with an explanation after it — so
  * the glyph cannot be anchored to end-of-line. Everything after the id is
  * captured and scanned for the first glyph instead: the glyph decides the
  * outcome (language-independent, and it does not shift when the backend rewords
  * a status), and any words beside it are carried into the payload rather than
- * dropped, since on those three shapes they are the only explanation there is.
+ * dropped, since on those four shapes they are the only explanation there is.
  */
 const AGENT_HEADER_RE = /^Agent `([^`\n]+)`(?: \(([^)\n]*)\))?([^\n]*)$/m
 const OUTCOME_GLYPH_RE = /[✅❌⏹⚠]/
@@ -61,10 +78,104 @@ const OUTCOME_BY_GLYPH: Record<string, SubagentOutcome> = {
   '✅': 'ok',
   '❌': 'failed',
   '⏹': 'stopped',
-  // A restart orphan: the run did not finish, but its result WAS written to
+  // A run a gateway restart cut off mid-turn: a fragment of its output is on
   // disk, so this is neither a success nor a plain failure.
   '⚠': 'interrupted',
 }
+
+/**
+ * True only when a model was BOTH requested and served, both ids are known, and
+ * they name genuinely different models. The ``"auto"`` sentinel (no explicit
+ * pin) and an unknown ("") id never count as a downgrade — a downgrade is a
+ * broken PROMISE, and neither made one.
+ *
+ * "Same model?" is decided by the shared ``normalizeModelKey`` (``lib/model.ts``,
+ * mirroring the backend ``_normalize_model_key``), which routes both ids through
+ * the canonical registry (#5339): a canonical key, an alias, or a
+ * provider-prefixed id all fold to one key, so a config pin `claude-opus-4.8`
+ * and a served `global.anthropic.claude-opus-4-8[1m]` are equal, while distinct
+ * 1M/200K entries stay distinct. When both ids are in the registry, `reqKey ===
+ * resKey` is the whole answer.
+ *
+ * UNREGISTERED IDS (GPT/DeepSeek/Qwen, future models) are absent from the
+ * Anthropic-only registry, so `normalizeModelKey` leaves them at the lossless
+ * string fold — which does NOT peel a routing prefix or a version tail. For that
+ * case only, we keep the interim heuristic: strip a KNOWN leading routing prefix
+ * and fold a trailing version tail to MEET a tail-less side, then treat a whole
+ * token-suffix match as INCONCLUSIVE (no amber) — a served id under an
+ * unrecognized partition (`newvendor.gpt-…`) is not evidence of a different
+ * model, and a false amber on an honored pin trains users to ignore the signal
+ * (#5394). This heuristic is skipped when either side resolved through the
+ * registry: there the canonical fold is authoritative, so a registered pin
+ * served an unregistered id (or vice versa) is a genuine difference and flags.
+ */
+export function isModelDowngrade(requestedModel: string, resolvedModel: string): boolean {
+  const req = requestedModel.trim()
+  const res = resolvedModel.trim()
+  if (!req || !res) return false
+  const reqKey = normalizeModelKey(req)
+  // `normalizeModelKey` folds `auto`/`default` to `"auto"` — no pin, so nothing
+  // to downgrade from.
+  if (reqKey === 'auto') return false
+  const resKey = normalizeModelKey(res)
+  if (reqKey === resKey) return false
+  // The registry fold is authoritative when it recognizes BOTH sides: two
+  // different canonical keys name genuinely different models (a real 1M/200K or
+  // kiro-distinct downgrade). When only ONE side resolves, comparing the
+  // registry canonical key against the other side's raw string fold would mix
+  // normal forms and can never match (e.g. pin `opus-4.8-1m` vs served
+  // `us-anthropic-claude-opus-4-8-v1:0`), turning an honored version-suffixed pin
+  // into a FALSE downgrade amber (GPT review on #6280). So the registry decides
+  // ONLY the both-registered case; otherwise fall through to the conservative
+  // heuristic, which operates on the RAW string folds of both sides (one normal
+  // form) — a missed downgrade is safer than a false one (#5394).
+  const reqCanon = canonicalKey(req)
+  const resCanon = canonicalKey(res)
+  if (reqCanon !== null && resCanon !== null) return reqCanon !== resCanon
+  // Raw string fold (lowercase, `.`->`-`), NOT the registry-canonical key, so
+  // both sides share one normal form for the prefix/version-tail comparison.
+  const rawFold = (s: string): string => s.toLowerCase().replace(/\./g, '-')
+  const pReq = stripKnownRoutingPrefix(rawFold(req))
+  const pRes = stripKnownRoutingPrefix(rawFold(res))
+  // A version/date tail is folded only to MEET a side that has none — the
+  // canonical-pin-vs-bare-alias shape. When BOTH sides carry a tail the tails
+  // are kept and must agree: dated snapshot ids are first-class pins, and
+  // stripping both tails would silently equate two different snapshots.
+  const reqTail = VERSION_TAIL_RE.test(pReq)
+  const resTail = VERSION_TAIL_RE.test(pRes)
+  const bareReq = reqTail && !resTail ? pReq.replace(VERSION_TAIL_RE, '') : pReq
+  const bareRes = resTail && !reqTail ? pRes.replace(VERSION_TAIL_RE, '') : pRes
+  // A fold that consumed the whole id left nothing to compare — inconclusive.
+  if (!bareReq || !bareRes) return false
+  if (bareReq === bareRes) return false
+  // One bare id is the token-suffix of the other: an unstripped routing prefix
+  // (unknown partition/provider), not a demonstrably different model.
+  if (isTokenSuffix(bareReq, bareRes)) return false
+  return true
+}
+
+/** Trailing version/revision tail: `-v1:0`, `:0`, or a date like `-20250101`.
+ *  No `g` flag — `$`-anchored, and a stateful `lastIndex` would poison
+ *  `.test()` across calls. */
+const VERSION_TAIL_RE = /(?::\d+|-v\d+(?::\d+)?|-\d{6,})$/
+
+/** Drop a KNOWN leading provider/partition prefix from a normalized model key.
+ *  Leading: `us-`/`eu-`/… region, `anthropic-`/`openai-`/`bedrock-`/`global-`. */
+function stripKnownRoutingPrefix(key: string): string {
+  return key.replace(/^(?:[a-z]{2}-)?(?:anthropic-|openai-|bedrock-|global-)+/, '')
+}
+
+/** True when the shorter of the two ids names the WHOLE tail of the longer one
+ *  at a `-` token boundary — the shape an unrecognized routing prefix leaves
+ *  behind (checked by length, so it is inconclusive in BOTH directions: an
+ *  unknown prefix on the served id or on the pin). Anchored on the boundary so
+ *  a version-family extension (`claude-opus-4` vs `claude-opus-4-1`) never
+ *  matches: the longer id there ends in `-1`, not in `-claude-opus-4`. */
+function isTokenSuffix(a: string, b: string): boolean {
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a]
+  return long.endsWith('-' + short)
+}
+
 
 export interface ParsedSingleCompletion {
   kind: 'single'
@@ -73,6 +184,13 @@ export interface ParsedSingleCompletion {
   agentName: string
   outcome: SubagentOutcome
   task: string
+  /** Model the spawn requested (pinned), '' when none was pinned. Mirrors the
+   *  backend `requestedModel` meta key (#3582). */
+  requestedModel: string
+  /** Model the session actually served, '' when unknown/inconclusive. Mirrors
+   *  the backend `resolvedModel` meta key; the card shows this and flags a
+   *  downgrade when it differs from `requestedModel`. */
+  resolvedModel: string
   /** Everything after the header block — the agent's own output. */
   body: string
 }
@@ -119,13 +237,13 @@ function splitHeadBody(content: string): { head: string; body: string } {
  * restart-recovery and delivery-timeout paths in subagent.py do NOT — they run the
  * `Task:` line straight into the payload:
  *
- *     Agent `53e3e5eb` ⚠️ orphaned by gateway restart
+ *     Agent `53e3e5eb` ✅ finished before gateway restart
  *     Task: …
  *     Result saved at: `/…/result.txt`
  *     Use the read tool to retrieve it.
  *
  * Anchoring only on the blank line therefore threw away exactly the lines those
- * three shapes exist to deliver — the location of an orphaned result, and whether
+ * four shapes exist to deliver — the location of an orphaned result, and whether
  * a result was captured at all. So when no blank line is present, the boundary is
  * the END OF THE HEADER instead: the marker line, the `Agent …` line, and the
  * optional `Task:` line. The blank-line split stays primary, because the ordinary
@@ -142,9 +260,101 @@ function splitAgentHeadBody(content: string): { head: string; body: string } {
   return { head: lines.slice(0, end).join('\n'), body: lines.slice(end).join('\n').trim() }
 }
 
-/** Parse a completion event, or null when the header does not match the
- *  expected shape (the caller then falls back to normal rendering). */
-export function parseSubagentCompletion(content: string): ParsedSubagentCompletion | null {
+const OUTCOMES: ReadonlySet<string> = new Set<SubagentOutcome>(['ok', 'failed', 'stopped', 'interrupted'])
+const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+const isStr = (v: unknown): v is string => typeof v === 'string'
+
+/**
+ * Reconstruct a parsed completion from the structured `meta.subagentCompletion`
+ * the gateway stamps at composition time, or null when the meta is absent or
+ * malformed (the caller then falls back to the header regexes).
+ *
+ * Only the fragile part — the header FACTS (outcome, tallies, indices, ids) —
+ * comes from meta. The `body` still comes from the same structural blank-line
+ * split the regex path uses, because that boundary is not prose: it is where
+ * the gateway joins its machine-facing header block to the payload, and reusing
+ * it keeps orphan/timeout result-path lines intact without re-parsing them.
+ *
+ * Every field is type-checked; a single wrong type collapses the whole parse to
+ * null rather than rendering a card with a NaN tally or an undefined outcome. A
+ * tampered or version-skewed meta therefore degrades to the legacy prose path,
+ * never to a broken card.
+ */
+function fromMeta(content: string, meta: Record<string, unknown> | undefined): ParsedSubagentCompletion | null {
+  const raw = meta?.[META_KEY]
+  if (!raw || typeof raw !== 'object') return null
+  const d = raw as Record<string, unknown>
+
+  if (d.kind === 'single' && content.startsWith(SINGLE_PREFIX)) {
+    if (!isStr(d.agentId) || !d.agentId) return null
+    if (!isStr(d.outcome) || !OUTCOMES.has(d.outcome)) return null
+    const { body } = splitAgentHeadBody(content)
+    // Words beside the glyph (orphan/timeout explanation) live in meta.note; on
+    // the ordinary path it is empty. Same redundant-status guard as the regex
+    // path so a status word the chip already renders is not repeated in-body.
+    const note = isStr(d.note) ? d.note.trim() : ''
+    const keptNote = note && !REDUNDANT_STATUS_RE.test(note) ? note : ''
+    return {
+      kind: 'single',
+      agentId: d.agentId,
+      agentName: isStr(d.agentName) ? d.agentName : '',
+      outcome: d.outcome as SubagentOutcome,
+      task: isStr(d.task) ? d.task.trim() : '',
+      requestedModel: isStr(d.requestedModel) ? d.requestedModel : '',
+      resolvedModel: isStr(d.resolvedModel) ? d.resolvedModel : '',
+      body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
+    }
+  }
+
+  if (d.kind === 'batch' && content.startsWith(BATCH_PREFIX)) {
+    if (!isInt(d.chunk) || !isInt(d.chunks) || !isInt(d.total)) return null
+    if (typeof d.final !== 'boolean') return null
+    const { body } = splitHeadBody(content)
+    if (d.final) {
+      if (!isInt(d.ok) || !isInt(d.failed) || !isInt(d.stopped)) return null
+      return {
+        kind: 'batch',
+        chunk: d.chunk,
+        chunks: d.chunks,
+        final: true,
+        ok: d.ok,
+        failed: d.failed,
+        stopped: d.stopped,
+        total: d.total,
+        delivered: d.total,
+        running: 0,
+        body,
+      }
+    }
+    if (!isInt(d.delivered) || !isInt(d.running)) return null
+    return {
+      kind: 'batch',
+      chunk: d.chunk,
+      chunks: d.chunks,
+      final: false,
+      ok: 0,
+      failed: 0,
+      stopped: 0,
+      total: d.total,
+      delivered: d.delivered,
+      running: d.running,
+      body,
+    }
+  }
+
+  return null
+}
+
+/** Parse a completion event, or null when neither the structured meta nor the
+ *  header matches the expected shape (the caller then falls back to normal
+ *  rendering). `meta` is read FIRST; the regexes below are a legacy fallback for
+ *  rows persisted before the gateway stamped the structured fields. */
+export function parseSubagentCompletion(
+  content: string,
+  meta?: Record<string, unknown>,
+): ParsedSubagentCompletion | null {
+  const viaMeta = fromMeta(content, meta)
+  if (viaMeta) return viaMeta
   if (content.startsWith(BATCH_PREFIX)) {
     const { head, body } = splitHeadBody(content)
     const wave = WAVE_RE.exec(head)
@@ -203,6 +413,9 @@ export function parseSubagentCompletion(content: string): ParsedSubagentCompleti
     agentName: m[2] || '',
     outcome: OUTCOME_BY_GLYPH[glyph[0]] || 'ok',
     task: (task?.[1] || '').trim(),
+    // Legacy scrollback prose never carried a model; the meta path supplies it.
+    requestedModel: '',
+    resolvedModel: '',
     body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
   }
 }
@@ -217,12 +430,15 @@ const parseCache = new WeakMap<
   { content: string; parsed: ParsedSubagentCompletion | null }
 >()
 
-/** Cached `parseSubagentCompletion` for a message. */
+/** Cached `parseSubagentCompletion` for a message. Reads the structured
+ *  `message.meta` first (see `fromMeta`) and falls back to the header regexes.
+ *  Cache identity is the content string: a message's `meta` is set once at
+ *  append and never mutated in place, so it does not need to key the cache. */
 export function parseSubagentCompletionMessage(message: ChatMessage): ParsedSubagentCompletion | null {
   const content = message.content || ''
   const cached = parseCache.get(message)
   if (cached && cached.content === content) return cached.parsed
-  const parsed = parseSubagentCompletion(content)
+  const parsed = parseSubagentCompletion(content, message.meta)
   parseCache.set(message, { content, parsed })
   return parsed
 }

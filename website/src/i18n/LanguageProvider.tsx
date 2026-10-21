@@ -109,6 +109,8 @@ export interface LanguageContextValue {
    * reconciles it on its own. Showing the failure is what makes that recoverable.
    */
   syncFailed: boolean
+  /** True when the selected catalog did not load and the previous language remains active. */
+  catalogFailed: boolean
 }
 
 const LanguageContext = createContext<LanguageContextValue | null>(null)
@@ -216,11 +218,20 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
     return () => { i18next.off('languageChanged', onChanged) }
   }, [active])
 
-  // Apply to i18next + <html lang>. Runs on mount too, so a server-provided or
-  // browser-detected language takes effect without a second render pass.
+  const [catalogFailed, setCatalogFailed] = useState(false)
+
+  // Apply to i18next + <html lang>. Runs on mount too, so a catalog that failed
+  // during the bounded boot wait is retried after English renders. The result is
+  // retained for the picker: its selected choice must not imply that the switch
+  // happened when the previous language is still on screen.
   useEffect(() => {
-    void changeLanguage(resolved)
-    document.documentElement.lang = resolved
+    let current = true
+    void changeLanguage(resolved).then((switched) => {
+      if (!current) return
+      setCatalogFailed(!switched)
+      document.documentElement.lang = i18next.language || resolved
+    })
+    return () => { current = false }
   }, [resolved])
 
   const [syncFailed, setSyncFailed] = useState(false)
@@ -260,10 +271,13 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // Cross-tab sync: switching language in one tab updates the others without a
-  // reload. Same StorageEvent pattern as useUIMode.
+  // reload. A storage event represents an explicit choice in another tab, so it
+  // must also outrank any server value that was already in flight at boot.
+  // Same StorageEvent pattern as useUIMode.
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
       if (e.key !== LANG_STORAGE_KEY) return
+      userChose.current = true
       setLanguageState(e.newValue ?? AUTO_LANGUAGE)
     }
     window.addEventListener('storage', onStorage)
@@ -292,7 +306,15 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
   )
 
   return (
-    <LanguageContext.Provider value={{ language, resolved, detected, setLanguage, syncFailed }}>
+    // The value object is DELIBERATELY rebuilt every render — do not wrap it in
+    // useMemo([language, resolved, …]). The post-swap repaint of memoized
+    // useLanguage() consumers rides on this identity changing when `setActive`
+    // re-renders the provider AFTER the async catalog swap (none of the would-be
+    // deps change on that render, so memoizing would freeze the identity and
+    // leave memo() consumers rendering the previous catalog).
+    // MemoI18nSubscriptionRatchet.test.ts's format branch counts a useLanguage()
+    // read as a valid subscription on exactly this guarantee.
+    <LanguageContext.Provider value={{ language, resolved, detected, setLanguage, syncFailed, catalogFailed }}>
       {refreshed}
     </LanguageContext.Provider>
   )
@@ -315,5 +337,6 @@ export function useLanguage(): LanguageContextValue {
     detected: resolveLanguage(AUTO_LANGUAGE),
     setLanguage: () => {},
     syncFailed: false,
+    catalogFailed: false,
   }
 }

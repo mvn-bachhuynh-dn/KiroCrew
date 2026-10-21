@@ -4,64 +4,255 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
+import importlib as _importlib
 import logging
 import os
 import re
+import sys as _sys
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from kiro_crew.loop_lock import LoopBoundLock
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider  # noqa: F811
 
+    # ``sessions_parts.restart`` annotates with LLMProvider and reads it from here: this
+    # file keeps the family's one provider-layer import, the edge the agent-sdk baseline counts.
+    _RESTART_PROVIDER_TYPE = LLMProvider
+    # What the mirror at the bottom of this module serves, for type checkers and IDEs:
+    # every name an owner defines, then every project name an owner imports.
+    from kiro_crew.dashboard.handlers.sessions_parts.usage_scrape import (  # noqa: F401
+        _ANSI_ESCAPE_RE,
+        _BONUS_COLON_RE,
+        _BONUS_DASH_RE,
+        _MAX_BONUS_CREDITS,
+        _MAX_BONUS_DAYS_LEFT,
+        _MAX_BONUS_GRANTS,
+        _MAX_BONUS_NAME_CHARS,
+        _WHOAMI_UNPROVEN,
+        USAGE_SCRAPE_ENGINE_PIN_MIN_VERSION,
+        _safe_float,
+        _safe_int,
+        _usage_scrape_argv,
+        _wrap_argv_at_configured_tier,
+        _wrap_argv_whoami,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.app_scope import (  # noqa: F401
+        _NOT_TRANSCRIPT_OWNER,
+        _STATE_APPROVALS_NOT_APP_VISIBLE,
+        _app_bulk_history_refusal,
+        _app_may_claim_transcript,
+        _app_not_found,
+        _app_owned_messages,
+        _app_owned_sessions,
+        _app_owns_transcript,
+        _app_transcript_busy,
+        _app_transcript_refusal,
+        _audit_app_allow,
+        _audit_app_decision,
+        _audit_app_denial,
+        _sel,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.history_reads import (  # noqa: F401
+        _DASHBOARD_SLOT_STEM_RE,
+        _MACHINE_NAMESPACES,
+        _SHORT_SLOT_NAME_RE,
+        _AppOwnedKeys,
+        _app_search,
+        _is_machine_only_session,
+        _open_slot_transcript_keys,
+        _session_meta_row,
+        _sessions_named,
+        api_session_archive_list,
+        api_session_archive_read,
+        api_session_detail,
+        api_session_meta,
+        api_sessions,
+        api_sessions_search,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.summaries import (  # noqa: F401
+        _SUMMARIZE_MAX_SESSIONS,
+        _SUMMARIZE_MODEL,
+        _SUMMARIZE_MSG_LIMIT,
+        _SUMMARIZE_NARRATION_PREFIXES,
+        _SUMMARIZE_PROMPT,
+        _SUMMARIZE_PROSE_MAX_UNSPACED_CHARS,
+        _SUMMARIZE_PROSE_MAX_WORDS,
+        _SUMMARIZE_PROSE_OPENERS,
+        _SUMMARIZE_REFUSAL_MARKERS,
+        _SUMMARIZE_TIMEOUT_SECS,
+        _build_summary_prompt,
+        _summarize_one,
+        _summary_is_narrated_refusal,
+        api_sessions_summarize,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.delete_claim import (  # noqa: F401
+        _CRON_RELEASE_ATTEMPTS,
+        _CRON_RELEASE_BACKOFF_SECS,
+        CRON_OWNERSHIP_UNKNOWN_CODE,
+        CRON_STORE_BUSY_CODE,
+        CRON_STORE_UNREADABLE_CODE,
+        LEDGER_EXCLUSION_UNWRITABLE_CODE,
+        _AppOwnershipLost,
+        _HistoryDeleteClaim,
+        _OwnerKeyUnreadable,
+        _capture_history_delete_claim,
+        _cron_ownership_unknown_refusal,
+        _cron_store_refusal,
+        _delete_history_session,
+        _exclude_slot_units,
+        _history_delete_candidate_keys,
+        _ledger_rollback_refusal,
+        _linkable_stems_for_history_key,
+        _linked_session_key_for_history_key,
+        _live_slot_sid,
+        _owner_keys_after_unlink,
+        _owner_keys_bound_to_transcript,
+        _release_cron_ownership,
+        _resolve_history_delete_claim,
+        _rollback_ledger_exclusion,
+        _stranded_job_ids,
+        _unstrand_shared_ledger_unit,
+        _warn_stranded_cron_ownership,
+        _warn_unprovable_channel_binding,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.slot_teardown import (  # noqa: F401
+        _CREW_LOG_TEARDOWN_FLUSH_SECONDS,
+        _live_session_units,
+        _remove_session_crew_logs,
+        _remove_slot_for_history_key,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.delete_routes import (  # noqa: F401
+        _claim_history_delete,
+        _clear_history_rows,
+        _clearable_history_keys,
+        _delete_claimed_session,
+        api_session_delete,
+        api_sessions_clear,
+        api_sessions_clearable_count,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.live_turn import (  # noqa: F401
+        _provider_steer_stamp,
+        _resolve_app_approval,
+        _service_wait_ping,
+        _wait_end_reason,
+        api_approval_resolve,
+        api_approvals,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.tool_policy import (  # noqa: F401
+        _TOOL_POLICY_MEMO,
+        _UNREADABLE_SPEC_WARNED,
+        _UNREADABLE_SPEC_WARNED_MAX,
+        HONOUR_TOOL_REFS_KEY,
+        INCLUDE_LIST_SERVER,
+        POLICY_INCLUDE_KEY,
+        ManagedToolPolicyUnreadable,
+        _ambiguous_spec_reason,
+        _policy_answer,
+        _read_managed_tool_policy_sync,
+        _read_managed_tool_policy_uncached,
+        _refuse_if_any_spec_is_unreadable,
+        _spec_failure_kind,
+        _unreadable_spec_remedy,
+        _warn_unreadable_spec_once,
+    )
+    from kiro_crew.dashboard.handlers.sessions_parts.restart import (  # noqa: F401
+        _SHUTDOWN_TIMEOUT_SECS,
+        _reset_all_sessions,
+        api_sessions_restart,
+    )
+    import kiro_crew.dashboard.handlers as _h  # noqa: F401
+    from kiro_crew import hooks  # noqa: F401
+    from kiro_crew import session_directive  # noqa: F401
+    from kiro_crew.agent_discovery import AgentsDirMemo  # noqa: F401
+    from kiro_crew.agent_discovery import AmbiguousAgentSpecError  # noqa: F401
+    from kiro_crew.agent_discovery import SensitiveAgentSpecPathError  # noqa: F401
+    from kiro_crew.agent_discovery import _SpecReadRefused  # noqa: F401
+    from kiro_crew.agent_discovery import plain_markdown_document  # noqa: F401
+    from kiro_crew.agent_discovery import read_agent_spec_strict  # noqa: F401
+    from kiro_crew.agent_discovery import spec_by_declared_name  # noqa: F401
+    from kiro_crew.agent_sdk.mcp_refs import per_tool_grants  # noqa: F401
+    from kiro_crew.agent_spec_format import agent_spec_candidates  # noqa: F401
+    from kiro_crew.agent_spec_format import is_markdown_spec  # noqa: F401
+    from kiro_crew.agent_spec_format import iter_agent_spec_files  # noqa: F401
+    from kiro_crew.channel_transcript_migration import _orphan_target_stem  # noqa: F401
+    from kiro_crew.cloud.login_target import parse_whoami_output  # noqa: F401
+    from kiro_crew.config.paths import kiro_agents_dir  # noqa: F401
+    from kiro_crew.cron import CronStoreBusy  # noqa: F401
+    from kiro_crew.cron import CronStoreUnreadable  # noqa: F401
+    from kiro_crew.cron import cron_owner_matches  # noqa: F401
+    from kiro_crew.dashboard import directive_queue  # noqa: F401
+    from kiro_crew.dashboard.chat_utils import effective_session_key  # noqa: F401
+    from kiro_crew.dashboard.chat_utils import slot_history_key  # noqa: F401
+    from kiro_crew.dashboard.handlers._shared import SESSION_SEARCH_TEXT_FIELDS  # noqa: F401
+    from kiro_crew.dashboard.handlers._shared import internal_memory_scope  # noqa: F401
+    from kiro_crew.dashboard.interaction_coordinator import _slot_decision  # noqa: F401
+    from kiro_crew.dashboard.state import _normalize_slot_key  # noqa: F401
+    from kiro_crew.history import ConversationLog  # noqa: F401
+    from kiro_crew.history import HistoryLockTimeout  # noqa: F401
+    from kiro_crew.history import SEARCH_MIN_CHARS  # noqa: F401
+    from kiro_crew.history import TranscriptBusy  # noqa: F401
+    from kiro_crew.history import TranscriptWithheld  # noqa: F401
+    from kiro_crew.history import _archive_dir  # noqa: F401
+    from kiro_crew.history import transcript_lock_stems  # noqa: F401
+    from kiro_crew.history import transcript_stem  # noqa: F401
+    from kiro_crew.history import transcript_stems  # noqa: F401
+    from kiro_crew.history import transcript_withholds_derivation  # noqa: F401
+    from kiro_crew.kiro_cli import kiro_cli_version_at  # noqa: F401
+    from kiro_crew.kiro_cli import pin_kiro_cli  # noqa: F401
+    from kiro_crew.label_guard import PROSE_OPENERS  # noqa: F401
+    from kiro_crew.label_guard import is_verdict_reply  # noqa: F401
+    from kiro_crew.label_guard import looks_like_prose  # noqa: F401
+    from kiro_crew.llm_helpers import run_bg_oneliner  # noqa: F401
+    from kiro_crew.mcp_discovery import sync_discovered_servers  # noqa: F401
+    from kiro_crew.messaging.link import _in_namespace  # noqa: F401
+    from kiro_crew.messaging.link import canonical_key  # noqa: F401
+    from kiro_crew.platform import redact_log_via_context  # noqa: F401
+    from kiro_crew.runtime_ownership import release_session_lease  # noqa: F401
+    from kiro_crew.sandbox import configured_sandbox_mode  # noqa: F401
+    from kiro_crew.sandbox import wrap_argv  # noqa: F401
+    from kiro_crew.security import redact  # noqa: F401
+    from kiro_crew.security import redact_credentials  # noqa: F401
+    from kiro_crew.security import redact_exfiltration_urls  # noqa: F401
+    from kiro_crew.validation import sanitize_string  # noqa: F401
+
 from aiohttp import web
 
-# circular import: handlers/__init__.py re-exports this module's handlers, so
-# a `from ... import` of individual names would fail mid-cycle. `import ... as`
-# binds via sys.modules and defers attribute access to call time, which also
-# keeps tests' monkeypatching of handlers.redact_* effective (late binding).
-import kiro_crew.dashboard.handlers as _h
+from kiro_crew import _facade_mirror
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
-from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.handlers import kiro_usage_api
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.handlers._shared import (
+    guard_owner_surface_routes,
+)
+from kiro_crew.dashboard.handlers.sessions_parts.usage_scrape import (
+    _WHOAMI_DIFFERENT,
+    _WHOAMI_SAME,
+    _fetch_whoami,
+    _fetch_whoami_or_none,
+    _normalize_text_usage,
+    _parse_usage,
+    _redact_strings,
+    _same_identity,
+    _text_scrape_regresses_api_value,
+    _whoami_agreement,
+    _wrap_argv_usage_scrape,
+)
+from kiro_crew.dashboard.kiro_readiness import (
+    _POLL_GATE_MAX_AGE_SECS,
+    reject_if_kiro_unverified,
+)
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.history import INCOGNITO_MEMORY_MODES, SEARCH_MIN_CHARS, _archive_dir
-from kiro_crew.llm_helpers import run_bg_oneliner
-from kiro_crew.mcp_discovery import (
-    discover_servers_to_sync,
-    register_servers_for_cc,
-    sync_to_agent_config,
-)
+from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
+from kiro_crew.platform_compat import _SUBPROCESS_NO_WINDOW, kill_and_reap
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
-    configured_sandbox_mode,
-    create_subprocess_limited,
-    wrap_argv,
+    scrub_agent_subprocess_env,
 )
-from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
-from kiro_crew.validation import sanitize_string
 
-logger = logging.getLogger(__name__)
-
-_SHUTDOWN_TIMEOUT_SECS = 10
-
-
-def _sel():
-    """Late-binding _sel() for test monkeypatch compatibility."""
-    import kiro_crew.dashboard.handlers as _pkg  # noqa: F811 — circular import
-
-    return _pkg.sel()
-
-
-async def api_sessions_context(request: web.Request) -> web.Response:
-    """GET /api/sessions/context — context usage for all active sessions."""
-    state: DashboardState = request.app["state"]
-    return web.json_response({"sessions": state.sessions.context_info()})
-
+logger = logging.getLogger("kiro_crew.dashboard.handlers.sessions")
 
 # One sampler per process: it carries the CPU jiffy baseline and the rolling load
 # window, both of which are meaningless if rebuilt per request (a fresh baseline
@@ -90,17 +281,45 @@ async def api_sessions_memory(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
-_health_cache: dict[str, dict] = {}
+_health_cache: dict[str, Any] = {}
 _health_cache_ts: float = 0.0
-_health_lock: asyncio.Lock | None = None
+_health_lock = LoopBoundLock()
 _HEALTH_REFRESH_SECS = 15
 
 
-async def api_sessions_health(request: web.Request) -> web.Response:
-    """GET /api/sessions/health — slots flagged as stalled from log scan."""
-    global _health_cache, _health_cache_ts, _health_lock
-    if _health_lock is None:
-        _health_lock = asyncio.Lock()
+def _empty_health_payload() -> dict[str, Any]:
+    """The payload shape when nothing has been computed yet (or the compute failed)."""
+    return {
+        "stalled": {},
+        "slots": {},
+        "waiting": [],
+        "recovering": [],
+        "queued": {"available": False, "count": 0, "oldest_wait_secs": 0.0, "by_state": {}},
+        "effective_caps": {},
+        "degrade_reason": None,
+        "counts": {"running": 0, "queued": 0, "waiting": 0, "recovering": 0, "stalled": 0},
+    }
+
+
+async def refresh_session_health(state: Any) -> dict[str, Any]:
+    """Recompute the cached session-health verdict, and signal a change.
+
+    The one owner of both the cache and :data:`session_health.SESSION_HEALTH_EVENT`.
+    ``GET /api/sessions/health`` calls it to serve a request; the WS driver
+    (``dashboard/ws.py``) calls it on a timer so a verdict that moves with the
+    CLOCK -- a turn crossing the stall threshold, a queue draining -- is noticed
+    while nobody is polling. Both share the ``_HEALTH_REFRESH_SECS`` gate and the
+    single-flight lock, so N callers still cost at most one computation per
+    interval.
+
+    Returns the cached payload. Never raises: a failed computation logs, marks the
+    attempt so it is not retried per request, and leaves the previous value (or
+    the empty shape) in place.
+
+    Must be awaited ON the loop: the state snapshot walks live slot objects and
+    the signal touches WebSocket clients.
+    """
+    global _health_cache, _health_cache_ts
     now = time.monotonic()
     if now - _health_cache_ts > _HEALTH_REFRESH_SECS:
         async with _health_lock:
@@ -109,74 +328,86 @@ async def api_sessions_health(request: web.Request) -> web.Response:
                 try:
                     from kiro_crew.dashboard import session_health
 
-                    _health_cache = await asyncio.to_thread(session_health.compute_session_health)
+                    # ``state`` is a MagicMock in much of the suite: a missing
+                    # ``state`` yields an empty snapshot, and a store that is not
+                    # a real TaskStore fails its first read inside the
+                    # computation and reads as "unavailable" -- never an error.
+                    taskq = getattr(getattr(state, "subagents", None), "_taskq", None)
+                    snapshot = session_health.snapshot_state(state)
+                    computed = await asyncio.to_thread(
+                        session_health.compute_session_health,
+                        None,
+                        taskq=taskq,
+                        monitor=None,
+                        snapshot=snapshot,
+                    )
+                    _health_cache = computed
                     _health_cache_ts = time.monotonic()
+                    # Back on the loop: publish only when the VERDICT moved, so a
+                    # subscriber that cannot read this endpoint still learns when
+                    # to refresh what it can read. Signal only -- no session data.
+                    session_health.publish_health_change(state, computed)
                 except Exception:
-                    logger.warning("session_health scan failed", exc_info=True)
+                    logger.warning("session_health computation failed", exc_info=True)
                     _health_cache_ts = time.monotonic()
-    return web.json_response({"stalled": _health_cache})
+    payload = _empty_health_payload()
+    if isinstance(_health_cache, dict):
+        payload.update(_health_cache)
+    return payload
+
+
+async def api_sessions_health(request: web.Request) -> web.Response:
+    """GET /api/sessions/health — structured session health.
+
+    ``{stalled, slots, waiting, recovering, queued, effective_caps,
+    degrade_reason, counts, ...}`` from task rows + slot state + ACP handle
+    liveness (``dashboard/session_health.py``); the log scan is a secondary
+    evidence source only. ``stalled`` keeps its pre-structured shape
+    (``{slot_key: {reason, since_ts, ...}}``) so an older client still reads it.
+
+    The slot snapshot is taken ON the loop (it walks live slot objects), the
+    classification, store read and log tail run off it. Cached for
+    ``_HEALTH_REFRESH_SECS`` so a busy dashboard cannot turn this into a
+    per-request SQLite + file scan. The computation itself lives in
+    :func:`refresh_session_health`, shared with the WS refresh driver.
+    """
+    state = request.app.get("state") if hasattr(request.app, "get") else None
+    return web.json_response(await refresh_session_health(state))
 
 
 _usage_cache: dict[str, object] = {}
 _usage_cache_ts: float = 0.0
 _USAGE_REFRESH_SECS = 600  # background refresh every 10 min
+# Ceiling on ONE whole refresh. Sized above the sum of the inner bounded steps
+# (whoami ≤30s + the /usage scrape ≤60s, plus the unbounded API read between
+# them) so a healthy slow refresh still completes, while a wedged one is
+# guaranteed to release the in-flight guard instead of parking it forever.
+_USAGE_FETCH_DEADLINE_SECS = 180
 _usage_fetching = False
+# --- Text-scrape back-off --------------------------------------------------
+# The `/usage` text scrape is a kiro-cli slash command handled locally: it calls
+# the same free GetUsageLimits API the primary path uses and prints the usage
+# table, so no prompt reaches a model and the read costs no credits. That holds
+# only on kiro-cli's V2 engine -- the V3 engine sends `/usage` to the model as a
+# prompt -- so the scrape pins V2 (see :func:`_usage_scrape_argv`). It is the
+# automatic fallback whenever the API path returns no plan. What it does cost is
+# a subprocess (whoami + the scrape, up to a minute and a half) on every refresh
+# interval, so a scrape that keeps producing unparseable output (kiro-cli format
+# change, wedged CLI, revoked auth) is parked instead of retried forever.
 
-# --- Text-scrape gate ------------------------------------------------------
-# The `/usage` text scrape is a REAL billed kiro-cli chat turn, unlike the
-# GetUsageLimits API read the primary path uses. It runs on a timer for as long
-# as a dashboard tab is open, so an ungated fallback bills the user forever just
-# to render a credit meter. Hence: opt-in via config, logged once when it is
-# skipped, and backed off when it repeatedly fails.
-
-#: True once the "scrape is disabled" notice has been logged. The refresh runs
-#: every _USAGE_REFRESH_SECS forever, so logging per cycle would fill the log
-#: with a message that never changes.
-_usage_scrape_disabled_logged = False
 #: Consecutive scrape attempts that produced no usable credit plan.
 _usage_scrape_failures = 0
 #: monotonic deadline before which no further scrape is attempted.
 _usage_scrape_backoff_until = 0.0
 #: Consecutive failures tolerated before the scrape is parked. Two refresh
 #: intervals of bad luck stay within normal retry; a third means the scrape is
-#: broken (kiro-cli format change, wedged CLI, revoked auth), and every further
-#: attempt spends credits for output that cannot be parsed.
+#: broken, and every further attempt is a subprocess spent on output that cannot
+#: be parsed.
 _USAGE_SCRAPE_FAILURE_THRESHOLD = 3
 #: How long a broken scrape is parked. Long relative to the 10-minute refresh so
-#: a persistent breakage costs a handful of turns per day, not one per interval.
+#: a persistent breakage costs a handful of attempts per day, not one per
+#: interval.
 _USAGE_SCRAPE_BACKOFF_SECS = 6 * 3600
-
-
-def _text_scrape_enabled() -> bool:
-    """True when the user has opted in to the credit-spending `/usage` scrape.
-
-    Fails CLOSED: any error reading config means the scrape does not run, so a
-    malformed config can never silently start billing chat turns. Blocking I/O
-    (stat + parse), so callers offload it.
-    """
-    try:
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        return bool(KiroCrewConfig.load().dashboard.usage_text_scrape_enabled)
-    except Exception:
-        logger.debug("usage text-scrape gate unreadable; treating as disabled", exc_info=True)
-        return False
-
-
-def _log_scrape_disabled_once() -> None:
-    """Announce the skipped scrape exactly once per process."""
-    global _usage_scrape_disabled_logged
-    if _usage_scrape_disabled_logged:
-        return
-    _usage_scrape_disabled_logged = True
-    logger.info(
-        "Kiro usage: the API returned no credit plan and the /usage text scrape "
-        "is disabled, so the credit pill stays unavailable. The scrape is a "
-        "billed kiro-cli chat turn every %ds; enable it with "
-        "dashboard.usage_text_scrape_enabled = true in config.json if you want "
-        "to pay for the readout.",
-        _USAGE_REFRESH_SECS,
-    )
 
 
 def _scrape_in_backoff() -> bool:
@@ -187,9 +418,10 @@ def _scrape_in_backoff() -> bool:
 def _record_scrape_outcome(success: bool) -> None:
     """Track consecutive scrape failures and park the scrape once they pile up.
 
-    Every attempt costs credits, so a scrape that cannot produce a usable plan
-    must stop retrying on each TTL expiry. Any success clears the counter, so a
-    transient hiccup does not accumulate toward the ceiling.
+    A scrape that cannot produce a usable plan must stop retrying on each TTL
+    expiry: each attempt is a minute-scale subprocess for nothing. Any success
+    clears the counter, so a transient hiccup does not accumulate toward the
+    ceiling.
     """
     global _usage_scrape_failures, _usage_scrape_backoff_until
     if success:
@@ -201,35 +433,75 @@ def _record_scrape_outcome(success: bool) -> None:
         _usage_scrape_backoff_until = time.monotonic() + _USAGE_SCRAPE_BACKOFF_SECS
         logger.warning(
             "Kiro usage: %d consecutive /usage text scrapes yielded no credit "
-            "plan; pausing the scrape for %ds so it stops spending credits on "
+            "plan; pausing the scrape for %ds so it stops spawning kiro-cli for "
             "unusable output.",
             _usage_scrape_failures,
             _USAGE_SCRAPE_BACKOFF_SECS,
         )
 
 
-def _cache_without_scrape(api_usage: object, identity: dict[str, object]) -> None:
-    """Cache the best available value when the scrape is not going to run.
+#: Pill ``reason`` for an auth-class usage failure: no live credential could be
+#: read, or the API refuses the one that was. The remedy is a fresh sign-in.
+_REASON_SIGNIN_REQUIRED = "signin_required"
+
+
+def _unavailable_reason(api_result: kiro_usage_api.UsageResult) -> str | None:
+    """Pick the pill's ``reason`` for a refresh that ends without a reading.
+
+    An auth-class ``auth_state`` (no live credential was readable, or the API
+    rejected the one that was) reports ``signin_required``: the free API was
+    never answered about this account, and the ``/usage`` scrape needs the same
+    sign-in, so the one remedy is signing in again. Anything the API path could
+    not prove was an auth problem reports no reason -- a spurious "sign in again"
+    on a working sign-in would be the same class of defect in the other direction.
+
+    This is a message only; the scrape decision does not consult it. An empty
+    candidate list does NOT prove kiro-cli cannot authenticate, because kiro-cli
+    may authenticate from a store this module does not enumerate (see
+    :func:`_identity_matches_account`), so the scrape still runs and its own
+    outcome decides what the pill shows.
+    """
+    if api_result.auth_state in (
+        kiro_usage_api.AUTH_NO_CREDENTIAL,
+        kiro_usage_api.AUTH_REJECTED,
+    ):
+        return _REASON_SIGNIN_REQUIRED
+    return None
+
+
+def _cache_without_scrape(
+    api_usage: object, identity: dict[str, object] | None, reason: str | None = None
+) -> None:
+    """Cache the best available value when the parked scrape is not going to run.
 
     Degrades rather than erroring: keep a previously-good value (dimmed
     ``stale``) so the pill does not blink out, otherwise surface whatever
     partial fields the API did return alongside ``available: False`` — the
-    frontend's existing signal to hide the pill instead of rendering blanks.
+    frontend's signal to show a no-reading dash (and the modal's Refresh) instead
+    of rendering blanks.
+    ``reason`` (when given) rides that unavailable marker so the frontend can
+    explain WHY instead of hiding silently.
 
-    Preserving is gated on ``_same_identity``: with the scrape disabled, a
-    plan-less API answer recurs every refresh forever, so an unguarded preserve
+    Preserving is gated on ``_same_identity``: while the scrape is parked, a
+    plan-less API answer recurs every refresh for hours, so an unguarded preserve
     would serve the PREVIOUS account's balance and email indefinitely after a
     switch A->B. An unproven identity (missing or mismatched email / start_url,
     including an account that never carried one) therefore reports unavailable
-    instead — hiding the pill is a cosmetic loss, attributing one account's
+    instead — a dash on the pill is a cosmetic loss, attributing one account's
     spend to another is not.
 
-    ``identity`` is this refresh's whoami, resolved before the API attempt, so a
-    switch landing inside that attempt is caught on the following refresh rather
-    than this one.
+    ``identity`` is a whoami resolved ADJACENTLY, right before this call, not the
+    one read at the top of the refresh: the API attempt sits between the two,
+    and a profile switch landing inside it must be judged against the account
+    that is signed in now. ``None`` (kiro-cli never resolved) proves nothing, so
+    nothing is preserved.
     """
     global _usage_cache, _usage_cache_ts
-    if _usage_cache.get("credits_plan") is not None and _same_identity(_usage_cache, identity):
+    if (
+        _usage_cache.get("credits_plan") is not None
+        and identity is not None
+        and _same_identity(_usage_cache, identity)
+    ):
         _usage_cache = {**_usage_cache, "stale": True}
     else:
         partial = (
@@ -238,382 +510,78 @@ def _cache_without_scrape(api_usage: object, identity: dict[str, object]) -> Non
             else {}
         )
         partial.pop("_profile_arn", None)
-        _usage_cache = {**partial, "available": False}
+        unavailable: dict[str, object] = {**partial, "available": False}
+        if reason is not None:
+            unavailable["reason"] = reason
+        _usage_cache = unavailable
     _usage_cache_ts = time.time()
 
 
-def _safe_float(text: str) -> float | None:
-    """Parse a float, returning None on malformed input instead of raising."""
-    try:
-        return float(text)
-    except ValueError:
-        return None
+def _publish_usage(payload: dict[str, object]) -> None:
+    """Atomically replace the cache served by ``/api/sessions/usage``."""
+    global _usage_cache, _usage_cache_ts
+    _usage_cache = payload
+    _usage_cache_ts = time.time()
 
 
-def _parse_usage(raw: str) -> dict[str, object]:
-    """Parse structured fields from kiro-cli /usage output."""
-    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
-    result: dict[str, object] = {"raw": ""}
-
-    lines = clean.splitlines()
-    usage_lines: list[str] = []
-    capture = False
-    for line in lines:
-        if "Estimated Usage" in line:
-            capture = True
-        if capture:
-            usage_lines.append(line)
-    result["raw"] = "\n".join(usage_lines).strip()
-
-    # Parse fields. First-wins on each field so a duplicate header or echoed
-    # line later in the (untrusted) output can't overwrite a real value, and
-    # malformed numbers skip the field via _safe_float rather than aborting.
-    for line in usage_lines:
-        if "resets on" in line and "resets" not in result:
-            m = re.search(r"resets on (\S+)", line)
-            if m:
-                result["resets"] = m.group(1)
-            if "|" in line:
-                result["plan"] = line.rsplit("|", 1)[-1].strip()
-        if "Credits used" in line and "credits_used" not in result:
-            m = re.search(r"Credits used:\s*([\d.]+)", line)
-            if m:
-                v = _safe_float(m.group(1))
-                if v is not None:
-                    result["credits_used"] = v
-        if "Est. cost" in line and "cost_usd" not in result:
-            m = re.search(r"\$([\d.]+)", line)
-            if m:
-                v = _safe_float(m.group(1))
-                if v is not None:
-                    result["cost_usd"] = v
-        if "covered in plan" in line and "credits_plan" not in result:
-            m = re.search(r"\(([\d.]+)\s+of\s+([\d.]+)", line)
-            if m:
-                covered = _safe_float(m.group(1))
-                plan = _safe_float(m.group(2))
-                if covered is not None and plan is not None:
-                    result["credits_covered"] = covered
-                    result["credits_plan"] = plan
-        if "billed at" in line and "overage_rate" not in result:
-            m = re.search(r"\$([\d.]+)\s+per", line)
-            if m:
-                # Coerce to float so both sources emit one type for the
-                # canonical shape and consumers never branch on source.
-                rate = _safe_float(m.group(1))
-                if rate is not None:
-                    result["overage_rate"] = rate
-
-    # Bonus / promotional credits are a separate pool kiro-cli lists in its own
-    # section after the plan, e.g.:
-    #     Bonus Credits:
-    #       Welcome bonus: 386.34/500 (expires in 15 days)
-    # This pool is drawn down BEFORE the plan, so while it lasts the plan meter
-    # barely moves — which looked like a frozen counter until we surfaced it.
-    # Capture the first bonus line (first-wins) so the dashboard can pool it into
-    # the header total and show it in the credits modal.
-    in_bonus = False
-    for line in usage_lines:
-        if "Bonus Credits" in line:
-            in_bonus = True
-            continue
-        if not in_bonus or "bonus_limit" in result:
-            continue
-        m = re.search(r"([A-Za-z][A-Za-z0-9 ]*?):\s*([\d.]+)\s*/\s*([\d.]+)", line)
-        if not m:
-            continue
-        used = _safe_float(m.group(2))
-        limit = _safe_float(m.group(3))
-        if used is not None and limit is not None and limit > 0:
-            result["bonus_label"] = m.group(1).strip()
-            result["bonus_used"] = used
-            result["bonus_limit"] = limit
-            exp = re.search(r"\(([^)]*expires[^)]*)\)", line, re.IGNORECASE)
-            if exp:
-                result["bonus_expires_label"] = exp.group(1).strip()
-    return result
-
-
-def _normalize_text_usage(parsed: dict[str, object]) -> dict[str, object]:
-    """Convert the text-scrape parse result to the canonical usage shape.
-
-    Emits the canonical usage shape the dashboard consumes so it never branches
-    on source:
-      credits_used = TOTAL used, credits_overage = overage above plan,
-      credits_covered = in-plan portion, credits_plan = limit, percentage.
-
-    In the raw text, "Credits used:" is the OVERAGE field (0 for org accounts,
-    and absent entirely on kiro-cli 2.11.x), while "(X of Y covered in plan)" is
-    the in-plan covered/limit. Total = covered + overage. Post-regression the
-    text carries no overage, so this honestly reports covered==total.
-    """
-    covered = parsed.get("credits_covered")
-    plan = parsed.get("credits_plan")
-    if not isinstance(covered, (int, float)) or not isinstance(plan, (int, float)):
-        # No usable credit plan — preserve whatever parsed (e.g. just {"raw": ...}).
-        return dict(parsed)
-    raw_used = parsed.get("credits_used")
-    overage = float(raw_used) if isinstance(raw_used, (int, float)) else 0.0
-    total = float(covered) + overage
-    out: dict[str, object] = dict(parsed)
-    out["credits_used"] = total
-    out["credits_overage"] = overage
-    out["credits_covered"] = float(covered)
-    out["credits_plan"] = float(plan)
-    out["percentage"] = round(total / plan * 100, 1) if plan else 0.0
-    out["source"] = "text"
-    return out
-
-
-def _same_identity(cached: dict[str, object], identity: dict[str, object]) -> bool:
-    """True only when ``cached`` provably belongs to the current ``identity``.
-
-    Matches on BOTH the account email AND the SSO ``start_url`` (the IAM
-    Identity Center instance): the same human email can appear across different
-    Identity Center orgs, so email alone does not prove the same account —
-    pairing it with the issuer URL does. Every compared field must be a
-    non-empty string and equal; anything missing or mismatched is UNPROVEN
-    (``False``). The current identity's values are routed through the same
-    redaction the cached copy went through so the two are compared in the same
-    form.
-
-    This is the gate that stops an account switch A->B (with the API failing on
-    B's refresh) from keeping A's usage AND A's email on screen — including the
-    same-email-different-org case — without it, preserving the prior cache would
-    leak the previous account's data.
-    """
-
-    def _red(v: object) -> object:
-        return _redact_strings(v) if isinstance(v, str) else v
-
-    for key in ("email", "start_url"):
-        a = cached.get(key)
-        b = _red(identity.get(key))
-        if not (isinstance(a, str) and isinstance(b, str) and a and a == b):
-            return False
-    return True
-
-
-def _text_scrape_regresses_api_value(
-    prev: object, new: dict[str, object], identity: dict[str, object]
-) -> bool:
-    """True when a fresh text-scrape would clobber a richer API-sourced value.
-
-    The text scrape is overage-blind for org-managed accounts: recent kiro-cli
-    dropped the overage line from ``/usage`` stdout, so ``_normalize_text_usage``
-    caps ``credits_used`` at the plan (``covered + 0``) and reports zero overage.
-    The API path (``GetUsageLimits``) still returns the true total. When the API
-    call transiently fails and we fall back to the scrape, accepting that capped
-    value would overwrite the good API number and flip the pill from the real
-    figure (e.g. 41,336/10,000 = 413%) to a misleading 10,000/10,000 = 100%,
-    hiding all overage — the observed oscillation bug.
-
-    Guard against exactly that, but ONLY when it is safe to keep the prior value:
-      * the cached value is ``source == "api"`` (authoritative), AND
-      * it provably belongs to the CURRENT identity (``_same_identity``) — so an
-        account switch never pins the previous account's usage/email, AND
-      * it is the SAME billing cycle — BOTH ``resets`` dates present, non-empty
-        and equal; a missing or changed date lets the lower scrape win, AND
-      * it reports strictly more usage than the overage-blind scrape can see.
-    Text-only environments (no API prior) update normally, and a genuine
-    billing-cycle reset is reported by the primary API path, which runs first
-    every cycle, so this never pins a stale-high value once the API recovers.
-    """
-    if not isinstance(prev, dict) or prev.get("source") != "api":
-        return False
-    if not _same_identity(prev, identity):
-        return False
-    # Preserve ONLY within the same, provable billing cycle: both reset dates
-    # must be present, non-empty, and equal. A missing date on either side
-    # (e.g. GetUsageLimits omitting nextDateReset) is unprovable, so let the
-    # lower scrape win — a cycle rollover must never pin last cycle's total.
-    # Both sources emit `resets` as "%Y-%m-%d", so equality is apples-to-apples.
-    prev_resets = prev.get("resets")
-    new_resets = new.get("resets")
-    if not (
-        isinstance(prev_resets, str)
-        and prev_resets
-        and isinstance(new_resets, str)
-        and new_resets
-        and prev_resets == new_resets
-    ):
-        return False
-    prev_used = prev.get("credits_used")
-    new_used = new.get("credits_used")
-    if not isinstance(prev_used, (int, float)) or not isinstance(new_used, (int, float)):
-        return False
-    return prev_used > new_used
-
-
-def _redact_strings(value: object) -> object:
-    """Recursively redact credentials / exfil URLs from every string leaf.
-
-    Walks dicts and lists so nested values cannot bypass redaction, used on
-    untrusted kiro-cli output before it is cached and served to the dashboard.
-    """
-    if isinstance(value, str):
-        value, _ = redact_exfiltration_urls(value)
-        value, _ = redact_credentials(value)
-        return value
-    if isinstance(value, dict):
-        return {k: _redact_strings(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_strings(v) for v in value]
-    return value
-
-
-def _cache_transient_failure() -> None:
-    """Record a transient usage-fetch failure without blanking the pill.
+def _cache_transient_failure(identity: dict[str, object] | None, reason: str | None = None) -> None:
+    """Record a usage-fetch failure without blanking the pill for the same account.
 
     A timeout, an unexpected error, or a single unparseable scrape is transient.
     Overwriting a previously-good cache with ``{"available": False}`` on any of
     these hid the credit pill entirely for up to a full refresh interval — the
-    "disappearing pill" bug. Instead, when we already hold a good value, keep it
-    and flag it ``stale`` (the dashboard can dim it); only fall back to
-    ``available: False`` when there is no prior value to show (e.g. a cold-start
-    failure), preserving the original hide-on-no-data behavior. The definitive
-    "kiro-cli absent" case still sets ``available: False`` directly at its call
-    site — that is not transient.
+    "disappearing pill" bug. Instead, when we already hold a good value FOR THE
+    SAME ACCOUNT, keep it and flag it ``stale`` (the dashboard can dim it); fall
+    back to ``available: False`` when there is no prior value to show (e.g. a
+    cold-start failure). The definitive "kiro-cli absent" case still sets
+    ``available: False`` directly at its call site — that is not transient.
+
+    Preserving is gated on ``_same_identity``, exactly as :func:`_cache_without_scrape`
+    gates it: a plan-less refresh is what an account switch A->B looks like when
+    B's credential has lapsed (the API reports no plan, the scrape prints no
+    table), and that shape recurs on every interval until B signs in again. An
+    unguarded preserve would keep A's balance and email on screen under B's
+    session the whole time. ``identity`` is this refresh's whoami; ``None`` means
+    it was never resolved (the refresh failed before or during whoami), and an
+    unresolved or unproven identity reports unavailable rather than preserving —
+    a dash on the pill is a cosmetic loss, attributing one account's balance to
+    another is not.
+
+    ``reason`` rides the unavailable marker when the caller knows why the read
+    ended empty (the API's auth-class verdict, see :func:`_unavailable_reason`),
+    so the pill can name the remedy instead of hiding.
     """
     global _usage_cache, _usage_cache_ts
-    if _usage_cache.get("credits_plan") is not None:
+    if (
+        _usage_cache.get("credits_plan") is not None
+        and identity is not None
+        and _same_identity(_usage_cache, identity)
+    ):
         _usage_cache = {**_usage_cache, "stale": True}
     else:
         _usage_cache = {"available": False}
+        if reason is not None:
+            _usage_cache["reason"] = reason
     _usage_cache_ts = time.time()
 
 
-def _wrap_argv_at_configured_tier(argv: list[str]) -> tuple[list[str], str | None]:
-    """Sandbox-wrap a one-shot ``kiro-cli`` argv at the configured tier.
+async def fetch_local_identity() -> dict[str, object] | None:
+    """Return this machine's signed-in Kiro identity, ``{}`` or ``None``.
 
-    BLOCKING on two counts, which is why both callers hand it to an executor
-    rather than calling it inline: :func:`configured_sandbox_mode` stats (and on a
-    cache miss re-reads and revalidates) ``config.json``, and ``wrap_argv`` ->
-    ``detect_backend`` can cold-probe the sandbox backend with a synchronous
-    ``subprocess.run(..., timeout=5)``. Both reads must therefore happen in the
-    worker thread — resolving the mode on the loop and passing it in would leave
-    half the blocking work behind.
-
-    Exists so the mode resolution and the wrap cannot drift apart between the
-    identity fetch and the usage scrape: they spawn the same binary and must take
-    the same tier.
-
-    ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
-    only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
-    shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
-    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
-    misclassification skips the delegation branch — and with it the credential-env
-    scrub — so the child would inherit the sensitive environment. Both callers
-    here spawn kiro-cli by construction, and both ACP spawn paths pass the same
-    flag for the same reason.
+    The one dashboard-side door to ``kiro-cli whoami``: it resolves the same
+    binary chat spawns and runs :func:`_fetch_whoami_or_none` at the configured
+    sandbox tier. Other handlers (the Remote Crew launch form's identity
+    preselect) call this instead of reaching into the ACP layer themselves, so
+    the agent-backend boundary stays where this module already crosses it.
+    ``{}`` when kiro-cli is absent (non-Kiro provider) or whoami answered with
+    no identity -- this machine has no sign-in to inherit; ``None`` when whoami
+    could not answer -- the identity is unknown, and a caller must not present
+    the default as if it had been read.
     """
-    return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
-
-
-def _wrap_argv_usage_scrape(kiro_bin: str) -> tuple[list[str], str | None]:
-    """Executor entrypoint for the ``/usage`` scrape's wrap (see
-    :func:`_wrap_argv_at_configured_tier` for why this runs off the loop)."""
-    return _wrap_argv_at_configured_tier(
-        [kiro_bin, "chat", "--no-interactive", "--agent", "kirocrew-lite", "/usage"]
-    )
-
-
-def _wrap_argv_whoami(kiro_bin: str) -> tuple[list[str], str | None]:
-    """Executor entrypoint for the ``whoami`` identity fetch's wrap (see
-    :func:`_wrap_argv_at_configured_tier` for why this runs off the loop)."""
-    return _wrap_argv_at_configured_tier([kiro_bin, "whoami", "--format", "json"])
-
-
-async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
-    """Return the signed-in identity from ``kiro-cli whoami --format json``.
-
-    Answers "who is this Kiro account?" — the credit API cannot: GetUsageLimits
-    carries no identity, and the SSO token cache holds only opaque tokens (no
-    email/openid scopes). kiro-cli resolves the identity itself, so it is the
-    only local source of the account email.
-
-    Returns a dict with any of ``email`` / ``account_type`` / ``start_url``, or
-    ``{}`` on any failure — identity is decorative, so it must never break the
-    credit readout. stdout is untrusted: only the LEADING JSON object is parsed
-    (kiro-cli appends a non-JSON "Profile:" block after it), values must be
-    strings, and each is length-bounded before it can reach the cache/UI.
-    """
-    proc = None
-    cleanup = None
-    try:
-        # Configured tier, not a hardcoded "standard": this is the same binary
-        # chat spawns, so it must not demand stricter isolation than chat does.
-        # Where the operator set agent.sandbox="off" (isolation deferred to
-        # kiro-cli's own internal sandbox) on a host with no backend, the pinned
-        # "standard" fail-closed and silently dropped the identity this readout
-        # labels the credit numbers with — failure here is non-fatal by design,
-        # so the symptom is a permanently blank email, not an error.
-        # Off the loop: see _wrap_argv_at_configured_tier for the two blocking reads.
-        argv, cleanup = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _wrap_argv_whoami, kiro_bin
-        )
-        argv = cgroup_scope_argv(argv)
-        proc = await create_subprocess_limited(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
-        raw = (out or err or b"").decode(errors="replace")
-        full = raw  # keep the whole output; the ARN lives AFTER the JSON object
-        # Take only the first {...} block; trailing "Profile:\n<name>" is not JSON.
-        depth = 0
-        start = raw.find("{")
-        if start < 0:
-            return {}
-        for i in range(start, len(raw)):
-            if raw[i] == "{":
-                depth += 1
-            elif raw[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    raw = raw[start : i + 1]
-                    break
-        else:
-            return {}
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return {}
-        out_map: dict[str, object] = {}
-        for src, dst, cap in (
-            ("email", "email", 254),
-            ("accountType", "account_type", 60),
-            ("startUrl", "start_url", 200),
-        ):
-            v = data.get(src)
-            if isinstance(v, str) and v:
-                out_map[dst] = v[:cap]
-        # whoami's own profile ARN, printed in the trailing (non-JSON) "Profile:"
-        # block. Private (leading underscore): used only to prove this identity
-        # belongs to the same account the credit numbers came from, and stripped
-        # before anything is cached or served.
-        m = re.search(r"arn:aws:codewhisperer:[^\s\"']+", full)
-        if m:
-            out_map["_profile_arn"] = m.group(0)[:200]
-        return out_map
-    except (asyncio.TimeoutError, json.JSONDecodeError, ValueError, OSError):
-        logger.debug("whoami identity fetch failed", exc_info=True)
+    kiro_bin = await _resolve_kiro_bin_for_spawn()
+    if not kiro_bin:
         return {}
-    except Exception:
-        logger.debug("whoami identity fetch failed (unexpected)", exc_info=True)
-        return {}
-    finally:
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                pass
-        if cleanup:
-            try:
-                os.remove(cleanup)
-            except OSError:
-                pass
+    return await _fetch_whoami_or_none(kiro_bin)
 
 
 def _identity_matches_account(api_arn: object, identity: dict[str, object]) -> bool:
@@ -639,102 +607,242 @@ def _identity_matches_account(api_arn: object, identity: dict[str, object]) -> b
     return isinstance(api_arn, str) and isinstance(whoami_arn, str) and api_arn == whoami_arn
 
 
-async def _fetch_usage_bg() -> None:
-    """Background task: fetch usage and update cache."""
+#: Outcome of a refresh whose API read returned no plan while the scrape was
+#: parked: no reading was fetched, and :func:`_cache_without_scrape` decided what
+#: the cache holds (a same-identity prior reading dimmed ``stale``, otherwise an
+#: unavailable marker).
+_SKIPPED_SCRAPE_PARKED = "scrape_parked"
+
+
+async def _fetch_usage_bg() -> str | None:
+    """Fetch usage and update the cache: the free API first, then the ``/usage``
+    scrape whenever the API returns no plan and the scrape is not parked.
+
+    Single-flight through ``_usage_fetching``: a refresh already in progress
+    makes this call return at once, so the timer and the account modal's
+    Refresh can never run two kiro-cli subprocesses for one reading.
+
+    Identity invariant, for BOTH sources: a reading is published only when a
+    whoami taken immediately before the credential read and one taken
+    immediately after it PROVE the same account (:func:`_whoami_agreement` is
+    ``same``). The API read is bracketed by the top-of-refresh whoami (nothing
+    but synchronous checks sit between the two) and one adjacent to its
+    publish; the ``/usage`` scrape is bracketed by a whoami taken right before
+    the spawn and one taken right after the child returns, before its output
+    is parsed. ``different`` publishes nothing and keeps nothing of the prior
+    account; ``unproven`` (no identity either side) publishes nothing either
+    -- the API branch then falls back to the scrape, and the scrape branch,
+    having nothing left to fall back to, reports unavailable. A kiro-cli whose
+    whoami prints no identity therefore yields no reading at all: that is the
+    intended posture, since a switch between two empty snapshots cannot be
+    detected. Every failure path judges what it keeps against the whoami
+    adjacent to that decision, never the top-of-refresh one.
+
+    Returns ``_SKIPPED_SCRAPE_PARKED`` when the API yielded no plan AND the
+    scrape is parked -- skipped for being parked already, OR attempted in this
+    very refresh and parked by that attempt's failure (the third miss). It is
+    the one outcome the refresh route reports differently, because no reading
+    was fetched and none will be until the park lifts: the cache then holds a
+    same-identity prior reading dimmed ``stale``, or an unavailable marker.
+    Every other outcome, including the early return above, returns ``None``.
+    """
     global _usage_cache, _usage_cache_ts, _usage_fetching
     if _usage_fetching:
-        return
+        return None
     _usage_fetching = True
     proc = None
     sandbox_cleanup = None
     kiro_bin: str | None = None
-    # Only a refresh that actually SPAWNED the billed scrape feeds the failure
+    # Only a refresh that actually SPAWNED the scrape feeds the failure
     # backoff — an API-path error or a missing kiro-cli says nothing about
     # whether the scrape works.
     scrape_attempted = False
-    try:
+
+    async def _adjacent_identity() -> dict[str, object] | None:
+        """Re-resolve whoami adjacent to a credential read or a cache decision.
+
+        The identity read at the top of the refresh can be a minute or more old
+        by the time a source has answered (the API attempt plus the scrape's
+        own timeout), and a profile switch can land inside that window. Judging
+        against the top-of-refresh value would then match the PREVIOUS account:
+        a failure path would keep its balance on screen under the new one, and
+        a success path would publish its balance and email as the new one's. So
+        each credential read is bracketed by a whoami immediately before and
+        one immediately after it (:func:`_whoami_agreement` decides whether the
+        pair proves one account), and each failure path judges what it keeps
+        against a whoami resolved adjacently. ``None`` when kiro-cli was never
+        resolved: nothing can be proven, nothing is kept or published. whoami
+        costs no credits and is bounded, so each call is one short subprocess.
+        """
+        return await _fetch_whoami(kiro_bin) if kiro_bin else None
+
+    async def _reap_scrape_proc() -> None:
+        """Kill and reap the ``/usage`` scrape child, once, if it is still running.
+
+        ``kill_and_reap`` kills the whole group, then reaps through a draining
+        ``communicate()``: that is what closes the asyncio transport and pipe FDs
+        (otherwise they leak, and this runs on a timer), bounded so a wedged
+        process cannot reintroduce the unbounded hang. Idempotent:
+        the handle is dropped once reaped, so the ``finally`` below has nothing
+        left to do after a handler already reaped it.
+        """
+        nonlocal proc
+        if proc is None:
+            return
+        child, proc = proc, None
+        if child.returncode is not None:
+            return
+        try:
+            await kill_and_reap(child, timeout=5)
+        except Exception:
+            pass
+
+    async def _refresh() -> str | None:
+        nonlocal proc, sandbox_cleanup, kiro_bin, scrape_attempted
+        global _usage_cache, _usage_cache_ts
+
         kiro_bin = await _resolve_kiro_bin_for_spawn()
         if not kiro_bin:
             # kiro-cli absent (non-Kiro provider): cache an unavailable marker so
-            # the dashboard hides the credit pill instead of polling forever.
-            _usage_cache = {"available": False}
-            _usage_cache_ts = time.time()
-            return
+            # the dashboard shows its no-reading dash instead of polling forever.
+            _publish_usage({"available": False})
+            return None
         # Identity FIRST, because it is the anchor for credential selection.
         # ``whoami`` is kiro-cli's own account, and it costs no credits; passing
         # its profile ARN into fetch_usage_limits is what stops a still-valid
         # credential from a signed-out profile supplying the numbers. Fetched
         # once here and reused by both the API and text branches below.
         identity = await _fetch_whoami(kiro_bin)
+        # Fail fast on API-key auth. kiro-cli's whoami reports the AuthMethod
+        # enum variant ``ApiKey``; the compare normalizes case and strips
+        # separators so an upstream respelling (``API_KEY``, ``Api-Key``)
+        # still fails fast instead of silently regressing to the slow path —
+        # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
+        # would spend its full timeout walking credential stores that cannot
+        # contain one, and the text scrape is no better a source. The
+        # ``reason`` rides the existing unavailable-marker shape so the
+        # frontend can say WHY, with a label specific to this auth type.
+        account_type = identity.get("account_type")
+        if (
+            isinstance(account_type, str)
+            and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
+        ):
+            _publish_usage({"available": False, "reason": "api_key_auth"})
+            logger.info("Kiro usage: not available under API key auth; skipping fetch")
+            return None
         raw_arn = identity.get("_profile_arn")
         expected_arn = raw_arn if isinstance(raw_arn, str) and raw_arn else None
         # Primary source: the real GetUsageLimits API. It reads the live bearer
         # token kiro-cli already maintains and returns the true used/limit/overage,
-        # so it survives kiro-cli stdout format changes (the regression that dropped
-        # the overage line).
+        # so it survives kiro-cli stdout format changes, including a text format
+        # that drops the overage line.
         #
         # Both ARN values are safe to pass. An ARN anchors on identity; None
         # anchors on PROVENANCE (kiro-cli's own auth store only) — see
         # fetch_usage_limits. So an account with no profile ARN, and a whoami that
-        # could not be resolved at all, both still get the free API call instead of
-        # the credit-consuming text scrape, while an unprovable credential is still
-        # refused.
+        # could not be resolved at all, both still get the API call ahead of the
+        # slower text scrape, while an unprovable credential is still refused.
         #
         # Runs on the subprocess pool (not the default to_thread pool): the client
         # makes blocking urllib calls that can hang on DNS / a wedged TLS
         # handshake, so they are isolated from the maintenance/cron pools. Fails
         # closed (returns None) so we fall through to the text scrape rather than
         # showing a fabricated number.
-        api_usage = await asyncio.get_running_loop().run_in_executor(
+        api_result = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             functools.partial(kiro_usage_api.fetch_usage_limits, expected_arn=expected_arn),
         )
+        # ``usage`` is the number; ``auth_state`` is why it is missing when it is,
+        # and is only ever consulted to pick the unavailable message below.
+        api_usage = api_result.usage
         if api_usage and api_usage.get("credits_plan") is not None:
             # API output is untrusted too: redact every string leaf before caching.
             api_usage = {k: _redact_strings(v) for k, v in api_usage.items()}
             # Strip the private coupling metadata before it can reach the cache.
             api_arn = api_usage.pop("_profile_arn", None)
-            # Attach the signed-in identity ONLY when it provably belongs to the
-            # account these credits were billed to (see _identity_matches_account).
-            # Anchoring already guarantees this whenever an ARN existed on both
-            # sides; the check is kept as the independent assertion of it, and
-            # still carries the no-ARN (Builder ID) case on its own.
-            if identity and _identity_matches_account(api_arn, identity):
-                api_usage.update(
-                    {k: _redact_strings(v) for k, v in identity.items() if not k.startswith("_")}
+            # The reading is judged against a whoami resolved HERE, adjacent to
+            # the publish, not against the top-of-refresh one. The API attempt
+            # sat between the two (up to its own timeout), and a profile switch
+            # can land inside it; the top identity anchored the credential the
+            # API used, so comparing the API's ARN with THAT identity passes by
+            # construction and can prove nothing about who is signed in now.
+            fresh_identity = (await _adjacent_identity()) or {}
+            agreement = _whoami_agreement(identity, fresh_identity)
+            if agreement == _WHOAMI_DIFFERENT:
+                # The numbers belong to the account that was signed in a moment
+                # ago: nothing of it is published, and the failure path judges
+                # the cache against the account that is signed in now, so
+                # nothing of the previous one is kept either.
+                logger.info(
+                    "Kiro usage: the signed-in account changed during the refresh; "
+                    "discarding the reading fetched for the previous one"
                 )
-            _usage_cache = api_usage
-            _usage_cache_ts = time.time()
+                _cache_transient_failure(fresh_identity)
+                return None
+            if agreement == _WHOAMI_SAME:
+                # Attach the signed-in identity ONLY when it provably belongs to
+                # the account these credits were billed to (see
+                # _identity_matches_account) -- the ADJACENT identity, so the
+                # fields published are the account's current ones. The no-ARN
+                # (Builder ID) case carries no proof and publishes the numbers
+                # alone.
+                if _identity_matches_account(api_arn, fresh_identity):
+                    api_usage.update(
+                        {
+                            k: _redact_strings(v)
+                            for k, v in fresh_identity.items()
+                            if not k.startswith("_")
+                        }
+                    )
+                _publish_usage(api_usage)
+                logger.info(
+                    "Kiro usage refreshed (api): %s / %s credits",
+                    api_usage.get("credits_used", "?"),
+                    api_usage.get("credits_plan", "?"),
+                )
+                return None
+            # Unproven: kiro-cli printed no identity either time, so the API --
+            # anchored on nothing -- may have read whichever stored token it
+            # found, the outgoing account's included. The reading is dropped
+            # here, and dropped BEFORE the fallback below so that neither the
+            # parked-scrape marker nor anything else can surface its numbers.
+            # The `/usage` scrape that follows is kiro-cli's own panel: it
+            # describes the signed-in account by construction and labels
+            # itself from its own adjacent whoami.
             logger.info(
-                "Kiro usage refreshed (api): %s / %s credits",
-                api_usage.get("credits_used", "?"),
-                api_usage.get("credits_plan", "?"),
+                "Kiro usage: no signed-in identity could be proven for the API "
+                "reading; falling back to the /usage scrape"
             )
-            return
-        # Fallback: scrape kiro-cli /usage stdout. Lossy for org-managed accounts
-        # on recent kiro-cli (no overage line), but the only source when the API
-        # path is unavailable (no token / non-Kiro build).
-        #
-        # This is a BILLED chat turn, not a free read, and this refresh runs on a
-        # timer whenever a dashboard tab is open — so it only happens when the
-        # user has explicitly opted in, and stops entirely once it has failed
-        # enough times to look broken. Both checks are before the spawn, so a
-        # disabled or parked scrape costs nothing at all.
-        if not await asyncio.to_thread(_text_scrape_enabled):
-            _log_scrape_disabled_once()
-            _cache_without_scrape(api_usage, identity)
-            return
+            api_usage = None
+        # Fallback: scrape kiro-cli /usage stdout. `/usage` is a slash command
+        # kiro-cli answers locally from the same free GetUsageLimits call, so
+        # this costs no credits; what it costs is a subprocess. Lossy for
+        # org-managed accounts on recent kiro-cli (no overage line), but the only
+        # source when the API path is unavailable (no readable token / non-Kiro
+        # build). It stops once it has failed enough times to look broken; that
+        # check is before the spawn, so a parked scrape costs nothing at all.
         if _scrape_in_backoff():
-            _cache_without_scrape(api_usage, identity)
-            return
+            # Judged against a whoami resolved HERE, not the top-of-refresh one:
+            # the API attempt sits between them and a profile switch can land
+            # inside it (see _adjacent_identity). The API's partial fields (a
+            # plan name, a reset date) came from a credential anchored on the
+            # TOP identity, so they ride the unavailable marker only when this
+            # whoami and the top one prove the same account.
+            parked_identity = (await _adjacent_identity()) or {}
+            if _whoami_agreement(identity, parked_identity) != _WHOAMI_SAME:
+                api_usage = None
+            _cache_without_scrape(
+                api_usage, parked_identity, reason=_unavailable_reason(api_result)
+            )
+            return _SKIPPED_SCRAPE_PARKED
         scrape_attempted = True
         # Route through the OS-level sandbox, consistent with how the main agent
         # kiro-cli process is spawned (AcpClient._spawn -> wrap_argv) — including
         # the TIER. This is a `kiro-cli chat` invocation, so a hardcoded
         # "standard" asks for stricter isolation than the very same chat binary
         # gets on the interactive path, and fail-closes wherever no backend
-        # exists. Doubly wasteful here: the scrape is a BILLED turn, so the
-        # refusal also fed the backoff counter that eventually parks it.
+        # exists. Doubly wasteful here: the refusal also feeds the backoff
+        # counter that eventually parks the scrape.
         #
         # OFF the loop, for two blocking reads: `configured_sandbox_mode()` stats
         # (and on a cache miss re-reads + revalidates) config.json, and
@@ -749,34 +857,59 @@ async def _fetch_usage_bg() -> None:
             kiro_bin,
         )
         argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
-        proc = await create_subprocess_limited(
-            *argv,
+        # The scrape reads whichever account kiro-cli has signed in WHEN IT
+        # RUNS, so it is bracketed like the API read: one whoami immediately
+        # before the spawn (not the top-of-refresh one -- the API attempt and
+        # the sandbox wrap sit between) and one immediately after the child
+        # returns, before anything is parsed. Only a pair that proves the same
+        # account may label and publish what came back between them.
+        before = (await _adjacent_identity()) or {}
+        proc = await spawn_supervised_oneshot(
+            argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrub_agent_subprocess_env(),
+            # Windows: the gateway has no console, so a helper spawned without
+            # CREATE_NO_WINDOW gets a fresh console allocated and flashes on
+            # screen ~every 30s. Suppress it (no-op on POSIX, where the flag is
+            # 0). Same guard the ACP spawn paths and kiro_prerequisite apply.
+            creationflags=_SUBPROCESS_NO_WINDOW,
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
         raw = (out or err or b"").decode(errors="replace")
+        after = (await _adjacent_identity()) or {}
         parsed = _parse_usage(raw)
         if parsed.get("credits_plan") is not None:
             # A parseable plan means the scrape itself works, so clear any
-            # accumulated failures even on the preservation path below (which
-            # discards the value for being overage-blind, not for being broken).
+            # accumulated failures even on the paths below that discard the
+            # value (for being overage-blind, or for an unproven account --
+            # neither is the scrape being broken).
             _record_scrape_outcome(True)
+            agreement = _whoami_agreement(before, after)
+            if agreement != _WHOAMI_SAME:
+                # `different`: the child ran across a switch, so its numbers
+                # belong to whoever was signed in at that instant -- unknowable,
+                # so unpublishable. `unproven`: no identity either side, so a
+                # switch between the two would be invisible; there is no source
+                # left to fall back to, so this refresh ends with no reading.
+                # Either way the cache is judged against the account signed in
+                # NOW, so nothing of a previous one is kept.
+                logger.info(
+                    "Kiro usage: the signed-in account could not be proven across "
+                    "the /usage scrape (%s); discarding its reading",
+                    agreement,
+                )
+                _cache_transient_failure(after)
+                return None
             # Converge on the canonical shape (credits_used = total, explicit
             # credits_overage) so the dashboard never branches on source, then
             # redact credentials / exfil URLs from every string leaf before the
             # dict is cached and served (kiro-cli output is untrusted).
             parsed = _normalize_text_usage(parsed)
-            # Re-resolve identity ADJACENT to the scrape, BEFORE any decision
-            # that consumes it. A profile switch can land in the window between
-            # the top-of-refresh whoami and now (the API attempt ≤30s + this
-            # scrape ≤60s), so the top identity may already be stale. This fresh
-            # value gates the preservation guard below AND labels the scrape if
-            # we proceed — both must judge against the same, adjacent identity,
-            # else an account switch mid-fallback could keep the previous
-            # account's usage/email on screen. whoami costs no credits.
-            fresh_identity = await _fetch_whoami(kiro_bin)
-            if _text_scrape_regresses_api_value(_usage_cache, parsed, fresh_identity):
+            # `after` gates the preservation guard below AND labels the scrape if
+            # we proceed -- both judge against the same adjacent identity, the
+            # one proven to have been signed in throughout the read.
+            if _text_scrape_regresses_api_value(_usage_cache, parsed, after):
                 # The overage-blind text scrape reports less usage than a richer
                 # API value we already hold (the API call just transiently
                 # failed) that belongs to THIS account AND THIS billing cycle.
@@ -790,57 +923,86 @@ async def _fetch_usage_bg() -> None:
                     _usage_cache.get("credits_used", "?"),
                     parsed.get("credits_used", "?"),
                 )
-                return
+                return None
             parsed = {k: _redact_strings(v) for k, v in parsed.items()}
             # No ARN coupling check here: this scrape IS kiro-cli's own `/usage`
-            # output, so it and `fresh_identity` describe the same account by
-            # construction — because `fresh_identity` was resolved ADJACENTLY
-            # just above, not reused from the top of this refresh. The API branch
-            # above does not need this: it gates its merge on
-            # `_identity_matches_account`, so a mid-refresh switch makes the stale
-            # identity's ARN mismatch the accepted credential's and the email is
-            # simply dropped.
+            # output, and `before`/`after` have just proven that one account was
+            # signed in on both sides of it, so the output and `after` describe
+            # the same account. The API branch follows the same contract with
+            # one more step: its numbers come from a credential anchored on the
+            # top-of-refresh whoami, so after its own bracket proves `same` it
+            # also couples the identity fields to the billed ARN
+            # (`_identity_matches_account`). Both branches publish only what the
+            # account signed in throughout the read can be shown to own.
             parsed.update(
-                {k: _redact_strings(v) for k, v in fresh_identity.items() if not k.startswith("_")}
+                {k: _redact_strings(v) for k, v in after.items() if not k.startswith("_")}
             )
-            _usage_cache = parsed
-            _usage_cache_ts = time.time()
+            _publish_usage(parsed)
             logger.info(
                 "Kiro usage refreshed (text): %s credits used",
                 parsed.get("credits_used", "?"),
             )
-        else:
-            # No parseable credit plan this cycle (unrecognized /usage output,
-            # or transient garbage). Keep the last good value (stale) rather than
-            # blanking the pill; only hide when we have nothing to show.
-            _record_scrape_outcome(False)
-            _cache_transient_failure()
+            return None
+        # No parseable credit plan this cycle (unrecognized /usage output, or
+        # transient garbage). Keep the last good value (stale) when it belongs to
+        # this same account rather than blanking the pill; hide when we have
+        # nothing provably ours to show. The account is judged against `after`,
+        # the whoami adjacent to this decision, not the top-of-refresh one.
+        # When the API had already classified the failure as auth-class, the
+        # scrape failing too is the expected shape of a lapsed sign-in, so the
+        # marker names that remedy.
+        _record_scrape_outcome(False)
+        _cache_transient_failure(after, reason=_unavailable_reason(api_result))
+        return _parked_by_this_attempt()
+
+    def _parked_by_this_attempt() -> str | None:
+        # A failure that was the third miss has just parked the scrape. The
+        # caller pressed Refresh and got no reading; it must also learn that
+        # pressing again is pointless until the park lifts, exactly as it does
+        # when the scrape was parked before the press. The API yielded no plan
+        # whenever a scrape was attempted, so the park alone decides.
+        return _SKIPPED_SCRAPE_PARKED if _scrape_in_backoff() else None
+
+    try:
+        # ONE deadline over the whole refresh. Every await inside is either
+        # already bounded or an executor call that can block on DNS or a wedged
+        # TLS handshake; without a ceiling on the total, one such hang means
+        # this coroutine never reaches its `finally`, `_usage_fetching` stays
+        # True for the process lifetime, and every later refresh returns at the
+        # guard above — so the cache is never populated and the dashboard's
+        # credit pill shows "Checking usage..." forever with nothing logged.
+        # A timeout here lands in the handler below, which keeps the last good
+        # value or marks usage unavailable, so the pill always resolves.
+        return await asyncio.wait_for(_refresh(), timeout=_USAGE_FETCH_DEADLINE_SECS)
     except asyncio.TimeoutError:
-        # Transient hang — keep the last good value (stale) instead of blanking.
+        # Transient hang — keep the last good value (stale) for the same account
+        # instead of blanking. The account is re-resolved here too: the hang may
+        # have outlasted a profile switch. The wedged scrape is reaped FIRST:
+        # the adjacent whoami is another kiro-cli subprocess of up to its own
+        # timeout, and a child left running through it would outlive the
+        # deadline this handler exists to enforce, holding the agent lock and
+        # its sandbox scope for that whole time.
         logger.debug("Background usage fetch timed out")
+        await _reap_scrape_proc()
         if scrape_attempted:
             _record_scrape_outcome(False)
-        _cache_transient_failure()
+        _cache_transient_failure(await _adjacent_identity())
+        return _parked_by_this_attempt() if scrape_attempted else None
     except Exception:
         logger.debug("Background usage fetch failed", exc_info=True)
+        await _reap_scrape_proc()
         if scrape_attempted:
             _record_scrape_outcome(False)
-        _cache_transient_failure()
+        _cache_transient_failure(await _adjacent_identity())
+        return _parked_by_this_attempt() if scrape_attempted else None
     finally:
-        # Always reap the subprocess on any exit path (timeout, error, or task
-        # cancellation, which is a BaseException the excepts above don't catch)
-        # so a leaked kiro-cli process can't hold the agent lock or keep burning
-        # credit quota. kill() is non-blocking; the OS reaps the zombie.
+        # Always reap the subprocess on any exit path (the handlers above did
+        # it before their whoami; this covers the success path's early returns
+        # and task cancellation, a BaseException the excepts above don't catch)
+        # so a leaked kiro-cli process can't hold the agent lock or keep a
+        # sandbox scope alive.
         _usage_fetching = False
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                # Await termination so the asyncio transport + pipe FDs close
-                # (otherwise they leak, and this runs on a timer). Bounded by
-                # wait_for so a wedged process can't reintroduce an unbounded hang.
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                pass
+        await _reap_scrape_proc()
         if sandbox_cleanup:
             try:
                 os.remove(sandbox_cleanup)
@@ -854,7 +1016,14 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
     # `kiro-cli chat --no-interactive ... /usage`, which auto-opens a browser
     # login while signed out. This endpoint is polled every 30s by the top-bar
     # credit pill, so an unauthenticated gateway spawned a browser every 30s.
-    blocked = await reject_if_kiro_unverified(request)
+    #
+    # Read on the poll-gate max-age, not the tight destructive bound: a 30s bound
+    # matches this endpoint's own 30s poll, so the latch expires at nearly every
+    # tick and the request runs a whoami probe inline — the documented-cached
+    # read then waits seconds on the probe. The wider window authorizes many
+    # polls between probes while still containing the only risk (a browser login
+    # spawned on a stale ready=True).
+    blocked = await reject_if_kiro_unverified(request, max_age_secs=_POLL_GATE_MAX_AGE_SECS)
     if blocked is not None:
         return blocked
     now = time.time()
@@ -864,8 +1033,8 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
         # `conversations`, `history` and `state` alongside `auth_kv`, so ordinary
         # chat traffic rewrites it roughly every 30 seconds; a disk-change trigger
         # would fire on nearly every poll, and each fire can reach the `/usage`
-        # text scrape, which spends credits. A faster readout is not worth billing
-        # the user for it; a profile switch is picked up on the next interval.
+        # text scrape, a minute-scale kiro-cli subprocess. A faster readout is
+        # not worth that churn; a profile switch is picked up on the next interval.
         state: DashboardState = request.app["state"]
         task = asyncio.create_task(_fetch_usage_bg())
         state._background_tasks.add(task)
@@ -873,870 +1042,102 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
     return web.json_response({"usage": _usage_cache})
 
 
-async def api_sessions(request: web.Request) -> web.Response:
-    """GET /api/sessions — list conversation session files.
+async def api_sessions_usage_refresh(request: web.Request) -> web.Response:
+    """POST /api/sessions/usage/refresh — refresh the credit reading now.
 
-    Query params:
-      - ``limit``: max sessions to return (default 50, max 200)
-      - ``offset``: skip first N sessions (default 0)
-      - ``preview``: when truthy, attach a redacted last-message ``preview``
-        to each returned session (bounded tail read; page-scoped so the
-        default list stays a cheap metadata scan)
+    The account modal's Refresh button. Runs one refresh (the same API-first,
+    scrape-second sequence the timer runs) and answers with the cache the GET
+    serves -- ``{"usage": <payload>}`` -- so the frontend parses both the same
+    way.
 
-    Returns ``{sessions, total, has_more}`` for pagination.
+    Guards, in order, and why each is here:
+
+    * :func:`reject_if_kiro_unverified` -- the scrape shells out to ``kiro-cli
+      chat``, which opens a browser login while signed out (same as the GET).
+    * Single flight -- while a refresh is in progress (the timer's or another
+      click's) a second POST is refused with 409 ``refresh_in_flight`` rather
+      than started: a refresh is a whoami + scrape subprocess pair that can
+      take up to :data:`_USAGE_FETCH_DEADLINE_SECS`, and two of them for one
+      reading is waste. Checked synchronously against ``_usage_fetching`` with
+      no await in between, and :func:`_fetch_usage_bg` sets the flag before
+      its first await, so two requests on the same loop cannot both pass.
+    * Back-off -- reported, not pre-checked. The refresh runs the free API
+      attempt regardless of the scrape's state; only when the API yields no
+      plan AND the scrape is parked -- parked before this refresh, or parked
+      BY this refresh's own failed attempt (the third miss) -- does the
+      response carry ``skipped: "scrape_parked"`` with ``retry_after``
+      (seconds until the park lifts), telling the UI no new reading was
+      fetched and none will be until then: the ``usage`` it received is a
+      same-identity prior reading dimmed ``stale``, or an unavailable marker
+      (see :func:`_cache_without_scrape` / :func:`_cache_transient_failure`).
     """
-    state: DashboardState = request.app["state"]
-    if not state.conversation_log:
-        return web.json_response({"sessions": [], "total": 0, "has_more": False})
-    try:
-        limit = min(int(request.query.get("limit", "50")), 200)
-    except (TypeError, ValueError):
-        limit = 50
-    try:
-        offset = int(request.query.get("offset", "0"))
-    except (TypeError, ValueError):
-        offset = 0
-    want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
-    all_sessions = state.conversation_log.list_sessions()
-    total = len(all_sessions)
-    page = all_sessions[offset : offset + limit]
-    if want_preview:
-        log = state.conversation_log
-
-        def _attach_previews(sessions: list[dict]) -> None:
-            for s in sessions:
-                preview = log.last_message_preview(s.get("key", ""))
-                if preview:
-                    preview, _ = _h.redact_exfiltration_urls(preview)
-                    preview, _ = _h.redact_credentials(preview)
-                    s["preview"] = preview
-
-        # Tail reads are sync file IO — keep them off the event loop.
-        await asyncio.get_running_loop().run_in_executor(None, _attach_previews, page)
-    return web.json_response(
-        {
-            "sessions": page,
-            "total": total,
-            "has_more": offset + limit < total,
-        }
-    )
+    blocked = await reject_if_kiro_unverified(request)
+    if blocked is not None:
+        return blocked
+    if _usage_fetching:
+        return web.json_response(
+            {"error": "A refresh is already running", "code": "refresh_in_flight"},
+            status=409,
+        )
+    outcome = await _fetch_usage_bg()
+    if outcome == _SKIPPED_SCRAPE_PARKED:
+        parked_for = max(1, int(_usage_scrape_backoff_until - time.monotonic() + 0.999))
+        return web.json_response(
+            {
+                "usage": _usage_cache,
+                "skipped": _SKIPPED_SCRAPE_PARKED,
+                "retry_after": parked_for,
+            }
+        )
+    return web.json_response({"usage": _usage_cache})
 
 
-_SUMMARIZE_MAX_SESSIONS = 8  # bound cost/latency: only the top-N get an LLM pass
-_SUMMARIZE_MODEL = "auto"  # inherit the governed default; a hardcoded id 400s where unavailable
-_SUMMARIZE_MSG_LIMIT = 12  # messages fed to the summarizer per session
-_SUMMARIZE_TIMEOUT_SECS = (
-    30  # per-session deadline so one stalled prompt can't pin the shared _bg session
+# ``kiro_crew.dashboard.handlers.sessions`` stays the import path and the patch surface of
+# the session routes. This module keeps the usage refresh, whose ``kiro-cli`` spawn resolves
+# through the ACP layer, and the health and memory meters; the rest lives in the owner
+# modules below, one responsibility each, lowest layer first: the first owner that binds a
+# name answers a read of it. ``_facade_mirror`` keeps a patch whole -- a write or delete of
+# a name through this module lands in every owner that binds it, and here too when this
+# module binds it -- and no owner imports this module at run time.
+_OWNERS = (
+    "kiro_crew.dashboard.handlers.sessions_parts.usage_scrape",
+    "kiro_crew.dashboard.handlers.sessions_parts.app_scope",
+    "kiro_crew.dashboard.handlers.sessions_parts.history_reads",
+    "kiro_crew.dashboard.handlers.sessions_parts.summaries",
+    "kiro_crew.dashboard.handlers.sessions_parts.delete_claim",
+    "kiro_crew.dashboard.handlers.sessions_parts.slot_teardown",
+    "kiro_crew.dashboard.handlers.sessions_parts.delete_routes",
+    "kiro_crew.dashboard.handlers.sessions_parts.live_turn",
+    "kiro_crew.dashboard.handlers.sessions_parts.tool_policy",
+    "kiro_crew.dashboard.handlers.sessions_parts.restart",
 )
-_SUMMARIZE_PROMPT = (
-    "Summarize the following conversation in ONE terse line (max 18 words), "
-    "describing what the user and assistant are working on. No preamble, no "
-    "quotes, no trailing period. If the topic is unclear, reply exactly SKIP.\n\n"
-    "===== CONVERSATION =====\n"
-    "{transcript}\n"
-    "===== END ====="
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+# The three routes that verify and scope their own caller, bound here so the guard at the
+# bottom of this module can name them as the ones it leaves unwrapped.
+from kiro_crew.dashboard.handlers.sessions_parts.live_turn import (  # noqa: E402, F401
+    api_session_directive,
+    api_session_keepalive,
+)
+from kiro_crew.dashboard.handlers.sessions_parts.tool_policy import (  # noqa: E402, F401
+    api_session_tool_policy,
 )
 
-
-def _build_summary_prompt(messages: list[dict]) -> str | None:
-    """Build a one-line-summary prompt from a session's recent messages."""
-    lines: list[str] = []
-    for m in messages[:_SUMMARIZE_MSG_LIMIT]:
-        role = m.get("role", "")
-        content = " ".join(str(m.get("content", "")).split())
-        if role in ("user", "assistant") and content:
-            lines.append(f"{role}: {content[:300]}")
-    if not lines:
-        return None
-    return _SUMMARIZE_PROMPT.format(transcript="\n".join(lines))
-
-
-async def _summarize_one(state: DashboardState, key: str) -> str:
-    """Generate a one-line LLM summary for a single session. "" on any failure.
-
-    Mirrors dashboard.chat_title._generate_title_via_kiro: uses an ephemeral
-    background session on the cheap/fast model and destroys it in a finally.
-    Best-effort — every failure path returns "" so the caller falls back to the
-    session's stored title.
-    """
-    log = state.conversation_log
-    if not log:
-        return ""
-    loop = asyncio.get_running_loop()
-    # get_metadata + recent do synchronous full-file reads (read_text + per-line
-    # JSON parse, up to 2MB). Offload to the executor so a batch of large session
-    # files never freezes the gateway event loop — mirrors api_sessions above.
-    meta = await loop.run_in_executor(None, log.get_metadata, key)
-    # Defense in depth: never summarize an incognito/temporary session even if a
-    # caller somehow passes its key.
-    if str(meta.get("memory_mode", "")).lower() in INCOGNITO_MEMORY_MODES:
-        return ""
-    # Cache: a summary persisted in a sidecar file is reusable as long as the
-    # session file hasn't changed since it was generated. session_mtime advances
-    # only on real message appends (preserved across metadata writes), so it is a
-    # cheap, exact staleness signal — a repeat list_sessions(summarize=true) for
-    # an unchanged session pays zero LLM cost. The cache lives in a sidecar
-    # (never the session JSONL) so summarizing an *active* session never rewrites
-    # its log and cannot lose a concurrently-appended message.
-    sig = await loop.run_in_executor(None, log.session_mtime, key)
-    cached = await loop.run_in_executor(None, log.get_cached_summary, key)
-    if cached:
-        return str(cached)
-    messages = await loop.run_in_executor(
-        None,
-        functools.partial(
-            log.recent, key, max_messages=_SUMMARIZE_MSG_LIMIT, roles={"user", "assistant"}
-        ),
-    )
-    prompt = _build_summary_prompt(messages)
-    if not prompt:
-        return ""
-    try:
-        text = await run_bg_oneliner(
-            state.sessions, prompt, model=_SUMMARIZE_MODEL, timeout=_SUMMARIZE_TIMEOUT_SECS
-        )
-    except Exception:
-        logger.debug("Session summary generation failed for %s", key, exc_info=True)
-        return ""
-    summary = text.strip().strip('"').strip("'").strip(".")
-    if not summary or summary.upper() == "SKIP":
-        return ""
-    summary, _ = redact_exfiltration_urls(summary)
-    summary, _ = redact_credentials(summary)
-    summary = summary[:200]
-    # Persist for reuse in a sidecar cache (best-effort; keyed by the mtime we
-    # observed above so a concurrent append invalidates it on the next call).
-    # Writing the sidecar never touches the session JSONL, so it cannot race a
-    # concurrent append or reorder list_sessions.
-    if sig is not None:
-        try:
-            await loop.run_in_executor(
-                None,
-                functools.partial(log.set_cached_summary, key, summary, sig),
-            )
-        except Exception:
-            logger.debug("Failed to persist summary cache for %s", key, exc_info=True)
-    return summary
-
-
-async def api_sessions_summarize(request: web.Request) -> web.Response:
-    """POST /api/sessions/summarize — one-line LLM summaries for given sessions.
-
-    Body: ``{"keys": ["<session_key>", ...]}``. Only the first
-    ``_SUMMARIZE_MAX_SESSIONS`` keys are summarized (cost/latency bound); the
-    rest are silently skipped and the caller falls back to their titles.
-    Returns ``{"summaries": {key: one_line_summary}}`` — keys that produced no
-    usable summary are omitted. Best-effort: a per-session failure never fails
-    the whole request.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.conversation_log:
-        return web.json_response({"summaries": {}})
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    keys = body.get("keys") if isinstance(body, dict) else None
-    if not isinstance(keys, list):
-        return web.json_response({"error": "keys must be a list"}, status=400)
-    # Dedupe while preserving order, drop non-strings, then bound the count.
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for k in keys:
-        if isinstance(k, str) and k and k not in seen:
-            seen.add(k)
-            ordered.append(k)
-    ordered = ordered[:_SUMMARIZE_MAX_SESSIONS]
-
-    summaries: dict[str, str] = {}
-    for key in ordered:
-        if not state.conversation_log.has_log(key):
-            continue
-        summary = await _summarize_one(state, key)
-        if summary:
-            summaries[key] = summary
-    return web.json_response({"summaries": summaries})
-
-
-async def api_sessions_search(request: web.Request) -> web.Response:
-    """GET /api/sessions/search — content search over session JSONL files.
-
-    Query params:
-      - ``q``: search string (min 2 chars; empty returns no results)
-      - ``limit``: max results (default 50, max 200)
-
-    Returns ``{sessions}`` — same metadata shape as:func:`api_sessions`.
-    Session titles may be LLM-generated and are redacted before return.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.conversation_log:
-        return web.json_response({"sessions": []})
-    q = sanitize_string(request.query.get("q", "")).strip()[:256]
-    if len(q) < SEARCH_MIN_CHARS:
-        return web.json_response({"sessions": []})
-    try:
-        limit = max(1, min(int(request.query.get("limit", "50")), 200))
-    except (TypeError, ValueError):
-        limit = 50
-    sessions = await asyncio.get_running_loop().run_in_executor(
-        None, state.conversation_log.search_sessions, q, limit
-    )
-    for s in sessions:
-        title = s.get("title")
-        if title:
-            title, _ = _h.redact_exfiltration_urls(title)
-            title, _ = _h.redact_credentials(title)
-            s["title"] = title
-        snip = s.get("snippet")
-        if snip:
-            snip, _ = _h.redact_exfiltration_urls(snip)
-            snip, _ = _h.redact_credentials(snip)
-            s["snippet"] = snip
-    return web.json_response({"sessions": sessions})
-
-
-async def api_session_detail(request: web.Request) -> web.Response:
-    """GET /api/sessions/{key} — return messages for a session."""
-    state: DashboardState = request.app["state"]
-    key = request.match_info["key"]
-    if not state.conversation_log:
-        return web.json_response([])
-    return web.json_response(state.conversation_log.read_messages(key))
-
-
-async def api_session_delete(request: web.Request) -> web.Response:
-    """DELETE /api/sessions/{key} — permanently delete a history session."""
-    state: DashboardState = request.app["state"]
-    key = request.match_info["key"]
-    if not state.conversation_log:
-        return web.json_response({"error": "no conversation log"}, status=400)
-    # delete_session enters _locked (flock acquire + os.close); offload off the
-    # loop so a wedged cross-process peer can't freeze chat/WS/heartbeat.
-    ok = await asyncio.to_thread(state.conversation_log.delete_session, key)
-    if ok:
-        try:
-            await _remove_slot_for_history_key(state, key)
-        except Exception:
-            logger.warning("cleanup failed for session %s", key, exc_info=True)
-        state.push_slots_update()
-        state.push_refresh("history")
-    return web.json_response({"ok": ok})
-
-
-async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
-    """Remove the active chat slot corresponding to a history key.
-
-    Slot keys may be the raw history key (``dashboard_chat-X-TS`` when
-    resumed from history) or the stripped form (``chat-X-TS`` for
-    sessions that were never closed and resumed).  Try the exact key
-    first, then the stripped variant.  Also kills the kiro-cli session
-    to prevent orphaned processes.
-    """
-    from kiro_crew.dashboard.state import _normalize_slot_key
-
-    stripped = key
-    if stripped.startswith("dashboard:"):
-        stripped = stripped[len("dashboard:") :]
-    while stripped.startswith("dashboard_"):
-        stripped = stripped[len("dashboard_") :]
-    normalized = _normalize_slot_key(key)
-    pin_slot_keys = {key, stripped, "dashboard_" + key, normalized}
-
-    slot = state._slots.pop(key, None)
-    if not slot:
-        slot = state._slots.pop(stripped, None)
-    if not slot:
-        # Reverse: history key has no prefix, but slot was stored with one
-        slot = state._slots.pop("dashboard_" + key, None)
-    if not slot:
-        # A channel-born slot's name is the key folded to the filename
-        # charset, which none of the prefix probes above produce. Without
-        # this the slot outlives its deleted history and keeps a kiro-cli
-        # process alive.
-        slot = state._slots.pop(normalized, None)
-    if slot:
-        pin_slot_keys.add(slot.key)
-    try:
-        await state.remove_chat_pins_for_slots(pin_slot_keys)
-    except Exception:
-        logger.warning("History delete: pin cleanup failed for %s", key, exc_info=True)
-    if slot:
-        # A pending ask_question is owned by the slot's running turn, but its
-        # future lives in DashboardState rather than on slot.task. History
-        # deletion tears down that task and provider directly, bypassing the
-        # normal stop/delete handlers; resolve the wait first so the MCP HTTP
-        # request returns and its finally block retracts the now-stale card.
-        cancelled = state.cancel_questions_for_slot(slot.key)
-        if cancelled:
-            logger.info(
-                "History delete: cancelled %d pending question(s) on slot %s",
-                cancelled,
-                slot.key,
-            )
-    if slot and slot.running and slot.task is not None:
-        slot.task.cancel()
-        try:
-            await asyncio.wait_for(slot.task, timeout=2.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-    # Kill the kiro-cli subprocess to free resources
-    if slot:
-        try:
-            # Destroy the session the slot actually RUNS, not one derived from
-            # the history key. A channel-born slot runs the channel's own
-            # session, so ``_history_key_for`` would name a key no session has:
-            # the provider survives the delete and its next inbound message
-            # recreates the transcript the user just removed.
-            from kiro_crew.dashboard.chat_utils import effective_session_key
-
-            await state.sessions.destroy(effective_session_key(slot))
-        except Exception:
-            pass
-
-
-async def api_sessions_clear(request: web.Request) -> web.Response:
-    """DELETE /api/sessions — permanently delete closed history sessions only.
-
-    Skips sessions currently open in the sidebar (any slot in
-    ``state._slots``) and sessions with ``pinned=True`` on disk.
-    Bulk-archiving open unpinned/idle sessions is out of scope here.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.conversation_log:
-        return web.json_response({"error": "no conversation log"}, status=400)
-
-    from kiro_crew.dashboard.chat_utils import slot_history_key, slot_transcript_key
-    from kiro_crew.history import _safe_key
-
-    protected: set[str] = set()
-    for slot in state._slots.values():
-        # Protect EVERY transcript this slot could be reading, not just the one
-        # it currently writes. ``list_sessions`` reports filename stems, so each
-        # candidate contributes its key AND its stem: ``_safe_key`` is the
-        # function that produced the filename, and a single-colon replace would
-        # leave a multi-colon channel key like ``discord:kirocrew:direct:123``
-        # mapped to a stem that does not exist, putting a live conversation
-        # outside ``protected`` so this bulk delete removes it.
-        #
-        # The union matters because a slot's write target and its DISPLAY source
-        # can differ: a channel tab the dashboard could not bind runs under
-        # ``dashboard:<stem>`` while the conversation on screen lives in the
-        # channel transcript. Choosing between them here would make deletion
-        # depend on provenance resolving correctly, and provenance is exactly
-        # what a legacy transcript cannot supply. Protection only ever PREVENTS
-        # a delete, so covering both candidates is the safe direction: the worst
-        # case is that Clear All skips a transcript nobody is reading.
-        for candidate in (slot_history_key(slot), slot_transcript_key(slot.key)):
-            protected.add(candidate)
-            protected.add(_safe_key(candidate))
-
-    sessions = state.conversation_log.list_sessions()
-    count = 0
-    skipped = 0
-    failed = 0
-    cleanup_tasks = []
-    for s in sessions:
-        key = s["key"]
-        if key in protected:
-            skipped += 1
-            continue
-        try:
-            meta = state.conversation_log.get_metadata(key)
-        except Exception:
-            logger.warning(
-                "api_sessions_clear: unreadable metadata for %s, skipping", key, exc_info=True
-            )
-            skipped += 1
-            continue
-        if not isinstance(meta, dict):
-            skipped += 1
-            continue
-        if meta.get("pinned"):
-            skipped += 1
-            continue
-        try:
-            # delete_session enters _locked (flock + os.close) — offload off the
-            # event loop so a wedged peer can't stall the bulk clear on it.
-            if await asyncio.to_thread(state.conversation_log.delete_session, key):
-                cleanup_tasks.append(_remove_slot_for_history_key(state, key))
-                count += 1
-            else:
-                failed += 1
-        except Exception:
-            failed += 1
-            logger.warning("api_sessions_clear: delete raised for %s", key, exc_info=True)
-    if cleanup_tasks:
-        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-    if count:
-        state.push_slots_update()
-        state.push_refresh("history")
-    logger.info("api_sessions_clear: cleared=%d skipped=%d failed=%d", count, skipped, failed)
-    return web.json_response(
-        {"ok": failed == 0, "cleared": count, "skipped": skipped, "failed": failed}
-    )
-
-
-# ── Approvals ──
-
-
-async def api_approvals(request: web.Request) -> web.Response:
-    """GET /api/approvals — list pending tool approvals."""
-    state: DashboardState = request.app["state"]
-    return web.json_response(list(state._pending_approvals.values()))
-
-
-async def api_approval_resolve(request: web.Request) -> web.Response:
-    """POST /api/approvals/{id}/{action} — approve or reject."""
-    state: DashboardState = request.app["state"]
-    approval_id = request.match_info["id"]
-    action = request.match_info["action"]
-    if action not in ("approve", "reject"):
-        return web.json_response({"error": "invalid action"}, status=400)
-    ok = state.resolve_approval(approval_id, action == "approve")
-    if not ok:
-        return web.json_response({"error": "not found or expired"}, status=404)
-    return web.json_response({"ok": True})
-
-
-async def api_session_keepalive(request: web.Request) -> web.Response:
-    """POST /api/session-keepalive — refresh activity timestamp on the
-    session's provider so idle-detection/stale-checks don't SIGTERM a
-    session that's intentionally blocking in a long-running MCP tool
-    (e.g. the `wait` tool).
-
-    Authenticated via X-Internal-Secret; session is selected via the
-    X-Session-Key header that all MCP subprocesses already send.
-
-    Doubles as the sleeping `wait` tool's only inbound channel. When the body
-    names a ``wait_id`` the reply may carry ``end_wait: <wait_id>``, which the
-    tool treats as "return early, keep the turn". The body is optional and every
-    field in it is advisory: a caller that sends ``{}`` gets the original
-    touch-only behaviour.
-    """
-    state: DashboardState = request.app["state"]
-    session_key = request.headers.get("X-Session-Key", "").strip()
-    if not session_key:
-        return web.json_response({"error": "X-Session-Key required"}, status=400)
-    provider = state.sessions.get_provider(session_key)
-    if provider is None:
-        return web.json_response({"error": "session not found"}, status=404)
-    body: dict = {}
-    try:
-        if request.can_read_body:
-            parsed = await request.json()
-            if isinstance(parsed, dict):
-                body = parsed
-    except Exception:
-        # A malformed body must never cost the session its keepalive — that is
-        # the half of this route that keeps the watchdog from killing the ACP
-        # subprocess mid-wait.
-        body = {}
-    try:
-        provider.touch_activity()
-    except Exception as exc:
-        logger.debug("touch_activity failed for %s: %s", session_key, exc)
-        return web.json_response({"error": "touch failed"}, status=500)
-    # Also advance the session's own last_used clock. touch_activity() only
-    # refreshes the ACP runtime's activity timestamp, which feeds
-    # is_responsive()/the stall watchdog — the periodic idle sweep reads
-    # ``last_used`` instead, so without this a session blocking in a long
-    # `wait` still ages toward being reaped for idleness.
-    try:
-        touched = getattr(state.sessions, "touch", None)
-        if callable(touched):
-            touched(session_key)
-    except Exception:
-        logger.debug("last_used touch failed for %s", session_key, exc_info=True)
-    reply: dict = {"ok": True}
-    wait_id = str(body.get("wait_id") or "").strip()[:64]
-    if wait_id:
-        _service_wait_ping(state, session_key, wait_id, body, reply)
-    return web.json_response(reply)
-
-
-def _service_wait_ping(
-    state: DashboardState,
-    session_key: str,
-    wait_id: str,
-    body: dict,
-    reply: dict,
-) -> None:
-    """Track an in-flight `wait` sleep and hand back any early-end request.
-
-    Mutates ``reply`` in place, adding ``end_wait`` when the user asked to end
-    this exact wait. Silent no-op when the calling session has no dashboard tab
-    (a Slack/cron session can call `wait` too — it just has nothing to render a
-    countdown on).
-    """
-    # Local import: this module's other chat_utils uses are function-local for
-    # the same circular-import reason (handlers/__init__ re-exports this module).
-    from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-
-    slot_name = dashboard_slot_key(session_key)
-    slot = state.get_slot(slot_name) if slot_name else None
-    if slot is None:
-        return
-    now = time.time()
-    # How stale the incumbent's last ping must be before its sleep is presumed
-    # gone. 2.5 intervals tolerates one dropped ping plus scheduling jitter
-    # without tolerating a sleep that is simply still running.
-    try:
-        interval = float(body.get("interval") or 5.0)
-    except (TypeError, ValueError):
-        interval = 5.0
-    window = max(2.0, min(60.0, interval) * 2.5)
-    if body.get("wait_done"):
-        # Only the wait that owns the state may retire it, so a late final ping
-        # from a previous sleep cannot blank the countdown of the current one.
-        if slot._wait_state and slot._wait_state.get("wait_id") == wait_id:
-            slot._wait_state = None
-            slot._end_wait_request = None
-            slot._wait_last_ping = 0.0
-            state.push_slots_update()
-        return
-    # ── Ambiguous-identity guard ──
-    # `_resolve_session_key()` answers per RUNTIME, not per ACP session: with the
-    # MCP gateway disabled (the default) KIROCREW_SESSION_KEY is unset and one MCP
-    # process serves the whole runtime, so a subagent's `wait` and its parent's
-    # resolve to the SAME session key and land on this one slot. Taking the newer
-    # wait over would then attribute one sleep's countdown to the other's pill,
-    # and worse, hand the user's End-wait click to whichever sleep polled next.
-    #
-    # The ping doubles as a heartbeat, which makes the ambiguity detectable: a
-    # second wait_id arriving while the incumbent is still pinging means two
-    # sleeps genuinely share this slot. There is no way to tell which one the
-    # user is looking at, so track neither, and stay that way for the rest of the
-    # turn (see the latch below -- a self-expiring window flapped the hole back
-    # open). Deliberately a containment, not a cure: the cure is per-session
-    # identity, which this cannot synthesize.
-    # Tracked in https://github.com/kirodotdev/KiroCrew/issues/2347, which also
-    # lists this guard among the things to delete once identity is fixed.
-    if slot._wait_contested:
-        # Latched for the REST OF THE TURN, not for a fixed window. An expiring
-        # window reopened the hole it was built to close: both sleeps keep
-        # pinging, so on expiry whichever pinged first re-minted state, and for
-        # up to one ping interval that wait's id and deadline were published and
-        # painted onto the OTHER one's pill -- with a live button that would end
-        # the wrong sleep. Re-detection closed it again a ping later, so the
-        # attribution flapped open every window instead of staying shut.
-        if slot._wait_state is not None or slot._end_wait_request is not None:
-            slot._wait_state = None
-            slot._end_wait_request = None
-            slot._wait_last_ping = 0.0
-            state.push_slots_update()
-        return
-    prev = slot._wait_state
-    if prev and prev.get("wait_id") != wait_id:
-        if now - slot._wait_last_ping < window:
-            slot._wait_contested = True
-            slot._wait_state = None
-            slot._end_wait_request = None
-            slot._wait_last_ping = 0.0
-            logger.info("two concurrent waits share session %s; countdown suppressed", session_key)
-            state.push_slots_update()
-            return
-        # The incumbent stopped pinging: its sleep is over (a missed wait_done, a
-        # killed MCP process, a hard stop). Safe to hand the slot to this one.
-    if not prev or prev.get("wait_id") != wait_id:
-        try:
-            remaining = max(0, min(1800, int(body.get("remaining") or 0)))
-            total = max(0, min(1800, int(body.get("seconds") or 0)))
-        except (TypeError, ValueError):
-            remaining, total = 0, 0
-        slot._wait_state = {
-            "wait_id": wait_id,
-            "seconds": total,
-            # Absolute deadline on the DASHBOARD's clock, derived once on first
-            # sight from the tool's own remaining budget. Two reasons not to
-            # recompute it every ping: the countdown would jitter by one
-            # round-trip each tick, and the tool's monotonic clock has no shared
-            # epoch it could send instead.
-            "deadline_ts": now + remaining,
-        }
-        # A brand-new wait cannot inherit an end request aimed at an older one.
-        slot._end_wait_request = None
-        slot._wait_last_ping = now
-        state.push_slots_update()
-    else:
-        # Heartbeat only. Held OFF the wire payload so the deadline the browser
-        # counts down against stays byte-identical between pushes.
-        slot._wait_last_ping = now
-    if slot._end_wait_request and slot._end_wait_request == wait_id:
-        # Consume exactly once. Leaving it set would make the NEXT wait in this
-        # session return instantly, which is the failure mode a session-scoped
-        # boolean flag would have had.
-        slot._end_wait_request = None
-        slot._wait_state = None
-        slot._wait_last_ping = 0.0
-        reply["end_wait"] = wait_id
-        state.push_slots_update()
-
-
-async def api_session_tool_policy(request: web.Request) -> web.Response:
-    """GET /api/session-tool-policy — return managedToolPolicy for the
-    calling session's agent.
-
-    Used by managed MCP servers (kirocrew-core, kirocrew-cron) to filter
-    their tool lists per-agent.  Returns {"exclude": [...]} on success,
-    or 400/404 when the session cannot be identified (deny-by-default:
-    callers that cannot prove identity get an error, not an empty policy).
-    Authenticated via X-Internal-Secret + X-Session-Key.
-    """
-    state: DashboardState = request.app["state"]
-    session_key = request.headers.get("X-Session-Key", "").strip()
-    if not session_key:
-        _sel().log_api_access(
-            caller="unknown",
-            operation="session_tool_policy",
-            outcome="denied",
-            source="dashboard",
-            resources="missing X-Session-Key",
-        )
-        return web.json_response({"error": "X-Session-Key required"}, status=400)
-
-    # Resolve agent name from session
-    agent_name = ""
-
-    # Dashboard slot
-    if session_key.startswith("dashboard:"):
-        slot_key = session_key[len("dashboard:") :]
-        slot = state.get_slot(slot_key)
-        if slot:
-            agent_name = slot.agent
-    # Subagent — look up in SubagentManager
-    elif session_key.startswith("subagent:"):
-        if state.subagents:
-            subagent_id = session_key[len("subagent:") :]
-            info = state.subagents.get(subagent_id)
-            if info:
-                agent_name = info.agent
-    # Cron — fall through to session manager lookup below
-    elif session_key.startswith("cron:"):
-        pass
-
-    # Also check session manager for agent name
-    if not agent_name and state.sessions:
-        agent_name = state.sessions.get_agent(session_key)
-
-    if not agent_name:
-        _sel().log_api_access(
-            caller=session_key,
-            operation="session_tool_policy",
-            outcome="denied",
-            source="dashboard",
-            resources="agent not resolved",
-        )
-        return web.json_response({"error": "agent not resolved"}, status=404)
-
-    # Sanitize agent_name to prevent path traversal
-    if "/" in agent_name or "\\" in agent_name or ".." in agent_name:
-        _sel().log_api_access(
-            caller=session_key,
-            operation="session_tool_policy",
-            outcome="denied",
-            source="dashboard",
-            resources=f"invalid agent_name={agent_name!r}",
-        )
-        return web.json_response({"error": "invalid agent name"}, status=400)
-
-    # Read agent config from disk
-    agent_path = kiro_agents_dir() / f"{agent_name}.json"
-    if not agent_path.is_file():
-        return web.json_response({})
-
-    try:
-        config = json.loads(agent_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return web.json_response({})
-
-    policy = config.get("managedToolPolicy", {})
-    if not isinstance(policy, dict):
-        return web.json_response({})
-
-    _sel().log_api_access(
-        caller=session_key,
-        operation="session_tool_policy",
-        outcome="ok",
-        source="dashboard",
-        resources=f"agent={agent_name}",
-    )
-    return web.json_response(policy)
-
-
-async def _reset_all_sessions(request: web.Request) -> int:
-    """Reset all active sessions so they pick up config changes.
-
-    Reloads provider factory (handles provider switch ACP→CC or vice versa),
-    shuts down all active sessions AND drains the warm pool (pre-spawned
-    processes loaded the old MCP config at spawn time).
-    New sessions cold-start on next message.
-    Returns the number of sessions reset.
-    """
-    state: DashboardState = request.app["state"]
-    sessions = state.sessions
-
-    # Reload factory so provider switch takes effect immediately
-    await sessions.reload_provider_factory()
-
-    # Pop all active sessions
-    providers: list[LLMProvider] = []
-    count = sessions.count
-    if count > 0:
-        providers = await sessions.drain_all_providers()
-
-    # Drain warm pool — pre-spawned processes have stale MCP config
-    pool_providers = await sessions.drain_warm_pool()
-    providers.extend(pool_providers)
-
-    if count > 0 or pool_providers:
-        logger.info(
-            "Reset %d session(s) + %d pool process(es) after config change",
-            count,
-            len(pool_providers),
-        )
-
-    state.broadcast_ws("sessions_restarting", {"status": "restarting"})
-
-    async def _background_restart() -> None:
-        if providers:
-
-            async def _safe_shutdown(p: LLMProvider) -> None:
-                import kiro_crew.dashboard.handlers as _h  # noqa: F811
-
-                _timeout = _SHUTDOWN_TIMEOUT_SECS
-                try:
-                    await asyncio.wait_for(p.shutdown(), timeout=_timeout)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Session shutdown hung past %.1fs; forcing kill",
-                        _timeout,
-                    )
-                    try:
-                        _h._sync_kill_provider(p)
-                    except Exception:
-                        logger.exception("Force-kill fallback also failed for %r", p)
-                except Exception:
-                    pass
-
-            await asyncio.gather(*[_safe_shutdown(p) for p in providers])
-
-        sessions._pool_started = False
-        await sessions.start_pool(blocking=False)
-        logger.info("Background session restarted")
-        state.push_refresh("agents")
-        state.push_slots_update()
-        state.broadcast_ws("sessions_restarting", {"status": "ready"})
-
-    task = asyncio.create_task(_background_restart())
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
-
-    return count
-
-
-async def api_sessions_restart(request: web.Request) -> web.Response:
-    """POST /api/sessions/restart — reset all kiro-cli sessions.
-
-    Forces fresh context injection on the next message. Use after editing
-    memory, lessons, or skills to pick up changes immediately.
-
-    Also syncs MCP servers from mcp.json → kirocrew.json so newly
-    installed servers (e.g. via AIM) are picked up on restart.
-    """
-    # Sync MCP servers before restarting so new installs take effect.
-    # Run in thread — discover/sync do blocking file I/O and subprocess calls.
-    # Cap at 30s so a hung kiro-cli subprocess doesn't stall the restart.
-    synced = 0
-    try:
-
-        async def _sync() -> int:
-            to_sync = await asyncio.to_thread(discover_servers_to_sync)
-            if to_sync:
-                ok: bool = await asyncio.to_thread(sync_to_agent_config, to_sync)
-                # Register for CC unconditionally (CC uses its own .mcp.json)
-                await asyncio.to_thread(register_servers_for_cc, to_sync)
-                if ok:
-                    return len(to_sync)
-            return 0
-
-        synced = await asyncio.wait_for(_sync(), timeout=30)
-    except Exception:
-        logger.warning("MCP server sync failed before restart", exc_info=True)
-    count = await _reset_all_sessions(request)
-    return web.json_response({"ok": True, "sessions_reset": count, "mcp_synced": synced})
-
-
-async def api_session_archive_list(request: web.Request) -> web.Response:
-    """GET /api/session/archive?key=... — list archive files for a session key."""
-    from typing import Any
-
-    from kiro_crew.history import _archive_dir, _safe_key
-
-    key = request.query.get("key", "").strip()
-    adir = _archive_dir()
-    if not adir.exists():
-        return web.json_response({"archives": []})
-    prefix = f"{_safe_key(key)}__" if key else ""
-
-    def _collect() -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        for p in adir.glob(f"{prefix}*.jsonl"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            stem = p.stem
-            # Archive filenames use '__' delimiter: {safekey}__{stamp}.jsonl
-            sep = stem.find("__")
-            safekey = stem[:sep] if sep >= 0 else stem
-            stamp = stem[sep + 2 :] if sep >= 0 else ""
-            items.append(
-                {
-                    "name": p.name,
-                    "key": safekey,
-                    "stamp": stamp,
-                    "size": st.st_size,
-                    "mtime": st.st_mtime,
-                }
-            )
-        items.sort(key=lambda x: x["mtime"], reverse=True)
-        return items
-
-    items = await asyncio.to_thread(_collect)
-    return web.json_response({"archives": items})
-
-
-async def api_session_archive_read(request: web.Request) -> web.Response:
-    """GET /api/session/archive/{name} — read a single archive file as JSONL text."""
-    name = request.match_info.get("name", "")
-    if not name.endswith(".jsonl"):
-        return web.json_response({"error": "invalid archive name"}, status=400)
-    adir = _archive_dir().resolve()
-    try:
-        resolved = (adir / name).resolve()
-    except (OSError, RuntimeError, ValueError):
-        return web.json_response({"error": "invalid archive name"}, status=400)
-    # Canonical path check: file must be a direct child of the archive dir.
-    if resolved.parent != adir:
-        return web.json_response({"error": "invalid archive name"}, status=400)
-
-    def _read_capped(p: Path, limit: int = 250_000) -> str:
-        with p.open(encoding="utf-8") as f:
-            data = f.read(limit)
-        # Truncate at last newline to keep NDJSON valid.
-        if len(data) == limit:
-            nl = data.rfind("\n")
-            if nl > 0:
-                data = data[: nl + 1]
-        return data
-
-    try:
-        raw = await asyncio.to_thread(_read_capped, resolved)
-    except FileNotFoundError:
-        return web.json_response({"error": "not found"}, status=404)
-    except (OSError, UnicodeDecodeError) as exc:
-        logger.warning("Failed to read archive %s: %s", name, exc)
-        return web.json_response({"error": "unreadable archive"}, status=422)
-    # Archives contain LLM output; redact credentials and exfiltration URLs before serving.
-    redacted = await asyncio.to_thread(lambda: redact(raw))
-    return web.Response(text=redacted, content_type="application/x-ndjson")
+#: Name this module serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the family, as the one module bound it.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+
+
+# Every ``api_session*`` handler is an owner surface, so a private member's
+# internal call is refused before it runs (audit label = handler name). These
+# three verify and scope their own caller instead.
+guard_owner_surface_routes(
+    globals(),
+    prefix="api_session",
+    member_scoped=frozenset(
+        {"api_session_directive", "api_session_keepalive", "api_session_tool_policy"}
+    ),
+)

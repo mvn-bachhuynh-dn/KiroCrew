@@ -1,8 +1,10 @@
 import * as React from 'react'
+import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { i18nT } from '../../i18n/t'
+import { GlobalOverlayScope } from '../overlayRoot'
 
 /**
  * shadcn/ui `dialog` over Radix Dialog, themed to this repo's tokens the way
@@ -19,16 +21,25 @@ import { i18nT } from '../../i18n/t'
  *     name, and warns when `aria-describedby` points at nothing. `DialogContent`
  *     therefore defaults `aria-describedby` to `undefined`; pass a
  *     `DialogDescription` and wire it explicitly if a description is wanted.
- *   - Animations use this repo's own `scale-in`/`scale-out` + `fade-in`/
- *     `fade-out` keyframes, NOT shadcn's stock `animate-in`/`zoom-in-95`. Those
- *     stock class names come from `tailwindcss-animate`, which is not installed
- *     here — they are inert in ui/select.tsx today, and making them real would
- *     silently start animating every dropdown, popover and context menu in the
- *     app.
+ *   - Animations are `tw-animate-css`'s `animate-in` / `animate-out` pair, the
+ *     same classes shadcn ships. `DialogContent` is centred with
+ *     `-translate-x-1/2 -translate-y-1/2`, which Tailwind emits as the standalone
+ *     `translate` property, while the enter/exit keyframe animates `transform`
+ *     (a translate3d + scale3d composed from `--tw-enter-*` vars). The two
+ *     properties compose instead of competing, so the zoom plays around the
+ *     centred position with no extra slide utility. The same package backs
+ *     `ui/select.tsx`, `ui/dropdown-menu.tsx`, `ui/popover.tsx` and
+ *     `ui/context-menu.tsx`.
  */
 
 const Dialog = DialogPrimitive.Root
 const DialogTrigger = DialogPrimitive.Trigger
+// Deliberately NOT in the local overlay root, and neither is anything opened
+// inside it (GlobalOverlayScope): a modal dialog holds the whole window while
+// open (pointer lock, the rest of the page aria-hidden), and that hold cannot be
+// lifted without remounting its content, which would lose what the user
+// entered. Hidden behind a remote Crew it would keep that hold invisibly, so it
+// stays on screen across a Crew switch instead. See components/overlayRoot.
 const DialogPortal = DialogPrimitive.Portal
 const DialogClose = DialogPrimitive.Close
 
@@ -40,7 +51,8 @@ const DialogOverlay = React.forwardRef<
     ref={ref}
     className={cn(
       'fixed inset-0 z-[100] bg-bg/60 backdrop-blur-md',
-      'data-[state=open]:animate-fade-in data-[state=closed]:animate-fade-out',
+      'data-[state=open]:animate-in data-[state=closed]:animate-out',
+      'data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0',
       className,
     )}
     {...props}
@@ -54,16 +66,21 @@ interface DialogContentProps
   maxWidth?: number
   /** Hide the built-in close button when the caller renders its own. */
   hideClose?: boolean
+  /** Raise one dialog's overlay above a lower modal without changing every caller. */
+  overlayClassName?: string
 }
 
 const DialogContent = React.forwardRef<
   React.ComponentRef<typeof DialogPrimitive.Content>,
   DialogContentProps
->(({ className, children, maxWidth = 640, hideClose = false, style, onKeyDown, ...props }, ref) => (
+>(({ className, children, maxWidth = 640, hideClose = false, overlayClassName, style, onKeyDown, ...props }, ref) => {
+  const trustRoot = useGuideTrustRootAttrs()
+  return (
   <DialogPortal>
-    <DialogOverlay />
+    <DialogOverlay className={overlayClassName} />
     <DialogPrimitive.Content
       ref={ref}
+      {...trustRoot}
       // Radix warns when this points at an id that does not exist. Callers that
       // want a description render a DialogDescription and set it themselves.
       aria-describedby={undefined}
@@ -77,7 +94,8 @@ const DialogContent = React.forwardRef<
       // It does NOT cost us Escape: Radix's DismissableLayer listens with
       // `{ capture: true }`, and a capture-phase listener runs BEFORE the event
       // reaches this element, so stopping bubble propagation here cannot hide it.
-      // (Asserted end-to-end in scripts/verify-crews-dialog-select.mjs.)
+      // (Driven in a real browser by scripts/verify-crews-dialog-select.mjs, on
+      // demand only: no CI lane runs it.)
       onKeyDown={e => {
         onKeyDown?.(e)
         e.stopPropagation()
@@ -85,8 +103,24 @@ const DialogContent = React.forwardRef<
       style={{ maxWidth, maxHeight: '90vh', ...style }}
       className={cn(
         'fixed left-1/2 top-1/2 z-[101] flex w-[calc(100%-4rem)] -translate-x-1/2 -translate-y-1/2',
-        'flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl outline-none',
-        'data-[state=open]:animate-scale-in data-[state=closed]:animate-scale-out',
+        'flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl outline-hidden',
+        // The centering is the `translate` property (from `-translate-x-1/2
+        // -translate-y-1/2` above) and the enter/exit keyframe animates
+        // `transform`, so the zoom plays around the centred position. Do NOT add
+        // a `slide-in-from-*` re-centring pair here: with `translate` already
+        // holding the -50%/-50%, a slide utility would ADD another half-width
+        // offset and the dialog would fly in from off-screen.
+        //
+        // These classes must stay on THIS element (the one the forwarded `ref`
+        // and role="dialog" land on), not on a wrapper: SketchDialog's placement
+        // gate calls `getAnimations()` on the ref'd element and holds its
+        // measurement-dependent pad back until the enter animation has finished.
+        // Moving the animation up a level makes that call return `[]`, the gate
+        // waves the pad through mid-flight, and the ~7px pointer offset returns
+        // with no CI signal beyond src/test/DialogEnterAnimation.test.tsx.
+        'duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out',
+        'data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0',
+        'data-[state=open]:zoom-in-95 data-[state=closed]:zoom-out-95',
         className,
       )}
       {...props}
@@ -98,7 +132,7 @@ const DialogContent = React.forwardRef<
       // alone so the visible Title still names the dialog.
       {...(props['aria-label'] ? { 'aria-labelledby': undefined } : {})}
     >
-      {children}
+      <GlobalOverlayScope>{children}</GlobalOverlayScope>
       {!hideClose && (
         <DialogPrimitive.Close
           aria-label={i18nT('components.dialog.close')}
@@ -109,7 +143,8 @@ const DialogContent = React.forwardRef<
       )}
     </DialogPrimitive.Content>
   </DialogPortal>
-))
+  )
+})
 DialogContent.displayName = DialogPrimitive.Content.displayName
 
 /** Fixed-height header strip. `pr-12` keeps content clear of the close button. */

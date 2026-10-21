@@ -6,7 +6,7 @@ process holds the internal secret; the agent never sees a credential). Three
 planes must stay mutually consistent, and each has a failure mode this module
 pins:
 
-- the **(method, path) allowlist** in ``validation.py`` — widening it is an
+- the **(method, path) allowlist** in ``validation_parts/app_schemas.py`` — widening it is an
   authorization change and must look like one in review;
 - the **schema** rejecting off-surface calls before any HTTP happens;
 - the **gateway's mixed-internal path set** admitting exactly the allowlisted
@@ -17,6 +17,7 @@ pins:
 import unittest
 
 from kiro_crew.dashboard.server import _MIXED_INTERNAL_API_PATHS
+from kiro_crew.dashboard.token_auth import internal_path_matches
 from kiro_crew.validation import (
     OPS_MISSION_CONTROL_ALLOWED_CALLS,
     OPS_MISSION_CONTROL_API_SCHEMA,
@@ -137,8 +138,7 @@ class TestGatewayAdmission(unittest.TestCase):
 
     @staticmethod
     def _admitted(path: str, mixed) -> bool:
-        # Mirrors token_auth.middleware's matcher: exact or prefix.
-        return any(path == p or path.startswith(p + "/") for p in mixed)
+        return internal_path_matches(path, mixed)
 
     def test_every_allowlisted_call_is_admitted(self):
         """A pair the schema allows but the gateway 403s is a broken tool."""
@@ -153,8 +153,8 @@ class TestGatewayAdmission(unittest.TestCase):
     def test_sensitive_routes_are_not_admitted(self):
         """The routes that must stay dashboard-only (cookie/token auth).
 
-        This is the property PR #1066 named when it chose full paths over the
-        app prefix: prefix-matching would admit provider secret writes and the
+        This is the property that makes the allowlist use full paths rather than
+        the app prefix: prefix-matching would admit provider secret writes and the
         human proposal-decision route to anything holding the internal secret.
         """
         mixed = self._mixed()

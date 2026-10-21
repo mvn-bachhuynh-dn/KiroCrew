@@ -12,11 +12,13 @@
  * a keyboard user and undiscoverable to everyone else.
  */
 import { useMemo, useState } from 'react'
+import { useIsMobile } from '../../hooks/useIsMobile'
 import { ChevronDown, ChevronRight, FileText, Folder, Image, Library, Plus, Settings2, Trash2 } from 'lucide-react'
 import Clickable from '../../components/Clickable'
 import { buildTree, flattenTree, sourceFiles, type TreeNode } from './lib'
 
 import { i18nT } from '../../i18n/t'
+import { guideCaution } from '../../guide/trustRoot'
 
 export interface FileTreeProps {
   files: string[]
@@ -113,9 +115,10 @@ export default function FileTree({
           <button
             type="button"
             aria-label={i18nT('apps.papyrus.fileTree.delete_file', { file: node.name })}
+            {...guideCaution}
             title={i18nT('apps.papyrus.fileTree.delete_file', { file: node.name })}
             onClick={() => onDeleteFile(node.path)}
-            className="p-1 rounded text-muted opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-danger hover:bg-danger/10 cursor-pointer bg-transparent border-none transition-colors"
+            className="p-1 rounded text-muted opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 hover:text-danger-text hover:bg-danger/10 cursor-pointer bg-transparent border-none transition-colors"
           >
             <Trash2 className="lucide-inline" />
           </button>
@@ -124,12 +127,17 @@ export default function FileTree({
     )
   }
 
+  const isMobile = useIsMobile()
   return (
-    <div className="h-full min-h-0 flex flex-col border-r border-border bg-bg-subtle" data-testid="papyrus-file-tree">
+    <div className="h-full min-h-0 flex flex-col border-r border-border bg-bg-accent" data-testid="papyrus-file-tree">
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border shrink-0">
-        <span className="flex-1 text-[12px] font-medium text-muted uppercase tracking-[.04em]">
+        {/* While narrow the page puts a labelled disclosure bar directly above
+            this row, so repeating the word here is two adjacent headings saying
+            the same thing. The spacer keeps the new-file button where it is. */}
+        <span className={`flex-1 text-[12px] font-medium text-muted uppercase tracking-[.04em] ${isMobile ? 'sr-only' : ''}`}>
           {i18nT('apps.papyrus.fileTree.files')}
         </span>
+        {isMobile && <span className="flex-1" />}
         <button
           type="button"
           aria-label={i18nT('apps.papyrus.fileTree.new_file')}

@@ -23,11 +23,12 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
-from kiro_crew.sandbox import cgroup_scope_argv, resource_limit_preexec, wrap_argv
+from kiro_crew.sandbox import cgroup_scope_argv, run_limited, wrap_argv
 
 logger = logging.getLogger(__name__)
 
@@ -85,15 +86,253 @@ def random_bucket_name() -> str:
     return f"{BUCKET_PREFIX}{secrets.token_hex(_BUCKET_RAND_BYTES)}"
 
 
+# Well-known AWS CLI install dirs, searched (after the inherited PATH) when
+# resolving the binary absolutely. A Finder/Dock-launched macOS gateway inherits
+# the minimal launchd PATH (``/usr/bin:/bin:/usr/sbin:/sbin``), which contains
+# neither Homebrew nor the official-pkg symlink dir — so a bare ``"aws"`` fails
+# ``execvp`` inside ``sandbox-exec`` with "No such file or directory", which is
+# exactly why the Artifact Deploy "Verify" step failed for Homebrew users until
+# the gateway was relaunched from a shell that carried the full PATH. The SSM
+# session-manager-plugin installs into these same dirs, so it is resolved and
+# spawn-searched through them too.
+_AWS_BIN_DIRS = (
+    "/opt/homebrew/bin",  # Apple Silicon Homebrew
+    "/usr/local/bin",     # Intel Homebrew + official AWS CLI v2 pkg symlink
+)
+
+# ``(name, directory)`` pairs in :data:`_AWS_BIN_DIRS` whose candidate the
+# provenance chokepoint most recently REFUSED. Keyed by the pair, not the dir
+# alone, because :func:`resolve_aws_tool_bin` is generic over ``name``: ``aws``
+# and ``session-manager-plugin`` share one body and one install dir, so a dir can
+# hold a refused ``session-manager-plugin`` next to an accepted ``aws``. A
+# dir-only key would let the accepted ``aws`` clear the plugin's refusal and
+# re-expose the plugin to the credential-bearing child's by-name PATH lookup.
+# Written only by :func:`resolve_aws_tool_bin` (which re-runs the real validation
+# on every call and clears a pair the moment that name passes in that dir again,
+# so a fixed install is picked up without a gateway restart) and read only by
+# :func:`aws_spawn_env`, which drops a dir refused for ANY name — see that
+# function's fail-closed rule. Keeping it here is what lets ``aws_spawn_env`` stay
+# filesystem-free and event-loop safe.
+_REFUSED_AWS_BIN_DIRS: set[tuple[str, str]] = set()
+
+
+def resolve_aws_tool_bin(name: str) -> str:
+    """Resolve an AWS-tooling binary to an absolute path, or the bare ``name``.
+
+    Searches the inherited ``PATH`` first, then the well-known install dirs in
+    :data:`_AWS_BIN_DIRS`, so the desktop-app gateway resolves the tool no matter
+    how it was launched (Finder/Dock give a minimal PATH; a terminal launch does
+    not). Falling back to the bare ``name`` preserves the prior behaviour — and
+    its "not found" error — when the tool genuinely is not installed anywhere.
+
+    Public and generic over ``name`` because ``aws`` is not the only AWS binary
+    the gateway has to find in those dirs: ``session-manager-plugin`` installs
+    into exactly the same ones (AWS's macOS ``.pkg`` symlinks it into
+    ``/usr/local/bin``, the Homebrew cask into the brew prefix), and its probe hit
+    the identical minimal-PATH gap. Both callers therefore share this one
+    body rather than each re-deriving the dirs and the provenance rule.
+
+    A hit found only through the fallback dirs (i.e. NOT reachable via the
+    inherited ``PATH``, which the pre-existing bare-argv behaviour already
+    trusted) is additionally routed through
+    :func:`kiro_crew.github_runner.validate_provider_executable` — the repo's
+    executable-provenance chokepoint — so an agent- or third-party-planted shim
+    in a user-writable install dir is refused rather than executed inside the
+    credential-bearing sandbox.
+
+    A refusal ends that DIR, not the search: the remaining dirs are tried in
+    order and only an exhausted list falls back to the bare name, preserving the
+    prior not-found/execvp error rather than inventing a new failure mode.
+    Refusing-and-stopping made one unrelated install shadow a legitimate one and
+    took the whole feature down with it: on a macOS host where Homebrew is
+    managed by a *second* unprivileged account (Workbrew installs as
+    ``workbrew``), ``/opt/homebrew/bin/aws`` is owned by another user and is
+    correctly refused — but it also sorts first, so the root-owned official-pkg
+    ``/usr/local/bin/aws`` was never reached and every SSM tunnel died at gateway
+    start with ``[Errno 2] No such file or directory: 'aws'``. Installing the
+    official pkg, the documented remedy, could not fix it. The refused
+    ``(name, dir)`` is recorded in :data:`_REFUSED_AWS_BIN_DIRS` so
+    :func:`aws_spawn_env` keeps that dir off the child's ``PATH`` while any name
+    there is refused; the pair is cleared when that name passes in that dir, so
+    repairing the install needs no restart.
+    """
+    return resolve_aws_tool_bin_with_refusals(name)[0]
+
+
+class AwsToolRefusal(NamedTuple):
+    """One install-dir candidate the provenance check refused, and why."""
+
+    path: str
+    reason: str
+
+
+def resolve_aws_tool_bin_with_refusals(name: str) -> tuple[str, tuple[AwsToolRefusal, ...]]:
+    """:func:`resolve_aws_tool_bin`, plus the candidates THIS walk refused.
+
+    Same search, same validation and same :data:`_REFUSED_AWS_BIN_DIRS` updates;
+    the second element only reports what the walk already decided, so a caller
+    that has to explain a bare-name result can tell "nothing installed" from
+    "installed but refused" and name the refusal reason. The refusals come from
+    this call alone, never from the shared set, so a candidate removed since an
+    earlier walk is not reported.
+    """
+    refusals: list[AwsToolRefusal] = []
+    env_path = os.environ.get("PATH", "")
+    found = shutil.which(name, path=env_path) if env_path else None
+    if found:
+        # Same trust class as the pre-existing behaviour: execvp against the
+        # inherited PATH already executed exactly this binary.
+        return found, ()
+    for directory in _AWS_BIN_DIRS:
+        if not directory:
+            continue
+        found = shutil.which(name, path=directory)
+        if not found:
+            continue
+        from kiro_crew.github_runner import validate_provider_executable
+
+        try:
+            resolved = validate_provider_executable(found)
+        except ValueError as exc:
+            # This (name, dir) is out — for the argv head AND for the child's
+            # PATH. Keyed by name too: a sibling name passing in this dir must not
+            # clear THIS name's refusal.
+            _REFUSED_AWS_BIN_DIRS.add((name, directory))
+            refusals.append(AwsToolRefusal(found, str(exc)))
+            logger.warning(
+                "refusing %s at %s: failed provenance validation; trying the remaining "
+                "install dirs",
+                name,
+                found,
+            )
+            continue
+        _REFUSED_AWS_BIN_DIRS.discard((name, directory))
+        return resolved, tuple(refusals)
+    return name, tuple(refusals)
+
+
+def resolve_aws_bin() -> str:
+    """Resolve ``aws`` to an absolute path, falling back to the bare name.
+
+    Public: this is the repo's single ``aws``-CLI resolution chokepoint, reused
+    by every sibling spawn site (``cloud.aws``, ``cloud.ssm``, ``voice_reply``,
+    ``dashboard.chat_voice``, the artifact-deploy skill scripts) so each one
+    survives a GUI-launched gateway's minimal PATH the same way. See
+    :func:`resolve_aws_tool_bin` for the search order and the provenance rule.
+    """
+    return resolve_aws_tool_bin("aws")
+
+
+def aws_spawn_env(aws_bin: str) -> dict[str, str]:
+    """The ``env=`` for an ``aws`` child: :func:`tool_spawn_env` of its head.
+
+    ``aws_bin`` is the argv head the caller is about to spawn — the return value of
+    :func:`resolve_aws_bin` for that same spawn. Kept as the name every ``aws``
+    spawn site already imports; the widening and its fail-closed rule live in
+    :func:`tool_spawn_env`, shared with the ssh children that run a user's
+    ``ProxyCommand``, so the two cannot drift.
+    """
+    return tool_spawn_env(aws_bin)
+
+
+def tool_spawn_env(argv_head: str) -> dict[str, str]:
+    """This process's env with :data:`_AWS_BIN_DIRS` APPENDED to ``PATH``.
+
+    ``argv_head`` is the argv head the caller is about to spawn, already resolved
+    by the caller (:func:`resolve_aws_bin` for ``aws``,
+    ``instances.token_mint.resolve_ssh_bin`` for ``ssh``). It is required, not
+    optional: see the fail-closed rule below, which cannot be enforced without it.
+
+    Resolving our own argv head absolutely is not sufficient for ``aws ssm
+    start-session``: the CLI locates ``session-manager-plugin`` itself, by name,
+    against the CHILD's inherited ``PATH`` at exec time. A GUI-launched gateway
+    hands the child the minimal launchd ``PATH``, so the tunnel dies inside a
+    correctly-resolved ``aws`` — the resolver cannot reach that lookup, only the
+    child's environment can. Passing this as ``env=`` is therefore the
+    other half of the same fix, not a duplicate of it.
+
+    ``ssh`` has the identical gap one level further out. A tunnel, token mint or
+    probe to a host whose ``~/.ssh/config`` routes through a ``ProxyCommand``
+    runs that command under the ssh child's ``PATH``, and the proxies in real use
+    (an SSM connect helper, ``aws ssm start-session``) look ``session-manager-plugin``
+    or ``aws`` up by name — so under a GUI-launched gateway ``ssh`` exited 255
+    with "session-manager-plugin is not installed" while the plugin sat in
+    ``/usr/local/bin``. Those children get this same env, under this same rule.
+
+    APPENDED, never prepended: the inherited ``PATH`` keeps first claim on every
+    name, so this can only make an otherwise-unresolvable lookup succeed and can
+    never re-point one the child already resolved. That is the whole trust
+    argument for widening a credential-bearing child's ``PATH`` at all, and it is
+    also why this is not :func:`kiro_crew.env.augmented_path`, which PREPENDS a
+    broader set (``~/.local/bin``, npm/mise/volta shims) — the right search space
+    for finding an MCP launcher, too wide and wrongly-ordered ahead of ``/usr/bin``
+    for a child holding AWS credentials and a live tunnel to the user's box.
+
+    **A non-absolute ``argv_head`` returns the env UNWIDENED.** This is the one case
+    where "can only make an unresolvable lookup succeed" is not a safety argument
+    but the hazard itself: :func:`resolve_aws_tool_bin` falls back to the bare name
+    precisely when every install dir either held nothing or held a candidate
+    ``validate_provider_executable`` REFUSED, and that refusal is enforced only
+    by the bare name failing ``execvp`` against a ``PATH`` those dirs are absent
+    from. Widening the child's ``PATH`` would put the refused binary back on it and
+    hand it AWS credentials — converting a fail-closed rejection into an execution.
+    So the widening is offered only to a head that was already resolved
+    absolutely, where ``execvp`` performs no ``PATH`` search at all and the dirs
+    can affect nothing but the CLI's own onward lookups.
+    ``ssh`` meets the rule the same way from the other side: its resolver
+    searches only the inherited ``PATH`` (the trust class the bare ``"ssh"`` argv
+    already had), so a bare head means no ``ssh`` there, and widening would hand
+    execvp an ``ssh`` found only in these dirs that nothing vetted.
+
+    **Individually refused dirs are dropped even from a widened env.** A resolved
+    absolute head does not imply every dir was clean: the resolver walks past a
+    refused dir to a later good one, so a Workbrew-owned ``/opt/homebrew/bin``
+    coexists with an accepted ``/usr/local/bin``. Appending the refused dir would
+    re-expose exactly the shim that was just rejected to the CLI's onward
+    ``session-manager-plugin`` lookup, which is the same execution the refusal
+    exists to prevent. :data:`_REFUSED_AWS_BIN_DIRS` carries that decision here as
+    ``(name, dir)`` pairs; a dir is dropped while ANY name in it is refused, so an
+    accepted ``aws`` cannot re-admit a dir whose ``session-manager-plugin`` was
+    refused. This stays a set lookup and touches no filesystem.
+
+    Dirs already on ``PATH`` are not repeated, so a terminal-launched gateway
+    (whose ``PATH`` carries them) gets a byte-identical env and the fix is inert
+    outside the minimal-PATH case it exists for.
+
+    Unlike the resolvers above this touches no filesystem — it is a dict copy and
+    a string join over ``os.environ`` — so it is safe to call directly on the
+    gateway event loop, where a PATH scan would not be.
+    """
+    env = dict(os.environ)
+    if not os.path.isabs(argv_head):
+        # Unresolved head: the bare name IS the provenance refusal. Leave PATH
+        # alone so it keeps failing execvp, as it did before this env existed.
+        return env
+    current = env.get("PATH", "")
+    have = {p for p in current.split(os.pathsep) if p}
+    refused_dirs = {directory for _name, directory in _REFUSED_AWS_BIN_DIRS}
+    extra = [d for d in _AWS_BIN_DIRS if d and d not in have and d not in refused_dirs]
+    if extra:
+        env["PATH"] = os.pathsep.join(([current] if current else []) + extra)
+    return env
+
+
 def _aws(args: list[str], profile: str) -> list[str]:
     """Build an ``aws`` CLI argv with an optional ``--profile`` (never a raw key)."""
-    cmd = ["aws"] + list(args)
+    cmd = [resolve_aws_bin()] + list(args)
     if profile:
         cmd += ["--profile", profile]
     return cmd
 
 
-def run_aws(args: list[str], profile: str, timeout: int = 30) -> tuple[int, str, str]:
+def run_aws(
+    args: list[str],
+    profile: str,
+    timeout: int = 30,
+    *,
+    extra_visible_dirs: tuple[str, ...] = (),
+    stdin_fd: int | None = None,
+) -> tuple[int, str, str]:
     """Run an ``aws`` CLI command. Returns (returncode, stdout, stderr).
 
     Single subprocess chokepoint — unit tests monkeypatch this. Credentials are
@@ -105,16 +344,41 @@ def run_aws(args: list[str], profile: str, timeout: int = 30) -> tuple[int, str,
     must read ``~/.aws`` to resolve credentials; the argv is fixed (no shell, no
     user-controlled command structure — only ``--profile`` and validated args are
     appended), so ``standard`` is the correct tier (same as app subprocesses).
+
+    ``extra_visible_dirs`` re-exposes an agent-hidden tree to THIS spawn alone: a
+    transfer that must land in a directory every agent sandbox masks (so a
+    same-UID agent cannot swap the destination for a link) still needs the CLI
+    itself to see that directory. Naming it here lifts the mask for the one
+    fixed-argv child, never for the agent.
+
+    ``stdin_fd`` becomes the child's standard input, which is how a caller uploads
+    a file it has already opened and checked rather than a name the child would
+    resolve again: it pairs with ``--body /dev/stdin``, so the bytes the CLI sends
+    come from THAT descriptor and no path is resolved at all. The descriptor stays
+    the caller's to close. Omitted, ``stdin`` is ``DEVNULL`` -- closed, not
+    inherited -- so the CLI and any ``credential_process`` it spawns get no
+    inherited handle, and the dedicated descriptor is the only way a body reaches
+    the child.
     """
-    sandboxed, cleanup = wrap_argv(_aws(args, profile), mode="standard")
+    sandboxed, cleanup = wrap_argv(
+        _aws(args, profile), mode="standard", extra_visible_dirs=extra_visible_dirs
+    )
     sandboxed = cgroup_scope_argv(sandboxed)  # cgroup DoS ceiling
+    # stdin is CLOSED by default rather than inherited. The CLI resolves credentials
+    # through its own provider chain, which can spawn a ``credential_process`` child;
+    # that child would inherit whatever this process's stdin happens to be, so an
+    # inherited handle is a path for one subprocess's input to reach another. A body
+    # upload passes its OWN descriptor here (paired with ``--body /dev/stdin``); every
+    # other call gets ``DEVNULL``, so no inherited handle is exposed to the CLI or to
+    # anything it spawns.
+    stdin_arg: Any = subprocess.DEVNULL if stdin_fd is None else stdin_fd
     try:
-        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell, sandbox-wrapped
+        proc = run_limited(  # noqa: S603 — fixed argv, no shell, sandbox-wrapped
             sandboxed,
             capture_output=True,
             text=True,
             timeout=timeout,
-            preexec_fn=resource_limit_preexec(),
+            stdin=stdin_arg,
         )
     finally:
         if cleanup:
@@ -135,16 +399,50 @@ def map_access_denied(stderr: str) -> Optional[str]:
     return "the deploy-web IAM policy (see §7)"
 
 
-def _checked(args: list[str], profile: str, *, action: str, timeout: int = 30) -> str:
+def _trimmed_stderr(err: str, limit: int = 200) -> str:
+    """CLI stderr, REDACTED and then trimmed -- in that order.
+
+    Order is the whole point. Trimming first can cut a credential in half, and a
+    half token matches no redaction pattern: the fragment then survives every
+    downstream pass (a response body, a SEL audit, a log line) because by the
+    time a redactor sees the string, the evidence that it WAS a credential is
+    gone. Redacting the full text first means the placeholder is what gets
+    trimmed, so the cutoff can only shorten already-safe text.
+
+    Callers may redact again at their own boundary; these passes are idempotent.
+    """
+    from kiro_crew.security import redact
+
+    text = redact(err.strip())
+    return text[:limit]
+
+
+def _checked(
+    args: list[str],
+    profile: str,
+    *,
+    action: str,
+    timeout: int = 30,
+    extra_visible_dirs: tuple[str, ...] = (),
+    stdin_fd: int | None = None,
+) -> str:
     """Run an aws call, raising AWSError (with AccessDenied mapping) on failure."""
-    rc, out, err = run_aws(args, profile, timeout=timeout)
+    # Forwarded only when set: ``run_aws`` is the chokepoint tests monkeypatch,
+    # and a call without a visible-dir grant or a body descriptor keeps the exact
+    # call shape those stubs were written against.
+    extra: dict[str, Any] = {}
+    if extra_visible_dirs:
+        extra["extra_visible_dirs"] = extra_visible_dirs
+    if stdin_fd is not None:
+        extra["stdin_fd"] = stdin_fd
+    rc, out, err = run_aws(args, profile, timeout=timeout, **extra)
     if rc != 0:
         # Only attach an IAM-statement remediation hint when the failure is a
         # genuine authorization error. Client-side errors (NoRegion,
         # InvalidArgument, etc.) must NOT be reported as a missing permission.
         sid = map_access_denied(err)
         hint = f" — add `{action}` (policy statement `{sid}`) and re-run" if sid else ""
-        raise AWSError(f"{action} failed: {err.strip()[:200]}{hint}", missing_statement=sid)
+        raise AWSError(f"{action} failed: {_trimmed_stderr(err)}{hint}", missing_statement=sid)
     return out
 
 
@@ -258,7 +556,7 @@ def _harden_bucket(bucket: str, profile: str, tagset: str) -> None:
     #
     # No put-bucket-logging either. These buckets set ObjectOwnership
     # BucketOwnerEnforced, which disables the ACL that server access logging
-    # historically relies on, so a log destination has to be granted to
+    # relies on, so a log destination has to be granted to
     # logging.s3.amazonaws.com in the target's BUCKET POLICY instead. That grant
     # cannot live in this helper: put_oac_bucket_policy writes a complete policy
     # document after hardening and would overwrite it.
@@ -301,8 +599,16 @@ def create_oac(name: str, profile: str) -> str:
     return json.loads(out)["OriginAccessControl"]["Id"]
 
 
-def distribution_config(bucket: str, region: str, oac_id: str) -> dict[str, Any]:
-    """Build the CloudFront DistributionConfig: S3 REST origin + OAC, HTTPS, index.html."""
+def distribution_config(
+    bucket: str, region: str, oac_id: str, response_headers_policy_id: str = ""
+) -> dict[str, Any]:
+    """Build the CloudFront DistributionConfig: S3 REST origin + OAC, HTTPS, index.html.
+
+    ``response_headers_policy_id`` substitutes the managed SecurityHeadersPolicy below.
+    A caller serving MUTUALLY UNTRUSTED documents from one distribution needs headers the
+    managed policy does not carry, and the policy id is the only place a distribution can
+    express them. Omitting it keeps the historical behaviour exactly.
+    """
     origin_domain = f"{bucket}.s3.{region}.amazonaws.com"
     origin_id = f"s3-{bucket}"
     return {
@@ -329,16 +635,29 @@ def distribution_config(bucket: str, region: str, oac_id: str) -> dict[str, Any]
             # nosniff, X-Frame-Options SAMEORIGIN, and Referrer-Policy on every
             # response — without HSTS a MITM could downgrade the first request
             # (CWE-319). Parity with base-stack.yaml's SecurityHeadersPolicy.
-            "ResponseHeadersPolicyId": "67f7725c-6f97-4210-82d7-5512b31e9d03",
+            "ResponseHeadersPolicyId": response_headers_policy_id
+            or "67f7725c-6f97-4210-82d7-5512b31e9d03",
         },
     }
 
 
-def create_distribution(bucket: str, region: str, oac_id: str, site_id: str, profile: str) -> dict[str, str]:
-    """Create a tagged distribution (tag-on-create, §5). Returns id/arn/domain."""
+def create_distribution(bucket: str, region: str, oac_id: str, site_id: str, profile: str,
+                        tags: list[dict[str, str]] | None = None,
+                        response_headers_policy_id: str = "") -> dict[str, str]:
+    """Create a tagged distribution (tag-on-create, §5). Returns id/arn/domain.
+
+    ``tags`` overrides the tag set written on create. It exists because the tags below
+    are the SITE surface's, and a caller needing a different set had no way to get one:
+    it had to create with these and then tag/untag afterwards, which is two more calls,
+    a window in which the resource is mis-tagged, and a ``cloudfront:UntagResource``
+    permission it would otherwise never need. Omitting it keeps the historical behaviour
+    exactly, so every existing caller is unaffected.
+    """
     payload = {
-        "DistributionConfig": distribution_config(bucket, region, oac_id),
-        "Tags": {"Items": [
+        "DistributionConfig": distribution_config(
+            bucket, region, oac_id, response_headers_policy_id
+        ),
+        "Tags": {"Items": tags if tags is not None else [
             {"Key": TAG_MANAGED, "Value": "true"},
             {"Key": TAG_SITE, "Value": site_id},
         ]},
@@ -452,7 +771,7 @@ def deploy(site_id: str, src_dir: str, profile: str, region: str = DEFAULT_REGIO
             if "BucketAlreadyExists" in err or "BucketAlreadyOwnedByYou" in err:
                 continue
             sid = map_access_denied(err)
-            raise AWSError(f"s3:CreateBucket failed: {err.strip()[:200]}", missing_statement=sid)
+            raise AWSError(f"s3:CreateBucket failed: {_trimmed_stderr(err)}", missing_statement=sid)
         if not bucket:
             raise AWSError("could not allocate a unique bucket name after retries")
 

@@ -26,7 +26,17 @@ import { json, makeFixedApi, handleBootRoute } from './boot-api.mjs'
  * @param {unknown} opts.detail         body for `/api/chat/slots/<key>`
  * @param {object} [opts.viewport]      browser viewport
  * @param {number} [opts.deviceScaleFactor]
- * @returns {Promise<{browser: import('playwright').Browser, page: import('playwright').Page, base: string, load: (theme?: string, waitFor?: {selector?: string, settle?: number}) => Promise<void>, close: () => Promise<void>}>}
+ * @param {boolean} [opts.hasTouch]     emulate a touch device — this is what
+ *   makes `(hover: none)` / `(pointer: coarse)` media queries match in
+ *   Chromium (CDP `Emulation.setEmulatedMedia` does NOT cover those two
+ *   features)
+ * @param {{dir: string, size?: {width: number, height: number}}} [opts.recordVideo]
+ *   record the session to a webm in `dir`; `close()` then returns the file's
+ *   path. Needed for anything a still cannot carry — an entrance animation, a
+ *   transition, a multi-step gesture.
+ * @param {string} [opts.dist]          built SPA to serve; defaults to website/dist.
+ *   A before/after pair points two runs at two builds of the same page.
+ * @returns {Promise<{browser: import('playwright').Browser, page: import('playwright').Page, base: string, ws: () => import('playwright').WebSocketRoute | null, load: (theme?: string, waitFor?: {selector?: string, settle?: number}) => Promise<void>, close: () => Promise<string | null>}>}
  */
 export async function openTranscriptHarness({
   slot,
@@ -35,12 +45,18 @@ export async function openTranscriptHarness({
   detail,
   viewport = { width: 1280, height: 900 },
   deviceScaleFactor = 2,
+  hasTouch = false,
+  recordVideo = undefined,
+  dist = undefined,
 }) {
-  const { srv, base } = await serveDist()
+  const { srv, base } = await serveDist(dist)
   const browser = await chromium.launch()
-  const context = await browser.newContext({ viewport, deviceScaleFactor })
+  const context = await browser.newContext({ viewport, deviceScaleFactor, hasTouch, ...(recordVideo ? { recordVideo } : {}) })
   const page = await context.newPage()
-  await page.routeWebSocket(/\/api\/ws/, () => {})
+  // The route is bound either way so the app's socket does not hang; the handle
+  // is kept so a harness that drives a live turn can push frames through it.
+  let socket = null
+  await page.routeWebSocket(/\/api\/ws/, ws => { socket = ws })
 
   const fixedApi = makeFixedApi(project)
   // Mutable so `load` can switch theme between shots without re-registering the
@@ -74,9 +90,15 @@ export async function openTranscriptHarness({
   }
 
   async function close() {
+    // `video().path()` only resolves once the CONTEXT is closed, and the handle
+    // must be taken while the page is still alive — asking the out-dir for "the
+    // newest webm" instead would pick up a previous run's finished recording.
+    const video = recordVideo ? page.video() : null
+    await context.close()
     await browser.close()
     srv.close()
+    return video ? await video.path() : null
   }
 
-  return { browser, page, base, load, close }
+  return { browser, page, base, load, close, ws: () => socket }
 }

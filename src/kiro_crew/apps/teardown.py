@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,7 +46,10 @@ from kiro_crew.apps.backend import (
     unstopped_backend_port,
 )
 from kiro_crew.apps.bridges import deregister_app
-from kiro_crew.apps.hooks_integration import on_app_disable
+from kiro_crew.apps.hooks_integration import (
+    on_app_disable,
+    stop_app_startup_hooks,
+)
 from kiro_crew.apps.lifecycle_scripts import run_lifecycle_script
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.security import redact
@@ -84,10 +88,11 @@ async def teardown_app_runtime(
 ) -> TeardownResult:
     """Stop *name*'s running code.
 
-    Never raises for a failing step: a teardown that aborts halfway leaves the app
-    in a worse state than one that pushes through and reports. Each failure is
-    logged, collected into ``failures``, and the next step still runs — stopping the
-    backend matters even when a shutdown hook threw.
+    Never raises for a failing step: once teardown starts, aborting halfway leaves
+    the app in a worse state than pushing through and reporting. The sole preflight
+    is retained startup ownership: if it cannot be proven clear, this function
+    returns a retryable failure before stopping workers, running app shutdown code,
+    or mutating routes, crons, backend state, and registrations.
 
     ``record`` is the app's installed metadata (``manager.get_app``) and is passed
     straight to the app's own shutdown hooks. Hooks and the backend stop run for
@@ -112,6 +117,35 @@ async def teardown_app_runtime(
     warnings: list[str] = []
     failures: list[str] = []
     loop = asyncio.get_running_loop()
+
+    # A retained startup hook can recreate every resource this function removes.
+    # Trust withdrawal therefore checks ownership under the caller's lifecycle lock
+    # and refuses BEFORE any teardown mutation. Ordinary disable keeps its existing
+    # unbounded wait contract. The proven result is passed into on_app_disable so
+    # ownership cannot be checked a second time after teardown has begun.
+    startup_stopped = await stop_app_startup_hooks(
+        name, bounded=withdrawing_trust
+    )
+    if not startup_stopped:
+        return TeardownResult(
+            warnings=[],
+            failures=[
+                "startup cleanup incomplete: detached startup hook is still running; "
+                "teardown made no runtime changes"
+            ],
+        )
+
+    # Stand the app's in-process workers down FIRST, before anything here can block.
+    #
+    # Ordering is the whole point. Every later step can take real time — the app's
+    # own ``onDisable`` script is third-party code, and stopping a backend process
+    # waits on it — so a worker holding something time-bounded (Issue Radar's crews
+    # hold an auto-approval grant) would keep that authority for the duration and
+    # could take one more fully-approved turn after the operator said stop. This
+    # call is first so the window is closed before it can open, and it runs before
+    # ``disable_app`` writes the ``enabled`` flag, so a hook must not wait on that
+    # flag to decide it has been switched off.
+    await notify_app_disabled(name)
 
     # Every note is scrubbed HERE, as it is created, rather than by each caller.
     #
@@ -139,16 +173,15 @@ async def teardown_app_runtime(
     # before the backend process is stopped, because the script may need its own
     # backend alive to shut down cleanly.
     #
-    # This step used to live only in the disable HANDLER, which made trust
-    # revocation strictly WEAKER than an ordinary off-switch: `onEnable` can start
-    # something the gateway never tracked (a detached helper, a daemon it spawned),
-    # and `onDisable` is the only thing that knows how to stop it. Revoking trust
-    # stopped the tracked backend and hooks, returned 200, and left that helper
+    # Running this step only in the disable HANDLER would make trust revocation
+    # strictly WEAKER than an ordinary off-switch: `onEnable` can start something
+    # the gateway never tracked (a detached helper, a daemon it spawned), and
+    # `onDisable` is the only thing that knows how to stop it. Revoking trust would
+    # then stop the tracked backend and hooks, return 200, and leave that helper
     # running — third-party code still executing after its permission to execute was
     # withdrawn. An inversion, since revoke is the security operation and disable is
-    # merely lifecycle. Moving it into the ONE shared teardown is what the disable
-    # handler's own comment already asked for: a second copy is how the revoke path
-    # came to miss steps in the first place.
+    # merely lifecycle. It lives in the ONE shared teardown instead: a second copy
+    # is how a revoke path comes to miss steps.
     #
     # Classified as a WARNING, never a failure, for both callers — the same call as
     # ``hooks_shutdown`` below and for a sharper reason: this script is the app's own
@@ -231,15 +264,21 @@ async def teardown_app_runtime(
 
     try:
         hooks_result = await on_app_disable(
-            name, record, run_app_hooks=app_may_be_running
+            name,
+            record,
+            run_app_hooks=app_may_be_running,
+            bounded_startup_cleanup=withdrawing_trust,
+            startup_stopped=True,
         )
         # Two outcome fields, deliberately classified DIFFERENTLY, because they say
         # different things about the postcondition this teardown exists to reach:
         #
-        # ``cron_cleanup`` failing means the app's scheduled jobs MAY STILL FIRE —
-        # third-party code can still execute — so the postcondition is not met and
-        # this is a FAILURE. The caller leaves the grant in place and the client
-        # retries. The "failed:" marker is the contract in hooks_integration.py.
+        # ``cron_cleanup`` failing means scheduled jobs MAY STILL FIRE, while
+        # ``startup_cleanup`` failing means a detached startup hook IS STILL
+        # RUNNING. Both are residual third-party execution, so the postcondition
+        # is not met and this is a FAILURE. The caller leaves the grant in place
+        # and the client retries. The "failed:" marker is the contract in
+        # hooks_integration.py.
         #
         # ``hooks_shutdown`` failing means the app's OWN ``on_shutdown`` hook did not
         # succeed, so anything it was buffering may be lost. That is data loss, not
@@ -253,9 +292,10 @@ async def teardown_app_runtime(
         # on and the operator had no way to learn state was dropped.
         if hooks_result:
             for key, value in hooks_result.items():
-                if key == "cron_cleanup" and isinstance(value, str) and value:
+                if key in {"cron_cleanup", "startup_cleanup"} and isinstance(value, str):
                     if value.startswith("failed:"):
-                        _fail(f"cron cleanup incomplete: {value}")
+                        label = "cron cleanup" if key == "cron_cleanup" else "startup cleanup"
+                        _fail(f"{label} incomplete: {value}")
                     else:
                         _warn(value)
                 elif key == "hooks_shutdown" and value == "failed":
@@ -332,3 +372,196 @@ async def teardown_app_runtime(
             _fail(f"deregister failed: {exc}")
 
     return TeardownResult(warnings=warnings, failures=failures)
+
+
+# ── the user dismissing an app-owned chat tab ───────────────────────────────
+#
+# A second thing that has to stop an app's work, and the reason it lives beside
+# app teardown rather than in the dashboard: the ✕ on a chat tab is core UI, but
+# an app-owned worker slot is only the VISIBLE half of something the app is
+# driving on a timer. Closing the tab has to reach the app, and
+# ``dashboard.chat_handlers`` may not import one.
+#
+# So the close handler dispatches on the slot's OWN ``_app`` string to whatever
+# that app registered here. Core never names an app; an app never patches core.
+
+#: Called with the app's own name when its code is being stopped. Registered per app.
+AppDisableHook = Callable[..., Awaitable[Any]]
+
+_APP_DISABLE_HOOKS: dict[str, AppDisableHook] = {}
+
+
+def register_app_disable_hook(app: str, hook: AppDisableHook) -> None:
+    """Ask to be told, INSIDE the disable request, that *app* is being switched off.
+
+    Same contract as :func:`register_slot_close_hook`: idempotent by app name, and
+    apps re-register from their own watchdog rather than once at boot because this
+    registry is process memory.
+
+    This exists because a periodic sweep is not an off-switch. An app whose workers
+    hold anything time-bounded — an auto-approval grant, a lease, a lock — can act
+    once more in the gap between the operator's click and the next poll, which is a
+    whole turn's worth of authority handed out after permission was withdrawn. A
+    hook fired in the request closes that gap; the app's own sweep stays as the
+    backstop for a disable this process never saw (another process, a hand-edited
+    ``installed.json``, a restart).
+    """
+    if app:
+        _APP_DISABLE_HOOKS[app] = hook
+
+
+def unregister_app_disable_hook(app: str) -> None:
+    """Drop *app*'s hook. Safe when nothing is registered."""
+    _APP_DISABLE_HOOKS.pop(app, None)
+
+
+async def notify_app_disabled(app: str) -> None:
+    """Tell *app* its in-process workers must stop now.
+
+    Never raises: the teardown has to complete whether or not the app could stand
+    its workers down, for the same reason every other step here pushes through.
+    """
+    hook = _APP_DISABLE_HOOKS.get(app)
+    if hook is None:
+        return
+    try:
+        await hook(app)
+    except Exception:  # noqa: BLE001 - the teardown must complete regardless
+        logger.warning("app-disable hook for app %r failed", app, exc_info=True)
+
+
+#: Called with the dismissed slot's key. Registered per app name.
+SlotCloseHook = Callable[[str], Awaitable[None]]
+
+_SLOT_CLOSE_HOOKS: dict[str, SlotCloseHook] = {}
+
+
+def register_slot_close_hook(app: str, hook: SlotCloseHook) -> None:
+    """Ask to be told when the user dismisses one of *app*'s slots.
+
+    Idempotent by app name — re-registering replaces. Apps re-register from their
+    own periodic watchdog rather than once at boot, because this registry is
+    process memory: a gateway restart empties it, and an app that only registered
+    at import time would go quiet after any reload.
+    """
+    if app:
+        _SLOT_CLOSE_HOOKS[app] = hook
+
+
+def unregister_slot_close_hook(app: str) -> None:
+    """Drop *app*'s hook. Safe when nothing is registered."""
+    _SLOT_CLOSE_HOOKS.pop(app, None)
+
+
+_SLOT_CLOSE_UNDO_HOOKS: dict[str, SlotCloseHook] = {}
+
+
+def register_slot_close_undo_hook(app: str, hook: SlotCloseHook) -> None:
+    """Ask to be told when a dismissal *app* already recorded has to be TAKEN BACK.
+
+    The close touches three independent stores — the in-memory slot table, the
+    history file, and whatever the app itself writes — and it cannot make them
+    atomic. So each committed step needs an inverse, or some ordering of the three
+    always leaves a pair disagreeing when a later step fails: notify last leaves a
+    live worker behind a dismissed tab, notify first leaves a stopped worker behind
+    a tab that came back. Only a compensating action closes both.
+
+    Same contract as :func:`register_slot_close_hook`: idempotent by app name, and
+    re-registered from the app's watchdog because this registry is process memory.
+    """
+    if app:
+        _SLOT_CLOSE_UNDO_HOOKS[app] = hook
+
+
+def unregister_slot_close_undo_hook(app: str) -> None:
+    """Drop *app*'s undo hook. Safe when nothing is registered."""
+    _SLOT_CLOSE_UNDO_HOOKS.pop(app, None)
+
+
+async def notify_slot_close_undone(app: str, slot_key: str) -> bool:
+    """Tell *app* the dismissal of ``slot_key`` did NOT happen after all.
+
+    Called only when the close failed AFTER :func:`notify_slot_closed` succeeded,
+    so the app has recorded a stop the user is not getting. Never raises, and
+    returns whether the app was told — a caller that is already reporting failure
+    has nothing better to do with a second failure than log it, and the app's own
+    reconciliation is what recovers from there.
+    """
+    hook = _SLOT_CLOSE_UNDO_HOOKS.get(app)
+    if hook is None:
+        return True
+    try:
+        await hook(slot_key)
+    except Exception:  # noqa: BLE001 - reported to the caller, never raised
+        logger.warning(
+            "slot-close UNDO hook for app %r failed on %r", app, slot_key, exc_info=True
+        )
+        return False
+    return True
+
+
+async def notify_slot_closed(app: str, slot_key: str) -> bool:
+    """Tell *app* the user dismissed ``slot_key``.
+
+    Only for a DELIBERATE dismissal. Idle-slot archival also persists a slot with
+    ``closed=True``, and it must NOT come through here: an app cannot tell the two
+    apart from the transcript afterwards (the ``closed_at`` stamp is written on both
+    paths), so mixing them would make "the user asked this to stop" and "this was
+    quiet for three days" the same event. An app worker that stops because it was
+    merely idle is a silent failure; that is precisely what this seam exists to
+    avoid, so the distinction is drawn by WHICH call site fires — not by a flag the
+    hook has to interpret.
+
+    Never raises, and returns whether the app was actually TOLD. The caller needs
+    that answer because the hook is not a notification for its own sake: for a
+    crew it is the write that pauses the worker. Swallowing a failure silently let
+    the close finish while the crew stayed live and auto-approved, and its
+    watchdog then relaunched the tab the user had just dismissed. So the failure
+    is reported rather than raised — the seam keeps its promise not to blow up an
+    unrelated app's teardown, and the close path decides what a lost dismissal
+    means (see ``api_chat_slot_delete``, which refuses to proceed).
+    """
+    hook = _SLOT_CLOSE_HOOKS.get(app)
+    if hook is None:
+        return True
+    try:
+        await hook(slot_key)
+    except Exception:  # noqa: BLE001 - reported to the caller, never raised
+        logger.warning(
+            "slot-close hook for app %r failed on %r", app, slot_key, exc_info=True
+        )
+        return False
+    return True
+
+
+def forget_app_hooks(app: str) -> None:
+    """Drop every in-process hook *app* registered. For UNINSTALL, not disable.
+
+    The three registries above are process memory keyed by app name, and nothing
+    dropped an entry: ``unregister_app_disable_hook``,
+    ``unregister_slot_close_hook`` and ``unregister_slot_close_undo_hook`` existed
+    with no caller. Uninstall already drops the app's other per-app process state
+    (notification channels, the app-secret cache) and deletes its workspace, so a
+    surviving hook is a closure over a store whose files are gone.
+
+    That is not merely untidy, because :func:`notify_slot_closed` reports failure
+    rather than swallowing it and ``api_chat_slot_delete`` REFUSES the dismissal on
+    a false return. A slot belonging to an uninstalled app therefore becomes
+    undismissable: the stale hook raises, the close is refused with
+    ``app_close_hook_failed``, and the user is left with a tab they cannot get rid
+    of for an app that does not exist. Dropping the entry restores the
+    no-hook-registered path, which returns True and lets the close proceed.
+
+    DISABLE deliberately does not call this, and the asymmetry with the
+    notification channels next to it is the reason rather than an oversight:
+    those ARE unregistered on both paths, because the gateway's own enable
+    pipeline puts them back. These registries are not gateway-owned. They are
+    repopulated only from each app's own watchdog -- ``register_app_disable_hook``
+    says so -- so clearing them on disable would leave a window after a re-enable,
+    before that watchdog next runs, in which a dismissal quietly fails to reach a
+    worker that is live again. Uninstall has no such window: nothing re-registers
+    behind it.
+    """
+    unregister_app_disable_hook(app)
+    unregister_slot_close_hook(app)
+    unregister_slot_close_undo_hook(app)

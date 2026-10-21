@@ -388,16 +388,25 @@ class TestLifecycle:
         s.load()
         calls = {"n": 0}
 
+        class ScriptedStop:
+            def __init__(self) -> None:
+                self.waits = 0
+
+            def wait(self, _timeout: float) -> bool:
+                self.waits += 1
+                return self.waits > 2
+
         def boom() -> None:
             calls["n"] += 1
             raise RuntimeError("tick exploded")
 
+        scripted_stop = ScriptedStop()
+        monkeypatch.setattr(s, "_stop", scripted_stop)
         monkeypatch.setattr(s, "tick", boom)
-        s.start()
-        # The loop waits TICK_SECONDS before the first call; give it two chances.
-        time_mod.sleep(2.5)
-        s.stop()
-        assert calls["n"] >= 2, f"loop stopped after {calls['n']} call(s)"
+        s._run()
+
+        assert calls["n"] == 2
+        assert scripted_stop.waits == 3
 
 
 class TestPetPosition:
@@ -462,10 +471,10 @@ class TestPendingSurvivesRestart:
 
     The window this pins: a due reminder is consumed from `reminders` the moment
     the tick queues it, so between that tick and the overlay's poll the fire
-    exists ONLY in `_pending`. A restart in that window used to lose it — the
-    reminder row was already gone, the queue was memory-only, and the client's
-    refetch-from-zero restart recovery found nothing to refetch. The user's
-    promise silently evaporated. `seq` persists with it so a restart cannot
+    exists ONLY in `_pending`. A restart in that window loses it unless the queue
+    is persisted — the reminder row is already gone, and the client's
+    refetch-from-zero restart recovery finds nothing to refetch, so the user's
+    promise evaporates silently. `seq` persists with it so a restart cannot
     reissue numbers below a client's stored cursor.
     """
 

@@ -4,13 +4,19 @@ The stub is the shim kiro-cli execs in place of the real MCP binary. It
 connects to gatewayd over a unix socket, Registers with a full
 :class:`PoolKey` payload, then bridges kiro-cli stdio ↔ gateway until
 either side closes. On handshake failure it logs a structured fallback
-record to ``$KIROCREW_HOME/logs/stub_fallback.jsonl`` and ``execvpe``\u200bs
-the real MCP backend in place, preserving per-session correctness.
+record to ``$KIROCREW_HOME/logs/stub_fallback.jsonl`` and hands the session
+to the real MCP backend, preserving per-session correctness: ``execvpe`` in
+place on POSIX, and on Windows -- which has no in-place exec -- a child
+inheriting this process's stdio (see :func:`_fallback_spawn_child`).
 
 Register fields match :meth:`PoolKey.from_register`; hashes use SHA-256
 (stdlib). Bridge phase is NOT wrapped in a timeout (learned correction
 — a single timeout around a long-lived session silently kills healthy
-streams). Import budget: stdlib + pool + mcp_caller only.
+streams). Import budget: stdlib, ``transport`` and the stdlib-only leaves it
+needs to connect. The stub runs once per session per MCP server, so anything
+else -- pool, config, metrics, the caller and cleanup helpers -- is imported by
+the function that uses it (see :data:`_DEFERRED`), and
+``test_mcp_gateway_stub_import_budget.py`` holds the line.
 """
 
 from __future__ import annotations
@@ -18,116 +24,75 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import hashlib
-import json
+import importlib as _importlib
 import logging
 import os
-import queue
-import shutil
 import signal
 import sys
-import threading
-import time
-import uuid
-from pathlib import Path
-from typing import Optional
+import sys as _sys
+from typing import TYPE_CHECKING, NoReturn, Optional
 
-from kiro_crew import platform_compat
-from kiro_crew.executors import subprocess_executor
-from kiro_crew.mcp_caller import CallerContext, _parent_pid
-from kiro_crew.mcp_gateway import transport
-from kiro_crew.mcp_gateway.hashing import hash_command, hash_effective_env
-from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, PoolKey
+from kiro_crew import _facade_mirror
+from kiro_crew.executors import configure_default_executor, subprocess_executor
+from kiro_crew.mcp_gateway.hashing import expand_stub_flags, format_pool_label
+from kiro_crew.mcp_gateway.stub_bridge import (
+    StubSession,
+    _emit_error_frames,
+    _safe_close,
+    _write_frame,
+    logger,
+    run_bridge,
+)
+from kiro_crew.mcp_gateway.stub_fallback import (
+    _keep_socket_across_exec,
+    alog_fallback,
+    fallback_exec,
+)
+from kiro_crew.mcp_gateway.stub_link import (
+    _ADMIT_CLOSED,
+    _ADMIT_REJECTED,
+    _ADMIT_TIMEOUT,
+    _FALLBACK_CLASSES,
+    _HANDSHAKE_TIMEOUT_SECS,
+    _REJECT_CLASS_CAPACITY,
+    _SPAWN_QUEUE_WAIT_BUDGET_SECS,
+    FallbackRequestedError,
+    _adopt_read_ceiling,
+    _ensure_backend_admitted,
+    _reconnect_while_draining,
+    _rejection_class,
+    _serve_capacity_refusal,
+    _split_abandoned_ids,
+    handshake,
+    must_degrade_nonce_blind,
+    must_degrade_unknown_target,
+    must_degrade_unshareable,
+)
+from kiro_crew.mcp_gateway.stub_register import (
+    _build_caller_block,
+    _default_socket_path,
+    _resolve_channel_id,
+    build_register_payload,
+)
 
-logger = logging.getLogger(__name__)
-
-_HANDSHAKE_TIMEOUT_SECS = 3.0
-
-# --- Bridge liveness (ping-while-outstanding) constants ---------------------
-# Interval between successive stub→gateway liveness pings while at least one
-# JSON-RPC request is outstanding. A peer that is merely slow (but alive)
-# responds to pings even while processing a long tool call.
-_BRIDGE_PING_INTERVAL_SECS = 10.0
-# How many CONSECUTIVE pings must go unanswered before declaring the peer dead.
-# Total grace period is _BRIDGE_PING_INTERVAL_SECS × _BRIDGE_PING_MAX_MISSES.
-_BRIDGE_PING_MAX_MISSES = 3
-# Reserved type field for the stub→gateway liveness ping control frame and its
-# response. The gateway echoes {"type": "pong"} for any {"type": "ping"} it
-# receives from a registered stub.
-_BRIDGE_PING_TYPE = "ping"
-# Cap on emitting the liveness error frames. Bounded because the whole point of
-# that path is to stop a caller hanging — an unbounded write to a wedged reader
-# would reproduce the defect it exists to fix.
-_ERROR_EMIT_TIMEOUT_SECS = 5.0
-_BRIDGE_PONG_TYPE = "pong"
-# Reserved type for the gateway->stub keepalive control frame. The gateway
-# writes one to every live stub each heartbeat sweep so that a half-open
-# transport — which a parked reader cannot observe — fails an actual write and
-# becomes detectable. It carries no payload and expects no reply: the write
-# succeeding or failing IS the signal, and it is consumed here rather than
-# forwarded, exactly like the pong frame above.
-_BRIDGE_KEEPALIVE_TYPE = "keepalive"
-# Pre-flight ``ensure_backend`` reply timeout. Must comfortably
-# exceed cold backend fork latency. On timeout the stub falls back to a
-# direct per-session exec, so an over-generous value only costs a slower
-# recovery when the gateway is genuinely wedged.
-_ENSURE_BACKEND_TIMEOUT_SECS = 25.0
-# Content-hash cap for ``binary_version``. Every shipped MCP is <1 MiB, so
-# 4 MiB covers them with margin. Larger binaries
-# (npm/Node/Java runtimes) are NOT hashed synchronously on the cold-start
-# path — a 64 MiB hash blocked the stub event loop ~150-300 ms — they fall
-# back to a cheap (size, mtime) token, which is still a stable pool-split key.
-_BINARY_HASH_CAP_BYTES = 4 * 1024 * 1024
-# Placeholder: stub does not yet observe a config snapshot, so all
-# same-session stubs agree on this value (never a false split).
-# Safety note: approval_mode and sandbox_mode are already separate PoolKey
-# dimensions, so the dangerous config divergences (permission escalation,
-# sandbox escape) are already covered by distinct pool entries.
-# TODO: Hash relevant config fields (e.g. tool allowlists,
-# hook settings) in a future iteration to detect non-security config drift
-# that could cause subtle behavioral differences across pooled sessions.
-_CONFIG_SNAPSHOT_PLACEHOLDER = "0" * 64
-
-
-def _crew_home() -> Path:
-    """Data home the stub resolves its paths under.
-
-    ``Path.home()`` rather than ``os.environ["HOME"]``: that variable is
-    normally unset on Windows (which uses ``USERPROFILE``), so the previous
-    fallback evaluated to ``Path("")`` and every derived path became RELATIVE to
-    the stub's cwd. For the socket that is worse than untidy on Windows, where
-    the pipe name is a hash of this path -- a daemon and a stub started from
-    different working directories would hash to different pipe names and never
-    meet. ``Path.home()`` consults the right variable on each platform.
-
-    Never raises. ``Path.home()`` raises ``RuntimeError`` when no home can be
-    resolved at all, and both callers are on paths that must not fail: the
-    socket default is an argparse default (a raise there kills the stub before
-    it can degrade to a per-session exec) and the log path is used by
-    ``log_fallback``, whose handler catches ``OSError`` only.
-
-    Deliberately not ``config.paths.config_dir()``: this module is on the stub's
-    cold-start path and stays import-light.
-    """
-    home = os.environ.get("KIROCREW_HOME")
-    if home:
-        return Path(home)
-    try:
-        base = Path.home()
-    except RuntimeError:
-        base = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or ".")
-    return base / ".kiro" / "crew"
-
-
-def _default_socket_path() -> str:
-    """Resolve the default gateway socket under KIROCREW_HOME (0700 dir)."""
-    home = _crew_home()
-    new_path = home / "kirocrew-mcp-gateway.sock"
-    # Accept legacy socket name written by older versions (#928).
-    legacy_path = home / "mc-mcp-gateway.sock"
-    if not new_path.exists() and legacy_path.exists():
-        return str(legacy_path)
-    return str(new_path)
+# --- Import budget ----------------------------------------------------------
+# The stub runs once per session per MCP server, so what it loads is multiplied
+# by every session on the host. Two rules keep that bounded, and they are
+# different rules because they bound different things:
+#
+# * The modules ABOVE are the ones every run reaches anyway -- it builds a
+#   Register payload and connects on every start -- so importing them here
+#   rather than inside a function changes when, not whether, and the eager
+#   spelling is the readable one.
+# * ``mcp_gateway.pool``, ``metrics.events`` and ``jsonl_util`` are NOT on that
+#   path, and ``pool`` in particular costs the whole config package (its body
+#   resolves the read-buffer ceiling, which reads config). They are imported by
+#   the function that needs them: a reconnect counter, a fallback record, a
+#   degrade check. ``test_mcp_gateway_stub_import_budget.py`` holds that line.
+#
+# The ceiling the stub DOES need comes from the stdlib-only ``read_limits``
+# leaf, and the pool label it logs comes from ``hashing.format_pool_label``, so neither
+# requires ``pool`` itself.
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -136,7 +101,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     is accepted and ignored — older installations' overlay wrappers may
     still pass it; we swallow the flag so the stub stays backward-
     compatible with on-disk agent overlays written by earlier rewriter
-    revisions."""
+    revisions.
+
+    The rewriter emits the flags as one ``--stub-flags-b64`` envelope so raw
+    paths and identifiers cross a cmd.exe launch without ``%NAME%`` expansion;
+    it is spliced back into plain tokens here, ahead of the parser, and an
+    overlay that spells the flags out directly parses the same way.
+    """
+    argv = expand_stub_flags(sys.argv[1:] if argv is None else argv)
     p = argparse.ArgumentParser(
         prog="kirocrew-mcp-stub",
         description="KiroCrew MCP shim: proxies kiro-cli stdio to the local gateway",
@@ -144,7 +116,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--server", required=True)
     p.add_argument("--agent", required=True)
     p.add_argument("--target-command", required=True, dest="target_command")
-    p.add_argument("--target-args", default="", dest="target_args")
+    p.add_argument(
+        "--target-args-b64",
+        default=None,
+        help="Base64url-encoded JSON argv; takes precedence over --target-args.",
+    )
+    p.add_argument("--target-args", default="", help="Legacy delimiter-separated argv.")
     p.add_argument("--target-args-sep", default="|", dest="target_args_sep")
     p.add_argument("--sandbox-mode", default="standard", dest="sandbox_mode")
     p.add_argument("--work-dir", required=True, dest="work_dir")
@@ -167,768 +144,194 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--auto-approve", default="", dest="auto_approve")
     p.add_argument("--approval-mode", default="interactive", dest="approval_mode")
     p.add_argument("--trust-all", action="store_true", dest="trust_all")
+    p.add_argument(
+        "--poolable",
+        action="store_true",
+        dest="poolable",
+        help=(
+            "Declare this connection's backend shareable with other connections "
+            "carrying an identical PoolKey. Absent, the gateway gives this "
+            "connection its own backend -- the same process topology as no "
+            "gateway at all, which is why absent is the safe default: a stub "
+            "from an overlay predating this flag never silently starts sharing."
+        ),
+    )
     p.add_argument("--channel-id", default=None, dest="channel_id")
+    p.add_argument(
+        "--pool-identity-env-b64",
+        default=None,
+        help="Base64url-encoded JSON env names; takes precedence over --pool-identity-env.",
+    )
+    p.add_argument(
+        "--pool-identity-env",
+        default="",
+        dest="pool_identity_env",
+        help=(
+            "DEPRECATED: env variable NAMES separated by --target-args-sep. "
+            "Read only when --pool-identity-env-b64 is absent. Folded into "
+            "effective_env_hash even when the name looks like a rotating "
+            "secret. Names only, never values, so this is safe on argv. "
+            "Carries NO authority: gatewayd re-reads the operator's own list "
+            "at spawn and refuses to forward when the hash it recomputes does "
+            "not match the one registered here, so a stub cannot widen what "
+            "gets applied to a shared backend."
+        ),
+    )
     p.add_argument(
         "--socket",
         default=os.environ.get("KIROCREW_MCP_SOCKET") or os.environ.get("MC_MCP_SOCKET") or _default_socket_path(),
     )
     p.add_argument("--real-stub", default=None, dest="real_stub")
+    # The read ceiling, pre-resolved from config by the rewriter that wrote this
+    # overlay. Taking it on argv is what keeps a running stub out of the config
+    # package: see :func:`_adopt_read_ceiling`. Absent on an overlay written
+    # before the flag existed, which the resolver handles. ``type=str`` and not
+    # ``int``: an unparsable value must degrade to the resolver, and argparse's
+    # own int conversion would exit the process instead.
+    p.add_argument("--read-limit", default=None, dest="read_limit")
     return p.parse_args(argv)
 
 
-def _split_target_args(raw: str, sep: str) -> list[str]:
-    return raw.split(sep) if raw else []
-
-
-def _parse_env_csv(raw: str) -> dict[str, str]:
-    """Parse ``K=V,K2=V2``; malformed fragments are skipped.
-
-    DEPRECATED: values containing ``,`` get truncated. New callers should
-    use ``--env-json`` which round-trips cleanly through
-    :func:`_parse_env_json`.
-    """
-    if not raw:
-        return {}
-    out: dict[str, str] = {}
-    for pair in raw.split(","):
-        if "=" not in pair:
-            continue
-        k, v = pair.split("=", 1)
-        if k:
-            out[k] = v
-    return out
-
-
-def _parse_env_json(raw: str) -> dict[str, str]:
-    """Parse a JSON-encoded env dict. Returns ``{}`` on empty / malformed.
-
-    Preferred over :func:`_parse_env_csv` because values with ``,`` or
-    ``=`` round-trip intact. Non-string values are coerced via ``str()``.
-    """
-    if not raw:
-        return {}
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("stub --env-json malformed; dropping env block")
-        return {}
-    if not isinstance(decoded, dict):
-        logger.warning("stub --env-json not a JSON object; dropping env block")
-        return {}
-    return {str(k): str(v) for k, v in decoded.items() if k}
-
-
-def _parse_env_file(path: str) -> dict[str, str]:
-    """Read a JSON env dict from ``path`` (a 0600 sidecar). Returns ``{}``
-    on missing/malformed. Keeps env secrets off argv; same coercion as
-    :func:`_parse_env_json`.
-    """
-    if not path:
-        return {}
-    try:
-        raw = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("stub --env-file unreadable; dropping env block")
-        return {}
-    return _parse_env_json(raw)
-
-
-def _parse_auto_approve(raw: str) -> list[str]:
-    if not raw:
-        return []
-    # New form: JSON array (escape-safe for tool names containing commas).
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return [str(s) for s in parsed if s]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Back-compat: legacy CSV form.
-    return [s for s in raw.split(",") if s]
-
-
-def _hash_permission_profile(
-    auto_approve: list[str], approval_mode: str, trust_all: bool
-) -> str:
-    """Hash ``(autoApprove sorted, approval_mode, trust_all)`` — two
-    sessions with different permission surfaces MUST NOT share a backend."""
-    h = hashlib.sha256()
-    for tool in sorted(auto_approve):
-        h.update(tool.encode("utf-8"))
-        h.update(b"\0")  # NUL delimiter: injective — cannot occur in a tool name,
-        #                  so ["a,b"] and ["a","b"] no longer collide onto one key.
-    h.update(b"mode=")
-    h.update(approval_mode.encode("utf-8"))
-    h.update(b"\0trust_all=")
-    h.update(b"1" if trust_all else b"0")
-    return h.hexdigest()
-
-
-def _binary_version(command: str) -> str:
-    """Return a stable version token for the target binary, or ``"unknown"``.
-
-    Content-hashes binaries up to :data:`_BINARY_HASH_CAP_BYTES`; larger ones
-    use a cheap ``(size, mtime)`` token so the stub cold-start path never
-    blocks on a multi-MiB synchronous hash.
-    """
-    try:
-        real = os.path.realpath(shutil.which(command) or command)
-        if not os.path.isfile(real):
-            return "unknown"
-        st = os.stat(real)
-        if st.st_size > _BINARY_HASH_CAP_BYTES:
-            return f"sz{st.st_size}-mt{int(st.st_mtime)}"
-        h = hashlib.sha256()
-        with open(real, "rb") as f:
-            for chunk in iter(lambda: f.read(64 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()[:24]
-    except OSError:
-        return "unknown"
-
-
-def _resolve_channel_id(cli_value: Optional[str]) -> Optional[str]:
-    """``--channel-id`` wins; else ``KIROCREW_CHANNEL_ID`` env; else None."""
-    return cli_value or os.environ.get("KIROCREW_CHANNEL_ID") or None
-
-
-#: Ancestor-walk depth cap for the Register ``ancestor_pids`` chain. The real
-#: tree is ~4 deep (sandbox wrapper → kiro-cli → kiro-cli-chat → stub); 10
-#: leaves headroom without letting a pathological /proc loop run away.
-_ANCESTOR_WALK_MAX = 10
-
-
-def _ancestor_pids() -> list[int]:
-    """Ancestor PID chain of this stub, nearest parent first.
-
-    Uses :func:`kiro_crew.mcp_caller._parent_pid`, which delegates to
-    ``platform_compat.get_ppid``: ``/proc`` on Linux, libproc on macOS,
-    ``CreateToolhelp32Snapshot`` on Windows -- none of which spawns a
-    subprocess. Stops at PID 1, a
-    lookup failure, or the depth cap. Always contains at least
-    ``os.getppid()`` when resolvable.
-    """
-    chain: list[int] = []
-    pid = os.getppid()
-    seen: set[int] = set()
-    while pid > 1 and pid not in seen and len(chain) < _ANCESTOR_WALK_MAX:
-        chain.append(pid)
-        seen.add(pid)
-        pid = _parent_pid(pid)
-    return chain
-
-
-def _build_caller_block(channel_id: Optional[str]) -> dict[str, str]:
-    """Assemble caller-identity from ``KIROCREW_*`` env vars.
-
-    ``session_key`` is resolved via :meth:`CallerContext.from_env`, which
-    reads ``KIROCREW_SESSION_KEY`` first and falls back to the warm-pool PID
-    file (``config_dir()/session_pid_<pid>.txt``) by walking the process
-    ancestry. Warm-pool kiro-cli is pre-spawned with NO session key (the key
-    is only known once the session is claimed), so a bare env read here would
-    register an empty caller and gatewayd would stamp ``caller=None`` on every
-    forwarded call — silently breaking state-mutating tools (``learn_add`` et
-    al.) that need session identity. Sharing the backend-side resolver keeps
-    both ends of the wire in agreement. If the key is still unknown at register
-    (claim hasn't happened yet), the recaller loop repairs it later."""
-    session_key = CallerContext.from_env().session_key
-    principal = (
-        os.environ.get("KIROCREW_PRINCIPAL") or os.environ.get("USER") or ""
+# --------------------------------------------------------------------------- #
+# Compatibility facade. The stub's machinery lives in the ``stub_*`` owner modules
+# listed below, one responsibility each; this module keeps the process: its argv,
+# its signal handlers, the warm-pool caller repair and :func:`_amain`, which drives
+# the owners from first connect to exit. Every name stays readable as
+# ``kiro_crew.mcp_gateway.stub.<name>``: this module answers a name it does not
+# bind from the owner that defines it, and a write or delete through this module
+# reaches every owner binding the same object (``kiro_crew._facade_mirror``), so a
+# patch of ``kiro_crew.mcp_gateway.stub.<name>`` reaches every reader it reached
+# when this was one module. Owners never import this module. The install runs
+# here, above the process code, which binds its own names on this module after
+# it, and reads ``_sys.modules[__name__]``: under ``python -m`` this module is
+# ``__main__``.
+# --------------------------------------------------------------------------- #
+#: The owner modules, lowest layer first: an owner imports only owners listed before
+#: it, and the first holder of a name answers a read of it.
+_STUB_OWNERS: tuple[str, ...] = (
+    "kiro_crew.mcp_gateway.stub_bridge",
+    "kiro_crew.mcp_gateway.stub_register",
+    "kiro_crew.mcp_gateway.stub_fallback",
+    "kiro_crew.mcp_gateway.stub_link",
+)
+for _owner in _STUB_OWNERS:
+    _importlib.import_module(_owner)
+#: Name this module serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(
+    _facade_mirror.install(_sys.modules[__name__], _STUB_OWNERS, excluded=()).served
+)
+# The forwarding is live from here for every caller. The definitions below bind
+# their names on this module directly, and a write through it of a name it binds
+# itself stays here (``_facade_mirror._creation_owners``).
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    # The names the unsplit module imported from the rest of kiro_crew and that only
+    # an owner reads now, from their home modules.
+    from kiro_crew import platform_compat  # noqa: F401
+    from kiro_crew.json_line import parse_json_object_line  # noqa: F401
+    from kiro_crew.mcp_caller import (  # noqa: F401
+        CallerContext,
+        _parent_pid,
     )
-    if session_key.startswith("cron:"):
-        session_type = "cron"
-    elif session_key.startswith("hook:"):
-        session_type = "hook"
-    elif session_key.startswith("dashboard:"):
-        session_type = "dashboard"
-    elif session_key:
-        session_type = "slack-thread"
-    else:
-        session_type = "unknown"
-    return {
-        "session_key": session_key,
-        "session_type": session_type,
-        "principal_id": principal,
-        "channel_id": channel_id or "",
-    }
-
-
-def build_register_payload(args: argparse.Namespace) -> dict:
-    """Compute every PoolKey field and assemble the Register frame.
-
-    The result is accepted verbatim by :meth:`PoolKey.from_register` —
-    callers do not post-process."""
-    target_args = _split_target_args(args.target_args, args.target_args_sep)
-    # Prefer --env-json when present (commas/equals round-trip intact);
-    # fall back to the legacy --env CSV for overlay files written by a
-    # pre-JSON rewriter that may still be on disk during the transition.
-    if args.env_file:
-        env_pairs = _parse_env_file(args.env_file)
-    elif args.env_json:
-        env_pairs = _parse_env_json(args.env_json)
-    else:
-        env_pairs = _parse_env_csv(args.env)
-    auto_approve = _parse_auto_approve(args.auto_approve)
-    channel_id = _resolve_channel_id(args.channel_id)
-
-    try:
-        work_dir = str(Path(args.work_dir).resolve())
-    except OSError:
-        work_dir = str(args.work_dir)
-
-    caller = _build_caller_block(channel_id)
-    # USERNAME is the Windows spelling of USER; check both so this diagnostic
-    # dimension is not empty on one platform.
-    user_identity = (
-        caller["principal_id"]
-        or os.environ.get("USER", "")
-        or os.environ.get("USERNAME", "")
-        or "unknown"
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS  # noqa: F401
+    from kiro_crew.mcp_gateway import transport  # noqa: F401
+    from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV  # noqa: F401
+    from kiro_crew.mcp_gateway.hashing import (  # noqa: F401
+        decode_target_args,
+        hash_command,
+        hash_effective_env,
+        runs_install_code,
     )
-
-    return {
-        "type": "register",
-        "stub_uuid": str(uuid.uuid4()),
-        "server_name": args.server,
-        "agent_name": args.agent,
-        "command_args_hash": hash_command(args.target_command, target_args),
-        "effective_env_hash": hash_effective_env(env_pairs),
-        "work_dir": work_dir,
-        "binary_version": _binary_version(args.target_command),
-        # Not os.getuid(): that attribute does not exist on Windows, where an
-        # AttributeError here would abort the Register frame and send every
-        # session to per-session exec -- pooling would appear enabled and
-        # never take effect. local_user_id() is the uid on POSIX and a
-        # SID-derived int on Windows, so the PoolKey dimension keeps both its
-        # type and its partitioning meaning.
-        "os_uid": platform_compat.local_user_id(),
-        "sandbox_mode": args.sandbox_mode,
-        "autoapprove_set_hash": _hash_permission_profile(
-            auto_approve, args.approval_mode, bool(args.trust_all)
-        ),
-        "approval_mode": args.approval_mode,
-        "trust_all_tools": bool(args.trust_all),
-        "user_identity": user_identity,
-        "channel_id": channel_id,
-        "config_snapshot_hash": _CONFIG_SNAPSHOT_PLACEHOLDER,
-        "caller": caller,
-        # Claim-push (gateway → gatewayd ``claim`` frame): the ancestor PID
-        # chain of this stub, nearest first. gatewayd indexes the connection
-        # under EVERY ancestor so a claim naming any level of the runtime's
-        # process tree hits. The chain matters because the PID the gateway
-        # records for a runtime (``AcpClient._process.pid``) can sit several
-        # layers above the stub's immediate parent — e.g.
-        # sandbox-wrapper → kiro-cli → kiro-cli-chat → stub — and a
-        # single-PID index would never match (found live: claim frames
-        # applied to 0 connections).
-        "ancestor_pids": _ancestor_pids(),
-        # Flat mirror — gatewayd accepts either shape; flat wins on
-        # log/diff tooling legibility.
-        "session_key": caller["session_key"],
-        "session_type": caller["session_type"],
-        "principal_id": caller["principal_id"],
-    }
-
-
-async def _write_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
-    # stdin_pump and _recaller_loop both write this shared stub->gateway socket
-    # and both await drain(). Each write() here lands a WHOLE frame in one
-    # synchronous call, so frame bytes cannot interleave — the hazard is the
-    # concurrent drain(): under backpressure, FlowControlMixin._drain_helper on
-    # many deployed interpreter patch releases holds a single drain waiter
-    # (`assert waiter is None or waiter.cancelled()`), so a second concurrent
-    # drain() trips the assert, kills that pump task, and tears the bridge down
-    # (newer patch releases allow multiple waiters; older ones are common).
-    # Serialize the write+drain pair through the writer's lock — the same
-    # _mc_write_lock idiom gatewayd/backend use on their writers — which also
-    # keeps the invariant robust if a future edit splits a frame across writes.
-    lock = getattr(writer, "_mc_write_lock", None)
-    guard = lock if lock is not None else contextlib.nullcontext()
-    async with guard:
-        writer.write(json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\n")
-        await writer.drain()
-
-
-async def _read_frame(reader: asyncio.StreamReader) -> Optional[dict]:
-    try:
-        line = await reader.readuntil(b"\n")
-    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-        return None
-    # errors="replace": an invalid-UTF-8 byte must NOT raise UnicodeDecodeError
-    # (a ValueError, not json.JSONDecodeError) out through the handshake /
-    # ensure_backend catch sets — that would kill the stub before fallback_exec.
-    # A replaced char just yields a JSONDecodeError below, which IS caught and
-    # degrades cleanly to a per-session exec.
-    return json.loads(line.decode("utf-8", errors="replace")) if line else None
-
-
-async def _safe_close(writer: asyncio.StreamWriter) -> None:
-    try:
-        writer.close()
-        await writer.wait_closed()
-    except Exception:
-        pass
-
-
-class FallbackRequestedError(Exception):
-    """Handshake cannot complete; caller must exec the real backend."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
-async def handshake(
-    socket_path: str, payload: dict
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str, dict]:
-    """Connect + Register. Raises :class:`FallbackRequestedError` for any
-    gateway-unavailable condition (connect refused, socket missing,
-    rejected register, unexpected reply)."""
-    try:
-        reader, writer = await transport.connect(
-            socket_path, limit=READ_BUFFER_LIMIT_BYTES,
-        )
-    except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
-        raise FallbackRequestedError(f"connect failed: {exc}") from exc
-
-    try:
-        await _write_frame(writer, payload)
-        resp = await _read_frame(reader)
-    except (OSError, ConnectionError, json.JSONDecodeError) as exc:
-        await _safe_close(writer)
-        raise FallbackRequestedError(f"register io failed: {exc}") from exc
-
-    if resp is None:
-        await _safe_close(writer)
-        raise FallbackRequestedError("gateway closed during handshake")
-    if not isinstance(resp, dict):
-        # _read_frame returns raw json.loads output, which can be a non-dict
-        # (list / number / string) for a malformed broker reply. resp.get(...)
-        # would then raise AttributeError OUTSIDE the caught
-        # (OSError, ConnectionError, json.JSONDecodeError) set above, crashing
-        # the stub before fallback_exec and defeating the always-degrade-to-
-        # per-session guarantee. Treat it as a fallback-eligible bad reply.
-        await _safe_close(writer)
-        raise FallbackRequestedError(
-            f"unexpected handshake reply (not an object): {type(resp).__name__}"
-        )
-
-    msg_type = resp.get("type")
-    if msg_type == "registered":
-        return reader, writer, payload["stub_uuid"], resp
-    await _safe_close(writer)
-    if msg_type == "rejected":
-        raise FallbackRequestedError(f"gateway rejected: {resp.get('reason', '?')}")
-    raise FallbackRequestedError(f"unexpected handshake reply: type={msg_type!r}")
-
-
-class BridgeLivenessFailure:
-    """Returned by :func:`run_bridge` when the peer stops responding to
-    liveness pings while requests are outstanding. Contains the IDs of
-    the requests that were still pending so the caller can emit JSON-RPC
-    error frames before degrading."""
-
-    __slots__ = ("outstanding_ids",)
-
-    def __init__(self, outstanding_ids: list) -> None:  # noqa: D107
-        self.outstanding_ids = outstanding_ids
-
-
-async def run_bridge(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    stop_event: asyncio.Event,
-    *,
-    stdin: Optional[asyncio.StreamReader] = None,
-    stdout_writer: Optional[asyncio.StreamWriter] = None,
-    ping_interval: float = _BRIDGE_PING_INTERVAL_SECS,
-    ping_max_misses: int = _BRIDGE_PING_MAX_MISSES,
-    peer_supports_ping: bool = False,
-) -> Optional[BridgeLivenessFailure]:
-    """Pump stdin ↔ socket until either side closes or ``stop_event`` fires.
-
-    ``stdin``/``stdout_writer`` are dependency-injected so tests can drive
-    the bridge through in-process pipes; ``None`` falls back to real
-    ``sys.stdin``/``sys.stdout``. On clean stdin EOF an ``Unregister``
-    frame is sent so gatewayd detaches without waiting on refcount.
-
-    Returns ``None`` on normal termination. Returns a
-    :class:`BridgeLivenessFailure` when the gateway stopped answering
-    liveness pings while requests were outstanding — the caller should
-    emit JSON-RPC errors for the listed IDs and fall back to a direct
-    exec.
-    """
-
-    # Writer-thread liveness signals. The real bridge hands stdout frames to a
-    # daemon writer thread (see stdout_pump); if that thread dies (broken pipe
-    # to the kiro-cli reader) the bridge must tear down even when NO further
-    # upstream line ever arrives to trip the producer-side check — otherwise
-    # stdout_pump parks in reader.readuntil() forever and the bridge hangs, the
-    # very leak this guards against. The threading.Event is polled by the
-    # producer (_emit) as a fast path; the asyncio.Event, set via
-    # call_soon_threadsafe from the writer thread, wakes a dedicated bridge task
-    # so teardown never depends on upstream traffic.
-    bridge_loop = asyncio.get_running_loop()
-    # stdin_pump and _recaller_loop both write this shared stub->gateway socket;
-    # serialize their write+drain through one lock (mirrors gatewayd/backend).
-    if getattr(writer, "_mc_write_lock", None) is None:
-        setattr(writer, "_mc_write_lock", asyncio.Lock())
-    writer_failed = threading.Event()
-    writer_failed_evt = asyncio.Event()
-
-    def _flag_writer_failed() -> None:
-        writer_failed.set()
-        bridge_loop.call_soon_threadsafe(writer_failed_evt.set)
-
-    # --- Liveness state (ping-while-outstanding) ----------------------------
-    # Track JSON-RPC request IDs forwarded to the gateway that have not yet
-    # received a response. The liveness monitor fires ONLY while this set is
-    # non-empty, so idle/slow-but-alive sessions are never timed out.
-    _outstanding_ids: set = set()
-    # Pong receipt flag: set by the stdout pump when a pong arrives, cleared
-    # by the monitor each tick. Lightweight alternative to a counter/queue.
-    _pong_received = asyncio.Event()
-    # Peer-dead event: set by the monitor when consecutive pings go unanswered.
-    _peer_dead_evt = asyncio.Event()
-
-    async def stdin_pump() -> None:
-        # Inbound line source. Tests inject an in-process StreamReader; the
-        # real stub reads sys.stdin on a DEDICATED DAEMON THREAD and hands
-        # lines over via a queue. A daemon thread is never joined at
-        # interpreter/asyncio shutdown, so a readline still blocked because
-        # kiro-cli holds stdin open can no longer hang graceful SIGTERM — the
-        # old run_in_executor(readline) used the default executor, which
-        # asyncio.run() joins via shutdown_default_executor().
-        loop = asyncio.get_running_loop()
-        # Bounded + backpressured: the reader thread blocks on put() (via
-        # run_coroutine_threadsafe) when the queue is full, so a stalled
-        # writer.drain() (gatewayd slow to accept) can no longer let the reader
-        # keep draining stdin into an unbounded queue and balloon RSS.
-        line_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=256)
-        if stdin is None:
-            def _blocking_reader() -> None:
-                fh = sys.stdin.buffer
-                try:
-                    while True:
-                        chunk = fh.readline()
-                        # Block this thread until the queue has room. .result()
-                        # waits on the loop; if the loop has stopped (shutdown)
-                        # it raises and the daemon thread simply exits.
-                        asyncio.run_coroutine_threadsafe(
-                            line_q.put(chunk), loop
-                        ).result()
-                        if not chunk:
-                            return
-                except Exception:  # pragma: no cover — defensive
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            line_q.put(b""), loop
-                        ).result(timeout=1.0)
-                    except Exception:
-                        pass
-
-            threading.Thread(
-                target=_blocking_reader, name="stub-stdin", daemon=True
-            ).start()
-
-        async def _next_line() -> bytes:
-            if stdin is not None:
-                try:
-                    return await stdin.readuntil(b"\n")
-                except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-                    return b""
-            return await line_q.get()
-
-        while True:
-            line = await _next_line()
-            if not line:
-                try:
-                    await _write_frame(writer, {"type": "unregister"})
-                except Exception:
-                    pass
-                return
-            # Track outbound JSON-RPC request IDs (have "method" + "id").
-            # Best-effort: parse failures are silently ignored — the frame is
-            # still forwarded verbatim.
-            try:
-                msg = json.loads(line)
-                if isinstance(msg, dict) and "method" in msg and "id" in msg:
-                    _outstanding_ids.add(msg["id"])
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
-            try:
-                # Serialize with _recaller_loop's _write_frame writes on the
-                # same socket: the write itself is whole-frame atomic, but a
-                # second concurrent drain() under backpressure trips the
-                # single-waiter assert in FlowControlMixin._drain_helper on
-                # pre-3.12-fix interpreters, killing this pump task and tearing
-                # the bridge down (see _write_frame).
-                _lock = getattr(writer, "_mc_write_lock", None)
-                _guard = _lock if _lock is not None else contextlib.nullcontext()
-                async with _guard:
-                    writer.write(line if line.endswith(b"\n") else line + b"\n")
-                    await writer.drain()
-            except (ConnectionError, BrokenPipeError):
-                return
-
-    async def stdout_pump() -> None:
-        stdout_fh = sys.stdout.buffer
-        # Real path: hand frames to a DEDICATED daemon writer thread rather than
-        # asyncio.to_thread (the default executor). asyncio.run() joins the
-        # default executor via shutdown_default_executor(), so a write blocked
-        # on a stalled kiro-cli reader (its stdout pipe buffer full) would hang
-        # graceful SIGTERM. A daemon thread is never joined — mirroring the
-        # stdin reader decoupling above. The queue is bounded so a stalled
-        # reader can't balloon RSS; the pump applies backpressure with a
-        # cancellable sleep, never the default executor.
-        write_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=256)
-        writer_thread: Optional[threading.Thread] = None
-        # writer_failed (threading.Event) + writer_failed_evt (asyncio.Event)
-        # are defined at run_bridge scope; _flag_writer_failed() sets both so a
-        # dead writer surfaces both to the producer (_emit fast path) and to a
-        # dedicated bridge task, tearing the bridge down even if upstream goes
-        # silent.
-        if stdout_writer is None:
-            def _blocking_writer() -> None:
-                try:
-                    while True:
-                        item = write_q.get()
-                        if item is None:
-                            return
-                        try:
-                            stdout_fh.write(item)
-                            stdout_fh.flush()
-                        except Exception:
-                            # Real write failure (reader gone / pipe broken):
-                            # flag it so _emit raises and the bridge tears down
-                            # even with no more upstream lines, then exit.
-                            _flag_writer_failed()
-                            return
-                except Exception:  # pragma: no cover — defensive
-                    _flag_writer_failed()
-            writer_thread = threading.Thread(
-                target=_blocking_writer, name="stub-stdout", daemon=True
-            )
-            writer_thread.start()
-
-        async def _emit(line: bytes) -> None:
-            if stdout_writer is not None:
-                stdout_writer.write(line)
-                await stdout_writer.drain()
-                return
-            # Bounded put with cancellable backpressure — never the default
-            # executor, so a stalled writer thread cannot hang SIGTERM.
-            while True:
-                if writer_failed.is_set():
-                    # Writer thread died — propagate instead of parking on a
-                    # full queue forever so the bridge tears down.
-                    raise BrokenPipeError("stub stdout writer thread died")
-                try:
-                    write_q.put_nowait(line)
-                    return
-                except queue.Full:
-                    await asyncio.sleep(0.05)
-
-        try:
-            while True:
-                try:
-                    line = await reader.readuntil(b"\n")
-                except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-                    return
-                if not line:
-                    return
-                # Intercept control frames (gateway liveness reply, gateway
-                # keepalive) and track response IDs to clear outstanding
-                # requests.
-                # Best-effort: parse failures pass the line through verbatim.
-                _is_control = False
-                try:
-                    msg = json.loads(line)
-                    if isinstance(msg, dict):
-                        _mtype = msg.get("type")
-                        if _mtype == _BRIDGE_PONG_TYPE:
-                            _pong_received.set()
-                            _is_control = True
-                        elif _mtype == _BRIDGE_KEEPALIVE_TYPE:
-                            # Gateway-side transport probe. Nothing to do: the
-                            # gateway learns what it needs from whether the
-                            # write succeeded. Swallow it.
-                            _is_control = True
-                        elif "id" in msg and "method" not in msg:
-                            # A response (has id, no method) — clear from
-                            # outstanding set.
-                            _outstanding_ids.discard(msg["id"])
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    pass
-                # Control frames are gateway<->stub only; never forward to
-                # kiro-cli stdout.
-                if _is_control:
-                    continue
-                try:
-                    await _emit(line)
-                except (ConnectionError, BrokenPipeError):
-                    return
-        finally:
-            # Best-effort stop signal; the daemon thread is never joined, so
-            # shutdown never blocks on it regardless.
-            if writer_thread is not None:
-                try:
-                    write_q.put_nowait(None)
-                except queue.Full:
-                    pass
-
-    async def _liveness_monitor() -> None:
-        """Ping the gateway ONLY while requests are outstanding, and declare the
-        peer dead after ``ping_max_misses`` consecutive unanswered pings.
-
-        Each ping/miss cycle consumes exactly ONE ``ping_interval``: when
-        something is outstanding the wait for the pong *is* the interval, so the
-        advertised grace is ``ping_interval × ping_max_misses`` rather than twice
-        that. Only an idle bridge sleeps separately, and it resets the miss count
-        so an earlier partial streak cannot carry across an idle gap.
-
-        Never fires on an idle bridge, nor on a peer that answers while still
-        working — that is the distinction between "slow" and "wedged", and the
-        reason a blanket bridge timeout is the wrong mechanism here.
-        """
-        consecutive_misses = 0
-        while not stop_event.is_set() and not _peer_dead_evt.is_set():
-            if not _outstanding_ids:
-                # Idle: burn one interval, then re-check. A stop during the wait
-                # exits cleanly.
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=ping_interval)
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                consecutive_misses = 0
-                continue
-            # Clear the pong flag before sending so a reply to THIS ping is what
-            # satisfies the wait below, not a stale one.
-            _pong_received.clear()
-            try:
-                await _write_frame(writer, {"type": _BRIDGE_PING_TYPE})
-            except (OSError, ConnectionError, BrokenPipeError):
-                # Socket already broken — bridge will tear down on its own.
-                return
-            # This wait IS the cycle's interval — do not sleep again.
-            # We check immediately after sending: the pong may have arrived
-            # between our clear and the send (or during the write).
-            # Give the peer the full next interval to reply.
-            try:
-                await asyncio.wait_for(
-                    _pong_received.wait(), timeout=ping_interval
-                )
-            except asyncio.TimeoutError:
-                pass
-            if _pong_received.is_set():
-                consecutive_misses = 0
-            else:
-                consecutive_misses += 1
-                logger.warning(
-                    "stub liveness: ping unanswered (%d/%d), "
-                    "outstanding_ids=%d",
-                    consecutive_misses,
-                    ping_max_misses,
-                    len(_outstanding_ids),
-                )
-                if consecutive_misses >= ping_max_misses:
-                    logger.error(
-                        "stub liveness: peer dead after %d missed pings; "
-                        "triggering fallback",
-                        consecutive_misses,
-                    )
-                    _peer_dead_evt.set()
-                    return
-
-    tasks = {
-        asyncio.create_task(stdin_pump(), name="kirocrew-mcp-stub-stdin"),
-        asyncio.create_task(stdout_pump(), name="kirocrew-mcp-stub-stdout"),
-        asyncio.create_task(stop_event.wait(), name="kirocrew-mcp-stub-stop"),
-        # Wakes when the stdout writer thread dies, so the bridge tears down
-        # even if no further upstream line arrives to trip _emit's fast-path
-        # check.
-        asyncio.create_task(
-            writer_failed_evt.wait(), name="kirocrew-mcp-stub-writer-failed"
-        ),
-    }
-    # Gated on negotiation, not assumed: an older gatewayd has no ping handler,
-    # so pinging it would guarantee a miss streak and force-degrade a healthy
-    # session. No capability, no monitor — the bridge behaves exactly as before.
-    if peer_supports_ping:
-        tasks.add(
-            asyncio.create_task(
-                _liveness_monitor(), name="kirocrew-mcp-stub-liveness"
-            )
-        )
-    result: Optional[BridgeLivenessFailure] = None
-    try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await _safe_close(writer)
-        # If the peer-dead event fired, report a liveness failure so the
-        # caller can emit JSON-RPC errors and degrade.
-        if _peer_dead_evt.is_set() and _outstanding_ids:
-            result = BridgeLivenessFailure(list(_outstanding_ids))
-    return result
-
-
-def _fallback_log_path() -> Path:
-    return _crew_home() / "logs" / "stub_fallback.jsonl"
-
-
-def log_fallback(
-    reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
-) -> None:
-    """Append one JSON record to the fallback audit log. OS errors are
-    swallowed — logging failure must never block the exec that keeps
-    kiro-cli working."""
-    try:
-        log_path = _fallback_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "ts": time.time(),
-            "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "pid": os.getpid(),
-            "stub_uuid": stub_uuid,
-            "pool_label": pool_label,
-            "reason": reason,
-            "server": args.server,
-            "agent": args.agent,
-            "channel_id": args.channel_id or "",
-            "target_command": args.target_command,
-        }
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
-    except OSError:
-        pass
-
-
-def fallback_exec(args: argparse.Namespace) -> None:
-    """Replace the current process with the real MCP backend. ``execvpe``
-    never returns on success; a return raises so the caller surfaces a
-    diagnostic."""
-    target_args = _split_target_args(args.target_args, args.target_args_sep)
-    argv = [args.target_command, *target_args]
-    # Restore the server's declared env. The rewriter moves declared env
-    # (which routinely holds tokens / API keys) into a 0600 sidecar the stub
-    # otherwise reads only for PoolKey hashing. On this fallback path we exec
-    # the real backend directly, so it must run with its declared env to match
-    # the non-pooled baseline — the daemon's own environment lacks it.
-    exec_env = dict(os.environ)
-    exec_env.update(_parse_env_file(getattr(args, "env_file", "") or ""))
-    # exec IS this fallback stub's whole purpose: when the gateway is
-    # unavailable, replace this process with the operator's real MCP backend.
-    # argv (target_command / target_args) and exec_env (the server's declared
-    # env) both originate from the operator's own ~/.kiro/agents/*.json via the
-    # rewriter — never from a peer or stub — so the tainted-input audit rule is
-    # a false positive under this threat model.
-    os.execvpe(argv[0], argv, exec_env)  # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
-    raise RuntimeError(f"execvpe({argv[0]!r}) returned unexpectedly")
+    from kiro_crew.mcp_gateway.read_limits import (  # noqa: F401
+        _DEFAULT_READ_BUFFER_LIMIT,
+        read_buffer_limit_from_flag,
+    )
+    from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS  # noqa: F401
+    from kiro_crew.mcp_gateway.stub_bridge import (  # noqa: F401
+        _BRIDGE_KEEPALIVE_TYPE,
+        _BRIDGE_PING_INTERVAL_SECS,
+        _BRIDGE_PING_MAX_MISSES,
+        _BRIDGE_PING_TYPE,
+        _BRIDGE_PONG_TYPE,
+        _ERROR_EMIT_TIMEOUT_SECS,
+        _SPAWN_QUEUED_TYPE,
+        _STDIN_QUEUE_MAXSIZE,
+        _is_json_non_object,
+        _NonObjectFrame,
+        _read_frame,
+    )
+    from kiro_crew.mcp_gateway.stub_fallback import (  # noqa: F401
+        _EXIT_UNRESOLVED_SECRET,
+        _FALLBACK_COUNT_WINDOW_SECS,
+        _FALLBACK_LOG_MAX_BYTES,
+        _child_exit_status,
+        _fallback_log_path,
+        _fallback_spawn_child,
+        _fallback_target_is_own_control_plane,
+        _fallback_user_site_holds_our_package,
+        _inherited_std_fd,
+        _refuse_unresolved_secret_references,
+        fallback_counts,
+        log_fallback,
+    )
+    from kiro_crew.mcp_gateway.stub_link import (  # noqa: F401
+        _ADMIT_READY,
+        _CAPACITY_ERROR_CODE,
+        _ENSURE_BACKEND_TIMEOUT_SECS,
+        _HELD_FRAME_BYTES,
+        _HELD_TOTAL_BYTES,
+        _QUEUED_FAIL_MESSAGE,
+        _QUEUED_GRACE_SECS,
+        _RECONNECT_BACKOFF_MAX_SECS,
+        _RECONNECT_BACKOFF_START_SECS,
+        _RECONNECT_CRASH_LOOP_CYCLES,
+        _RECONNECT_TOTAL_BUDGET_SECS,
+        _REJECT_CLASS_COMPAT,
+        _REJECT_CLASS_ISOLATION,
+        _REPLAY_INIT_TIMEOUT_SECS,
+        _REPLAY_OK,
+        _REPLAY_REFUSE,
+        _REPLAY_RETRY,
+        _SPAWN_QUEUE_SILENCE_SECS,
+        _SUPERVISOR_COLD_START_SECS,
+        _SUPERVISOR_LIVENESS_MAX_FAILURES,
+        _SUPERVISOR_LIVENESS_PING_INTERVAL_SECS,
+        _SUPERVISOR_RESPAWN_BACKOFF_MAX_SECS,
+        _SUPERVISOR_RESPAWN_CYCLE_SECS,
+        READ_BUFFER_LIMIT_BYTES,
+        TARGET_UNKNOWN_REASON,
+        StaleGenerationError,
+        _admission_control_frame,
+        _drain_while_disconnected,
+        _is_failable_request,
+        _no_room_to_hold,
+        _reconnect,
+        _reconnect_now,
+        _reconnect_wait,
+        _replay_initialize,
+        _write_stdout_line,
+    )
+    from kiro_crew.mcp_gateway.stub_register import (  # noqa: F401
+        _ANCESTOR_WALK_MAX,
+        _BINARY_HASH_CAP_BYTES,
+        _CONFIG_SNAPSHOT_PLACEHOLDER,
+        _KIROCREW_MCP_SUBCOMMANDS,
+        _ancestor_pids,
+        _binary_version,
+        _crew_home,
+        _hash_permission_profile,
+        _parse_auto_approve,
+        _parse_env_csv,
+        _parse_env_file,
+        _parse_env_json,
+        _pool_binary_identity,
+        _resolve_pool_identity_env,
+        _resolve_target_args,
+        _split_target_args,
+        binary_fingerprint,
+        pool_binary_version,
+    )
 
 
 def _install_signal_handlers(
@@ -1029,6 +432,13 @@ async def _recaller_loop(
 
 
 async def _amain(argv: Optional[list[str]] = None) -> int:
+    # ── Name the default executor ──
+    # asyncio.to_thread and run_in_executor(None, ...) route onto the loop's
+    # default executor, which Python names threads anonymously.  This names
+    # them ``mc-default`` so profilers like py-spy can attribute blocking work
+    # to this stub.  Must run BEFORE any to_thread offload.
+    configure_default_executor()
+
     # An invalid MC_MCP_LOG (e.g. "verbose") would make basicConfig raise
     # "Unknown level" and kill the stub BEFORE its fallback-to-per-session-exec
     # path can run. Fall back to WARNING on any unrecognised level.
@@ -1041,6 +451,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
         stream=sys.stderr,
     )
     args = _parse_args(argv)
+    _adopt_read_ceiling(args)
     # build_register_payload -> _build_caller_block -> CallerContext.from_env
     # does a synchronous /proc ancestry walk + file reads (and _binary_version
     # hashes the target binary), so offload the whole cold-start resolution to
@@ -1050,10 +461,10 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     payload = await loop.run_in_executor(subprocess_executor(), build_register_payload, args)
 
     try:
-        pool_label = PoolKey.from_register(payload).human_readable()
+        pool_label = format_pool_label(payload)
     except ValueError as exc:
         # Defensive — our own payload should never be malformed.
-        logger.warning("built malformed PoolKey payload: %s", exc)
+        logger.warning("built an unlabelable Register payload: %s", exc)
         pool_label = f"{args.agent}:{args.server}"
 
     stop_event = asyncio.Event()
@@ -1065,16 +476,64 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             timeout=_HANDSHAKE_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
-        log_fallback("handshake_timeout", payload["stub_uuid"], pool_label, args)
+        await alog_fallback("handshake_timeout", payload["stub_uuid"], pool_label, args)
         logger.warning("handshake timed out; falling back pool=%s", pool_label)
         fallback_exec(args)
         return 1  # unreachable
     except FallbackRequestedError as exc:
-        log_fallback(exc.reason, payload["stub_uuid"], pool_label, args)
+        await alog_fallback(exc.reason, payload["stub_uuid"], pool_label, args)
         logger.warning("handshake failed (%s); falling back pool=%s", exc.reason, pool_label)
         fallback_exec(args)
         return 1  # unreachable
     logger.info("registered stub_uuid=%s pool=%s", stub_uuid, pool_label)
+
+    capabilities = registered.get("capabilities") if isinstance(registered, dict) else None
+    _caps = capabilities if isinstance(capabilities, list) else []
+
+    # A private backend is the one thing this connection cannot verify after the
+    # fact. ``poolable`` is a register-payload field, so a daemon predating it
+    # ignores the flag and routes this register through the shared index —
+    # silently co-tenanting a server the operator never allowlisted. Such a
+    # daemon is reachable: the manager adopts anything answering ``pong``, with
+    # no version handshake, so one that outlived a package upgrade serves new
+    # stubs. Degrade instead: the per-session exec IS the private topology this
+    # connection asked for, and kiro-cli's ``initialize`` is still unread, so the
+    # fallback is clean. A stub that DID ask to share needs no check — an old
+    # daemon pools it, which is what it wanted.
+    if must_degrade_unshareable(bool(args.poolable), _caps):
+        reason = "gateway does not honour the poolable field"
+        await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
+        logger.warning(
+            "handshake: gateway did not advertise poolable_ack and this server is "
+            "not shareable; falling back to a per-session exec rather than risk "
+            "being pooled pool=%s",
+            pool_label,
+        )
+        await _safe_close(writer)
+        fallback_exec(args)
+        return 1  # unreachable
+
+    # The mirror case: pooling ASKED FOR, behind a daemon that mints no
+    # per-connection nonce. This server separates the co-tenants the gateway
+    # cannot name by that nonce, so without it one pooled backend holds one
+    # namespace for all of them -- and the backend cannot tell that from the 1:1
+    # topology where its per-process fallback is right. Same reachability as
+    # above: the manager adopts any daemon answering ``pong``. Degrading is the
+    # honest answer rather than a loss, because an exclusive backend is exactly
+    # where that per-process fallback separates sessions correctly, and
+    # ``initialize`` is still unread so the exec is clean.
+    if must_degrade_nonce_blind(args.server, bool(args.poolable), _caps):
+        reason = "gateway mints no per-connection tenant nonce"
+        await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
+        logger.warning(
+            "handshake: gateway did not advertise tenant_nonce and this server "
+            "separates unnamed co-tenants by it; falling back to a per-session "
+            "exec rather than pooling without it pool=%s",
+            pool_label,
+        )
+        await _safe_close(writer)
+        fallback_exec(args)
+        return 1  # unreachable
 
     # B1 pre-flight: trigger the gateway's backend spawn with a
     # control frame BEFORE forwarding any real MCP traffic, so a capacity /
@@ -1084,137 +543,366 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     # would treat the control frame as a real MCP frame and never reply, so we
     # skip the pre-flight and bridge directly (legacy lazy-spawn path, no 25s
     # skew penalty).
-    capabilities = registered.get("capabilities") if isinstance(registered, dict) else None
-    if isinstance(capabilities, list) and "ensure_backend" in capabilities:
-        try:
-            await _write_frame(writer, {"type": "ensure_backend"})
-            ready = await asyncio.wait_for(
-                _read_frame(reader), timeout=_ENSURE_BACKEND_TIMEOUT_SECS
-            )
-        except (asyncio.TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
-            # Gateway unreachable / wedged mid-pre-flight — same posture as a
-            # connect failure: fall back to a direct per-session exec.
-            await _safe_close(writer)
-            log_fallback(
-                f"ensure_backend_io:{type(exc).__name__}",
-                payload["stub_uuid"], pool_label, args,
-            )
-            logger.warning("ensure_backend io failed (%s); falling back pool=%s", exc, pool_label)
-            fallback_exec(args)
-            return 1  # unreachable
-        if not (isinstance(ready, dict) and ready.get("type") == "ready"):
-            if (
-                isinstance(ready, dict)
-                and ready.get("type") == "rejected"
-                and not ready.get("fallback")
-            ):
-                # Terminal rejection (unknown target / genuine spawn failure):
-                # the gateway says this server cannot run. Surface the failure
-                # instead of exec'ing — matches the lazy path and avoids
-                # per-session crash-loops of a broken backend.
-                await _safe_close(writer)
-                logger.error(
-                    "gateway terminally rejected ensure_backend (%s); not falling back pool=%s",
-                    ready.get("reason"), pool_label,
-                )
-                return 1
-            # Fallback-eligible rejection (``fallback: true``) or a closed /
-            # garbage reply -> exec the real backend directly for this session.
-            reason = (
-                ready.get("reason", "ensure_backend_rejected")
-                if isinstance(ready, dict) else "ensure_backend_closed"
-            )
-            await _safe_close(writer)
-            log_fallback(reason, payload["stub_uuid"], pool_label, args)
-            logger.warning("gateway fallback-rejected ensure_backend (%s); falling back pool=%s", reason, pool_label)
-            fallback_exec(args)
-            return 1  # unreachable
-
-    # Warm-pool caller repair: if we registered without a session key (the
-    # kiro-cli was pool-spawned before its session was claimed), watch for the
-    # key to materialize and re-register the caller so state-mutating tools
-    # (learn_add et al.) work for the claimed session. No-op for stubs that
-    # already had a key at register.
-    recaller_task: Optional[asyncio.Task[None]] = None
-    if not payload.get("session_key"):
-        recaller_task = asyncio.create_task(
-            _recaller_loop(writer, _resolve_channel_id(args.channel_id), stop_event),
-            name="kirocrew-mcp-stub-recaller",
-        )
-    try:
-        liveness_failure = await run_bridge(
+    if "ensure_backend" in _caps:
+        queue_aware = "spawn_queue" in _caps
+        outcome, ready = await _ensure_backend_admitted(
             reader,
             writer,
-            stop_event,
-            peer_supports_ping=bool(
-                isinstance(capabilities, list) and "bridge_ping" in capabilities
-            ),
+            queue_aware=queue_aware,
+            total_budget_secs=_SPAWN_QUEUE_WAIT_BUDGET_SECS,
         )
-    finally:
-        if recaller_task is not None:
-            if not recaller_task.done():
-                recaller_task.cancel()
-            # Always await — even a task that already finished (successfully or
-            # with an exception) must have its result/exception retrieved, or
-            # asyncio logs "Task exception was never retrieved" and hides a bug.
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await recaller_task
+        if outcome in (_ADMIT_TIMEOUT, _ADMIT_CLOSED):
+            # Gateway unreachable / wedged mid-pre-flight -- same posture as a
+            # connect failure: fall back to a direct per-session exec. A
+            # queue-aware wait that ran out of budget lands here too: silence
+            # for 25 s from a daemon that promised keepalives, or the whole
+            # budget spent, is a daemon that is not serving, not one that is
+            # full -- a full daemon says so with a ``capacity`` rejection.
+            await _safe_close(writer)
+            await alog_fallback(
+                f"ensure_backend_io:{outcome}", payload["stub_uuid"], pool_label, args,
+            )
+            logger.warning("ensure_backend %s; falling back pool=%s", outcome, pool_label)
+            fallback_exec(args)
+            return 1  # unreachable
+        if outcome == _ADMIT_REJECTED:
+            assert ready is not None
+            cls = _rejection_class(ready)
+            reason = str(ready.get("reason") or "ensure_backend_rejected")
+            if cls == _REJECT_CLASS_CAPACITY:
+                # The host is full and the daemon said so after the whole wait
+                # budget. No fallback -- an exec here is one more process on
+                # the host that just refused one -- and no death, which
+                # kiro-cli would read as the server crashing. Keep the stdio
+                # transport open and answer each request with a typed error
+                # the session can tell apart from a broken server.
+                retry_after = ready.get("retry_after_secs")
+                await _safe_close(writer)
+                await alog_fallback(
+                    f"capacity:{reason}", payload["stub_uuid"], pool_label, args, terminal=True,
+                )
+                logger.warning(
+                    "gateway refused ensure_backend for capacity (%s, retry_after=%s); "
+                    "answering requests with a typed error pool=%s",
+                    reason, retry_after, pool_label,
+                )
+                refusal_session = StubSession()
+                return await _serve_capacity_refusal(
+                    refusal_session,
+                    stop_event,
+                    reason=reason,
+                    retry_after_secs=retry_after if isinstance(retry_after, int) else None,
+                    pool_label=pool_label,
+                )
+            fallback_eligible = (
+                cls in _FALLBACK_CLASSES
+                if cls is not None
+                else (
+                    bool(ready.get("fallback"))
+                    # A legacy daemon cannot send the tag, so an untagged
+                    # target-unknown is routed to the fallback-exec path
+                    # rather than killing the server. See
+                    # ``must_degrade_unknown_target``.
+                    or must_degrade_unknown_target(reason)
+                )
+            )
+            if not fallback_eligible:
+                # Terminal rejection (genuine spawn failure): the gateway says
+                # this server cannot run. Surface the failure instead of
+                # exec'ing — matches the lazy path and avoids per-session
+                # crash-loops of a broken backend.
+                #
+                # Audited BEFORE returning, and this is the whole point of the
+                # record. A terminal exit writes no fallback record by
+                # definition, and this ``logger.error`` goes to the stub's own
+                # stderr, which kiro-cli swallows — so the pre-fix failure mode
+                # was a server whose entire tool surface vanished from a session
+                # while every durable log showed only a healthy ``registered``
+                # line. On the daemon side a terminal and a served stub were
+                # indistinguishable after the fact. The ``terminal:`` prefix
+                # keeps these separable from real fallbacks in
+                # ``stub_fallback_counts()``, which the gateway folds into its
+                # ``stats`` reply.
+                await _safe_close(writer)
+                await alog_fallback(
+                    f"terminal:{reason}",
+                    payload["stub_uuid"], pool_label, args,
+                    terminal=True,
+                )
+                logger.error(
+                    "gateway terminally rejected ensure_backend (%s); not falling back pool=%s",
+                    reason, pool_label,
+                )
+                return 1
+            # Fallback-eligible rejection (``compat`` / ``isolation``, or a
+            # legacy ``fallback: true``) -> exec the real backend directly for
+            # this session. A queue-aware daemon charged that exec to its host
+            # budget and releases it when this connection reaches EOF, so the
+            # socket is kept open across the exec rather than closed here.
+            if queue_aware:
+                _keep_socket_across_exec(writer)
+            else:
+                await _safe_close(writer)
+            await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
+            logger.warning(
+                "gateway fallback-rejected ensure_backend (%s, class=%s); falling back pool=%s",
+                reason, cls or "legacy", pool_label,
+            )
+            fallback_exec(args)
+            return 1  # unreachable
 
-    # Liveness failure: the gateway stopped answering pings while requests were
-    # outstanding. Fail the outstanding calls FAST and CLEANLY instead of leaving
-    # them parked forever.
+    # One session across every connection this stub makes. The stdin reader, the
+    # captured handshake and the ending reason all live here precisely because a
+    # connection dies with the daemon and the stub does not.
+    session = StubSession()
+    peer_supports_ping = bool(
+        isinstance(capabilities, list) and "bridge_ping" in capabilities
+    )
+    while True:
+        # Warm-pool caller repair: if we registered without a session key (the
+        # kiro-cli was pool-spawned before its session was claimed), watch for
+        # the key to materialize and re-register the caller so state-mutating
+        # tools (learn_add et al.) work for the claimed session. No-op for stubs
+        # that already had a key at register. Re-armed per connection: the task
+        # writes THIS socket, so one that outlived its connection would write a
+        # closed writer.
+        recaller_task: Optional[asyncio.Task[None]] = None
+        if not payload.get("session_key"):
+            recaller_task = asyncio.create_task(
+                _recaller_loop(
+                    writer, _resolve_channel_id(args.channel_id), stop_event
+                ),
+                name="kirocrew-mcp-stub-recaller",
+            )
+        try:
+            # The return value is the legacy single-connection signal; this
+            # caller reads the richer ending off the session instead.
+            await run_bridge(
+                reader,
+                writer,
+                stop_event,
+                peer_supports_ping=peer_supports_ping,
+                session=session,
+            )
+        finally:
+            if recaller_task is not None:
+                if not recaller_task.done():
+                    recaller_task.cancel()
+                # Always await — even a task that already finished (successfully
+                # or with an exception) must have its result/exception
+                # retrieved, or asyncio logs "Task exception was never
+                # retrieved" and hides a bug.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await recaller_task
+
+        if session.reason not in StubSession.RECONNECTABLE:
+            break
+
+        # The transport is gone but this process, its stdin and kiro-cli's frozen
+        # toolset are not. Answer whatever was in flight, exactly once, and hold
+        # back only what the replay below can still answer for real -- see
+        # _split_abandoned_ids for why each half is treated the way it is.
+        #
+        # What happens to requests across the reconnect that follows:
+        #
+        # * IN-FLIGHT calls (forwarded to the dead daemon, unanswered) are failed
+        #   HERE with a retryable -32603 before the reconnect starts. They are
+        #   not replayed: the stub cannot know whether the daemon forwarded them
+        #   upstream before dying, and replaying could double a side effect. The
+        #   one exception is an unanswered ``initialize``, which the replay can
+        #   still answer for real.
+        # * NEWLY ARRIVING requests are held briefly, then failed. The stdin
+        #   reader thread (``StubSession._start_reader``) keeps reading fd 0 into
+        #   the session's bounded queue, and ``_drain_while_disconnected`` below
+        #   is what reads that queue while no pump exists -- holding each frame
+        #   for ``_QUEUED_GRACE_SECS`` so an ordinary restart still forwards and
+        #   answers it for real, then failing whatever is left with the same
+        #   retryable ``-32603``. Held frames go back to the head of the stream,
+        #   so the next ``run_bridge`` forwards them in order and tracks their ids
+        #   as outstanding from that point; a failed one is dropped, because its
+        #   id has been answered. stdout stays open throughout, so kiro-cli never
+        #   sees the transport close until the budget is genuinely spent.
+        _to_fail, deferred_init_id = _split_abandoned_ids(session)
+        await _emit_error_frames(
+            _to_fail,
+            "Gateway restarted; this call was failed so it would not hang. "
+            "Retry it.",
+            pool_label=pool_label,
+        )
+        session.outstanding_ids = (
+            [] if deferred_init_id is None else [deferred_init_id]
+        )
+
+        if session.has_live_subscriptions():
+            # Recovering the transport for a subscribed session would hand it
+            # back a connection that answers calls but never delivers another
+            # resource update: the daemon's subscription table died with the old
+            # process. That is a NEW silent degradation, and trading a visible
+            # outage for a quiet one is precisely what this fix exists to stop.
+            # Refuse, and leave replaying subscriptions to the change that can
+            # do it properly.
+            logger.warning(
+                "stub bridge ended (%s) with live resource subscriptions; "
+                "refusing to reconnect because they cannot be re-established "
+                "here pool=%s",
+                session.reason,
+                pool_label,
+            )
+            break
+
+        if session.captured_init is None:
+            # Nothing to re-prime a fresh daemon with, so a reconnect could only
+            # produce a never-initialized backend that rejects every later call.
+            logger.warning(
+                "stub bridge ended (%s) before initialize was seen; no reconnect "
+                "is possible pool=%s",
+                session.reason,
+                pool_label,
+            )
+            break
+
+        # Refresh the caller before re-registering: the session key may have
+        # materialized since the first Register (warm-pool claim), and carrying
+        # it in the new handshake is better than re-running the recaller.
+        #
+        # The uuid in this payload is a placeholder: ``_reconnect`` mints a fresh
+        # one per handshake ATTEMPT, because it is a per-REGISTRATION handle the
+        # daemon keys attach, refcount and the private backend map on. A
+        # reconnectable ending does not prove the daemon died -- a wedged peer or
+        # a broken write leaves the predecessor registration in place -- so
+        # reusing a handle would either attach twice under one or let the
+        # predecessor's teardown tear down the replacement.
+        try:
+            payload = await loop.run_in_executor(
+                subprocess_executor(), build_register_payload, args
+            )
+        except Exception as exc:  # noqa: BLE001 — never lose the reconnect to this
+            logger.warning(
+                "stub reconnect: keeping the previous register payload (%s)", exc
+            )
+
+        await alog_fallback(f"bridge_lost_{session.reason}", stub_uuid, pool_label, args)
+        attached = await _reconnect_while_draining(
+            args.socket,
+            payload,
+            session,
+            stop_event,
+            poolable=bool(args.poolable),
+            pool_label=pool_label,
+        )
+        if attached is None:
+            logger.warning(
+                "stub could not re-attach to the gateway after %s; this session "
+                "loses these servers pool=%s",
+                session.reason,
+                pool_label,
+            )
+            break
+        reader, writer, registered, stub_uuid = attached
+        # The audit and log records must name the registration that is actually
+        # live: the reconnect loop mints one per ATTEMPT, so the payload this
+        # frame holds is not necessarily the one that registered.
+        capabilities = registered.get("capabilities")
+        peer_supports_ping = bool(
+            isinstance(capabilities, list) and "bridge_ping" in capabilities
+        )
+
+    # Terminal: the bridge ended for a reason no reconnect can address, or the
+    # reconnect budget ran out.
     #
     # Deliberately NOT followed by fallback_exec. The four pre-flight fallback
     # sites work because kiro-cli's ``initialize`` is still unread in fd0, so the
     # exec'd server comes up initialized. Here stdin_pump has already consumed
-    # and forwarded ``initialize``, and kiro-cli never re-sends it (see
-    # gatewayd's ``captured_init`` rationale), so an exec'd server would be a
-    # fresh, never-initialized MCP server that rejects every subsequent call.
-    # Exec would convert "wedged" into "fast-failing", not into "working" — and
-    # it would also throw away the socket a future reconnect could reuse.
-    if liveness_failure is not None:
-        def _emit_errors() -> None:
-            """Write the error frames on a worker thread.
-
-            A blocked kiro-cli reader (full stdout pipe) must not wedge the very
-            path whose job is to unwedge the caller, so the write is offloaded
-            and bounded by the caller's timeout rather than run inline.
-            """
-            for req_id in liveness_failure.outstanding_ids:
-                err_frame = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32603,
-                        "message": (
-                            "Gateway stopped responding; this call was failed so "
-                            "it would not hang. Retry it."
-                        ),
-                    },
-                }
-                sys.stdout.buffer.write(
-                    json.dumps(err_frame, separators=(",", ":")).encode("utf-8") + b"\n"
-                )
-            sys.stdout.buffer.flush()
-
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(_emit_errors), timeout=_ERROR_EMIT_TIMEOUT_SECS
-            )
-        except (asyncio.TimeoutError, OSError, ValueError):
-            # Nothing better to do: the reader is gone or wedged, and the caller
-            # is already being abandoned. Exiting still closes stdout, which is
-            # what tells kiro-cli this server is done.
-            logger.warning("could not emit liveness error frames pool=%s", pool_label)
-        log_fallback("bridge_liveness_dead", stub_uuid, pool_label, args)
+    # and forwarded ``initialize``, and kiro-cli never re-sends it, so an exec'd
+    # server would be a fresh, never-initialized MCP server that rejects every
+    # subsequent call. Exec would convert "wedged" into "fast-failing", not into
+    # "working" — reconnecting is what converts it into "working", and it has
+    # already been tried by the time we get here.
+    #
+    # Anything the drain handed back that no bridge forwarded is answered here.
+    # Normally the next ``run_bridge`` sends those frames on; this path has no
+    # next bridge, so without this they would die with stdout unanswered -- the
+    # very shape the drain exists to remove. Ids already listed are skipped: one
+    # response per id, the same rule as everywhere else.
+    for _held_id in session.take_pending_request_ids():
+        if _held_id not in session.outstanding_ids:
+            session.outstanding_ids.append(_held_id)
+    if session.outstanding_ids:
+        _abandoned = session.outstanding_ids
+        # Dropped as they are answered: this is the last writer, but leaving them
+        # listed would let any future path here emit a second response for an id
+        # kiro-cli has already been given one for.
+        session.outstanding_ids = []
+        await _emit_error_frames(
+            _abandoned,
+            "Gateway stopped responding and could not be reached again; this "
+            "call was failed so it would not hang. Start a new session to "
+            "restore these tools.",
+            pool_label=pool_label,
+        )
+        await alog_fallback(
+            f"bridge_dead_{session.reason}", stub_uuid, pool_label, args
+        )
         logger.warning(
-            "bridge peer stopped answering pings; failed %d outstanding call(s) "
+            "bridge ended (%s) with %d outstanding call(s) after %d reconnect(s) "
             "pool=%s",
-            len(liveness_failure.outstanding_ids),
+            session.reason,
+            len(_abandoned),
+            session.reconnects,
+            pool_label,
+        )
+        return 1
+    if session.reason in StubSession.RECONNECTABLE:
+        # The transport was lost with nothing in flight, so no call needs an
+        # answer — but the session still loses these servers, and without this
+        # record that leaves no trace at all. Record it so a degraded session is
+        # explicable afterwards instead of looking like a healthy one whose
+        # tools fail.
+        await alog_fallback(
+            f"bridge_dead_{session.reason}", stub_uuid, pool_label, args
+        )
+        logger.warning(
+            "bridge ended (%s) and could not re-attach after %d reconnect(s); "
+            "this session loses these servers pool=%s",
+            session.reason,
+            session.reconnects,
             pool_label,
         )
         return 1
     return 0
+
+
+def _hard_exit(code: int) -> NoReturn:
+    """Terminate without interpreter finalization.
+
+    ``sys.exit()`` cannot be used here. The ``stub-stdin`` daemon thread parks
+    in ``sys.stdin.buffer.readline()`` for the life of the process, holding that
+    stream's lock, and interpreter finalization tries to flush and close the
+    same ``BufferedReader``. CPython cannot acquire the lock and aborts the
+    process with ``Fatal Python error: _enter_buffered_busy`` (SIGABRT, exit
+    134, core dumped) instead of returning ``code``.
+
+    Finalization is skipped, so do its two jobs that matter here explicitly:
+    ``logging.shutdown()`` drains handler buffers (the only handler is a
+    ``StreamHandler`` on stderr, configured in :func:`_amain`), then stderr is
+    flushed. stdout is deliberately NOT flushed here: every stdout frame is
+    written and flushed by the dedicated ``stub-stdout`` daemon writer thread,
+    which holds the buffer's lock while blocked on a stalled downstream pipe —
+    flushing from this thread would deadlock on that lock and the process
+    would never reach ``os._exit``. Nothing else is owed — the
+    atexit-registered thread-pool joins in ``kiro_crew.executors`` hold no
+    unflushed state, only threads the OS reclaims, and skipping them also
+    drops a teardown hang risk on a wedged filesystem read.
+    """
+    try:
+        logging.shutdown()
+    except Exception:  # pragma: no cover — never block exit on log teardown
+        pass
+    try:
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+    os._exit(code)
 
 
 def main() -> None:
@@ -1223,7 +911,15 @@ def main() -> None:
         rc = asyncio.run(_amain())
     except KeyboardInterrupt:
         rc = 0
-    sys.exit(rc)
+    _hard_exit(rc)
+
+
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(
+    name
+    for name in set(globals()) | set(_EXPORTS)
+    if not name.startswith("_") and name != "TYPE_CHECKING"
+)
 
 
 if __name__ == "__main__":

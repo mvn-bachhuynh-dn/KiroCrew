@@ -7,8 +7,8 @@ bypass sets NOR the internal-path sets, and an agent session has no dashboard
 credential to satisfy the cookie path with:
 
   * the access cookie is httpOnly (the frontend cannot hand it over),
-  * ``KIROCREW_INTERNAL_SECRET`` is stripped from agent env by
-    ``sandbox._AGENT_DENIED_ENV_KEYS``,
+  * the gateway mints its internal secret in-process and never puts it in an
+    agent's env,
   * ``.local_secret`` — needed for the documented ``GET /api/token/local``
     bootstrap — is on the ``security.py`` sensitive-path denylist.
 
@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew import mcp_core
 from kiro_crew.apps.builtins.issue_radar.backend import routes as ir_routes
@@ -68,6 +69,16 @@ class TestGatewayPathIsReachableWithTheInternalSecret(unittest.TestCase):
 
 
 class TestToolRegistration(unittest.TestCase):
+    def setUp(self):
+        # The listing follows app enablement, and the isolated test home
+        # has no app installed, so Issue Radar is switched on at the one seam the
+        # listing reads; the descriptor content asserted below does not depend on it.
+        from kiro_crew.mcp_tools import apps as apps_tools
+
+        patcher = patch.object(apps_tools, "app_enabled_state", lambda name: name == "issue-radar")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_schema_is_registered_so_bad_args_do_not_crash_the_server(self):
         # An unregistered tool's internal ValidationError escapes the stdio loop
         # and kills the whole kirocrew-core server (see test_mcp_core_arg_crash).
@@ -271,7 +282,7 @@ class TestMiddlewareDecision:
 
     Set membership alone would still pass if the middleware's prefix matcher
     changed, so assert the actual decision: the credential-less call the seed
-    prompt used to ask for is refused, and the tool's internal-secret call is
+    prompt asks for is refused, and the tool's internal-secret call is
     granted.
     """
 
@@ -300,7 +311,7 @@ class TestMiddlewareDecision:
 
     @pytest.mark.asyncio
     async def test_a_credentialless_put_is_still_refused(self):
-        # This is the exact 403 the Investigate prompt used to earn. Admitting
+        # This is the exact 403 the Investigate prompt earns. Admitting
         # the path for the internal secret must NOT have opened it up generally.
         resp = await self._mw()(self._request(), _ok_handler)
         assert resp.status == 403
@@ -345,6 +356,9 @@ class TestPutHandlerBoundsTheItemNumber:
 
     async def _put(self, body: dict):
         request = make_mocked_request("PUT", RECORD_PATH)
+        request.app["state"] = NoConfiguredOwner()
+        request["user"] = "local-app"
+        request["app"] = ""
 
         async def _json():
             return body

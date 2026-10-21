@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -141,6 +141,162 @@ class TestCeilingResolution:
         assert td.chat_turn_timeout_secs() == CHAT_TURN_TIMEOUT
 
 
+class TestBoundedTurnSetup:
+    @pytest.mark.asyncio
+    async def test_task_creation_failure_restores_deadline_and_closes_turn(
+        self, monkeypatch
+    ) -> None:
+        original_deadline = td._TURN_DEADLINE.get()
+        previous_deadline = 12345.0
+        td._TURN_DEADLINE.set(previous_deadline)
+
+        async def _turn() -> None:
+            raise AssertionError("failed setup must not start the turn")
+
+        turn = _turn()
+        monkeypatch.setattr(
+            td.asyncio,
+            "ensure_future",
+            MagicMock(side_effect=RuntimeError("task factory rejected turn")),
+        )
+        try:
+            with pytest.raises(RuntimeError, match="task factory rejected turn"):
+                await td._bounded_turn(turn, 60)
+            assert td._TURN_DEADLINE.get() == previous_deadline
+            assert turn.cr_frame is None
+        finally:
+            td._TURN_DEADLINE.set(original_deadline)
+
+    @pytest.mark.asyncio
+    async def test_timer_creation_failure_cancels_and_joins_owned_turn(self, monkeypatch) -> None:
+        original_deadline = td._TURN_DEADLINE.get()
+        previous_deadline = 67890.0
+        td._TURN_DEADLINE.set(previous_deadline)
+        created_tasks: list[asyncio.Task[None]] = []
+        real_ensure_future = asyncio.ensure_future
+
+        async def _turn() -> None:
+            raise AssertionError("failed setup must not start the turn")
+
+        def _record_task(coro):
+            task = real_ensure_future(coro)
+            created_tasks.append(task)
+            return task
+
+        loop = asyncio.get_running_loop()
+        turn = _turn()
+        monkeypatch.setattr(td.asyncio, "ensure_future", _record_task)
+        monkeypatch.setattr(
+            loop,
+            "call_later",
+            MagicMock(side_effect=RuntimeError("timer rejected deadline")),
+        )
+        try:
+            with pytest.raises(RuntimeError, match="timer rejected deadline"):
+                await td._bounded_turn(turn, 60)
+            assert td._TURN_DEADLINE.get() == previous_deadline
+            assert len(created_tasks) == 1
+            assert created_tasks[0].cancelled()
+            assert turn.cr_frame is None
+        finally:
+            td._TURN_DEADLINE.set(original_deadline)
+
+
+class TestBoundedTurnGeneratorExit:
+    """A ``_bounded_turn`` wrapper nobody ever awaited or cancelled through a
+    live Task -- e.g. a ``spawn_guarded_turn`` dispatch left in
+    ``state._background_tasks`` when the test's event loop closes -- is
+    reclaimed by the garbage collector instead, which calls ``close()`` on
+    its still-suspended coroutine directly. That throws ``GeneratorExit`` at
+    the ``await task`` suspension point, resumed synchronously by the
+    collector rather than by a loop callback. The old cleanup path answered
+    with ``task.cancel(); await task`` unconditionally -- fine for a live
+    ``CancelledError`` unwind, fatal here: suspending on that second
+    ``await`` while already unwinding a ``GeneratorExit`` is exactly what
+    raises "coroutine ignored GeneratorExit" as an unraisable exception
+    nobody can catch (surfaced in CI as ``PytestUnraisableExceptionWarning``,
+    misattributed to whichever later test happened to trigger the GC sweep).
+    """
+
+    def test_close_after_the_owning_loop_has_closed_does_not_raise(self) -> None:
+        """Faithful reproduction: a real loop, closed while the wrapper is
+        still suspended on it, then ``close()`` from entirely outside any
+        running loop -- exactly what a garbage-collected orphan goes through.
+
+        Not ``@pytest.mark.asyncio``: the whole point is driving the wrapper
+        to suspension on one real loop, closing THAT loop, and only then
+        calling ``close()`` -- which needs managing the loop by hand rather
+        than the fixture's own.
+        """
+
+        async def _inner() -> None:
+            await asyncio.sleep(3600)
+
+        async def _driver():
+            bt = td._bounded_turn(_inner(), 60)
+            # Drive the wrapper to its suspension point at `await task` for
+            # real, on a live loop -- exactly where a caller leaves it if
+            # nothing ever awaits or cancels the wrapper itself.
+            bt.send(None)
+            return bt
+
+        loop = asyncio.new_event_loop()
+        try:
+            bt = loop.run_until_complete(_driver())
+        finally:
+            loop.close()
+
+        # What the garbage collector does to an unreferenced, still-suspended
+        # coroutine once its owning loop is gone. Must not raise "coroutine
+        # ignored GeneratorExit" or "RuntimeError: Event loop is closed".
+        bt.close()
+
+    @pytest.mark.asyncio
+    async def test_owned_tasks_loop_already_closed_does_not_raise(self, monkeypatch) -> None:
+        """``Task.cancel()`` itself can raise once its owning loop is closed.
+
+        ``call_soon`` checks ``_check_closed()`` synchronously, so cancelling a
+        task whose loop closed between dispatch and collection raises
+        ``RuntimeError: Event loop is closed`` right out of ``task.cancel()``.
+        Mirrors ``TestBoundedTurnSetup``'s timer-failure setup: forcing entry
+        into the cleanup path via a rejected timer, but with the owned task's
+        own ``cancel`` failing too, the way it would against a closed loop.
+        """
+        original_deadline = td._TURN_DEADLINE.get()
+        created_tasks: list[asyncio.Task[None]] = []
+        real_ensure_future = asyncio.ensure_future
+
+        async def _turn() -> None:
+            raise AssertionError("failed setup must not start the turn")
+
+        def _record_task(coro):
+            task = real_ensure_future(coro)
+            monkeypatch.setattr(
+                task, "cancel", MagicMock(side_effect=RuntimeError("Event loop is closed"))
+            )
+            created_tasks.append(task)
+            return task
+
+        loop = asyncio.get_running_loop()
+        turn = _turn()
+        monkeypatch.setattr(td.asyncio, "ensure_future", _record_task)
+        monkeypatch.setattr(
+            loop,
+            "call_later",
+            MagicMock(side_effect=RuntimeError("timer rejected deadline")),
+        )
+        try:
+            # Must not raise the mocked "Event loop is closed" instead of the
+            # real setup failure -- task.cancel() failing is swallowed, not
+            # propagated over the exception already unwinding the wrapper.
+            with pytest.raises(RuntimeError, match="timer rejected deadline"):
+                await td._bounded_turn(turn, 60)
+            assert len(created_tasks) == 1
+            created_tasks[0].cancel.assert_called_once()
+        finally:
+            td._TURN_DEADLINE.set(original_deadline)
+
+
 class TestTimeoutCard:
     def test_names_the_limit_in_hours(self) -> None:
         assert "2-hour" in td.format_turn_timeout_card(7200.0)
@@ -152,8 +308,50 @@ class TestTimeoutCard:
         """The user's first question is "did I lose my work?"."""
         assert "written to disk is still there" in td.format_turn_timeout_card(7200.0)
 
+    def test_names_the_setting_and_where_it_lives(self) -> None:
+        """A user who hit the limit must be told how to raise it."""
+        card = td.format_turn_timeout_card(14400.0)
+        assert td.TURN_TIME_LIMIT_SETTING in card
+        assert "Settings → Chat → Advanced" in card
+
+    def test_names_the_setting_by_its_settings_label(self) -> None:
+        """The prose must name the row the Settings page actually renders."""
+        import json
+        from pathlib import Path
+
+        import kiro_crew
+
+        registry = Path(kiro_crew.__file__).parent / "docs" / "settings-registry.generated.json"
+        rows = json.loads(registry.read_text(encoding="utf-8"))["settings"]
+        row = next(r for r in rows if r.get("configKey") == "agent.chat_turn_timeout_secs")
+        assert row["label"].startswith(td.TURN_TIME_LIMIT_SETTING)
+        assert row["route"].startswith("/settings/chat/advanced")
+
 
 class TestFinishTurnTask:
+    @pytest.mark.asyncio
+    async def test_cancel_before_first_loop_step_closes_the_unclaimed_turn(self) -> None:
+        """Immediate cancellation must not leak the input coroutine.
+
+        The bounded wrapper has not started yet, so its ``finally`` cannot own
+        cleanup.  This is the exact dispatch race exercised when a completed
+        chat turn starts a queued successor and its test/teardown immediately
+        cancels ``slot.task``.
+        """
+        state, slot = _state(), _slot()
+
+        async def _turn() -> None:
+            raise AssertionError("the turn should never start")
+
+        turn = _turn()
+        task = td.spawn_guarded_turn(state, slot, turn, timeout_secs=60)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert turn.cr_frame is None
+
     @pytest.mark.asyncio
     async def test_timeout_renders_a_visible_card(self) -> None:
         """The headline regression: a ceiling hit must not be silent."""
@@ -172,6 +370,25 @@ class TestFinishTurnTask:
         body = slot.append.call_args_list[0].args[1]
         assert "limit" in body and "⏱️" in body
         assert task not in state._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_timeout_card_carries_the_turn_timeout_kind(self) -> None:
+        """The dashboard keys its settings link on the kind, never on the prose."""
+        state, slot = _state(), _slot()
+
+        async def _forever():
+            await asyncio.Event().wait()
+
+        task = td.spawn_guarded_turn(state, slot, _forever(), timeout_secs=0.01)
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await task
+        await asyncio.sleep(0)
+        error_calls = [c for c in slot.append.call_args_list if c.args[0] == "error"]
+        assert len(error_calls) == 1
+        assert error_calls[0].kwargs.get("meta") == {
+            "kind": td.TURN_TIMEOUT_KIND,
+            "limit_scope": td.TURN_LIMIT_GLOBAL,
+        }
 
     @pytest.mark.asyncio
     async def test_deadline_absorbed_by_the_turn_still_renders_a_card(self) -> None:
@@ -201,6 +418,128 @@ class TestFinishTurnTask:
             "indistinguishable from the agent going quiet"
         )
         assert "limit" in slot.append.call_args_list[0].args[1]
+
+    @pytest.mark.asyncio
+    async def test_timeout_cancels_native_turn_before_stream_unwinds(self) -> None:
+        """The native cancel request must precede local stream cancellation."""
+        state, slot = _state(), _slot()
+        slot._active_turn_session_key = "dashboard:chat-1"
+        order: list[str] = []
+
+        async def _cancel_owned_turn(key, owner, *, wait_ack_timeout):
+            assert key == "dashboard:chat-1"
+            assert owner.done() is False
+            assert wait_ack_timeout > 0
+            order.append("native-cancel")
+            return "acked"
+
+        state.sessions.cancel_owned_turn = AsyncMock(side_effect=_cancel_owned_turn)
+
+        async def _streaming_turn() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("stream-unwind")
+                raise
+
+        task = td.spawn_guarded_turn(
+            state,
+            slot,
+            _streaming_turn(),
+            timeout_secs=0.01,
+            cancel_ack_timeout_secs=0.1,
+        )
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await task
+        await asyncio.sleep(0)
+
+        assert order == ["native-cancel", "stream-unwind"]
+        state.sessions.cancel_owned_turn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unacknowledged_native_cancel_warns_not_to_resume(self) -> None:
+        """A timeout cannot claim a native turn stopped without acknowledgement."""
+        state, slot = _state(), _slot()
+        slot._active_turn_session_key = "dashboard:chat-1"
+        state.sessions.cancel_owned_turn = AsyncMock(return_value="timeout")
+
+        async def _streaming_turn() -> None:
+            await asyncio.Event().wait()
+
+        task = td.spawn_guarded_turn(
+            state,
+            slot,
+            _streaming_turn(),
+            timeout_secs=0.01,
+            cancel_ack_timeout_secs=0.1,
+        )
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await task
+        await asyncio.sleep(0)
+
+        card = slot.append.call_args_list[0].args[1]
+        assert "did not acknowledge" in card
+        assert "do not resume" in card.lower()
+
+    @pytest.mark.asyncio
+    async def test_second_cancellation_cannot_orphan_native_cancel(self) -> None:
+        """A second wrapper cancel leaves the bounded native request running."""
+        state, slot = _state(), _slot()
+        slot._active_turn_session_key = "dashboard:chat-1"
+        cancel_entered = asyncio.Event()
+        release_cancel = asyncio.Event()
+        cancel_finished = asyncio.Event()
+
+        async def _cancel_owned_turn(key, owner, *, wait_ack_timeout):
+            cancel_entered.set()
+            await release_cancel.wait()
+            cancel_finished.set()
+            return "acked"
+
+        state.sessions.cancel_owned_turn = AsyncMock(side_effect=_cancel_owned_turn)
+
+        async def _streaming_turn() -> None:
+            await asyncio.Event().wait()
+
+        task = td.spawn_guarded_turn(
+            state,
+            slot,
+            _streaming_turn(),
+            timeout_secs=0.01,
+            cancel_ack_timeout_secs=0.5,
+        )
+        await asyncio.wait_for(cancel_entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+        release_cancel.set()
+
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(cancel_finished.wait(), timeout=1)
+        assert state.sessions.cancel_owned_turn.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bounded_chat_turn_routes_owned_native_cancel(self, monkeypatch) -> None:
+        """Legacy async dispatches use the same pre-unwind cancellation path."""
+        state, slot = _state(), _slot()
+        slot._active_turn_session_key = "dashboard:chat-1"
+        state.sessions.cancel_owned_turn = AsyncMock(return_value="acked")
+        monkeypatch.setattr(td, "chat_turn_timeout_secs", lambda: 0.01)
+        monkeypatch.setattr(td, "native_cancel_ack_timeout_secs", lambda: 0.1)
+
+        async def _streaming_turn() -> None:
+            await asyncio.Event().wait()
+
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await td.bounded_chat_turn(
+                _streaming_turn(),
+                state=state,
+                slot=slot,
+            )
+
+        state.sessions.cancel_owned_turn.assert_awaited_once()
+        assert slot.append.call_args.args[0] == "error"
+        assert "limit" in slot.append.call_args.args[1]
 
     @pytest.mark.asyncio
     async def test_turn_finishing_just_under_the_ceiling_is_not_called_a_timeout(self) -> None:

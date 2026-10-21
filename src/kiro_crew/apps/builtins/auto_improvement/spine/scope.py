@@ -1,7 +1,7 @@
 """Diff-scope — restrict a run to the files changed between two branches.
 
 The self-improvement use case (point the app at its OWN feature branch): discovery
-otherwise ranges over the WHOLE target package (``discover_defect_surfaces`` scans
+otherwise ranges over the WHOLE target package (the profile's ``discover`` scans
 ``clone/src/kiro_crew``), so a bug run would fix all of Kiro Crew, not just the app.
 Scoping the run to ``diff(base_ref, HEAD)`` confines it to exactly the change set the
 branch introduced — i.e. the feature you are dogfooding — without any hand-maintained
@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 
 def scoped_relpaths(clone: Path, base_ref: str, *, runner=subprocess.run) -> set[str] | None:
@@ -61,7 +63,14 @@ def scoped_relpaths(clone: Path, base_ref: str, *, runner=subprocess.run) -> set
                 f"{ref}...HEAD",
             ],
             capture_output=True,
-            text=True,
+            # ``core.quotePath=false`` above makes git emit a non-ASCII path as raw
+            # UTF-8 bytes rather than octal escapes, so the decode must be pinned:
+            # bare ``text=True`` is the host ANSI code page on Windows, and this set
+            # is compared verbatim against paths ``gate._changed_status_paths``
+            # already decodes with the same mapping. A strict-decode failure would
+            # be swallowed below into ``None`` -- unscoped -- widening the edit
+            # fence to the whole repository.
+            **UTF8_TEXT,
             timeout=60,
         )
     except Exception:  # noqa: BLE001 — a git failure degrades to unscoped, never crashes the run

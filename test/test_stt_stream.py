@@ -1,4 +1,11 @@
-"""Tests for streaming STT WebSocket endpoint (dashboard/stt_stream.py)."""
+"""Tests for streaming STT WebSocket endpoint (dashboard/stt_stream.py).
+
+This file holds the endpoint's guards and the ``apple`` and ``transcribe`` providers'
+sessions. The default ``local`` provider's session lives in
+``test_stt_stream_local_session.py``, the STT config in ``test_stt_stream_config.py``,
+the failures around a stream in ``test_stt_stream_defensive_guards.py``, and the
+shared socket helpers in ``stt_stream_helpers.py``.
+"""
 
 from __future__ import annotations
 
@@ -8,68 +15,30 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
-from aiohttp import web
+from aiohttp import WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
+from stt_stream_helpers import transcribe_consented_fixture  # noqa: F401
+from stt_stream_helpers import (
+    _arm_cap,
+    _await_end_audit,
+    _cfg,
+    _make_app,
+    _recv_json,
+    _wait_for_operation,
+)
 
-from kiro_crew import platform_compat as pc
-from kiro_crew.config.loader import KiroCrewConfig, SttConfig
-
-# Upper bound for _wait_for_operation. Generous because it only ever elapses on
-# a genuine regression (the audit never fires); the happy path returns as soon
-# as the handler's next step runs, so a large bound costs nothing in wall clock.
-_AUDIT_WAIT_TIMEOUT_SECS = 5.0
+from kiro_crew import stt
+from kiro_crew.config.loader import SttConfig
+from kiro_crew.testing.wait import await_until, default_timeout
 
 
-async def _wait_for_operation(calls: list[dict], operation: str) -> None:
-    """Await *operation* appearing in *calls*, or fail with what did arrive.
+async def _bounded(awaitable):
+    """Await a client-side websocket read, failing by name instead of hanging.
 
-    The WS error-frame handshake does NOT order the client's assertion after the
-    server's audit. Every early-return path in ``api_ws_stt`` runs
-    ``send_json(error)`` -> ``ws.close()`` -> ``_emit_end_audit(...)``, so
-    ``receive_json()`` returns on the error frame while the handler still has two
-    steps to go. Exiting the ``TestClient`` context is not a barrier either: it
-    closes the client side and does not await the server handler's coroutine to
-    completion. Asserting on ``calls`` right after either point is therefore a
-    race that fails whenever the event loop happens not to resume the handler
-    first — reproduced at roughly 1-in-8 locally and seen intermittently on CI.
-
-    Polling the real condition removes the guesswork: it returns the instant the
-    audit lands and fails with a useful message if it never does.
+    A regression that leaves the server silent would otherwise park the test until
+    the 300 s duration cap, past the suite's per-test timeout, and lose the worker.
     """
-
-    async def _poll() -> None:
-        while operation not in [c["operation"] for c in calls]:
-            # sleep(0) yields to the loop so the pending handler continues; the
-            # loop is single-threaded, so a busy-wait without it would hang.
-            await asyncio.sleep(0)
-
-    # asyncio.wait_for, not asyncio.timeout: the latter is 3.11+ and this project
-    # supports 3.10 (CI runs a 3.10 shard).
-    try:
-        await asyncio.wait_for(_poll(), timeout=_AUDIT_WAIT_TIMEOUT_SECS)
-    except asyncio.TimeoutError:
-        raise AssertionError(
-            f"{operation!r} audit never emitted within {_AUDIT_WAIT_TIMEOUT_SECS}s; "
-            f"got {[c['operation'] for c in calls]}"
-        ) from None
-
-
-def _make_app() -> web.Application:
-    from kiro_crew.dashboard import stt_stream
-
-    app = web.Application()
-    app.router.add_get("/api/ws/stt", stt_stream.api_ws_stt)
-    return app
-
-
-def _cfg(**kwargs) -> KiroCrewConfig:
-    stt = SttConfig(
-        enabled=kwargs.pop("enabled", True),
-        provider=kwargs.pop("provider", "transcribe"),
-        streaming=kwargs.pop("streaming", True),
-        **kwargs,
-    )
-    return KiroCrewConfig(stt=stt)
+    return await asyncio.wait_for(awaitable, default_timeout())
 
 
 class TestGuards:
@@ -85,7 +54,17 @@ class TestGuards:
             assert resp.status == 503
 
     @pytest.mark.asyncio
-    async def test_rejects_when_provider_is_whisper(self, monkeypatch):
+    async def test_rejects_a_provider_that_cannot_stream(self, monkeypatch):
+        """A provider outside ``_STREAMING_PROVIDERS`` is refused, not half-served.
+
+        The handler's provider checks are a chain ending in the AWS branch, so a
+        value with no streaming implementation of its own does not fail: it falls
+        through to Transcribe, which is the one provider that bills. The guard is
+        what makes that unreachable. ``whisper`` stands in for such a value because
+        it is a retired name a hand-edited or legacy ``config.json`` can still hold;
+        ``KiroCrewConfig.load`` degrades it to ``local``, which is exactly why the
+        socket needs its own gate rather than trusting the loaded value.
+        """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
             classmethod(lambda cls: _cfg(provider="whisper")),
@@ -94,6 +73,18 @@ class TestGuards:
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/ws/stt")
             assert resp.status == 503
+
+    def test_the_default_provider_can_stream(self):
+        """Whatever ships as the default must be admitted by this endpoint.
+
+        Streaming is also on by default, so a default provider missing from
+        ``_STREAMING_PROVIDERS`` would 503 every microphone press on a fresh
+        install, with the settings panel showing voice input as ready.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        assert SttConfig().provider in stt_stream._STREAMING_PROVIDERS
+        assert SttConfig().streaming is True
 
     @pytest.mark.asyncio
     async def test_rejects_when_stt_disabled(self, monkeypatch):
@@ -165,9 +156,11 @@ class TestGuards:
     async def test_rejects_when_concurrent_cap_reached(self, monkeypatch):
         """New connections rejected with 503 once active sessions hit the cap.
 
-        Regression: without a cap, a single user opening many tabs (or an
-        attacker past origin) multiplies Transcribe cost and can exhaust
-        the account concurrent-stream quota.
+        The cap covers all three providers, for two different reasons: on
+        ``transcribe`` a single user opening many tabs (or an attacker past origin)
+        multiplies cost and can exhaust the account's concurrent-stream quota, and
+        on the free on-device providers each session still buffers its whole
+        utterance and serialises its decodes onto one resident model.
         """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
@@ -181,6 +174,47 @@ class TestGuards:
             assert resp.status == 503
 
 
+@pytest.mark.asyncio
+async def test_receive_until_takes_its_pending_read_down_with_an_outer_cancellation():
+    """A reader cancelled from outside must not leave its `__anext__` in flight.
+
+    That orphan would sit in `receive()` until the close and end unretrieved.
+    """
+    from kiro_crew.dashboard import stt_stream
+
+    started = asyncio.Event()
+    released = asyncio.Event()
+    seen: list[str] = []
+
+    class Blocking:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            started.set()
+            try:
+                await released.wait()
+            except asyncio.CancelledError:
+                seen.append("read cancelled")
+                raise
+            raise StopAsyncIteration
+
+    async def consume():
+        async for _ in stt_stream._receive_until(Blocking(), asyncio.Event()):
+            pass
+
+    task = asyncio.create_task(consume())
+    await await_until(started, what="the reader starting")
+    task.cancel()
+    # Joined under the lost-run bound without awaiting the task itself: a reader
+    # that swallowed the cancellation would never finish, and this join must fail
+    # here by name rather than hang until the suite's global timeout.
+    await await_until(
+        asyncio.gather(task, return_exceptions=True), what="the cancelled reader finishing"
+    )
+    assert seen == ["read cancelled"]
+
+
 class TestAppleStreamingSession:
     """The `apple` provider's own WebSocket path (`_run_apple_session`).
 
@@ -189,11 +223,27 @@ class TestAppleStreamingSession:
     coverage here rather than being assumed shared.
     """
 
-    def _install(self, monkeypatch, *, session=None, start_error="", feed_ok=True):
-        """Point the endpoint at the apple provider with a stubbed helper session."""
+    def _install(
+        self,
+        monkeypatch,
+        *,
+        session=None,
+        start_error="",
+        feed_ok=True,
+        avail=None,
+        language_code="auto",
+    ):
+        """Point the endpoint at the apple provider with a stubbed helper session.
+
+        *avail* is what the double reports from ``availability()``, which the error
+        path consults to name a start failure. It defaults to a capable host so the
+        cases that never fail to start do not depend on the runner's OS.
+        """
+        from kiro_crew import apple_speech as real_apple_speech
+
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg(provider="apple")),
+            classmethod(lambda cls: _cfg(provider="apple", language_code=language_code)),
         )
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
 
@@ -228,6 +278,8 @@ class TestAppleStreamingSession:
         fake_module = SimpleNamespace(
             StreamingSession=session or FakeSession,
             STREAM_SAMPLE_RATE_HZ=16000,
+            Availability=real_apple_speech.Availability,
+            availability=lambda: avail or real_apple_speech.Availability(True),
         )
         # BOTH, deliberately. `_run_apple_session` does `from kiro_crew import
         # apple_speech`, which resolves the ATTRIBUTE on the already-imported
@@ -239,6 +291,157 @@ class TestAppleStreamingSession:
         return events, fed
 
     @pytest.mark.asyncio
+    async def test_ready_advertises_the_connection_cap(self, monkeypatch):
+        """Same figure, same field, as the other two providers: one contract."""
+        self._install(monkeypatch)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 7)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            ready = await _recv_json(ws)
+            assert ready["type"] == "ready"
+            assert ready["max_duration_ms"] == 7000
+            await ws.send_json({"type": "stop"})
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_the_cap_finishes_the_helper_before_its_error_frame(self, monkeypatch):
+        """The cap must reach `session.finish()` while the socket is still open.
+
+        Closing stdin is the helper's cue to finalize, and its trailing final is
+        relayed afterwards; a socket already closed by the deadline task has no
+        recipient for it. Order on the wire: the helper's final, the cap frame,
+        the close.
+        """
+        # `_install` returns the queue the fake helper's `events()` drains; its
+        # `finish()` ends that queue with None. Subclass through the patched
+        # module attribute (as `test_stream_uses_effective_locale` does) so
+        # finish() first enqueues the trailing final the real helper would emit.
+        events, _ = self._install(monkeypatch)
+        from kiro_crew import apple_speech
+
+        class Finishing(apple_speech.StreamingSession):
+            async def finish(self, **kwargs):
+                await events.put({"type": "final", "text": "what was being said"})
+                return await super().finish(**kwargs)
+
+        monkeypatch.setattr(apple_speech, "StreamingSession", Finishing)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            # Only an OPEN socket can carry this frame: it proves finish() ran
+            # before the close, which the old deadline task made impossible.
+            assert await _recv_json(ws) == {
+                "type": "final",
+                "text": "what was being said",
+            }
+            assert await _recv_json(ws) == {
+                "type": "error",
+                "message": "max stream duration exceeded",
+                "code": "stt_max_duration_exceeded",
+            }
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_a_cap_that_fires_mid_feed_lets_the_frame_finish(self, monkeypatch):
+        """The reader stops between frames, never inside one.
+
+        Cancelling the reader task mid-`feed` would cut a frame half-way into the
+        helper's stdin. The cap now only ends the loop once the frame in flight
+        has been forwarded, and the helper is finished after it — so the frame is
+        whole, in order, and the trailing final still precedes the cap frame.
+        """
+        events, fed = self._install(monkeypatch)
+        from kiro_crew import apple_speech
+
+        fire = _arm_cap(monkeypatch)
+        feeding = asyncio.Event()
+        release = asyncio.Event()
+        order: list[str] = []
+
+        class SlowFeed(apple_speech.StreamingSession):
+            async def feed(self, pcm):
+                feeding.set()
+                await await_until(release, what="the test releasing the feed")
+                order.append("fed")
+                return await super().feed(pcm)
+
+            async def finish(self, **kwargs):
+                order.append("finish")
+                await events.put({"type": "final", "text": "after the frame"})
+                return await super().finish(**kwargs)
+
+        monkeypatch.setattr(apple_speech, "StreamingSession", SlowFeed)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            await await_until(feeding, what="the frame reaching feed()")
+            fire.set()  # the cap lands while that frame is still being fed
+            release.set()
+            assert await _recv_json(ws) == {
+                "type": "final",
+                "text": "after the frame",
+            }
+            assert (await _recv_json(ws))["code"] == ("stt_max_duration_exceeded")
+            await ws.close()
+        assert order == ["fed", "finish"]
+        assert fed == [b"\x00\x01" * 16]
+
+    @pytest.mark.asyncio
+    async def test_a_cap_cancels_a_reader_stuck_inside_a_feed_after_the_grace(self, monkeypatch):
+        """A helper that stopped reading its stdin cannot hold the session past the cap.
+
+        The reader stops between frames, but a feed that never returns has no
+        next frame; after `_CAP_READER_GRACE_SECS` the cap cancels it after all,
+        the helper is finished, and the cap frame still reaches the client.
+        """
+        _, fed = self._install(monkeypatch)
+        from kiro_crew import apple_speech
+        from kiro_crew.dashboard import stt_stream
+
+        fire = _arm_cap(monkeypatch)
+        monkeypatch.setattr(stt_stream, "_CAP_READER_GRACE_SECS", 0.05)
+        feeding = asyncio.Event()
+        stuck = asyncio.Event()  # never set: the helper stopped reading
+
+        class Stuck(apple_speech.StreamingSession):
+            async def feed(self, pcm):
+                feeding.set()
+                await stuck.wait()
+                return await super().feed(pcm)
+
+        monkeypatch.setattr(apple_speech, "StreamingSession", Stuck)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            await await_until(feeding, what="the frame reaching feed()")
+            fire.set()
+            assert (await _recv_json(ws))["code"] == "stt_max_duration_exceeded"
+            await ws.close()
+        assert fed == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("language", "expected_locale"),
+        [("auto", "en-US"), ("en-US", "en-US"), ("zh-CN", "zh-CN")],
+    )
+    async def test_stream_uses_effective_locale(self, monkeypatch, language, expected_locale):
+        self._install(monkeypatch, language_code=language)
+        from kiro_crew import apple_speech
+
+        factory = MagicMock(wraps=apple_speech.StreamingSession)
+        monkeypatch.setattr(apple_speech, "StreamingSession", factory)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_json({"type": "stop"})
+            await ws.close()
+        assert factory.call_args.kwargs["locale"] == expected_locale
+
+    @pytest.mark.asyncio
     async def test_duration_cap_fires_for_a_client_that_sends_nothing(self, monkeypatch):
         """Regression: the cap MUST run on a dedicated task, not per-message.
 
@@ -246,15 +449,23 @@ class TestAppleStreamingSession:
         heartbeat ping/pong internally, so a message-driven deadline never
         evaluates for an idle-but-alive client — leaking the helper process, an OS
         speech session, and one of `_MAX_CONCURRENT_SESSIONS` slots indefinitely.
+
+        The frame is pinned whole, `code` included: the dashboard renders `message`
+        verbatim into a 12-language UI, so the code is the part a localised string
+        can key off and an uncoded frame can only ever be shown in English.
         """
         self._install(monkeypatch)
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             # Deliberately send NO audio — only the deadline task can end this.
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "max stream duration exceeded"}
+            assert msg == {
+                "type": "error",
+                "message": "max stream duration exceeded",
+                "code": "stt_max_duration_exceeded",
+            }
             await ws.close()
 
     @pytest.mark.asyncio
@@ -274,13 +485,10 @@ class TestAppleStreamingSession:
         )
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await ws.receive_json()  # the cap's error frame
             await ws.close()
-        for _ in range(int(_AUDIT_WAIT_TIMEOUT_SECS / 0.02)):
-            if outcomes:
-                break
-            await asyncio.sleep(0.02)
+        await _await_end_audit(outcomes)
         assert outcomes == ["timeout"], outcomes
 
     @pytest.mark.asyncio
@@ -294,13 +502,10 @@ class TestAppleStreamingSession:
         )
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await ws.send_str('{"type":"stop"}')
             await ws.close()
-        for _ in range(int(_AUDIT_WAIT_TIMEOUT_SECS / 0.02)):
-            if outcomes:
-                break
-            await asyncio.sleep(0.02)
+        await _await_end_audit(outcomes)
         assert outcomes == ["ok"], outcomes
 
     @pytest.mark.asyncio
@@ -310,7 +515,7 @@ class TestAppleStreamingSession:
         events, _ = self._install(monkeypatch)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await events.put({"type": "partial", "text": "  my key is AKIAIOSFODNN7EXAMPLE  "})
             got = await ws.receive_json()
             assert got["type"] == "partial"
@@ -328,15 +533,20 @@ class TestAppleStreamingSession:
         The helper stops producing results after emitting `error`, so dropping the
         event leaves the client on a live socket that will never transcribe again —
         indistinguishable from a silent microphone.
+
+        The helper's own prose is forwarded for an operator reading the log, and the
+        code is what the localised UI renders: a mid-session helper death is a
+        session failure the user can only retry, not an availability problem.
         """
         events, _ = self._install(monkeypatch)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await events.put({"type": "error", "message": "result stream failed: boom"})
             msg = await ws.receive_json()
             assert msg["type"] == "error"
             assert "result stream failed" in msg["message"]
+            assert msg["code"] == "stt_session_failed"
             await ws.close()
 
     @pytest.mark.asyncio
@@ -351,49 +561,150 @@ class TestAppleStreamingSession:
         self._install(monkeypatch, feed_ok=False)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await ws.send_bytes(b"\x00\x01" * 32)
             msg = await ws.receive_json()
             assert msg["type"] == "error"
             assert "stopped" in msg["message"]
+            assert msg["code"] == "stt_session_failed"
 
     @pytest.mark.asyncio
     async def test_helper_start_failure_surfaces_and_closes(self, monkeypatch):
-        self._install(monkeypatch, start_error="the Xcode Command Line Tools are required")
+        """A session that never starts reports WHY in a form the UI can localise.
+
+        `start()` answers in prose, and "install the Xcode Command Line Tools" is
+        both the most likely cause and the only one with a user-actionable fix, so
+        collapsing it into a generic failure code would throw away the one thing
+        worth telling this user. The code is the availability probe's own, which is
+        what the settings panel already renders for the same condition.
+        """
+        from kiro_crew import apple_speech
+
+        self._install(
+            monkeypatch,
+            start_error="the Xcode Command Line Tools are required",
+            avail=apple_speech.Availability(False, "no toolchain", needs_toolchain=True),
+        )
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
             assert msg["type"] == "error"
             assert "Command Line Tools" in msg["message"]
+            assert msg["code"] == "stt_apple_needs_toolchain"
             await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_start_failure_on_a_capable_host_is_a_session_failure(self, monkeypatch):
+        """The mirror: a host that CAN run the framework but still failed to start.
+
+        A helper that would not build, a sandbox that is unavailable or a readiness
+        timeout are none of them availability problems, so reporting one of the
+        availability codes would send the user to install something they already
+        have.
+        """
+        self._install(monkeypatch, start_error="streaming helper did not become ready")
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "stt_session_failed"
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_still_closes_the_session(self, monkeypatch):
+        """`await session.start()` runs BEFORE the teardown `finally` exists.
+
+        A cancellation landing there (client gone, gateway shutdown) therefore
+        has no caller-side owner: without the call-site guard, the helper
+        session — and the sandbox launcher it may hold — is never closed, and
+        the `stt_stream_start` already emitted gets no matching end audit. The
+        guard must close the session, balance the trail, and re-raise.
+        """
+        started = asyncio.Event()
+        closed: list[bool] = []
+        outcomes: list[str] = []
+
+        class HangingSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def start(self):
+                started.set()
+                await asyncio.sleep(60)
+                return ""
+
+            async def close(self):
+                closed.append(True)
+
+        self._install(monkeypatch, session=HangingSession)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        from kiro_crew.dashboard import stt_stream
+
+        task = asyncio.create_task(
+            stt_stream._run_apple_session(
+                MagicMock(), _cfg(provider="apple"), MagicMock(), "test-caller"
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == [True]
+        assert outcomes == ["error"]
 
 
 class TestStreamLifecycle:
     """Mock TranscribeStreamingClient to verify lifecycle + redaction."""
 
     @pytest.fixture(autouse=True)
+    def _consented(self, transcribe_consented):
+        """Every case here drives ``api_ws_stt``, which is consent-gated."""
+
+    @pytest.fixture(autouse=True)
     def _require_amazon_transcribe(self):
         pytest.importorskip("amazon_transcribe")
 
-    def _install_stubs(self, monkeypatch, *, fail_start=False):
+    def _install_stubs(
+        self,
+        monkeypatch,
+        *,
+        fail_start=False,
+        language_code="auto",
+        vocabulary="",
+        start_exc=None,
+        languages=(),
+    ):
         from amazon_transcribe.handlers import TranscriptResultStreamHandler
 
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg()),
+            classmethod(
+                lambda cls: _cfg(
+                    language_code=language_code,
+                    transcribe_vocabulary=vocabulary,
+                    transcribe_languages=list(languages),
+                )
+            ),
         )
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
 
         # Stub Transcribe client.
         input_stream = MagicMock()
         input_stream.send_audio_event = AsyncMock()
-        input_stream.end_stream = AsyncMock()
+        # The real result stream ends only once the input stream is ended.
+        results_ended = asyncio.Event()
+        input_stream.end_stream = AsyncMock(side_effect=results_ended.set)
         stream = MagicMock()
         stream.input_stream = input_stream
         stream.output_stream = MagicMock()
 
         client = MagicMock()
-        if fail_start:
+        if start_exc is not None:
+            client.start_stream_transcription = AsyncMock(side_effect=start_exc)
+        elif fail_start:
             client.start_stream_transcription = AsyncMock(side_effect=RuntimeError("start failed"))
         else:
             client.start_stream_transcription = AsyncMock(return_value=stream)
@@ -402,32 +713,183 @@ class TestStreamLifecycle:
             lambda **kw: client,
         )
 
-        # Stub handler so handle_events exits quickly.
         original_init = TranscriptResultStreamHandler.__init__
         monkeypatch.setattr(
             TranscriptResultStreamHandler,
             "__init__",
             lambda self, output_stream: original_init(self, output_stream),
         )
+
+        async def _results_until_end_stream(self) -> None:
+            await results_ended.wait()
+
         monkeypatch.setattr(
-            TranscriptResultStreamHandler,
-            "handle_events",
-            AsyncMock(return_value=None),
+            TranscriptResultStreamHandler, "handle_events", _results_until_end_stream
         )
         return client, input_stream
 
     @pytest.mark.asyncio
-    async def test_ready_then_stop(self, monkeypatch):
+    async def test_ready_advertises_the_connection_cap(self, monkeypatch):
+        """Same figure, same field, as the other two providers: one contract."""
+        self._install_stubs(monkeypatch)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 7)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            ready = await _recv_json(ws)
+            assert ready["type"] == "ready"
+            assert ready["max_duration_ms"] == 7000
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_the_cap_ends_the_input_stream_before_its_error_frame(self, monkeypatch):
+        """On the metered provider the trailing final arrives after end_stream().
+
+        A cap that closed the socket first would leave that final decoded, billed
+        and thrown away. The input stream is ended and the handler drained while
+        the socket is open; the cap frame follows.
+        """
+        from kiro_crew.dashboard import stt_stream
+
         _, input_stream = self._install_stubs(monkeypatch)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
+        order: list[str] = []
+        input_stream.end_stream = AsyncMock(side_effect=lambda: order.append("end_stream"))
+        original = stt_stream._send_error
+
+        async def _spy(ws, message, code):
+            order.append(f"error:{code}")
+            await original(ws, message, code)
+
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._send_error", _spy)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            assert (await _recv_json(ws))["code"] == "stt_max_duration_exceeded"
+            await ws.close()
+        assert order == ["end_stream", "error:stt_max_duration_exceeded"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("language", "expected_locale"),
+        [("auto", "en-US"), ("en-US", "en-US"), ("zh-CN", "zh-CN")],
+    )
+    async def test_ready_then_stop(self, monkeypatch, language, expected_locale):
+        transcribe_client, input_stream = self._install_stubs(monkeypatch, language_code=language)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
-            assert msg == {"type": "ready"}
+            assert msg["type"] == "ready"
             await ws.send_bytes(b"\x00\x01" * 16)
             await ws.send_str('{"type":"stop"}')
             await ws.close()
         input_stream.send_audio_event.assert_awaited()
         input_stream.end_stream.assert_awaited()
+        assert (
+            transcribe_client.start_stream_transcription.call_args.kwargs["language_code"]
+            == expected_locale
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_languages_open_an_identifying_stream(self, monkeypatch):
+        """Two candidates: identification on, no ``LanguageCode`` (Amazon Transcribe
+        fails a request carrying both), and the vocabulary as ``VocabularyNames``.
+        Everything else on the request is the single-language stream's."""
+        transcribe_client, input_stream = self._install_stubs(
+            monkeypatch,
+            language_code="en-US",
+            vocabulary="team-terms",
+            languages=["vi-VN", "en-US"],
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+        input_stream.send_audio_event.assert_awaited()
+        kwargs = transcribe_client.start_stream_transcription.call_args.kwargs
+        assert kwargs["language_code"] is None
+        assert kwargs["identify_multiple_languages"] is True
+        assert kwargs["language_options"] == ["vi-VN", "en-US"]
+        assert kwargs["vocabulary_names"] == ["team-terms"]
+        assert "vocabulary_name" not in kwargs
+        assert kwargs["media_encoding"] == "pcm"
+        assert kwargs["partial_results_stability"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_a_vocabulary_refusal_keeps_its_code_with_mixed_languages(self, monkeypatch):
+        """Under identification the vocabulary rides as ``VocabularyNames``; a refusal
+        naming it (for example its language among none of the candidates) still points
+        at the vocabulary setting rather than reading as a service fault."""
+        from amazon_transcribe.exceptions import BadRequestException
+
+        self._install_stubs(
+            monkeypatch,
+            vocabulary="team-terms",
+            languages=["vi-VN", "fr-FR"],
+            start_exc=BadRequestException(
+                "None of the languages of the specified custom vocabularies match the "
+                "identified language."
+            ),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await _recv_json(ws)
+            assert msg["type"] == "error"
+            assert msg["code"] == "stt_transcribe_vocabulary_rejected"
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_one_candidate_keeps_the_single_language_stream(self, monkeypatch):
+        transcribe_client, _ = self._install_stubs(
+            monkeypatch, language_code="vi-VN", languages=["vi-VN"]
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+        kwargs = transcribe_client.start_stream_transcription.call_args.kwargs
+        assert kwargs["language_code"] == "vi-VN"
+        assert kwargs["vocabulary_name"] is None
+        assert "identify_multiple_languages" not in kwargs
+        assert "language_options" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_an_sdk_too_old_for_mixed_languages_is_refused_before_streaming(
+        self, monkeypatch
+    ):
+        """An SDK without the parameters would raise ``TypeError`` mid-start; the
+        socket names the fix instead, before any audio is read, and the audit pair
+        stays balanced."""
+        transcribe_client, input_stream = self._install_stubs(
+            monkeypatch, languages=["vi-VN", "en-US"]
+        )
+        started: list[dict] = []
+
+        async def start_stream_transcription(
+            *, language_code, media_sample_rate_hz, media_encoding, vocabulary_name=None
+        ):
+            started.append({"language_code": language_code})
+
+        transcribe_client.start_stream_transcription = start_stream_transcription
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream.sel",
+            lambda: MagicMock(log_api_access=lambda **kw: calls.append(kw)),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await _recv_json(ws)
+            assert msg["type"] == "error"
+            assert msg["code"] == "stt_transcribe_sdk_outdated"
+            await _wait_for_operation(calls, "stt_stream_end")
+            await ws.close()
+        assert started == []
+        input_stream.send_audio_event.assert_not_awaited()
+        assert [c["outcome"] for c in calls if c["operation"] == "stt_stream_end"] == ["error"]
 
     @pytest.mark.asyncio
     async def test_start_failure_emits_error(self, monkeypatch):
@@ -436,7 +898,169 @@ class TestStreamLifecycle:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
             assert msg["type"] == "error"
+            assert msg["code"] == "stt_session_failed"
             await ws.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("vocabulary", "expected"), [("team-terms", "team-terms"), ("", None)])
+    async def test_the_configured_vocabulary_rides_on_the_stream(
+        self, monkeypatch, vocabulary, expected
+    ):
+        """None, not ``""``, when unset: the SDK omits the header only for None, and an
+        empty name breaks the API's minimum length of 1."""
+        transcribe_client, _ = self._install_stubs(monkeypatch, vocabulary=vocabulary)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+        kwargs = transcribe_client.start_stream_transcription.call_args.kwargs
+        assert kwargs["vocabulary_name"] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("vocabulary", "service_message", "expected_code"),
+        [
+            # The refusal this code exists for: retrying cannot help, Settings can.
+            # This is the text Amazon Transcribe returned live (us-east-1) when
+            # start_stream_transcription named a vocabulary that does not exist.
+            (
+                "team-terms",
+                "The specified vocabulary doesn't exist. Check the name and try your "
+                "request again.",
+                "stt_transcribe_vocabulary_rejected",
+            ),
+            # Live text (us-east-1) for a vocabulary still PENDING.
+            (
+                "team-terms",
+                "The specified vocabulary isn't ready for use. Try your request again later.",
+                "stt_transcribe_vocabulary_rejected",
+            ),
+            # Live text (us-east-1) for a READY en-US vocabulary on a fr-FR stream.
+            (
+                "team-terms",
+                "Language used in the vocabulary doesn't match the specified language "
+                "code. Correct language code and try again.",
+                "stt_transcribe_vocabulary_rejected",
+            ),
+            # A bad request about something else is not blamed on the vocabulary.
+            (
+                "team-terms",
+                "The language code you specified isn't supported.",
+                "stt_session_failed",
+            ),
+            # With no vocabulary configured, it cannot be the vocabulary.
+            ("", "The requested vocabulary couldn't be found.", "stt_session_failed"),
+        ],
+    )
+    async def test_a_vocabulary_refusal_has_its_own_code(
+        self, monkeypatch, vocabulary, service_message, expected_code
+    ):
+        from amazon_transcribe.exceptions import BadRequestException
+
+        self._install_stubs(
+            monkeypatch, vocabulary=vocabulary, start_exc=BadRequestException(service_message)
+        )
+        outcomes: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == expected_code
+            await ws.close()
+        await _await_end_audit(outcomes)
+        assert outcomes == ["error"]
+
+    def test_only_the_service_refusal_counts_as_a_vocabulary_rejection(self):
+        """A transport failure whose text happens to say "vocabulary" is not the
+        service refusing it, and with no vocabulary configured nothing is."""
+        from amazon_transcribe.exceptions import BadRequestException
+
+        from kiro_crew.dashboard import stt_stream
+
+        refusal = BadRequestException("The requested vocabulary couldn't be found.")
+        assert stt_stream._vocabulary_rejected(refusal, "team-terms") is True
+        assert stt_stream._vocabulary_rejected(RuntimeError("vocabulary"), "team-terms") is False
+        assert stt_stream._vocabulary_rejected(refusal, "") is False
+
+    @pytest.mark.asyncio
+    async def test_access_denied_at_start_has_its_own_code(self, monkeypatch):
+        """AWS's authorization refusal reaches the browser as its own code.
+
+        Every retry is refused the same way, so the generic session failure, whose
+        remedy is to record again, leaves the user stuck. The English stays fixed
+        text: AWS's own message names the caller's ARN.
+        """
+        from amazon_transcribe.exceptions import UnknownServiceException
+
+        denied = UnknownServiceException(
+            403,
+            "AccessDeniedException",
+            "User: arn:aws:sts::111122223333:assumed-role/Test/session is not authorized "
+            "to perform: transcribe:StartStreamTranscription",
+        )
+        self._install_stubs(monkeypatch, start_exc=denied)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg == {
+                "type": "error",
+                "message": "AWS denied access to transcribe:StartStreamTranscription",
+                "code": "stt_aws_access_denied",
+            }
+            await ws.close()
+
+    def test_other_start_failures_keep_the_generic_code(self):
+        """Only the authorization refusal is told apart, not every 403 or SDK error.
+
+        An expired or invalid token is a 403 too, but the consent gate's identity
+        probe reports it on the next attempt, and a token IAM has not propagated yet
+        works seconds later, so "record again" is the right advice for both.
+        """
+        from amazon_transcribe.exceptions import BadRequestException, UnknownServiceException
+
+        from kiro_crew.dashboard import stt_stream
+
+        for exc in (
+            UnknownServiceException(403, "UnrecognizedClientException", "token is invalid"),
+            UnknownServiceException(500, "InternalFailure", "try again"),
+            BadRequestException("unsupported language"),
+            RuntimeError("No AWS credentials found for profile 'test'"),
+        ):
+            assert stt_stream._transcribe_start_failure(exc) == (
+                "failed to start transcription",
+                stt_stream._CODE_SESSION_FAILED,
+            ), exc
+
+    def test_access_denied_as_the_sdk_parses_it_keeps_its_code(self):
+        """AWS's refusal goes through the SDK's own error parser, not a hand-built exception.
+
+        The parser turns the response's ``x-amzn-errortype`` header into the exception
+        the stream start raises. If a release models ``AccessDeniedException`` as a
+        class of its own, this test fails, rather than users silently getting the
+        generic "record again" advice.
+        """
+        from amazon_transcribe.deserialize import TranscribeStreamingResponseParser
+
+        from kiro_crew.dashboard import stt_stream
+
+        response = SimpleNamespace(
+            status_code=403,
+            headers={"x-amzn-errortype": "AccessDeniedException:"},
+        )
+        body = (
+            b'{"Message": "User: arn:aws:sts::111122223333:assumed-role/Test/session is not '
+            b'authorized to perform: transcribe:StartStreamTranscription"}'
+        )
+        exc = TranscribeStreamingResponseParser().parse_exception(response, body)
+        assert stt_stream._transcribe_start_failure(exc) == (
+            "AWS denied access to transcribe:StartStreamTranscription",
+            stt_stream._CODE_AWS_ACCESS_DENIED,
+        ), f"the SDK raises {type(exc).__name__} for AccessDeniedException"
 
     @pytest.mark.asyncio
     async def test_start_failure_emits_sel_end_audit(self, monkeypatch):
@@ -468,6 +1092,10 @@ class TestStreamLifecycle:
         ``TranscribeStreamingClient = None``; the handler must still send a
         friendly WS error, close cleanly, and emit the matching end SEL audit.
         Covers the partial-install / stale-env recovery path.
+
+        The frame carries the availability probe's own missing-extra code rather
+        than a socket-specific one, so the socket and the settings panel name the
+        same condition and one localised string serves both.
         """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
@@ -482,7 +1110,11 @@ class TestStreamLifecycle:
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "amazon-transcribe not installed"}
+            assert msg == {
+                "type": "error",
+                "message": "amazon-transcribe not installed",
+                "code": stt.CODE_EXTRA_MISSING,
+            }
             await ws.close()
         # Wait for the end audit instead of assuming the handler already ran:
         # the error frame / client close is not a barrier for it.
@@ -551,7 +1183,7 @@ class TestStreamLifecycle:
         input_stream.send_audio_event = AsyncMock(side_effect=RuntimeError("throttled"))
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await ws.send_bytes(b"\x00\x01" * 16)
             await ws.close()
         input_stream.end_stream.assert_awaited()
@@ -562,28 +1194,129 @@ class TestStreamLifecycle:
         _, input_stream = self._install_stubs(monkeypatch)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await ws.send_bytes(b"\x00\x01" * 16)
             await ws.close()  # no stop message
         input_stream.end_stream.assert_awaited()
 
     @pytest.mark.asyncio
-    async def test_handler_task_exception_does_not_crash(self, monkeypatch):
-        """handle_events() raising must be logged, not propagated."""
+    @pytest.mark.parametrize(
+        "ending", [RuntimeError("signature mismatch"), None], ids=["raises", "returns"]
+    )
+    async def test_a_result_stream_that_ends_early_ends_the_session(
+        self, monkeypatch, caplog, ending
+    ):
+        """Transcribe ending its result stream mid-dictation must reach the client.
+
+        Without the frame and the close, the read loop keeps forwarding audio to a
+        dead stream and the dashboard keeps showing it is listening. The
+        failure itself is logged at teardown, not propagated.
+        """
         from amazon_transcribe.handlers import TranscriptResultStreamHandler
 
         _, input_stream = self._install_stubs(monkeypatch)
-        monkeypatch.setattr(
-            TranscriptResultStreamHandler,
-            "handle_events",
-            AsyncMock(side_effect=RuntimeError("connection lost")),
-        )
+
+        async def _ended(self) -> None:
+            if ending is not None:
+                raise ending
+
+        monkeypatch.setattr(TranscriptResultStreamHandler, "handle_events", _ended)
+        calls: list[dict] = []
+        fake_sel = MagicMock()
+        fake_sel.log_api_access = lambda **kw: calls.append(kw)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
+        with caplog.at_level("WARNING", logger="kiro_crew.dashboard.stt_stream"):
+            async with TestClient(TestServer(_make_app())) as client:
+                ws = await client.ws_connect("/api/ws/stt")
+                assert (await _bounded(ws.receive_json()))["type"] == "ready"
+                assert (await _bounded(ws.receive_json())) == {
+                    "type": "error",
+                    "message": "transcription stream ended",
+                    "code": "stt_session_failed",
+                }
+                assert (await _bounded(ws.receive())).type == WSMsgType.CLOSE
+                await ws.close()
+            await _wait_for_operation(calls, "stt_stream_end")
+        end = next(c for c in calls if c["operation"] == "stt_stream_end")
+        assert end["outcome"] == "error"
+        input_stream.end_stream.assert_awaited()
+        assert "ended the stream before the client stopped" in caplog.text
+        assert ("Transcribe handler task failed" in caplog.text) is (ending is not None)
+
+    @pytest.mark.asyncio
+    async def test_a_cap_landing_during_an_early_end_sends_no_second_frame(self, monkeypatch):
+        """The first cause to claim the session is the only one the client hears.
+
+        The result stream ends first and its frame is held in flight until the
+        duration cap has run. A cap that ignored the claim would see the socket
+        still open, send a contradictory frame and relabel the audit.
+        """
+        from amazon_transcribe.handlers import TranscriptResultStreamHandler
+
+        from kiro_crew.dashboard import stt_stream
+
+        self._install_stubs(monkeypatch)
+
+        async def _ended(self) -> None:
+            return None
+
+        monkeypatch.setattr(TranscriptResultStreamHandler, "handle_events", _ended)
+        monkeypatch.setattr(stt_stream, "_MAX_STREAM_DURATION_SECS", 0.05)
+        real_send_error = stt_stream._send_error
+        sent_codes: list[str] = []
+        cap_ran: list[bool] = []
+
+        async def _held_send_error(ws, message, code):
+            sent_codes.append(code)
+            if len(sent_codes) == 1:
+                cap = next(
+                    t
+                    for t in asyncio.all_tasks()
+                    if getattr(t.get_coro(), "__name__", "") == "_enforce_deadline"
+                )
+                await asyncio.wait({cap}, timeout=default_timeout())
+                cap_ran.append(cap.done())
+            await real_send_error(ws, message, code)
+
+        monkeypatch.setattr(stt_stream, "_send_error", _held_send_error)
+        calls: list[dict] = []
+        fake_sel = MagicMock()
+        fake_sel.log_api_access = lambda **kw: calls.append(kw)
+        monkeypatch.setattr(stt_stream, "sel", lambda: fake_sel)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
-            await ws.send_str('{"type":"stop"}')
+            assert (await _bounded(ws.receive_json()))["type"] == "ready"
+            assert (await _bounded(ws.receive_json()))["code"] == "stt_session_failed"
+            assert (await _bounded(ws.receive())).type == WSMsgType.CLOSE
             await ws.close()
-        input_stream.end_stream.assert_awaited()
+        await _wait_for_operation(calls, "stt_stream_end")
+        assert cap_ran == [True]
+        assert sent_codes == ["stt_session_failed"]
+        end = next(c for c in calls if c["operation"] == "stt_stream_end")
+        assert end["outcome"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_stop_is_not_reported_as_an_early_end(self, monkeypatch):
+        """The result stream also ends after a stop; that end is the normal one."""
+        self._install_stubs(monkeypatch)
+        calls: list[dict] = []
+        fake_sel = MagicMock()
+        fake_sel.log_api_access = lambda **kw: calls.append(kw)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
+
+        async def _frames_until_close(ws) -> list[object]:
+            return [msg.data async for msg in ws]
+
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _bounded(ws.receive_json()))["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            await ws.send_str('{"type":"stop"}')
+            frames = await _bounded(_frames_until_close(ws))
+        await _wait_for_operation(calls, "stt_stream_end")
+        assert frames == []
+        end = next(c for c in calls if c["operation"] == "stt_stream_end")
+        assert end["outcome"] == "ok"
 
     @pytest.mark.asyncio
     async def test_max_duration_timeout_closes_stream(self, monkeypatch):
@@ -592,17 +1325,83 @@ class TestStreamLifecycle:
         Regression: the deadline must fire on a dedicated task, not on
         per-message checks. An idle-but-alive client (heartbeat pings
         only) must still be torn down after the cap.
+
+        The cap's frame carries the same code as the other two providers': one
+        condition, one localised string, whichever provider the user is on.
         """
         _, input_stream = self._install_stubs(monkeypatch)
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             # Do NOT send any audio — rely purely on the deadline task.
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "max stream duration exceeded"}
+            assert msg == {
+                "type": "error",
+                "message": "max stream duration exceeded",
+                "code": "stt_max_duration_exceeded",
+            }
             await ws.close()
         input_stream.end_stream.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_consent_refusal_reaches_the_client_and_is_audited(self, monkeypatch):
+        """No recorded grant means no socket, reported over the same error channel.
+
+        Streaming Transcribe bills per audio-second, so the refusal happens before
+        the client is constructed and before any audio is read. It carries its own
+        code because the fix is an operator action in Settings, not the retry a
+        generic session failure invites, and the audit records ``refused`` rather
+        than ``error`` so an operator can tell a denied request from a broken one.
+        """
+        self._install_stubs(monkeypatch)
+
+        async def _refuse(service, *, profile, region):
+            return False, "AWS Transcribe needs your consent for profile default"
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream.aws_consent.authorize", _refuse, raising=True
+        )
+        calls: list[dict] = []
+        fake_sel = MagicMock()
+        fake_sel.log_api_access = lambda **kw: calls.append(kw)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg["type"] == "error"
+            assert "consent" in msg["message"]
+            assert msg["code"] == "stt_consent_required"
+            await ws.close()
+        await _wait_for_operation(calls, "stt_stream_end")
+        end = next(c for c in calls if c["operation"] == "stt_stream_end")
+        assert end["outcome"] == "refused"
+
+    @pytest.mark.asyncio
+    async def test_cap_teardown_is_audited_as_a_timeout(self, monkeypatch):
+        """A cap-driven teardown must be distinguishable from a clean stop.
+
+        This is the branch where it matters most: a session held open to the cap on
+        the metered provider is billed audio, so an operator reading the trail needs
+        to see which sessions ended that way. Inferring it from the deadline task's
+        own state cannot answer it, because the cap's ``ws.close()`` is what ends the
+        read loop, so the cleanup runs while that task is still awaiting the peer's
+        acknowledgement and reads as not-yet-done.
+        """
+        _, input_stream = self._install_stubs(monkeypatch)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
+        outcomes: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.receive_json()
+            await ws.close()
+        await _await_end_audit(outcomes)
+        assert outcomes == ["timeout"], outcomes
 
     @pytest.mark.asyncio
     async def test_oversized_text_frame_closes_connection(self, monkeypatch):
@@ -610,625 +1409,7 @@ class TestStreamLifecycle:
         _, input_stream = self._install_stubs(monkeypatch)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
+            assert (await ws.receive_json())["type"] == "ready"
             await ws.send_str("x" * 300)  # >_MAX_TEXT_FRAME_BYTES (256)
             await ws.close()
         input_stream.end_stream.assert_awaited()
-
-
-class TestConfig:
-    def test_streaming_defaults_false(self):
-        cfg = SttConfig()
-        assert cfg.streaming is False
-
-    def test_streaming_respects_value(self):
-        cfg = SttConfig(streaming=True)
-        assert cfg.streaming is True
-
-
-class TestConfigPutRoundTrip:
-    """Verify the STT config PUT handler persists the streaming field."""
-
-    @pytest.mark.asyncio
-    async def test_put_persists_streaming(self, tmp_path, monkeypatch):
-        # KIROCREW_HOME redirects both config_dir() and config_path() in a
-        # way that survives the `from ... import config_path` idiom used by
-        # the handler, unlike monkeypatching a module-level name.
-        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-        from kiro_crew.dashboard import handlers
-
-        app = web.Application()
-        app.router.add_get("/api/config/stt", handlers.api_stt_config)
-        app.router.add_put("/api/config/stt", handlers.api_stt_config)
-
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.put(
-                "/api/config/stt", json={"streaming": True, "provider": "transcribe"}
-            )
-            assert resp.status == 200
-            data = await resp.json()
-            assert data["streaming"] is True
-            assert data["provider"] == "transcribe"
-            # Assert it persisted to disk (survives a fresh load).
-            cfg_file = tmp_path / "config.json"
-            assert cfg_file.exists()
-            import json as _json
-
-            on_disk = _json.loads(cfg_file.read_text(encoding="utf-8"))
-            assert on_disk["stt"]["streaming"] is True
-            # Assert KiroCrewConfig.load() correctly deserializes — guards
-            # against field-name mismatches that would silently break at runtime.
-            reloaded = KiroCrewConfig.load()
-            assert reloaded.stt.streaming is True
-
-    @pytest.mark.asyncio
-    async def test_put_rejects_non_boolean_streaming(self, tmp_path, monkeypatch):
-        """Non-boolean ``streaming`` values must be ignored, not coerced.
-
-        Regression: ``bool("false") is True`` silently enabled streaming
-        when the client sent a string. The handler now checks
-        ``isinstance(body["streaming"], bool)`` and drops anything else.
-        """
-        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-        from kiro_crew.dashboard import handlers
-
-        app = web.Application()
-        app.router.add_put("/api/config/stt", handlers.api_stt_config)
-
-        async with TestClient(TestServer(app)) as client:
-            # "false" string: old bug would coerce to True. Must stay False.
-            resp = await client.put(
-                "/api/config/stt",
-                json={"streaming": "false", "provider": "transcribe"},
-            )
-            assert resp.status == 200
-            assert (await resp.json())["streaming"] is False
-
-            # "true" string: the test that would have caught the bug if
-            # default had been True. Must also be ignored (non-bool type).
-            resp = await client.put(
-                "/api/config/stt",
-                json={"streaming": "true", "provider": "transcribe"},
-            )
-            assert resp.status == 200
-            assert (await resp.json())["streaming"] is False
-
-            # Int 1 (truthy): same rule — reject, don't coerce.
-            resp = await client.put(
-                "/api/config/stt",
-                json={"streaming": 1, "provider": "transcribe"},
-            )
-            assert resp.status == 200
-            assert (await resp.json())["streaming"] is False
-
-    @pytest.mark.asyncio
-    async def test_get_exposes_transcribe_fields_for_ui(self, tmp_path, monkeypatch):
-        """GET response must include transcribe_region, transcribe_profile,
-        language_code, and language_codes so the Chat Settings STT section
-        can render the current values and a language dropdown.
-        """
-        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-        from kiro_crew.dashboard import handlers
-
-        app = web.Application()
-        app.router.add_get("/api/config/stt", handlers.api_stt_config)
-        app.router.add_put("/api/config/stt", handlers.api_stt_config)
-
-        async with TestClient(TestServer(app)) as client:
-            # PUT all three transcribe-specific fields and the provider.
-            resp = await client.put(
-                "/api/config/stt",
-                json={
-                    "provider": "transcribe",
-                    "transcribe_region": "eu-west-1",
-                    "transcribe_profile": "dev-account",
-                    "language_code": "fr-FR",
-                },
-            )
-            assert resp.status == 200
-
-            # GET must reflect the persisted values and expose the
-            # language-code list the UI picker uses.
-            resp = await client.get("/api/config/stt")
-            assert resp.status == 200
-            data = await resp.json()
-            assert data["provider"] == "transcribe"
-            assert data["transcribe_region"] == "eu-west-1"
-            assert data["transcribe_profile"] == "dev-account"
-            assert data["language_code"] == "fr-FR"
-            assert isinstance(data["language_codes"], list)
-            assert "en-US" in data["language_codes"]
-            assert "fr-FR" in data["language_codes"]
-
-
-class TestDefensiveGuards:
-    """Regression tests for review-bot rev 2 findings (posts #9, #10)."""
-
-    @pytest.mark.asyncio
-    async def test_guard_audit_sel_failure_preserves_status_code(self, monkeypatch):
-        """If sel() raises on a guard rejection, client must still get 403/503, not 500.
-
-        Regression for review-bot post #9: unwrapped sel().log_api_access() on
-        the origin/availability/concurrency guards would propagate and mask
-        the intended HTTPForbidden/HTTPServiceUnavailable.
-        """
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg()),
-        )
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: False)
-        # sel() itself raises — worst case. _emit_guard_audit must swallow.
-
-        def _raising_sel():
-            raise RuntimeError("SEL not initialized")
-
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", _raising_sel)
-        async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.get("/api/ws/stt")
-            # Must be 403 (from HTTPForbidden), not 500.
-            assert resp.status == 403
-
-    @pytest.mark.asyncio
-    async def test_client_construction_failure_closes_ws_and_emits_end_audit(self, monkeypatch):
-        """If TranscribeStreamingClient() raises, WS must close and end audit emit.
-
-        Regression for review-bot post #10: unwrapped resolver/client construction
-        would leak a prepare()d WebSocket and leave an unmatched
-        stt_stream_start in the audit trail.
-        """
-        pytest.importorskip("amazon_transcribe")
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg()),
-        )
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
-        # Force TranscribeStreamingClient constructor to raise.
-
-        def _raising_client(**kw):
-            raise RuntimeError("bad region")
-
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.stt_stream.TranscribeStreamingClient",
-            _raising_client,
-        )
-        calls: list[dict] = []
-        fake_sel = MagicMock()
-        fake_sel.log_api_access = lambda **kw: calls.append(kw)
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
-        async with TestClient(TestServer(_make_app())) as client:
-            ws = await client.ws_connect("/api/ws/stt")
-            msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "failed to create transcription client"}
-            await ws.close()
-        # Wait for the end audit instead of assuming the handler already ran:
-        # the error frame / client close is not a barrier for it.
-        await _wait_for_operation(calls, "stt_stream_end")
-        ops = [c["operation"] for c in calls]
-        assert (
-            "stt_stream_start" in ops and "stt_stream_end" in ops
-        ), f"both start and end audit events required; got {ops}"
-        end = next(c for c in calls if c["operation"] == "stt_stream_end")
-        assert end["outcome"] == "error"
-
-    @pytest.mark.asyncio
-    async def test_start_audit_sel_failure_closes_ws_and_emits_end_audit(self, monkeypatch):
-        """If the stt_stream_start sel call raises, WS must close and end audit emit.
-
-        Regression for review-bot post #13: unwrapped sel().log_api_access() for
-        stt_stream_start would propagate after ws.prepare() sent the 101
-        upgrade, leaking the WebSocket and leaving an unmatched start event.
-        """
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg()),
-        )
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
-        calls: list[dict] = []
-        # sel() itself returns an object whose log_api_access raises only for
-        # the start operation — guard rejections are unreachable (origin ok,
-        # streaming enabled, sessions free), and end-audit must still record.
-        fake_sel = MagicMock()
-
-        def _log(**kw):
-            calls.append(kw)
-            if kw.get("operation") == "stt_stream_start":
-                raise RuntimeError("SEL unavailable")
-
-        fake_sel.log_api_access = _log
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
-        async with TestClient(TestServer(_make_app())) as client:
-            ws = await client.ws_connect("/api/ws/stt")
-            msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "audit subsystem unavailable"}
-            await ws.close()
-        # Wait for the end audit instead of assuming the handler already ran:
-        # the error frame / client close is not a barrier for it.
-        await _wait_for_operation(calls, "stt_stream_end")
-        ops = [c["operation"] for c in calls]
-        assert (
-            "stt_stream_start" in ops and "stt_stream_end" in ops
-        ), f"both start and end audit events required; got {ops}"
-        end = next(c for c in calls if c["operation"] == "stt_stream_end")
-        assert end["outcome"] == "error"
-
-    @pytest.mark.asyncio
-    async def test_cleanup_ws_close_failure_still_emits_end_audit(self, monkeypatch):
-        """If the cleanup ws.close() raises on broken transport, end audit still fires.
-
-        Regression for review-bot post #18: unwrapped await ws.close() on the
-        normal cleanup path would skip _emit_end_audit when the transport
-        is broken, leaving an unmatched stt_stream_start in the audit trail.
-        """
-        pytest.importorskip("amazon_transcribe")
-        from amazon_transcribe.handlers import TranscriptResultStreamHandler
-
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg()),
-        )
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
-
-        # Stub Transcribe happy-path client.
-        input_stream = MagicMock()
-        input_stream.send_audio_event = AsyncMock()
-        input_stream.end_stream = AsyncMock()
-        stream = MagicMock(input_stream=input_stream, output_stream=MagicMock())
-        client = MagicMock()
-        client.start_stream_transcription = AsyncMock(return_value=stream)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.stt_stream.TranscribeStreamingClient",
-            lambda **kw: client,
-        )
-        monkeypatch.setattr(
-            TranscriptResultStreamHandler,
-            "handle_events",
-            AsyncMock(return_value=None),
-        )
-
-        # Patch WebSocketResponse.close to raise on the cleanup call.
-        from aiohttp import web as _web
-
-        real_close = _web.WebSocketResponse.close
-        call_count = {"n": 0}
-
-        async def _raising_close(self, *a, **kw):
-            call_count["n"] += 1
-            # First close call (cleanup path) raises; later ones (if any) succeed.
-            if call_count["n"] == 1:
-                raise ConnectionResetError("transport gone")
-            return await real_close(self, *a, **kw)
-
-        monkeypatch.setattr(_web.WebSocketResponse, "close", _raising_close)
-
-        calls: list[dict] = []
-        fake_sel = MagicMock()
-        fake_sel.log_api_access = lambda **kw: calls.append(kw)
-        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
-
-        async with TestClient(TestServer(_make_app())) as http_client:
-            ws = await http_client.ws_connect("/api/ws/stt")
-            assert (await ws.receive_json()) == {"type": "ready"}
-            await ws.send_str('{"type":"stop"}')
-            await ws.close()
-        # Wait for the end audit instead of assuming the handler already ran:
-        # the error frame / client close is not a barrier for it.
-        await _wait_for_operation(calls, "stt_stream_end")
-        ops = [c["operation"] for c in calls]
-        assert (
-            "stt_stream_start" in ops and "stt_stream_end" in ops
-        ), f"both start and end audit events required; got {ops}"
-
-
-class TestSttProviderGating:
-    """`mlx` is only offered on Apple Silicon, and the check must see through
-    Rosetta 2 (KiroCrew's bundled Python reports ``x86_64`` even on arm64)."""
-
-    def test_is_apple_silicon_false_off_darwin(self, monkeypatch):
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr("platform.system", lambda: "Linux")
-        monkeypatch.setattr("platform.machine", lambda: "x86_64")
-        assert core._is_apple_silicon() is False
-
-    def test_is_apple_silicon_true_native_arm64(self, monkeypatch):
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
-        monkeypatch.setattr("platform.machine", lambda: "arm64")
-        assert core._is_apple_silicon() is True
-
-    def test_is_apple_silicon_true_under_rosetta(self, monkeypatch):
-        """Darwin + ``x86_64`` interpreter, but ``hw.optional.arm64`` == 1."""
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
-        monkeypatch.setattr("platform.machine", lambda: "x86_64")
-
-        def fake_run(*_a, **_kw):
-            return SimpleNamespace(stdout="1\n")
-
-        monkeypatch.setattr("subprocess.run", fake_run)
-        assert core._is_apple_silicon() is True
-
-    def test_is_apple_silicon_false_on_intel_mac(self, monkeypatch):
-        """Darwin + ``x86_64``; sysctl key absent/0 on a true Intel Mac."""
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
-        monkeypatch.setattr("platform.machine", lambda: "x86_64")
-
-        def fake_run(*_a, **_kw):
-            return SimpleNamespace(stdout="")
-
-        monkeypatch.setattr("subprocess.run", fake_run)
-        assert core._is_apple_silicon() is False
-
-    def test_providers_include_mlx_on_apple_silicon(self, monkeypatch):
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        # `apple` has its own gate (macOS 26 + Swift toolchain); pin it off here so
-        # this test measures only the Apple-Silicon gate.
-        monkeypatch.setattr(
-            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
-        )
-        assert core._stt_providers() == ["whisper", "mlx", "transcribe"]
-
-    def test_providers_exclude_mlx_off_apple_silicon(self, monkeypatch):
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: False)
-        monkeypatch.setattr(
-            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
-        )
-        providers = core._stt_providers()
-        assert "mlx" not in providers
-        assert providers == ["whisper", "transcribe"]
-
-    def test_providers_include_apple_when_supported(self, monkeypatch):
-        """`apple` is advertised only where SpeechAnalyzer can actually run."""
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
-        assert core._stt_providers() == ["whisper", "mlx", "apple", "transcribe"]
-
-    def test_providers_exclude_apple_when_toolchain_missing(self, monkeypatch):
-        """A host that could run the framework but has no Swift toolchain must not be
-        offered the option — picking it would fail at transcription time."""
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(
-            apple_speech,
-            "availability",
-            lambda: apple_speech.Availability(False, "no toolchain", needs_toolchain=True),
-        )
-        assert "apple" not in core._stt_providers()
-
-    def test_mlx_prereqs_empty_when_brew_present(self, monkeypatch):
-        """The Install button installs ffmpeg/pipx/mlx-whisper, so when brew is
-        present there are no manual prereqs to surface (no duplication)."""
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr(core, "find_brew", lambda: "/opt/homebrew/bin/brew")
-        assert core._stt_prereq_commands("mlx") == []
-
-    def test_mlx_prereqs_empty_when_brew_off_path(self, monkeypatch):
-        """Homebrew installed but NOT on PATH must not be reported missing.
-
-        A GUI-launched gateway (desktop app / launchd) inherits
-        ``/usr/bin:/bin:/usr/sbin:/sbin``, so ``shutil.which("brew")`` returns
-        None on a machine that has Homebrew. Resolution goes through
-        ``find_brew``, which probes the install prefixes directly — otherwise the
-        UI tells a Homebrew user to install Homebrew.
-        """
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr("shutil.which", lambda _name, **_kw: None)
-        monkeypatch.setattr("os.path.isfile", lambda p: p == "/opt/homebrew/bin/brew")
-        monkeypatch.setattr("os.access", lambda p, _mode: p == "/opt/homebrew/bin/brew")
-        assert core._stt_prereq_commands("mlx") == []
-
-    def test_mlx_prereqs_only_homebrew_when_brew_absent(self, monkeypatch):
-        """Homebrew is the one thing the Install button can't bootstrap."""
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr(core, "find_brew", lambda: None)
-        cmds = core._stt_prereq_commands("mlx")
-        assert len(cmds) == 1
-        assert "brew" in cmds[0] and "install.sh" in cmds[0]
-        # Must NOT duplicate what the Install button already does.
-        assert not any("pipx install mlx-whisper" in c for c in cmds)
-
-    def test_mlx_prereqs_empty_off_apple_silicon(self, monkeypatch):
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: False)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        assert core._stt_prereq_commands("mlx") == []
-
-
-class TestSttInstallScriptPath:
-    """The install script must find Homebrew from a GUI-launched gateway.
-
-    ``bash -c`` is neither a login nor an interactive shell, so the user's
-    ``brew shellenv`` line never runs and the script only gets the inherited
-    PATH — which for a desktop-app gateway is ``/usr/bin:/bin:/usr/sbin:/sbin``.
-    Without a PATH prelude the first ``command -v brew`` check fails and the
-    whole install aborts with "ERROR: Homebrew required" on a machine that has it.
-
-    The two tests below that RUN a shell are POSIX-only. On Windows ``bash``
-    resolves to ``C:\\Windows\\System32\\bash.exe`` — the WSL launcher stub, which
-    exits 1 with "Windows Subsystem for Linux has no installed distributions"
-    rather than running the script. That is the same alias-stub hazard
-    ``platform_compat.find_python_interpreter`` guards against for Python, and it
-    makes the assertion measure the runner's WSL state instead of the prelude.
-    Only the shell-executing tests are skipped; the string assertions below run
-    everywhere, and Homebrew does not exist on Windows so the prelude's dirs are
-    inert there anyway.
-    """
-
-    @pytest.mark.parametrize("provider", ["mlx", "whisper"])
-    def test_script_prepends_brew_prefixes(self, provider):
-        from kiro_crew.dashboard.handlers import core
-
-        script = core._build_stt_install_script(provider)
-        assert "/opt/homebrew/bin" in script  # Apple Silicon prefix
-        assert "brew shellenv" in script
-        # The prelude must run BEFORE the brew probe that gates the install.
-        assert script.index("/opt/homebrew/bin") < script.index("command -v brew")
-
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="bash resolves to the WSL launcher stub")
-    @pytest.mark.parametrize("provider", ["mlx", "whisper"])
-    def test_script_is_valid_shell(self, provider, tmp_path):
-        """Guard the f-string-composed prelude against a syntax regression."""
-        import subprocess
-
-        from kiro_crew.dashboard.handlers import core
-
-        p = tmp_path / "install.sh"
-        p.write_text(core._build_stt_install_script(provider), encoding="utf-8")
-        assert subprocess.run(["bash", "-n", str(p)]).returncode == 0
-
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="bash resolves to the WSL launcher stub")
-    def test_prelude_finds_brew_under_launchd_path(self, tmp_path):
-        """End-to-end: the prelude alone recovers brew from a stripped PATH."""
-        import subprocess
-
-        from kiro_crew.dashboard.handlers import core
-
-        fake_prefix = tmp_path / "opt" / "homebrew" / "bin"
-        fake_prefix.mkdir(parents=True)
-        brew = fake_prefix / "brew"
-        brew.write_text("#!/bin/sh\necho 'export PATH=\"$PATH\"'\n", encoding="utf-8")
-        brew.chmod(0o755)
-
-        prelude = core._stt_install_path_prelude().replace("/opt/homebrew/bin", str(fake_prefix))
-        script = prelude + "\ncommand -v brew >/dev/null && echo FOUND || echo MISSING\n"
-        out = subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path)},
-        )
-        assert "FOUND" in out.stdout
-
-
-class TestSttInstallScriptWheels:
-    """The pip fallback must never drop into a source build.
-
-    openai-whisper is a pure-Python sdist, but numpy / numba / llvmlite / torch /
-    triton / tiktoken ship compiled wheels. On a host whose glibc is older than the
-    wheel's tag (Amazon Linux 2 = glibc 2.26, so manylinux_2_17 is the ceiling while
-    current numpy publishes manylinux_2_28) pip falls back to the source tarball and
-    the failure surfaces as a compiler error naming numpy — "GCC >= 9.3",
-    "metadata-generation-failed" — which reads as a numpy bug rather than the
-    wheel-compatibility problem it is.
-    """
-
-    def _pip_section(self):
-        """Return (full script, the pip-fallback section only).
-
-        Scoped deliberately: the brew branch above also mentions
-        ``openai-whisper``, so a whole-script index() would measure the wrong
-        occurrence and the ordering assertions would silently pass.
-        """
-        from kiro_crew.dashboard.handlers import core
-
-        script = core._build_stt_install_script("whisper")
-        marker = "# Fallback: pip install"
-        assert marker in script, "pip fallback section not found"
-        return script, script[script.index(marker) :]
-
-    def _pip_commands(self, section):
-        """Real pip invocations: continuations joined, comments dropped.
-
-        Each command is truncated at its ``||`` recovery clause — the CPU-torch
-        step's fallback ``echo`` mentions openai-whisper, and counting that as an
-        install target would inflate the command list.
-        """
-        joined = section.replace("\\\n", " ")
-        cmds = []
-        for ln in joined.splitlines():
-            stripped = ln.strip()
-            if stripped.startswith("#") or "pip install" not in stripped:
-                continue
-            cmds.append(" ".join(stripped.split()).split("||")[0].strip())
-        return cmds
-
-    def test_compiled_deps_are_wheel_only(self):
-        """Every pip install of the whisper stack constrains source builds."""
-        script, section = self._pip_section()
-        cmds = self._pip_commands(section)
-        assert cmds, "expected at least one pip install command"
-        for cmd in cmds:
-            assert "--only-binary" in cmd, f"unconstrained pip install: {cmd}"
-        # The named set must cover the deps that actually compile.
-        for pkg in ("numpy", "numba", "llvmlite", "torch", "triton", "tiktoken", "regex"):
-            assert pkg in section, f"{pkg} missing from the wheel-only set"
-
-    def test_no_hardcoded_version_ceiling(self):
-        """Wheel-only is the mechanism; a pinned cap would rot.
-
-        ``--only-binary`` drops sdists from the candidate set, so pip backtracks
-        to the newest release that HAS a compatible wheel on its own (glibc 2.26:
-        numpy 2.5.1 -> 2.2.6 manylinux_2_17). Pinning a ceiling instead would go
-        stale as hosts and wheel tags move, and would hold back a modern host.
-        """
-        _, section = self._pip_section()
-        whisper = [c for c in self._pip_commands(section) if "openai-whisper" in c]
-        assert len(whisper) == 1, f"expected one whisper install, got {len(whisper)}"
-        assert "numpy<" not in section, "no hardcoded numpy ceiling"
-        assert "numpy==" not in section, "no hardcoded numpy pin"
-
-    def test_cpu_torch_installed_first_when_no_gpu(self):
-        """A GPU-less Linux host must not pull ~2.5 GB of CUDA wheels."""
-        _, section = self._pip_section()
-        assert "nvidia-smi" in section, "GPU probe missing"
-        assert "download.pytorch.org/whl/cpu" in section
-        # --extra-index-url only ADDS a source; pip would still prefer the
-        # higher-versioned CUDA build, so the CPU index must be the ONLY index.
-        assert "--extra-index-url https://download.pytorch.org/whl/cpu" not in section
-        # torch has to land before the whisper resolve, or it is already satisfied
-        # by the CUDA build and the CPU step is a no-op.
-        assert section.index("download.pytorch.org/whl/cpu") < section.index(
-            "Installing openai-whisper"
-        )
-
-    def test_cpu_torch_failure_is_not_fatal(self):
-        """An unreachable CPU index must not fail an otherwise-fine install."""
-        _, section = self._pip_section()
-        tail = section[
-            section.index("download.pytorch.org/whl/cpu") : section.index(
-                "Installing openai-whisper"
-            )
-        ]
-        # The CPU-torch step recovers with `|| echo`, never `exit 1`.
-        assert "|| echo" in tail
-        assert "exit 1" not in tail
-
-    def test_pip_path_still_targets_system_python(self):
-        """Regression guard on a deliberate design choice, not an accident.
-
-        ``--user`` lands in ``~/.local/bin``, which ``transcribe._find_whisper``
-        probes explicitly via ``_WHISPER_SEARCH_PATHS`` (``_python3_bin_dir``
-        returns the interpreter's OWN prefix bin, not the --user target, so it is
-        not what covers this). Redirecting the install into the gateway's venv
-        would make the binary undiscoverable at runtime, and ``--user`` is
-        rejected outright inside a virtualenv.
-        """
-        script, section = self._pip_section()
-        for cmd in self._pip_commands(section):
-            assert "--user" in cmd, f"pip install must stay a --user install: {cmd}"
-        assert "sys.executable" not in script

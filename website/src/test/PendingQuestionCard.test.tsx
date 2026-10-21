@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 /* Render framer-motion elements as plain DOM. jsdom cannot run the height
    animation, and a real AnimatePresence keeps the exiting body mounted for the
@@ -10,7 +10,7 @@ vi.mock('framer-motion', async () => {
   const React = await import('react')
   const FRAMER_PROPS = new Set([
     'layout', 'layoutId', 'initial', 'animate', 'exit', 'transition',
-    'variants', 'whileHover', 'whileTap', 'onAnimationComplete',
+    'variants', 'custom', 'whileHover', 'whileTap', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
     React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
@@ -43,7 +43,7 @@ import PendingQuestionCard from '../components/PendingQuestionCard'
 import { createTestStore } from './helpers'
 import { ApiError } from '../api/client'
 import { api } from '../api/client'
-import { setQuestionCard } from '../store/chatSlice'
+import { resolveQuestionCard, setQuestionCard, setQuestionNotice } from '../store/chatSlice'
 import { reconcileQuestions, resolvedSince, staleAskIds } from '../hooks/useWebSocket'
 
 /**
@@ -59,12 +59,22 @@ const QUESTIONS = [
   { question: 'Pick a trust model', options: [{ label: 'Carve-out' }, { label: 'Public only' }] },
 ]
 
-const withCard = (askId?: string) =>
+const withCard = (askId?: string, questions: typeof QUESTIONS = QUESTIONS) =>
   createTestStore({
     chat: {
       activeSlot: 'chat-1',
+      messages: [],
       pendingQuestions: {
-        'chat-1': { slot: 'chat-1', ...(askId ? { ask_id: askId } : {}), questions: QUESTIONS },
+        'chat-1': {
+          slot: 'chat-1',
+          ...(askId
+            ? { ask_id: askId }
+            // A stateless card carries the server's record id: what the dismiss
+            // route retires, and what the store's identity-guarded clear
+            // compares against.
+            : { serverCardId: 'card-1' }),
+          questions,
+        },
       },
     },
   } as never)
@@ -138,6 +148,8 @@ describe('PendingQuestionCard — round 6 findings', () => {
 
     await waitFor(() => expect(dispatched).toContain('chat/resolveQuestionCard'))
     expect(dispatched).not.toContain('chat/clearQuestionCard')
+    expect(dispatched.indexOf('chat/markQuestionSettled'))
+      .toBeLessThan(dispatched.lastIndexOf('chat/setQuestionRequestInFlight'))
     // ask-NEW must survive the late response for ask-OLD.
     expect(store.getState().chat.pendingQuestions?.['chat-1']?.ask_id).toBe('ask-NEW')
   })
@@ -178,8 +190,9 @@ describe('PendingQuestionCard — round 6 findings', () => {
     expect(screen.getByText('staging')).toBeInTheDocument()
   })
 
-  it('offers a dismiss control on a legacy card, which just takes it off screen', () => {
+  it('offers a dismiss control on a legacy card, which retires its status', async () => {
     const answer = vi.spyOn(api, 'answerQuestion')
+    const dismissStatus = vi.spyOn(api, 'dismissQuestionCard').mockResolvedValue({ ok: true } as never)
     const store = withCard()
     const onFallbackSend = renderCard(store)
 
@@ -190,7 +203,99 @@ describe('PendingQuestionCard — round 6 findings', () => {
 
     expect(answer).not.toHaveBeenCalled()
     expect(onFallbackSend).not.toHaveBeenCalled()
+    // The server hears about it BY CARD IDENTITY: the slot's needs_input status is
+    // what the sidebar and sessions board read, and a newer card must not inherit
+    // this dismissal.
+    expect(dismissStatus).toHaveBeenCalledWith('chat-1', 'card-1')
+    await waitFor(() => expect(pendingOf(store)).toBeUndefined())
+  })
+
+  it('keeps a legacy card on screen when the dismissal fails', async () => {
+    // Clearing first and firing the request off unguarded leaves the record set
+    // with the only control that could retire it gone: every status surface then
+    // claims the agent is waiting, with nothing on screen to fix it.
+    vi.spyOn(api, 'dismissQuestionCard').mockRejectedValue(new ApiError(503, 'offline'))
+    const store = withCard()
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    await waitFor(() => expect(pendingOf(store)).toBeDefined())
+    // …and the control is usable again for a retry.
+    const dismiss = screen.getByLabelText('Dismiss question without answering') as HTMLButtonElement
+    await waitFor(() => expect(dismiss.disabled).toBe(false))
+    // …and the card SAYS why it is still here, or the retry never happens.
+    expect(screen.getByTestId('pending-question-error')).toHaveAttribute('role', 'alert')
+  })
+
+  it('drops a legacy card when the server says there is no such record (404)', async () => {
+    // Already retired by a message, a newer card, or a restart — the card on
+    // screen is stale, so it goes.
+    vi.spyOn(api, 'dismissQuestionCard').mockRejectedValue(new ApiError(404, 'gone'))
+    const store = withCard()
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    await waitFor(() => expect(pendingOf(store)).toBeUndefined())
+  })
+
+  it('leaves a NEWER card alone when a stale dismissal completes', async () => {
+    // Dismiss card A; card B replaces it in the same slot while the request is in
+    // flight. A slot-wide clear would take B off screen while B's own status stays
+    // pending on the server — the mirror image of the failure above.
+    let release: (v: unknown) => void = () => {}
+    vi.spyOn(api, 'dismissQuestionCard').mockReturnValue(
+      new Promise((res) => { release = res }) as never,
+    )
+    const store = withCard()
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+    // Card B arrives before A's dismissal lands: a new server identity.
+    act(() => {
+      store.dispatch(setQuestionCard({
+        slot: 'chat-1',
+        card_id: 'card-2',
+        questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
+      }) as never)
+    })
+    release({ ok: true })
+
+    // B survives, and it is B (not A) that is on screen.
+    await waitFor(() => expect(pendingOf(store)?.serverCardId).toBe('card-2'))
+    expect(screen.getByText('Which region?')).toBeTruthy()
+  })
+
+  it('clears a legacy card with no server identity without calling the route', () => {
+    // Nothing to name: a slot-only clear is exactly what the identity check
+    // exists to prevent, so the card is just removed locally.
+    const dismissStatus = vi.spyOn(api, 'dismissQuestionCard')
+    const store = createTestStore({
+      chat: {
+        activeSlot: 'chat-1',
+        pendingQuestions: { 'chat-1': { slot: 'chat-1', questions: QUESTIONS } },
+      },
+    } as never)
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    expect(dismissStatus).not.toHaveBeenCalled()
     expect(pendingOf(store)).toBeUndefined()
+  })
+
+  it('does not touch the status route when dismissing a BLOCKING card', () => {
+    // The answer endpoint owns that lifecycle: the status retires when the wait
+    // resolves. Calling the stateless route here would report the session as
+    // unblocked while its tool call is still parked.
+    vi.spyOn(api, 'answerQuestion').mockResolvedValue({ ok: true } as never)
+    const dismissStatus = vi.spyOn(api, 'dismissQuestionCard')
+    renderCard(withCard('ask-1'))
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    expect(dismissStatus).not.toHaveBeenCalled()
   })
 })
 
@@ -306,20 +411,163 @@ describe('PendingQuestionCard — ask_id round-trip', () => {
     submit()
 
     // The agent is still blocked, so the card must survive and no second turn
-    // may start.
-    await waitFor(() => expect(onFallbackSend).not.toHaveBeenCalled())
+    // may start — and the failure is named in place so the user knows to retry.
+    expect(await screen.findByTestId('pending-question-error')).toHaveAttribute('role', 'alert')
+    expect(onFallbackSend).not.toHaveBeenCalled()
     expect(pendingOf(store)).toBeDefined()
   })
 
-  it('falls back to a message only when the wait is provably gone (404)', async () => {
-    vi.spyOn(api, 'answerQuestion').mockRejectedValue(new ApiError(404, 'no pending question'))
+  it('names the fix when the server refuses the answers as too long', async () => {
+    // The 400 keeps the card up like any retryable failure, but "try again"
+    // would be wrong advice: only a shorter answer can succeed. The server's
+    // own prose never reaches the screen; the code picks the catalog message.
+    const body = JSON.stringify({ error: 'answers together exceed 8000 characters', code: 'answers_too_long' })
+    vi.spyOn(api, 'answerQuestion').mockRejectedValue(new ApiError(400, 'answers together exceed 8000 characters', body))
+    const store = withCard('ask-1')
+    const onFallbackSend = renderCard(store)
+
+    pick('Carve-out')
+    submit()
+
+    const notice = await screen.findByTestId('pending-question-error')
+    expect(notice).toHaveTextContent('Your answers are too long to send. Shorten them and submit again.')
+    expect(notice).not.toHaveTextContent('exceed 8000')
+    expect(onFallbackSend).not.toHaveBeenCalled()
+    expect(pendingOf(store)).toBeDefined()
+  })
+
+  it.each([
+    { reason: 'expired', body: JSON.stringify({ code: 'question_not_found', reason: 'expired' }) },
+    { reason: 'a legacy response', body: '' },
+  ])('restores the draft for $reason on a 404', async ({ body }) => {
+    vi.spyOn(api, 'answerQuestion').mockRejectedValue(new ApiError(404, 'no pending question', body))
     const store = withCard('ask-1')
     const onFallbackSend = renderCard(store)
 
     pick('Public only')
     submit()
 
-    await waitFor(() => expect(onFallbackSend).toHaveBeenCalledWith('Public only'))
+    // The questions ride along so the caller's notice can name what the answer was for.
+    await waitFor(() => expect(onFallbackSend).toHaveBeenCalledWith('Public only', QUESTIONS))
+    expect(pendingOf(store)).toBeUndefined()
+    expect(store.getState().chat.questionsSettled?.['ask-1']).toBeUndefined()
+  })
+
+  // GPT 6.1 on #15250 (errors-use-error-notice): the card can expire while the
+  // POST is in flight, so `question_card_resolved` retires it before the 404
+  // lands. Draft recovery stays with the retirement path, but the rejected
+  // submit must still reach the transcript as an error row.
+  it('records a rejected submit as an error even when the card already retired', async () => {
+    const body = JSON.stringify({ code: 'question_not_found', reason: 'expired' })
+    const store = withCard('ask-1')
+    vi.spyOn(api, 'answerQuestion').mockImplementation(async () => {
+      store.dispatch(resolveQuestionCard({ ask_id: 'ask-1' }))
+      throw new ApiError(404, 'no pending question', body)
+    })
+    const onFallbackSend = renderCard(store)
+
+    pick('Public only')
+    submit()
+
+    await waitFor(() => {
+      const { messages, slotMessages } = store.getState().chat
+      const rows = [...messages, ...(slotMessages?.['chat-1'] ?? [])]
+      expect(rows.some((m) => m.role === 'error' && /stopped waiting for "Pick a trust model"/.test(m.content))).toBe(true)
+    })
+    expect(onFallbackSend).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a server error', () => new ApiError(503, 'unavailable', '')],
+    ['a network failure', () => new TypeError('Failed to fetch')],
+  ])('records %s as an error when the card retired during the submit', async (_label, makeErr) => {
+    const store = withCard('ask-1')
+    vi.spyOn(api, 'answerQuestion').mockImplementation(async () => {
+      store.dispatch(resolveQuestionCard({ ask_id: 'ask-1' }))
+      throw makeErr()
+    })
+    const onFallbackSend = renderCard(store)
+
+    pick('Public only')
+    submit()
+
+    await waitFor(() => {
+      const { messages, slotMessages } = store.getState().chat
+      const rows = [...messages, ...(slotMessages?.['chat-1'] ?? [])]
+      expect(rows.some((m) => m.role === 'error' && /stopped waiting for "Pick a trust model"/.test(m.content))).toBe(true)
+    })
+    expect(onFallbackSend).not.toHaveBeenCalled()
+  })
+
+  it.each(['answered', 'composer', 'queued'])(
+    'discards the draft when another window reports the ask as %s',
+    async (reason) => {
+      const body = JSON.stringify({ code: 'question_not_found', reason })
+      vi.spyOn(api, 'answerQuestion').mockRejectedValue(new ApiError(404, 'no pending question', body))
+      const store = withCard('ask-1')
+      const onFallbackSend = renderCard(store)
+
+      pick('Public only')
+      submit()
+
+      await waitFor(() => expect(pendingOf(store)).toBeUndefined())
+      expect(store.getState().chat.questionsSettled['ask-1']).toBe(true)
+      expect(onFallbackSend).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('pending-question-error')).not.toBeInTheDocument()
+    },
+  )
+
+  it('publishes a mounted card draft for websocket retirement recovery', () => {
+    const store = withCard('ask-1')
+    renderCard(store)
+
+    pick('Public only')
+
+    expect(pendingOf(store)?.draftAnswers).toEqual({ 'Pick a trust model': 'Public only' })
+  })
+
+  it('remounts a pending card with its stored draft', async () => {
+    const store = withCard('ask-1')
+    const first = render(
+      <Provider store={store}>
+        <PendingQuestionCard slotKey="chat-1" onFallbackSend={vi.fn()} />
+      </Provider>,
+    )
+    fireEvent.change(screen.getByPlaceholderText(/custom answer/i), {
+      target: { value: 'eu-west-1' },
+    })
+    await waitFor(() => expect(pendingOf(store)?.draftAnswers)
+      .toEqual({ 'Pick a trust model': 'eu-west-1' }))
+
+    first.unmount()
+    render(
+      <Provider store={store}>
+        <PendingQuestionCard slotKey="chat-1" onFallbackSend={vi.fn()} />
+      </Provider>,
+    )
+
+    expect(screen.getByDisplayValue('eu-west-1')).toBeInTheDocument()
+  })
+
+  it('preserves a stateless draft across unmount and clears it on submit', async () => {
+    const store = withCard()
+    const first = render(
+      <Provider store={store}>
+        <PendingQuestionCard slotKey="chat-1" onFallbackSend={vi.fn()} />
+      </Provider>,
+    )
+    fireEvent.change(screen.getByPlaceholderText(/custom answer/i), {
+      target: { value: 'eu-west-1' },
+    })
+    await waitFor(() => expect(pendingOf(store)?.draftActive).toBe(true))
+    first.unmount()
+    expect(pendingOf(store)?.draftAnswers).toEqual({ 'Pick a trust model': 'eu-west-1' })
+
+    const send = renderCard(store)
+    expect(screen.getByDisplayValue('eu-west-1')).toBeInTheDocument()
+    submit()
+
+    expect(send).toHaveBeenCalledWith('eu-west-1')
     expect(pendingOf(store)).toBeUndefined()
   })
 
@@ -334,6 +582,41 @@ describe('PendingQuestionCard — ask_id round-trip', () => {
     expect(answer).not.toHaveBeenCalled()
     expect(onFallbackSend).toHaveBeenCalledWith('Carve-out')
     expect(pendingOf(store)).toBeUndefined()
+  })
+
+  it('sends a one-question card as the bare answer, not a Q/A pair', () => {
+    // The wrapper exists to keep N answers attached to the N questions they
+    // settled. One question needs none of that -- the agent asked a single thing,
+    // so the answer alone is already unambiguous, and wrapping it would quote the
+    // whole question back at the user in their own chat bubble.
+    const store = withCard()
+    const onFallbackSend = renderCard(store)
+
+    pick('Carve-out')
+    submit()
+
+    expect(onFallbackSend).toHaveBeenCalledWith('Carve-out')
+    expect(onFallbackSend.mock.calls[0][0]).not.toContain('Pick a trust model')
+  })
+
+  it('labels every answer with the question it settled', () => {
+    // A stateless card's text IS the agent's next message, so the pairing has to
+    // survive in the string itself. Two questions whose answers are both lists is
+    // the case bare answers cannot express: joined on newlines alone, "a, b" and
+    // "c" are four values in unknown slots.
+    const store = withCard(undefined, [
+      { question: 'Pick a trust model', options: [{ label: 'Carve-out' }, { label: 'Public only' }] },
+      { question: 'What should I do first', options: [{ label: 'Poke holes' }, { label: 'Prototype' }] },
+    ])
+    const onFallbackSend = renderCard(store)
+
+    pick('Carve-out')
+    pick('Prototype')
+    submit()
+
+    expect(onFallbackSend).toHaveBeenCalledWith(
+      'Q. Pick a trust model\nA. Carve-out\n\nQ. What should I do first\nA. Prototype',
+    )
   })
 
   it('renders nothing when the slot has no pending card', () => {
@@ -365,12 +648,18 @@ describe('QuestionCard — every question must be answered', () => {
     } as never)
     renderCard(store)
 
-    const button = screen.getByText('Submit').closest('button') as HTMLButtonElement
-    expect(button.disabled).toBe(true)
+    // Submit lives on the LAST question only, so the gate is asserted where the
+    // control actually is. On question 1 the primary action is Next, and it is
+    // held shut by the same missing answer.
+    expect(screen.queryByText('Submit')).not.toBeInTheDocument()
+    expect((screen.getByText('Next').closest('button') as HTMLButtonElement).disabled).toBe(true)
 
+    // Answering Q1 auto-advances to Q2, so its options are on screen without the
+    // user having to go looking for them.
+    pick('Carve-out')
+    const button = screen.getByText('Submit').closest('button') as HTMLButtonElement
     // One of two answered is still incomplete: submitting here would resume the
     // agent with a map missing an entry it asked for.
-    pick('Carve-out')
     expect(button.disabled).toBe(true)
 
     pick('staging')
@@ -501,11 +790,51 @@ describe('reconnect re-dispatch', () => {
     expect(screen.getByDisplayValue('still typing')).toBeTruthy()
   })
 
-  it('user dismiss removes the card', () => {
-    const store = withCard() // stateless card — dismiss is a pure local clear
+  it('user dismiss removes the card', async () => {
+    vi.spyOn(api, 'dismissQuestionCard').mockResolvedValue({ ok: true } as never)
+    const store = withCard() // stateless card — dismiss only retires its status
     renderCard(store)
     typeCustomAnswer('abandoned on purpose')
     fireEvent.click(screen.getByRole('button', { name: /dismiss/i }))
-    expect(store.getState().chat.pendingQuestions['chat-1']).toBeUndefined()
+    await waitFor(() => expect(store.getState().chat.pendingQuestions['chat-1']).toBeUndefined())
+  })
+})
+
+describe('durable question notices keep failures distinct from restored answers', () => {
+  const NOTICE = 'The question card is still waiting. Answer or dismiss it. Your message was sent.'
+
+  it('renders a restored answer as a polite status, never as an alert', () => {
+    const store = withCard('ask-open')
+    act(() => { store.dispatch(setQuestionNotice({ slot: 'chat-1', message: NOTICE })) })
+    renderCard(store)
+    const notice = screen.getByTestId('pending-question-notice')
+    expect(notice).toHaveAttribute('role', 'status')
+    expect(notice).toHaveTextContent(NOTICE)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('renders a failed card release as an alert', () => {
+    const store = withCard('ask-open')
+    act(() => {
+      store.dispatch(setQuestionNotice({
+        slot: 'chat-1',
+        message: NOTICE,
+        kind: 'release_failed',
+      }))
+    })
+    renderCard(store)
+    const notice = screen.getByTestId('pending-question-notice')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent(NOTICE)
+  })
+
+  it('dismiss clears only the notice and keeps the card', () => {
+    const store = withCard('ask-open')
+    act(() => { store.dispatch(setQuestionNotice({ slot: 'chat-1', message: NOTICE })) })
+    renderCard(store)
+    fireEvent.click(within(screen.getByTestId('pending-question-notice')).getByRole('button', { name: /dismiss/i }))
+    expect(store.getState().chat.restoredQuestionNotices?.['chat-1']).toBeUndefined()
+    expect(pendingOf(store)).toBeDefined()
+    expect(screen.queryByTestId('pending-question-notice')).toBeNull()
   })
 })
