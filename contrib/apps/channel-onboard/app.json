@@ -1,0 +1,36 @@
+{
+  "name": "channel-onboard",
+  "version": "0.6.0",
+  "displayName": "Channel Onboard",
+  "description": "Give every Slack channel its own Kiro Crew agent, workspace and private memory. Detects channels the bot was added to, onboards them automatically or on one click, and lets you re-point the workspace, activation and thread follow from the dashboard.",
+  "author": "mvn-bachhuynh-dn",
+  "license": "Apache-2.0",
+  "tags": ["slack", "productivity", "automation"],
+  "highlights": [
+    "Detects Slack channels the bot joined but that have no agent yet",
+    "One bundle per channel: agent, workspace directory, private member memory, channel binding",
+    "Edit workspace, activation and thread_follow per channel without touching config.json"
+  ],
+  "backend": {
+    "hooks": {
+      "routes": "backend.routes:register_routes",
+      "on_startup": "backend.hooks:on_startup",
+      "on_shutdown": "backend.hooks:on_shutdown"
+    }
+  },
+  "ui": {
+    "entry": "dist/index.mjs",
+    "pages": [
+      {
+        "route": "/apps/channel-onboard",
+        "label": "Channel Onboard",
+        "icon": "Hash"
+      }
+    ]
+  },
+  "permissions": {
+    "api": ["/api/apps/channel-onboard"],
+    "storage": true,
+    "network": true
+  }
+}
