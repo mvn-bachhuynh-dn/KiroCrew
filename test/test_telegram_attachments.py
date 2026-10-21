@@ -33,8 +33,11 @@ class TestCapabilityFlag:
     def test_files_inbound_enabled(self):
         assert TELEGRAM_CAPABILITIES.files_inbound is True
 
-    def test_files_outbound_still_disabled(self):
-        assert TELEGRAM_CAPABILITIES.files_outbound is False
+    def test_files_outbound_enabled(self):
+        # Flipped in the same change that added the multipart upload path; the
+        # declaration and the path move together. Which upload methods exist and
+        # what the ceilings are is pinned in test_telegram_parity.py.
+        assert TELEGRAM_CAPABILITIES.files_outbound is True
 
 
 # ── Client _dispatch extracts attachments from Telegram updates ────────────────
@@ -50,10 +53,11 @@ class TestDispatchExtraction:
         async def on_message(inbound: TelegramInbound) -> None:
             received.append(inbound)
 
-        client = TelegramClient.__new__(TelegramClient)
+        # The REAL constructor — see the note in test_telegram_album.py: a double
+        # assembled from `__new__` breaks on every field the client gains, and the
+        # failure reads as a production AttributeError rather than a test problem.
+        client = TelegramClient(token="t:1")
         client._on_message = on_message
-        client._on_callback = None
-        client._handler_tasks = set()
         return client, received
 
     def _run(self, client: TelegramClient, update: dict) -> None:
@@ -289,25 +293,33 @@ class TestProcessTelegramAttachments:
         assert result.image_paths == []
 
     @pytest.mark.asyncio
-    async def test_video_rejected(self):
-        """Video attachments produce a rejection, not a download."""
+    async def test_video_preserved_as_opaque_file(self):
+        """Video bytes are available to agent tools until caller cleanup."""
+        payload = b"\x00\x00\x00\x18ftypmp42telegram video"
         client = MagicMock()
-        client.download_file = AsyncMock()
 
+        async def fake_download(file_id: str, dest: str) -> None:
+            with open(dest, "wb") as f:
+                f.write(payload)
+
+        client.download_file = AsyncMock(side_effect=fake_download)
         attachments = [
             {
                 "file_id": "vid1",
                 "file_unique_id": "u3",
                 "file_name": "clip.mp4",
                 "mime_type": "video/mp4",
-                "file_size": 500000,
+                "file_size": len(payload),
             }
         ]
         result = await process_telegram_attachments(client, attachments)
-        assert result.image_paths == []
-        assert len(result.rejections) == 1
-        assert "video" in result.rejections[0].lower()
-        client.download_file.assert_not_called()
+        assert len(result.file_paths) == 1
+        with open(result.file_paths[0], "rb") as f:
+            assert f.read() == payload
+        assert "[Attached file: clip.mp4]" in result.text_blocks[0]
+        client.download_file.assert_awaited_once()
+        cleanup(result.temp_paths)
+        assert not any(os.path.exists(p) for p in result.temp_paths)
 
     @pytest.mark.asyncio
     async def test_voice_transcribed_when_available(self):
@@ -330,8 +342,11 @@ class TestProcessTelegramAttachments:
                 "file_size": len(ogg_data),
             }
         ]
-        with patch("kiro_crew.transcribe.is_available", return_value=True), \
-             patch("kiro_crew.transcribe.transcribe_audio", return_value="hello from voice"):
+        with (
+            patch("kiro_crew.transcribe.is_available", return_value=True),
+            patch("kiro_crew.transcribe.batch_duration_cap_secs", return_value=None),
+            patch("kiro_crew.transcribe.transcribe_audio", return_value="hello from voice"),
+        ):
             result = await process_telegram_attachments(client, attachments)
 
         assert len(result.text_blocks) == 1

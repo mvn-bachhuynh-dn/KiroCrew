@@ -16,7 +16,26 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew.mcp_shared import DeferredTool
 from kiro_crew.validation import SPAWN_RUN_SCHEMA, ValidationError, validate_tool_args
+
+
+def _through_solo_gate(args: dict[str, Any], tool: str) -> dict[str, Any]:
+    """Give a one-task call the reason the solo gate requires.
+
+    These tests are about the context-group wire contract, not the gate: a
+    lone task naming no agent/model/crew is otherwise refused before any POST
+    (see ``test_spawn_solo_gate``). Multi-task calls pass unchanged.
+    """
+    if tool == "spawn_sub_agents":
+        entries = args.get("agents") or []
+        single = len(entries) == 1 and not entries[0].get("agent_or_mode")
+    else:
+        single = bool(args.get("task")) and not args.get("tasks")
+        single = single and not (args.get("model") or args.get("agent") or args.get("crew"))
+    if single and not args.get("solo_reason"):
+        return {**args, "solo_reason": "bulk_data"}
+    return args
 
 
 def _posted(args: dict[str, Any], tool: str = "spawn_run") -> list[dict]:
@@ -35,7 +54,12 @@ def _posted(args: dict[str, Any], tool: str = "spawn_run") -> list[dict]:
         patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:chat-1"),
         patch.object(mcp_core, "sel", MagicMock()),
     ):
-        mcp_core._call_tool_inner(tool, args)
+        result = mcp_core._call_tool_inner(tool, _through_solo_gate(args, tool))
+        # spawn_sub_agents parks and posts one member per step; drive the
+        # submission here so the bodies are observable.
+        if isinstance(result, DeferredTool):
+            while getattr(result, "phase", None) == "submit":
+                result.step()
     return bodies
 
 
@@ -121,9 +145,10 @@ class TestApiSpawnHandler:
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
         mgr.max_concurrent = 4
-        state = SimpleNamespace(subagents=mgr)
+        state = SimpleNamespace(subagents=mgr, conversation_log=MagicMock())
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
 
         async def _json() -> dict:
             return body

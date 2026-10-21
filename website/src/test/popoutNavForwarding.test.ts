@@ -6,7 +6,7 @@ import {
   type PopoutMsg,
   type NavIntent,
 } from '../utils/popoutController'
-import { applyNavIntentInMain, writePrefill, PREFILL_STORAGE_KEY } from '../utils/navIntent'
+import { applyNavIntentInMain, chatDeepLinkSlot, writePrefill, PREFILL_STORAGE_KEY } from '../utils/navIntent'
 
 /**
  * Navigation-intent forwarding tests (popout navigation containment).
@@ -212,6 +212,7 @@ describe('applyNavIntentInMain', () => {
       {
         navigate: () => order.push('navigate'),
         switchSlot: () => order.push('switchSlot'),
+        mayLeave: () => true,
       },
     )
     expect(order).toEqual(['prefill', 'switchSlot', 'navigate'])
@@ -221,9 +222,90 @@ describe('applyNavIntentInMain', () => {
   it('skips slot switching for intents without a slotKey', () => {
     const switchSlot = vi.fn()
     const navigate = vi.fn()
-    applyNavIntentInMain({ path: '/artifacts' }, { navigate, switchSlot })
+    applyNavIntentInMain({ path: '/artifacts' }, { navigate, switchSlot, mayLeave: () => true })
     expect(switchSlot).not.toHaveBeenCalled()
     expect(navigate).toHaveBeenCalledWith('/artifacts')
+  })
+
+  it('drops the whole intent when the page on screen refuses to be left', () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    const switchSlot = vi.fn()
+    const navigate = vi.fn()
+    applyNavIntentInMain(
+      { path: '/chat', slotKey: 'new-1', prefill: { slotKey: 'new-1', prompt: 'do it' } },
+      { navigate, switchSlot, mayLeave: () => false },
+    )
+    expect(setItem).not.toHaveBeenCalledWith(PREFILL_STORAGE_KEY, expect.anything())
+    expect(switchSlot).not.toHaveBeenCalled()
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('navigates once the page on screen agrees to be left', () => {
+    const navigate = vi.fn()
+    const mayLeave = vi.fn(() => true)
+    applyNavIntentInMain({ path: '/artifacts' }, { navigate, switchSlot: vi.fn(), mayLeave })
+    expect(mayLeave).toHaveBeenCalledTimes(1)
+    expect(navigate).toHaveBeenCalledWith('/artifacts')
+  })
+
+  it('does not ask when the intent appends to the composer already on screen', () => {
+    const appendToOpenComposer = vi.fn(() => true)
+    const mayLeave = vi.fn(() => false)
+    applyNavIntentInMain(
+      { path: '/chat', slotKey: 'chat-1', prefill: { slotKey: 'chat-1', prompt: 'ref', append: 'ref' } },
+      { navigate: vi.fn(), switchSlot: vi.fn(), mayLeave, appendToOpenComposer },
+    )
+    expect(mayLeave).not.toHaveBeenCalled()
+    expect(appendToOpenComposer).toHaveBeenCalledWith('chat-1', 'ref')
+  })
+
+  it('appends to the composer already open on the target slot instead of leaving a stale prefill', () => {
+    const appendToOpenComposer = vi.fn(() => true)
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    const switchSlot = vi.fn()
+    const navigate = vi.fn()
+    applyNavIntentInMain(
+      { path: '/chat', slotKey: 'chat-1', prefill: { slotKey: 'chat-1', prompt: 'old draft\n\nref', append: 'ref' } },
+      { navigate, switchSlot, appendToOpenComposer, mayLeave: () => true },
+    )
+    expect(appendToOpenComposer).toHaveBeenCalledWith('chat-1', 'ref')
+    expect(setItem).not.toHaveBeenCalledWith(PREFILL_STORAGE_KEY, expect.anything())
+    expect(switchSlot).not.toHaveBeenCalled()
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('still seeds the prefill when no composer on screen shows the target slot', () => {
+    const appendToOpenComposer = vi.fn(() => false)
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    const switchSlot = vi.fn()
+    applyNavIntentInMain(
+      { path: '/chat', slotKey: 'chat-1', prefill: { slotKey: 'chat-1', prompt: 'ref', append: 'ref' } },
+      { navigate: vi.fn(), switchSlot, appendToOpenComposer, mayLeave: () => true },
+    )
+    expect(appendToOpenComposer).toHaveBeenCalledWith('chat-1', 'ref')
+    expect(setItem).toHaveBeenCalledWith(PREFILL_STORAGE_KEY, expect.stringContaining('"prompt":"ref"'))
+    expect(switchSlot).toHaveBeenCalledWith('chat-1')
+  })
+})
+
+describe('chatDeepLinkSlot', () => {
+  it('reads the session out of the dashboard session deep link', () => {
+    expect(chatDeepLinkSlot('/chat?sid=chat-69-1785905004')).toBe('chat-69-1785905004')
+    // The slug is decorative — ChatPage writes it from the session title.
+    expect(chatDeepLinkSlot('/chat/fix-the-parser?sid=chat-1')).toBe('chat-1')
+    // `?slot=` is the legacy spelling ChatPage still accepts.
+    expect(chatDeepLinkSlot('/chat?slot=chat-2')).toBe('chat-2')
+    expect(chatDeepLinkSlot('/chat?sid=chat%20a%2Fb')).toBe('chat a/b')
+  })
+
+  it('names no session for a path that is not one', () => {
+    // Each of these must fall through to a plain navigate: routing them as a
+    // session link would dispatch a switchSlot for a session that was never named.
+    expect(chatDeepLinkSlot('/chat')).toBe('')
+    expect(chatDeepLinkSlot('/settings?tab=about')).toBe('')
+    expect(chatDeepLinkSlot('/chats?sid=chat-1')).toBe('')
+    expect(chatDeepLinkSlot('/logs?sid=chat-1')).toBe('')
+    expect(chatDeepLinkSlot('')).toBe('')
   })
 })
 

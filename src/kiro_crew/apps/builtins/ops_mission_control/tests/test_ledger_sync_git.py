@@ -34,13 +34,21 @@ the text", so the thing worth testing is git.
 
 from __future__ import annotations
 
-import os
+import asyncio
+import contextlib
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -55,6 +63,8 @@ class _TwoInstances(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp())
+        # Registered first, so it runs last: after the patch record below is undone.
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.remote = self.root / "remote.git"
         self.remote.mkdir()
         subprocess.run(
@@ -67,78 +77,40 @@ class _TwoInstances(unittest.IsolatedAsyncioTestCase):
         self.home_b = self.root / "b"
         self.home_a.mkdir()
         self.home_b.mkdir()
-        self._prev = os.environ.get("KIROCREW_HOME")
-        # Snapshot the module table. ``_use`` evicts this app's modules to simulate two
-        # separate processes, and WITHOUT restoring them the eviction leaks into every
-        # later test in the same process: a sibling that had already imported
-        # ``routes``/``ledger_sync`` ends up patching a stale module object while the
-        # handler under test resolves a fresh one, so its mock silently never applies.
-        # Observed exactly that — four unrelated test_routes failures that passed when
-        # that file ran alone. A test that breaks other tests is a bug in the test.
-        self._modules = dict(sys.modules)
-
-    def tearDown(self) -> None:
-        if self._prev is None:
-            os.environ.pop("KIROCREW_HOME", None)
-        else:
-            os.environ["KIROCREW_HOME"] = self._prev
-        # Restore the exact table we started with: put back what we evicted, and drop
-        # the replacements we imported, so the next test sees the process as it was.
-        for name in list(sys.modules):
-            if name not in self._modules:
-                del sys.modules[name]
-        sys.modules.update(self._modules)
-        # `sys.modules` is NOT the only place a submodule is cached. Importing
-        # ``kiro_crew.apps.manager`` also SETS ``manager`` as an attribute on the
-        # ``kiro_crew.apps`` package object, and that package was never evicted — so
-        # restoring the table left the parent still pointing at the replacement.
-        #
-        # The two are then read by different syntax: ``import a.b as c`` resolves through
-        # the parent ATTRIBUTE, while ``from a.b import f`` goes through ``sys.modules``.
-        # So a later test doing ``import kiro_crew.apps.manager as manager`` patched the
-        # discarded copy while the code under test resolved the restored one, and the mock
-        # silently never applied — two `test_app_bridges` failures that passed when that
-        # file ran alone. Verified by asserting the two disagree before this loop and agree
-        # after. A test that breaks other tests is a bug in the test.
-        for name, module in self._modules.items():
-            parent_name, _, leaf = name.rpartition(".")
-            parent = self._modules.get(parent_name) if parent_name else None
-            if parent is not None and getattr(parent, leaf, None) is not module:
-                try:
-                    setattr(parent, leaf, module)
-                except AttributeError:  # pragma: no cover — read-only namespace
-                    pass
-        shutil.rmtree(self.root, ignore_errors=True)
+        # A private patch record for every instance switch, undone at cleanup, so the
+        # test ends on exactly the environment and module state it inherited.
+        self._patched = self.enterContext(pytest.MonkeyPatch.context())
 
     def _use(self, home: Path):
-        """Point the app at one instance's data home and reload its modules.
+        """Become one instance: its data home, with sync's latches as a fresh process holds them.
 
-        Module reload is required: ``ledger_sync`` resolves the repo root from the data
-        home through ``app_data_dir``, which caches. Re-importing is the honest way to
-        simulate two separate processes inside one test. ``tearDown`` restores the table.
+        Nothing is re-imported, because nothing on this path caches the home: ``ledger_path``
+        goes through ``app_data_dir`` to ``config_dir()`` on every call, and ``config_dir``'s
+        memo is keyed on KIROCREW_HOME's raw value. The remote and the branch live in per-home
+        files that ``set_settings`` writes below. The app state a new process starts empty is
+        ``ledger_sync``'s two refusal latches, so each instance starts them empty. Process-wide
+        state (the sandbox probe cache, the SEL singleton the root conftest binds to a session
+        directory) is shared by both instances, unlike two processes on one host; nothing
+        these tests assert reads it. A module-level latch added to ``ledger_sync`` belongs
+        here too.
+
+        Re-importing the app instead (evicting it from ``sys.modules``) leaves two live copies
+        of one import graph, and the restore has to repair the parent-package attributes too.
+
+        The assertion is the tripwire for a per-process cache of the home: without it, instance
+        B would read and write A's directory and these tests would pass with one instance.
         """
-        os.environ["KIROCREW_HOME"] = str(home)
-        # `bridges` must go WITH `manager`: it does `from kiro_crew.apps.manager import …`,
-        # so it binds those functions BY VALUE at import time. Evicting only `manager` left
-        # a surviving `bridges` holding references into the discarded module — and
-        # `test_app_bridges` then patched attributes on the fresh `manager` while the code
-        # under test still called the stale ones, so its mocks silently never applied
-        # (`KeyError: 'someapp:srv'`, two tests, only when this file ran first).
-        #
-        # Same class as the eviction-leak this setUp/tearDown pair already documents, one
-        # module further out: a partial eviction is worse than none, because it leaves two
-        # live copies of one import graph. `tearDown` restores the exact table either way.
-        for name in list(sys.modules):
-            if (
-                "ops_mission_control" in name
-                or name.startswith("kiro_crew.apps.manager")
-                or name.startswith("kiro_crew.apps.bridges")
-            ):
-                del sys.modules[name]
         from kiro_crew.apps.builtins.ops_mission_control.backend import ledger, ledger_sync
         from kiro_crew.apps.builtins.ops_mission_control.backend.models import LedgerEntry
 
+        self._patched.setenv("KIROCREW_HOME", str(home))
+        self._patched.setattr(ledger_sync, "_align_refusal", "")
+        self._patched.setattr(ledger_sync, "_sandbox_refusal", "")
         ledger_sync.set_settings(remote_url=str(self.remote), branch_name="main", enabled=True)
+        self.assertTrue(
+            ledger.ledger_path().resolve().is_relative_to(home.resolve()),
+            f"instance {home.name} did not switch data homes",
+        )
         return ledger, ledger_sync, LedgerEntry
 
 
@@ -833,8 +805,7 @@ class TestPushRefusesCredentialMaterial(_TwoInstances):
         """
         import inspect
 
-        # Through `_use`, like every other test here: the module is re-imported per instance
-        # (see its docstring), so a module-level reference would read a stale copy.
+        # Through `_use`, like every other test here, so the instance's data home is set.
         _ledger, sync, _entry = self._use(self.home_a)
         source = inspect.getsource(sync._credential_bearing_lines)
         self.assertIn("get_credential_patterns", source)
@@ -860,3 +831,56 @@ class TestPushRefusesCredentialMaterial(_TwoInstances):
         """An unreadable ledger must not turn into an unexplained refusal."""
         _ledger, sync, _entry = self._use(self.home_a)
         self.assertEqual(sync._credential_bearing_lines(), [])
+
+
+class _StopSpawn(Exception):
+    """Aborts `_git` at the spawn boundary, so no subprocess runs."""
+
+
+class TestTheAppCommitsUnderItsOwnIdentity(unittest.TestCase):
+    """A ledger commit must not depend on the operator having a git identity.
+
+    Nothing here needs git, a sandbox, or a repository: the assertion is on the ARGV the
+    module builds, which is where the property lives. That matters because the failure it
+    guards is invisible on a developer machine — git auto-detects an identity from a
+    fully-qualified hostname, so the missing-identity path never runs locally. On a host
+    where it cannot (a fresh container, a CI runner, a locked-down image) `git commit`
+    refuses with "Author identity unknown", the push that follows has nothing to send, and
+    the operator sees only "push errored". MEASURED: 18 of this file's 39 tests failed that
+    way the first time CI ran them with a real sandbox.
+    """
+
+    def test_every_git_invocation_carries_the_identity(self) -> None:
+        from kiro_crew.apps.builtins.ops_mission_control.backend import ledger_sync
+
+        seen: dict[str, list[str]] = {}
+
+        def _capture(argv, **_kwargs):
+            seen["argv"] = list(argv)
+            raise _StopSpawn
+
+        with mock.patch.object(ledger_sync, "sandboxed_spawn_argv", _capture):
+            with contextlib.suppress(_StopSpawn):
+                asyncio.run(ledger_sync._git("commit", "--no-edit", "-q", "-m", "x"))
+
+        argv = seen["argv"]
+        assert argv[0] == ledger_sync._GIT_BINARY
+        # `-c` pairs BEFORE the subcommand: git only accepts them there, and they must also
+        # precede it to override a repo-local `user.email` an agent could have written.
+        assert argv[1 : 1 + len(ledger_sync._COMMIT_IDENTITY)] == list(
+            ledger_sync._COMMIT_IDENTITY
+        )
+        assert argv[1 + len(ledger_sync._COMMIT_IDENTITY)] == "commit"
+        joined = " ".join(argv)
+        assert "user.name=" in joined and "user.email=" in joined
+
+    def test_the_identity_email_cannot_route(self) -> None:
+        """`.invalid` is reserved for exactly this (RFC 2606), so mail cannot escape."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import ledger_sync
+
+        email = next(
+            opt.split("=", 1)[1]
+            for opt in ledger_sync._COMMIT_IDENTITY
+            if opt.startswith("user.email=")
+        )
+        assert email.endswith(".invalid"), email

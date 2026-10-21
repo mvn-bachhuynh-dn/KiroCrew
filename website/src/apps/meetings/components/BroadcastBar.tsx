@@ -9,14 +9,18 @@ import { Send } from 'lucide-react'
 
 import { i18nT } from '../../../i18n/t'
 import { Input, SendBtn } from '../../../components/ui'
+import { useImeGuard } from '../../../hooks/useImeGuard'
 
 interface Props {
   onSend: (text: string) => void
   caption?: string
   disabled?: boolean
+  /** Overrides the compose placeholder, e.g. the paused-meeting explanation. */
+  placeholder?: string
 }
 
-export default function BroadcastBar({ onSend, caption, disabled }: Props) {
+export default function BroadcastBar({ onSend, caption, disabled, placeholder }: Props) {
+  const ime = useImeGuard()
   const inputRef = useRef<HTMLInputElement>(null)
 
   const send = () => {
@@ -27,7 +31,7 @@ export default function BroadcastBar({ onSend, caption, disabled }: Props) {
   }
 
   return (
-    <div className="flex-none px-6 py-3 border-t border-border bg-bg">
+    <div className="flex-none px-4 md:px-6 py-3 border-t border-border bg-bg">
       {caption && (
         <div
           // Wraps rather than clipping to one line: `truncate` set
@@ -48,13 +52,11 @@ export default function BroadcastBar({ onSend, caption, disabled }: Props) {
         <Input
           ref={inputRef}
           type="text"
-          placeholder={i18nT('apps.meetings.broadcastBar.placeholder')}
-          aria-label={i18nT('apps.meetings.broadcastBar.placeholder')}
+          placeholder={placeholder ?? i18nT('apps.meetings.broadcastBar.placeholder')}
+          aria-label={placeholder ?? i18nT('apps.meetings.broadcastBar.placeholder')}
           disabled={disabled}
           className="flex-1"
-          onKeyDown={e => {
-            if (e.key === 'Enter') send()
-          }}
+          {...ime.bindEnter({ onEnter: send })}
         />
         <SendBtn
           onClick={send}

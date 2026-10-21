@@ -10,6 +10,14 @@ from pathlib import Path
 from aiohttp.test_utils import make_mocked_request
 
 import kiro_crew.config.loader as loader
+from kiro_crew.secrets import SecretVault
+
+
+def _vault_value(env: Path, key: str) -> str | None:
+    """The vault secret a channel save stored beside *env* under *key*."""
+    stored = SecretVault(env.parent).get(key)
+    return stored.reveal() if stored is not None else None
+
 
 BOT_ID = "wxb-1234567890abcdef"
 SECRET = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd"
@@ -89,10 +97,11 @@ def test_save_persists_credentials_and_config(tmp_path: Path, monkeypatch) -> No
     assert body["restart_required"] is True
     env_text = env.read_text(encoding="utf-8")
     assert f"WECOM_BOT_ID={BOT_ID}" in env_text
-    assert f"WECOM_SECRET={SECRET}" in env_text
+    assert "WECOM_SECRET=secret://WECOM_SECRET" in env_text
+    assert _vault_value(env, "WECOM_SECRET") == SECRET
     assert (env.stat().st_mode & 0o077) == 0
     assert os.environ["WECOM_BOT_ID"] == BOT_ID
-    assert os.environ["WECOM_SECRET"] == SECRET
+    assert os.environ["WECOM_SECRET"] == "secret://WECOM_SECRET"
     cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert cfg["wecom"]["enabled"] is True
     assert cfg["wecom"]["allowed_users"] == [
@@ -212,18 +221,23 @@ def test_env_line_paste_is_stripped(tmp_path: Path, monkeypatch) -> None:
     )
     status, _body = status_body
     assert status == 200
-    assert f"WECOM_SECRET={SECRET}\n" in env.read_text(encoding="utf-8")
+    assert "WECOM_SECRET=secret://WECOM_SECRET\n" in env.read_text(encoding="utf-8")
+    assert _vault_value(env, "WECOM_SECRET") == SECRET
     assert f"WECOM_SECRET=WECOM_SECRET={SECRET}" not in env.read_text(encoding="utf-8")
 
 
 def test_allow_all_users_save_and_strict_boolean(tmp_path: Path, monkeypatch) -> None:
-    """allow_all_users persists as a strict boolean; truthy strings rejected."""
+    """allow_all_users persists as a strict boolean; truthy strings rejected.
+
+    The flag is applied to the running transport by the config watcher, so the
+    save must NOT promise a restart the operator does not need.
+    """
     import kiro_crew.dashboard.handlers.messaging as mod
 
     (status_body, _env) = _client_put(mod, monkeypatch, tmp_path, {"allow_all_users": True})
     status, body = status_body
     assert status == 200
-    assert body["restart_required"] is True
+    assert body["restart_required"] is False
     cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert cfg["wecom"]["allow_all_users"] is True
 
@@ -299,8 +313,11 @@ def test_soft_threshold_bounds(tmp_path: Path, monkeypatch) -> None:
         (status_body, _env) = _client_put(
             mod, monkeypatch, tmp_path, {"soft_threshold_pct": bad}
         )
-        status, _body = status_body
+        status, body = status_body
         assert status == 400
+        # A machine-readable code, not prose only: the dashboard renders `error`
+        # verbatim into a localized UI, so prose alone is untranslatable.
+        assert body["code"] == "soft_threshold_pct_invalid"
 
 
 def test_get_masks_secrets_and_reports_state(tmp_path: Path, monkeypatch) -> None:
@@ -368,3 +385,220 @@ def test_get_unconfigured_reports_needs_setup(tmp_path: Path, monkeypatch) -> No
     assert body["configured"] is False
     assert body["enabled"] is False
     assert body["allowed_user_ids"] == []
+
+
+def test_clear_config_write_failure_does_not_leave_env_cleared(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """On a CLEAR-only path (no config changes), the env write runs via
+    _write_env_off_loop.  If that write raises, .env must remain untouched —
+    the credential stays fully present, never half-cleared."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    env = tmp_path / ".env"
+    cfg_path = tmp_path / "config.json"
+    env.write_text(f"WECOM_SECRET={SECRET}\n", encoding="utf-8")
+    cfg_path.write_text(json.dumps({"wecom": {"enabled": True}}), encoding="utf-8")
+    monkeypatch.setattr(loader, "env_path", lambda: env)
+    monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+    monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+
+    async def _boom(_updates):
+        raise OSError("disk full writing .env")
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _boom)
+    try:
+        _client_put(mod, monkeypatch, tmp_path, {"bot_token_clear": True})
+    except Exception:
+        pass
+    # .env must still hold the credential — the env write failed before any
+    # content was cleared.
+    assert f"WECOM_SECRET={SECRET}" in env.read_text(encoding="utf-8")
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+
+
+def test_the_config_and_env_writes_run_under_the_live_config_hold(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A SET that widens the allow-list AND rotates a credential commits two
+    files. The whole transaction runs under ``live.hold()`` -- like the Teams,
+    Webex and Feishu savers -- so the watcher cannot apply the widened roster
+    to the running transport while the .env write is still in flight (and may
+    yet fail and roll the config back)."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+    from kiro_crew.config import live
+
+    env = tmp_path / ".env"
+    cfg_path = tmp_path / "config.json"
+    env.write_text("WECOM_BOT_ID=old-bot-id\nWECOM_SECRET=old-secret\n", encoding="utf-8")
+    cfg_path.write_text(json.dumps({"wecom": {"enabled": True}}), encoding="utf-8")
+
+    held_at: list[str] = []
+    watcher = live.watch()
+    real_json_write = loader.write_config_atomically
+    real_env_write = mod._write_env_off_loop
+
+    def _json_write(path, data, **kw):
+        held_at.append(f"config:{watcher._hold_depth}")
+        real_json_write(path, data, **kw)
+
+    async def _env_write(updates):
+        held_at.append(f"env:{watcher._hold_depth}")
+        await real_env_write(updates)
+
+    # The save writes through ``update_config_locked``, whose file write is the
+    # loader's ``write_config_atomically``.
+    monkeypatch.setattr(loader, "write_config_atomically", _json_write)
+    monkeypatch.setattr(mod, "_write_env_off_loop", _env_write)
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+    monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+
+    (status, _body), _ = _client_put(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {"allowed_user_ids": ["zhangsan"], "bot_id": BOT_ID, "secret": SECRET},
+    )
+    assert status == 200
+    assert held_at == ["config:1", "env:1"], held_at
+    assert watcher._hold_depth == 0  # released once the transaction committed
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+    monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+
+
+def test_set_config_write_failure_leaves_consistent_pair(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """On a SET, config.json is written FIRST.  If it fails, .env is never
+    touched — old credentials + old metadata, always a consistent pair.
+    This mirrors the Teams and Webex config-first SET pattern.
+
+    The config write only fires on the SET path when `staged` is non-empty
+    (i.e. at least one config field differs from stored).  This test includes
+    ``enabled: True`` in the body to ensure `staged` has an entry and the
+    config-write failure path is exercised."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    env = tmp_path / ".env"
+    cfg_path = tmp_path / "config.json"
+    env.write_text("WECOM_BOT_ID=old-bot-id\nWECOM_SECRET=old-secret\n", encoding="utf-8")
+    # enabled=False initially so sending enabled=True creates a staged change,
+    # giving the handler a non-empty `staged` and thus a config write to fail.
+    cfg_path.write_text(json.dumps({"wecom": {"enabled": False}}), encoding="utf-8")
+    monkeypatch.setattr(loader, "env_path", lambda: env)
+    monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+    monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+    monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+
+    def _boom(*_a, **_k):
+        raise OSError("disk full during config write")
+
+    monkeypatch.setattr(loader, "write_config_atomically", _boom)
+    try:
+        _client_put(
+            mod,
+            monkeypatch,
+            tmp_path,
+            {"bot_id": BOT_ID, "secret": SECRET, "enabled": True},
+        )
+    except Exception:
+        pass
+
+    # CRITICAL: .env must be untouched — config write failed before the
+    # handler reached _commit_env_wecom(), so both stores still hold originals.
+    env_text = env.read_text(encoding="utf-8")
+    assert "old-bot-id" in env_text, (
+        "Config-first: .env must be untouched when config write fails (WECOM_BOT_ID)"
+    )
+    assert "old-secret" in env_text, (
+        "Config-first: .env must be untouched when config write fails (WECOM_SECRET)"
+    )
+    assert BOT_ID not in env_text, ".env must not hold new bot_id when config write failed"
+    assert SECRET not in env_text, ".env must not hold new secret when config write failed"
+    monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+
+
+def test_set_config_write_failure_preserves_process_only_credential(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """WeCom SET with config-write failure must NOT clobber credentials that
+    live ONLY in os.environ (not in .env).
+
+    Scenario:
+      - os.environ["WECOM_BOT_ID"]  = "env-only-bot-id"  (process-only)
+      - os.environ["WECOM_SECRET"]  = "env-only-secret"   (process-only)
+      - .env file has no WECOM_* entries at all
+      - the config.json write raises (disk full)
+
+    With config-first ordering: the config write fails before
+    _commit_env_wecom() is called, so os.environ is never mutated by the
+    handler.  Both process-only credentials are trivially preserved.
+    """
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    env = tmp_path / ".env"
+    cfg_path = tmp_path / "config.json"
+    # .env has NO WECOM entries — credentials are process-only.
+    env.write_text("", encoding="utf-8")
+    # enabled=False so sending enabled=True creates a staged change and
+    # forces the config write (and its failure).
+    cfg_path.write_text(json.dumps({"wecom": {"enabled": False}}), encoding="utf-8")
+    monkeypatch.setattr(loader, "env_path", lambda: env)
+    monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+    monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+
+    # Plant both credentials ONLY in os.environ, not in .env.
+    monkeypatch.setenv("WECOM_BOT_ID", "env-only-bot-id")
+    monkeypatch.setenv("WECOM_SECRET", "env-only-secret")
+
+    def _boom(*_a, **_k):
+        raise OSError("disk full during config write")
+
+    monkeypatch.setattr(loader, "write_config_atomically", _boom)
+    try:
+        _client_put(
+            mod,
+            monkeypatch,
+            tmp_path,
+            {"bot_id": BOT_ID, "secret": SECRET, "enabled": True},
+        )
+    except Exception:
+        pass
+
+    # CRITICAL: both process-only credentials must survive intact.
+    # Config-first ordering: _commit_env_wecom() is never called when config
+    # write fails, so os.environ is untouched by the failed request.
+    assert os.environ.get("WECOM_BOT_ID") == "env-only-bot-id", (
+        "Config-first ordering: process-only WECOM_BOT_ID must be untouched "
+        f"when config write fails; got: {os.environ.get('WECOM_BOT_ID')!r}"
+    )
+    assert os.environ.get("WECOM_SECRET") == "env-only-secret", (
+        "Config-first ordering: process-only WECOM_SECRET must be untouched "
+        f"when config write fails; got: {os.environ.get('WECOM_SECRET')!r}"
+    )
+    # .env must NOT hold the new credential values — .env was never written.
+    env_text = env.read_text(encoding="utf-8")
+    assert BOT_ID not in env_text, ".env must not be written when config write fails (WECOM_BOT_ID)"
+    assert SECRET not in env_text, ".env must not be written when config write fails (WECOM_SECRET)"
+    monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+    monkeypatch.delenv("WECOM_SECRET", raising=False)
+
+
+def test_save_survives_wrong_typed_stored_allowed_users(tmp_path: Path, monkeypatch) -> None:
+    """A hand-edited non-list ``allowed_users`` in config.json degrades to
+    empty, so the saver's comprehension and ``list(...)`` comparison do not run
+    on a non-iterable and the save still applies."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"wecom": {"allowed_users": 123}}), encoding="utf-8")
+    (status_body, _env) = _client_put(
+        mod, monkeypatch, tmp_path, {"allowed_user_ids": ["zhangsan"]}
+    )
+    status, _ = status_body
+    assert status == 200
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved["wecom"]["allowed_users"] == [{"userid": "zhangsan", "name": ""}]

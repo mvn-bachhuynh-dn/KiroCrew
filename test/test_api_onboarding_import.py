@@ -7,6 +7,7 @@ import importlib
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard import handlers
+from kiro_crew.onboarding_sources import gemini as gemini_source
 
 
 class _AuditLog:
@@ -25,20 +27,34 @@ class _AuditLog:
         self.events.append(event)
 
 
+# Keep apply_import's MCP sidecar lock off the real ~/.kiro/settings (see the
+# shared fixture in test/conftest.py).
+pytestmark = pytest.mark.usefixtures("isolate_mcp_host_paths")
+
+
 def _handler_module():
     return importlib.import_module("kiro_crew.dashboard.handlers.onboarding_import")
 
 
-def _make_app(module, state: object | None = None) -> web.Application:
+def _make_app(
+    module, state: object | None = None, *, owner_id: str | None = "owner"
+) -> web.Application:
     @web.middleware
     async def test_auth(request: web.Request, handler):
         caller = request.headers.get("X-Test-User")
         if caller:
             request["user"] = caller
+        request["app"] = request.headers.get("X-Test-App", "")
         return await handler(request)
 
     app = web.Application(middlewares=[test_auth])
-    app["state"] = state or SimpleNamespace()
+    resolved_state = state if state is not None else SimpleNamespace()
+    # The handler tests exercise their own subject through the owner gate, so a
+    # fixture caller of "owner" is paired with the matching configured owner
+    # (the dashboard_owner_helpers.as_owner pattern, inline).
+    if owner_id is not None:
+        resolved_state.owner_id = owner_id
+    app["state"] = resolved_state
     app.router.add_get("/api/onboarding/import/scan", module.api_onboarding_import_scan)
     app.router.add_post("/api/onboarding/import/apply", module.api_onboarding_import_apply)
     app.router.add_put("/api/onboarding/import/state", module.api_onboarding_import_state)
@@ -72,8 +88,87 @@ async def test_all_onboarding_import_endpoints_require_authentication(
         response_body = await response.json()
 
     assert response.status == 401
-    assert response_body == {"error": "authentication required"}
+    assert response_body == {"error": "authentication required", "code": "auth_required"}
     assert audit.events[-1]["outcome"] == "denied"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/onboarding/import/scan"),
+        ("post", "/api/onboarding/import/apply"),
+        ("put", "/api/onboarding/import/state"),
+    ],
+)
+async def test_all_onboarding_import_endpoints_refuse_non_owner(
+    monkeypatch, method: str, path: str
+) -> None:
+    """A non-owner dashboard subject is refused on every onboarding import route."""
+    module = _handler_module()
+    audit = _AuditLog()
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+    monkeypatch.setattr(
+        module,
+        "_backend",
+        lambda: SimpleNamespace(
+            preview_import=lambda *args, **kwargs: {"sources": []},
+            apply_import=lambda *args, **kwargs: {},
+        ),
+    )
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await getattr(client, method)(
+            path, json={}, headers={"X-Test-User": "someone-else"}
+        )
+        response_body = await response.json()
+
+    assert response.status == 403
+    assert response_body["code"] == "owner_only"
+
+
+@pytest.mark.asyncio
+async def test_scan_refuses_a_non_owner_subject_when_no_owner_is_configured(
+    monkeypatch,
+) -> None:
+    """Pre-owner, only the signed local bootstrap subject passes the gate."""
+    module = _handler_module()
+    audit = _AuditLog()
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+    monkeypatch.setattr(
+        module,
+        "_backend",
+        lambda: SimpleNamespace(preview_import=lambda *args, **kwargs: {"sources": []}),
+    )
+
+    async with TestClient(TestServer(_make_app(module, owner_id=None))) as client:
+        response = await client.get(
+            "/api/onboarding/import/scan", headers={"X-Test-User": "slack:U123"}
+        )
+        response_body = await response.json()
+
+    assert response.status == 403
+    assert response_body["code"] == "owner_only"
+
+
+@pytest.mark.asyncio
+async def test_scan_allows_the_pre_owner_local_bootstrap_subject(monkeypatch) -> None:
+    """The local bootstrap subject that runs the real onboarding flow passes."""
+    module = _handler_module()
+    audit = _AuditLog()
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+    monkeypatch.setattr(
+        module,
+        "_backend",
+        lambda: SimpleNamespace(preview_import=lambda *args, **kwargs: {"sources": []}),
+    )
+
+    async with TestClient(TestServer(_make_app(module, owner_id=None))) as client:
+        response = await client.get(
+            "/api/onboarding/import/scan", headers={"X-Test-User": "local-app"}
+        )
+
+    assert response.status == 200
 
 
 @pytest.mark.asyncio
@@ -189,7 +284,7 @@ async def test_apply_rejects_invalid_plan_with_generic_400(monkeypatch, body: ob
         response_body = await response.json()
 
     assert response.status == 400
-    assert response_body == {"error": "invalid request"}
+    assert response_body == {"error": "invalid request", "code": "invalid_request"}
     assert audit.events[-1]["outcome"] == "failed"
     assert audit.events[-1]["error"] == "invalid_request"
 
@@ -212,7 +307,7 @@ async def test_apply_rejects_malformed_json(monkeypatch) -> None:
         response_body = await response.json()
 
     assert response.status == 400
-    assert response_body == {"error": "invalid request"}
+    assert response_body == {"error": "invalid request", "code": "invalid_request"}
     assert audit.events[-1]["error"] == "invalid_request"
 
 
@@ -526,17 +621,15 @@ async def test_state_persists_import_onboarded(monkeypatch, tmp_path) -> None:
     module = _handler_module()
     audit = _AuditLog()
     saved = tmp_path / "saved.txt"
-    dashboard = SimpleNamespace(import_onboarded=False)
 
-    class Config:
-        def __init__(self) -> None:
-            self.dashboard = dashboard
+    def _fake_update_config_locked(*args, **kwargs):
+        # The handler persists via a delta mutate through update_config_locked
+        # Apply it to an empty document and record what it wrote.
+        doc = kwargs["mutate"]({})
+        saved.write_text(str(doc["dashboard"]["import_onboarded"]), encoding="utf-8")
+        return doc
 
-        def save(self) -> None:
-            saved.write_text(str(self.dashboard.import_onboarded), encoding="utf-8")
-
-    config = Config()
-    monkeypatch.setattr(module.KiroCrewConfig, "load", lambda: config)
+    monkeypatch.setattr(module, "update_config_locked", _fake_update_config_locked)
     monkeypatch.setattr(module, "_sel", lambda: audit)
 
     async with TestClient(TestServer(_make_app(module))) as client:
@@ -568,7 +661,7 @@ async def test_state_rejects_invalid_completed_boolean(monkeypatch, body: object
         response_body = await response.json()
 
     assert response.status == 400
-    assert response_body == {"error": "invalid request"}
+    assert response_body == {"error": "invalid request", "code": "invalid_request"}
 
 
 @pytest.mark.asyncio
@@ -612,10 +705,10 @@ async def test_state_failure_is_generic_and_credential_free(monkeypatch) -> None
     audit = _AuditLog()
     private_detail = "/Users/alice/.kiro/crew/config.json"
 
-    def fail_load():
+    def fail_write(*args, **kwargs):
         raise OSError(private_detail)
 
-    monkeypatch.setattr(module.KiroCrewConfig, "load", fail_load)
+    monkeypatch.setattr(module, "update_config_locked", fail_write)
     monkeypatch.setattr(module, "_sel", lambda: audit)
 
     async with TestClient(TestServer(_make_app(module))) as client:
@@ -627,9 +720,45 @@ async def test_state_failure_is_generic_and_credential_free(monkeypatch) -> None
         response_body = await response.json()
 
     assert response.status == 500
-    assert response_body == {"error": "request failed"}
+    assert response_body == {"error": "request failed", "code": "state_failed"}
     assert private_detail not in str(audit.events)
     assert audit.events[-1]["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_state_names_an_unreadable_config(monkeypatch, tmp_path) -> None:
+    """A config.json the gateway cannot parse is the one failure the user can fix.
+
+    It is also self-perpetuating: the loader reads the same unparseable file as
+    defaults, so ``import_onboarded`` comes back false and first run reopens on
+    every load, while the fail-closed write behind every exit refuses. The
+    response has to say which of those it is, or the UI can only print a
+    generic retry message for a failure no retry clears.
+    """
+    module = _handler_module()
+    audit = _AuditLog()
+    config = tmp_path / "config.json"
+    # Cut off mid-document, as a torn hand edit leaves it: unreadable, not
+    # empty, so the fail-closed write must refuse rather than replace it.
+    original = b'{"dashboard": {"import_onboarded": fal'
+    config.write_bytes(original)
+    monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: config)
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.put(
+            "/api/onboarding/import/state",
+            json={"completed": True},
+            headers={"X-Test-User": "owner"},
+        )
+        response_body = await response.json()
+
+    assert response.status == 500
+    assert response_body == {"error": "request failed", "code": "config_unreadable"}
+    assert audit.events[-1]["error"] == "config_unreadable"
+    # Fail closed: the unreadable file is left exactly as it was.
+    assert config.read_bytes() == original
+    assert str(tmp_path) not in str(response_body)
 
 
 @pytest.mark.asyncio
@@ -671,7 +800,7 @@ async def test_apply_rejects_an_unrecognized_conflict_strategy(monkeypatch, stra
         body = await response.json()
 
     assert response.status == 400
-    assert body == {"error": "invalid request"}
+    assert body == {"error": "invalid request", "code": "invalid_request"}
     # Nothing was applied.
     assert called == []
     assert audit.events[-1]["error"] == "invalid_request"
@@ -820,6 +949,9 @@ async def test_scan_never_writes(monkeypatch, tmp_path) -> None:
     def refuse_write(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("preview wrote to a destination")
 
+    # The ``_write_json`` patch reaches the ledger, the JSON restore copies and
+    # ``mcp.json``, all through the apply owner's single binding, which the facade
+    # forwards it to. Refusing ``apply_import`` is what keeps every other writer out.
     monkeypatch.setattr(backend, "_write_json", refuse_write)
     monkeypatch.setattr(backend, "apply_import", refuse_write)
 
@@ -866,7 +998,7 @@ async def test_apply_rejects_an_explicit_null_conflict_strategy(monkeypatch) -> 
         body = await response.json()
 
     assert response.status == 400
-    assert body == {"error": "invalid request"}
+    assert body == {"error": "invalid request", "code": "invalid_request"}
     assert called == []
 
 
@@ -1017,3 +1149,247 @@ def test_backfill_embeddings_sweeps_a_ready_model(monkeypatch) -> None:
     assert (
         module._backfill_embeddings(SimpleNamespace(backfill_missing_embeddings=lambda: 12)) == 12
     )
+
+
+def test_the_two_source_id_patterns_cannot_drift() -> None:
+    """The handler keeps its own copy of the source-id shape rule.
+
+    That copy is deliberate — reaching through ``_backend()`` for request
+    validation would make all 35 handler test doubles carry an engine attribute
+    they do not otherwise need. But a second spelling of one rule is the exact
+    drift this PR's registry exists to end, so the two are pinned equal here
+    rather than trusted to stay in step.
+    """
+    module = _handler_module()
+    backend = importlib.import_module("kiro_crew.onboarding_import")
+
+    assert module._SOURCE_ID_SHAPE_RE.pattern == backend._SOURCE_ID_RE.pattern
+
+
+def test_handler_category_tables_match_the_backend() -> None:
+    """The handler's category tables must track ``onboarding_import.CATEGORY_IDS``.
+
+    ``_scan_response`` rejects a payload whose category id is not in the handler's
+    own ``_CATEGORY_IDS`` and then indexes ``_CATEGORY_NAMES[category_id]``, so a
+    category added to the backend but missed here does not degrade to "that
+    category is hidden" — it raises and the endpoint 500s, breaking the import
+    wizard for EVERY source. Pin both tables so the omission fails loudly in CI.
+
+    The SOURCE tables are deliberately absent: the handler does not keep a copy
+    of the source list to drift from. It derives ids from the engine's registry,
+    which is what makes an edition-registered source reachable at all.
+    """
+    module = _handler_module()
+    backend = importlib.import_module("kiro_crew.onboarding_import")
+
+    assert module._CATEGORY_IDS == frozenset(backend.CATEGORY_IDS)
+    assert set(module._CATEGORY_NAMES) >= frozenset(backend.CATEGORY_IDS) - {"instructions"}
+    # Diagnostic-only categories never enter _CATEGORY_IDS (they are not
+    # importable), but their ids DO reach the Review step's "Not imported"
+    # rows, where a missing label silently falls back to "General". Pin every
+    # category the unsupported-dirs table can emit to a real label.
+    assert set(module._CATEGORY_NAMES) >= {
+        category for _, category in gemini_source._GEMINI_UNSUPPORTED_DIRS
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/onboarding/import/scan"),
+        ("post", "/api/onboarding/import/apply"),
+        ("put", "/api/onboarding/import/state"),
+    ],
+)
+async def test_denial_code_is_the_wire_name_for_the_audited_identity(
+    monkeypatch, method: str, path: str
+) -> None:
+    """The 401 body names the same failure the audit records.
+
+    The audit taxonomy calls it ``authentication_required``; the wire
+    vocabulary for that denial is ``auth_required`` (``handlers_cloud.py``).
+    This pins the pair so neither can be renamed without the other being
+    considered.
+    """
+    module = _handler_module()
+    audit = _AuditLog()
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await getattr(client, method)(path, json={})
+        response_body = await response.json()
+
+    assert response.status == 401
+    assert response_body["code"] == "auth_required"
+    assert audit.events[-1]["error"] == "authentication_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "expected_code"),
+    [
+        ("get", "/api/onboarding/import/scan", "scan_failed"),
+        ("post", "/api/onboarding/import/apply", "apply_failed"),
+    ],
+)
+async def test_failure_code_equals_the_audited_error(
+    monkeypatch, method: str, path: str, expected_code: str
+) -> None:
+    """A 500's ``code`` is the identity the audit already recorded.
+
+    These two paths return the same opaque prose ("request failed") on purpose
+    — the detail is private (see
+    ``test_import_failures_do_not_expose_private_details``). Which operation
+    failed is not private, and before this it was visible only in the audit log.
+    """
+    module = _handler_module()
+    audit = _AuditLog()
+
+    def fail(*args: Any, **kwargs: Any):
+        raise RuntimeError("boom")
+
+    backend = SimpleNamespace(preview_import=fail, apply_import=fail)
+    monkeypatch.setattr(module, "_backend", lambda: backend)
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+    kwargs: dict[str, object] = {"headers": {"X-Test-User": "owner"}}
+    if method == "post":
+        kwargs["json"] = {"sources": [{"id": "claude_code", "categories": ["skills"]}]}
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await getattr(client, method)(path, **kwargs)
+        response_body = await response.json()
+
+    assert response.status == 500
+    assert response_body["code"] == expected_code
+    assert audit.events[-1]["error"] == expected_code
+    # The prose stays opaque: the code identifies the operation, not the cause.
+    assert response_body["error"] == "request failed"
+    assert "boom" not in str(response_body)
+
+
+@pytest.mark.asyncio
+async def test_state_failure_code_equals_the_audited_error(monkeypatch) -> None:
+    module = _handler_module()
+    audit = _AuditLog()
+
+    def fail_write(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(module, "update_config_locked", fail_write)
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.put(
+            "/api/onboarding/import/state",
+            json={"completed": True},
+            headers={"X-Test-User": "owner"},
+        )
+        response_body = await response.json()
+
+    assert response.status == 500
+    assert response_body["code"] == "state_failed"
+    assert audit.events[-1]["error"] == "state_failed"
+
+
+@pytest.mark.asyncio
+async def test_every_refusal_carries_a_code(monkeypatch) -> None:
+    """Per-file ratchet: no refusal path may regress to prose-only."""
+    module = _handler_module()
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        responses = [
+            await client.get("/api/onboarding/import/scan"),
+            await client.post(
+                "/api/onboarding/import/apply",
+                data="{",
+                headers={"Content-Type": "application/json", "X-Test-User": "owner"},
+            ),
+            await client.put(
+                "/api/onboarding/import/state",
+                json={"completed": "yes"},
+                headers={"X-Test-User": "owner"},
+            ),
+        ]
+        for response in responses:
+            body = await response.json()
+            assert response.status >= 400, body
+            assert isinstance(body.get("code"), str) and body["code"], body
+            assert isinstance(body.get("error"), str) and body["error"], body
+
+
+def _mcp_only_backend():
+    def preview_import(source_ids=None):
+        return {
+            "sources": [
+                {
+                    "id": "codex",
+                    "categories": [{"id": "mcp_servers", "selected": True}],
+                }
+            ],
+            "selection": [{"source_id": "codex", "category_id": "mcp_servers"}],
+        }
+
+    def apply_import(plan, **kwargs):
+        return {"imported": {"mcp_servers": 1}, "imported_count": 1, "already_imported": 0}
+
+    return SimpleNamespace(preview_import=preview_import, apply_import=apply_import)
+
+
+async def _apply_mcp_import(module) -> dict:
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.post(
+            "/api/onboarding/import/apply",
+            json={"sources": [{"id": "codex", "categories": ["mcp_servers"]}]},
+            headers={"X-Test-User": "owner"},
+        )
+        assert response.status == 200
+        return await response.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rebuild", "expected"),
+    [
+        pytest.param(
+            lambda **kw: (kw["_wrote_out"].append(True), Path("/dev/null"))[1],
+            True,
+            id="wrote",
+        ),
+        # The shared-home guard refused: the path comes back and nothing is written.
+        pytest.param(lambda **_: Path("/dev/null"), False, id="declined"),
+    ],
+)
+async def test_apply_reports_whether_the_agent_spec_was_rewritten(
+    monkeypatch, rebuild, expected
+) -> None:
+    import kiro_crew.agent as agent_mod
+
+    module = _handler_module()
+    monkeypatch.setattr(module, "_backend", _mcp_only_backend)
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", rebuild)
+
+    body = await _apply_mcp_import(module)
+
+    assert body["summary"]["imported"] == 1
+    assert body["agent_spec_rewritten"] is expected
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rebuild_keeps_the_import_and_reports_it(monkeypatch) -> None:
+    """The MCP entries already landed, so a rebuild error is a report, not a 500."""
+    import kiro_crew.agent as agent_mod
+
+    def boom(**_):
+        raise RuntimeError("boom")
+
+    module = _handler_module()
+    monkeypatch.setattr(module, "_backend", _mcp_only_backend)
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", boom)
+
+    body = await _apply_mcp_import(module)
+
+    assert body["agent_spec_rewritten"] is False

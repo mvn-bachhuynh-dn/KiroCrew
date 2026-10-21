@@ -1,15 +1,16 @@
 """Parity guard for the JWT credential patterns copied out of `security.py`.
 
 `security.py` owns the two JWT alternatives. Two other files carry hand-written
-copies because neither can import it: `pr_findings.py` is documented as portable
-and stdlib-only, and `sanitize.ts` runs in the browser. That is the exact setup
+copies because neither can import it: `_review_contract.py`, the prepare-pr
+scripts' shared module, is stdlib-only and portable, and `sanitize.ts` runs in
+the browser. That is the exact setup
 that already failed once: both copies missed the two-segment dashboard link
 token, so a bare token in CI-log prose and every token in chat rendered
 verbatim while the backend redacted them.
 
 Behavioural tests alone do not close that failure mode. Each copy is tested
 against its own samples, so a backend-only change leaves every mirror green
-while the mirrors no longer match the pattern they mirror. The planned
+while the mirrors do not match the pattern they mirror. The planned
 follow-up (decode segment one as a JOSE header, require `alg`/`enc`) lands in
 `security.py` FIRST by design, which is precisely when that would happen.
 
@@ -52,9 +53,20 @@ from kiro_crew.security import _CREDENTIAL_PATTERNS
 
 ROOT = Path(__file__).resolve().parents[1]
 
-BACKEND = ROOT / "src" / "kiro_crew" / "security.py"
+# The security PACKAGE, not one module: `security.py` is split into
+# vocabulary / helpers / shell_normalizer / paths / denied_rules / redaction /
+# exfil / argv_floor / diagnostics behind a facade, and a waiver reintroduced in
+# any of them — or in `__init__.py` — would be just as live. Scanning the whole
+# tree keeps the absence guard below correct across further splits, which is the
+# failure mode that already retired the single-file path this replaced.
+BACKEND_PKG = ROOT / "src" / "kiro_crew" / "security"
+# The module that owns the exfil URL classifier today. Named separately so a
+# guard can point at the enforcing site while the sweep stays package-wide.
+BACKEND_EXFIL = BACKEND_PKG / "exfil.py"
+# The owner beside it that declares the URL rule tables the classifier applies.
+BACKEND_EXFIL_RULES = BACKEND_PKG / "exfil_url_rules.py"
 PREPARE_PR = (
-    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "scripts" / "pr_findings.py"
+    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "kirocrew-prepare-pr" / "scripts" / "_review_contract.py"
 )
 FRONTEND = ROOT / "website" / "src" / "utils" / "sanitize.ts"
 TOKEN_MINT = ROOT / "src" / "kiro_crew" / "instances" / "token_mint.py"
@@ -106,12 +118,12 @@ class TestMirrorsMatchTheBackend:
 
     def test_two_segment_alternative_is_verbatim_in_prepare_pr(self) -> None:
         _, two_segment = _jwt_alternatives()
-        assert PREPARE_PR.is_file(), f"mirror moved or was renamed: {PREPARE_PR}"
+        assert PREPARE_PR.is_file(), f"_review_contract.py mirror moved or was renamed: {PREPARE_PR}"
         assert two_segment in PREPARE_PR.read_text(encoding="utf-8"), (
-            "pr_findings.py no longer carries the two-segment link-token alternative "
+            "_review_contract.py no longer carries the two-segment link-token alternative "
             "from security.py verbatim. It runs under CPython, so it has no reason to "
             "diverge. Copy it across, or delete this assertion and say in "
-            f"pr_findings.py why the mirror is allowed to differ.\nexpected: {two_segment}"
+            f"_review_contract.py why the mirror is allowed to differ.\nexpected: {two_segment}"
         )
 
     def test_two_segment_body_is_verbatim_in_the_frontend_mirror(self) -> None:
@@ -150,11 +162,29 @@ class TestMirrorsMatchTheBackend:
         )
 
 
+class TestBase64BlobMirror:
+    """The base64-blob signal is spelled identically on both halves.
+
+    ``=`` is trailing padding only and counts toward the 40 chars. A drift on one
+    half would redact a ``name=<id>`` link on one surface and not the other, or
+    let a padded 40-char blob through on one of them.
+    """
+
+    SPELLING = r"[A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]{39}=|[A-Za-z0-9+/]{38}=="
+
+    def test_backend_carries_the_spelling(self) -> None:
+        assert f'r"{self.SPELLING}"' in BACKEND_EXFIL_RULES.read_text(encoding="utf-8")
+
+    def test_frontend_carries_the_spelling(self) -> None:
+        text = FRONTEND.read_text(encoding="utf-8")
+        assert f"const EXFIL_B64_RE = /{self.SPELLING}/i" in text
+
+
 class TestDeliberateNonMirrors:
     """Two JWT regexes are intentionally NOT pinned to the backend."""
 
     def test_prepare_pr_keeps_its_own_wider_three_segment_form(self) -> None:
-        """`pr_findings.py` predates the backend form and uses `{8,}` per segment.
+        """`_review_contract.py` predates the backend form and uses `{8,}` per segment.
 
         It is wider on the first segment and narrower on segment count. Only its
         two-segment alternative was added as a mirror; rewriting this one to match
@@ -165,7 +195,7 @@ class TestDeliberateNonMirrors:
         text = PREPARE_PR.read_text(encoding="utf-8")
         assert r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}" in text
         assert three_segment not in text, (
-            "pr_findings.py now also carries the backend three-segment alternative. "
+            "_review_contract.py now also carries the backend three-segment alternative. "
             "If that was deliberate, move the assertion into TestMirrorsMatchTheBackend."
         )
 
@@ -182,4 +212,97 @@ class TestDeliberateNonMirrors:
         assert three_segment not in text and two_segment not in text, (
             "token_mint.py now carries a backend alternative verbatim. If it became a "
             "mirror, move the assertion into TestMirrorsMatchTheBackend."
+        )
+
+
+class TestPrefilledIssueCarveOutParity:
+    """NEITHER half may carve out the issue-prefill shape, and this pins the absence.
+
+    Neither a frontend nor a backend carve-out for this shape may exist. Two
+    spellings are both exfiltration primitives — one keyed to the prefill SHAPE, one
+    additionally pinned to this project's own tracker — because what these functions
+    sanitize is MODEL-AUTHORED text.
+    Injected content steers the model into emitting a prefill URL whose ``body``
+    carries percent-encoded private context, the waiver skips aggregate query
+    length, and the user submits it into a PUBLIC issue the attacker reads. Pinning
+    the repository does not help: the tracker is world-readable by design.
+
+    Behavioural tests on each side cannot hold this. A waiver reintroduced on ONE
+    half is silent — the backend redacts first on every server-rendered surface, so
+    a frontend-only waiver leaves both suites green while opening the hole on any
+    client-only render path, and a backend-only waiver opens it everywhere. So the
+    guard is structural and reads both enforcing sources at run time.
+
+    The feature that needed the waiver has a channel instead: ``_issue_url`` builds
+    the prefill link from structured fields and the dashboard renders its own anchor
+    from ``BundleResult.github_issue_url``, a JSON field no redactor scans. That is
+    what makes deleting these waivers cost nothing.
+    """
+
+    def test_the_backend_has_no_prefill_carve_out(self) -> None:
+        modules = sorted(BACKEND_PKG.rglob("*.py"))
+        assert modules, f"no modules under {BACKEND_PKG} — the package moved"
+        for symbol in ("_is_prefilled_issue_url", "allow_prefilled_issue", "_ISSUE_PREFILL_"):
+            offenders = [
+                f"{module.name}:{number}"
+                for module in modules
+                for number, line in enumerate(
+                    module.read_text(encoding="utf-8").splitlines(), start=1
+                )
+                if symbol in line and not line.lstrip().startswith("#")
+            ]
+            assert not offenders, (
+                f"{symbol} is back in the security package as executable code: "
+                f"{offenders}. A shape-based waiver on model-authored text is an "
+                "exfiltration primitive regardless of destination — see this "
+                "class's docstring."
+            )
+
+    def test_the_frontend_mirror_has_no_prefill_carve_out(self) -> None:
+        source = FRONTEND.read_text(encoding="utf-8")
+        for symbol in ("isPrefilledIssueUrl", "EXFIL_ISSUE_"):
+            offenders = [
+                line
+                for line in source.splitlines()
+                if symbol in line and not line.lstrip().startswith("//")
+            ]
+            assert not offenders, (
+                f"{symbol} is back in sanitize.ts as executable code: {offenders}. "
+                "The backend redacts first, so a frontend-only waiver is silent on "
+                "server-rendered surfaces and live on client-only ones."
+            )
+
+    def test_the_length_gate_is_unconditional_on_both_sides(self) -> None:
+        """The rule the waivers waived, asserted at its own site on each half.
+
+        Reads the comparison itself rather than the absence of a symbol name, so a
+        waiver spelled with fresh identifiers still fails one of these two tests.
+        """
+        backend = BACKEND_EXFIL.read_text(encoding="utf-8")
+        assert "if len(heuristic_query) >= _EXFIL_QUERY_MIN_LEN:" in backend, (
+            f"the aggregate-length gate is no longer an unconditional comparison in "
+            f"{BACKEND_EXFIL.name} — something was added to its condition, or the "
+            "classifier moved to another module and this guard needs repointing"
+        )
+        frontend = FRONTEND.read_text(encoding="utf-8")
+        assert "query.length >= EXFIL_QUERY_MIN_LEN" in frontend
+        assert "if (!redact && query.length >= EXFIL_QUERY_MIN_LEN)" not in frontend, (
+            "the frontend length signal is behind a conditional again"
+        )
+
+    def test_the_trusted_channel_the_waiver_was_replaced_by_still_exists(self) -> None:
+        """Deleting the waivers is only free while this seam is here.
+
+        If the structured path is removed or renamed, the pressure to re-add a
+        redactor waiver returns and this test is the place that says so.
+        """
+        diagnostics = (ROOT / "src" / "kiro_crew" / "diagnostics.py").read_text(encoding="utf-8")
+        assert "def _issue_url(" in diagnostics
+        assert "github_issue_url" in diagnostics
+        renderer = (
+            ROOT / "website" / "src" / "components" / "ReportProblemModal.tsx"
+        ).read_text(encoding="utf-8")
+        assert "result.github_issue_url" in renderer, (
+            "the dashboard no longer renders its own anchor from the structured "
+            "field — the trusted issue-link channel moved"
         )

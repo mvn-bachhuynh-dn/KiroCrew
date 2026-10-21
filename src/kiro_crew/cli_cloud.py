@@ -20,15 +20,30 @@ from kiro_crew.cloud import ec2, iam
 from kiro_crew.cloud import login as login_mod
 from kiro_crew.cloud import sizes, ssm, ui, wizard
 from kiro_crew.cloud.aws import AWSError, CloudActionDenied
-from kiro_crew.cloud.config import DEFAULT_REGION, CloudConfig
+from kiro_crew.cloud.config import DEFAULT_REGION
+from kiro_crew.cloud.launch_state import LaunchState
+from kiro_crew.cloud.login_target import (
+    KiroLoginTarget,
+    LoginTargetError,
+    discover_local_identity,
+    target_from_whoami,
+)
+from kiro_crew.deploy.engine import resolve_aws_bin
+from kiro_crew.sandbox import SandboxCeilingUnsealable
+from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import ValidationError
 
 
 def _resolve(args: argparse.Namespace) -> tuple[str, str]:
-    """Resolve (profile, region) from args, falling back to saved config."""
-    cfg = CloudConfig.load()
-    profile = getattr(args, "profile", "") or cfg.profile
-    region = getattr(args, "region", "") or cfg.region or DEFAULT_REGION
+    """Resolve (profile, region) from args, falling back to the launch record.
+
+    From ``launch_state``, not from ``cloud.json``: these two are what a LAUNCH decided, so
+    they are the launch path's to write. The record falls back to the legacy fields in
+    ``cloud.json`` when it holds none, so an install that predates it answers as it did.
+    """
+    state = LaunchState.load()
+    profile = getattr(args, "profile", "") or state.profile
+    region = getattr(args, "region", "") or state.region or DEFAULT_REGION
     return profile, region
 
 
@@ -37,24 +52,105 @@ def _resolve_tag(args: argparse.Namespace) -> str:
     tag = getattr(args, "tag", "") or ""
     if tag:
         return tag
-    cfg = CloudConfig.load()
-    if not cfg.last_tag:
+    state = LaunchState.load()
+    if not state.last_tag:
         ui.fail("No instance tag given and no previous launch found.")
         ui.detail("Pass --tag <tag>, or run `kirocrew cloud list` to see instances.")
         sys.exit(1)
-    return cfg.last_tag
+    return state.last_tag
+
+
+def _resolve_login_target(args: argparse.Namespace, *, inherit: bool) -> "KiroLoginTarget":
+    """The Kiro identity a cloud command signs the crew in as.
+
+    Precedence: explicit ``--identity-provider`` / ``--license`` / ``--idp-region``
+    flags; else (when *inherit*) the launching machine's own ``kiro-cli whoami``
+    identity — an Identity Center user launching a crew almost always wants the
+    crew signed in as the same organization; else the Builder ID default.
+
+    Inheriting an Identity Center identity needs the Identity Center REGION,
+    which ``whoami`` does not report. ``--idp-region`` supplies it; without one
+    the target is returned with an empty region and the wizard completes it —
+    interactively by asking, or under ``--yes`` by refusing with the flag to pass.
+    A target is never silently downgraded to Builder ID because a field was missing,
+    and never because discovery FAILED: when ``whoami`` could not run, or exited
+    nonzero without an identity, the identity is unknown, and the command refuses
+    until the caller names the target (``--identity-provider`` + ``--idp-region``)
+    or opts out of inheritance with ``--no-inherit-identity``. Only a ``whoami``
+    that ran cleanly and reported no Identity Center sign-in falls through to the
+    Builder ID default.
+    """
+    explicit_url = getattr(args, "identity_provider", "") or ""
+    explicit_lic = getattr(args, "license", "") or ""
+    explicit_reg = getattr(args, "idp_region", "") or ""
+    if explicit_url or explicit_lic:
+        return KiroLoginTarget.from_fields(
+            license=explicit_lic, start_url=explicit_url, region=explicit_reg
+        )
+    # ``--idp-region`` alone is a COMPLETION of the inherited target, not a
+    # replacement: it is the one field ``whoami`` cannot report. It falls
+    # through to inheritance and is merged into the result below.
+    inherited = KiroLoginTarget()
+    if inherit:
+        ident = discover_local_identity()
+        if ident is None:
+            raise LoginTargetError(
+                "could not read this computer's Kiro sign-in (kiro-cli whoami did not run "
+                "or reported an error), so the crew's identity cannot be inherited; pass "
+                "--identity-provider URL --idp-region REGION to name it, or "
+                "--no-inherit-identity to sign the crew in as Builder ID"
+            )
+        inherited_target = target_from_whoami(ident)
+        if inherited_target is None:
+            raise LoginTargetError(
+                "this computer is signed in to IAM Identity Center but kiro-cli whoami reported "
+                "no readable start URL, so the crew's identity cannot be inherited; pass "
+                "--identity-provider URL --idp-region REGION to name it, or "
+                "--no-inherit-identity to sign the crew in as Builder ID"
+            )
+        inherited = inherited_target
+    if not explicit_reg:
+        return inherited
+    # A region with nothing to attach it to is still refused (strictly) — the
+    # same validation the explicit branch applies.
+    return KiroLoginTarget.from_fields(
+        license=inherited.license, start_url=inherited.start_url, region=explicit_reg
+    )
 
 
 def _cloud_launch(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
+    try:
+        login_target = _resolve_login_target(
+            args, inherit=not getattr(args, "no_inherit_identity", False)
+        )
+    except LoginTargetError as exc:
+        ui.fail(f"Kiro identity target rejected: {exc}")
+        return 2
+    ami_id = getattr(args, "ami", "") or ""
+    try:
+        if ami_id:
+            ami_id = ec2.validate_ami_id(ami_id)
+        extra_packages = ec2.normalize_extra_packages(getattr(args, "extra_packages", "") or "")
+        ssm_kms_key_arn = getattr(args, "ssm_kms_key", "") or ""
+        if ssm_kms_key_arn:
+            ssm_kms_key_arn = ec2.validate_ssm_kms_key_arn(ssm_kms_key_arn)
+    except ValidationError as exc:
+        ui.fail(f"Invalid launch option: {exc}")
+        return 2
     return wizard.launch(
         profile=profile,
         region=region,
         size_key=getattr(args, "size", "") or "",
+        subnet_id=getattr(args, "subnet", "") or "",
         assume_yes=getattr(args, "yes", False),
         force_new=getattr(args, "new", False),
         keep_on_failure=getattr(args, "keep_on_failure", False),
         hold_tunnel=getattr(args, "hold_tunnel", True),
+        login_target=login_target,
+        ami_id=ami_id,
+        extra_packages=extra_packages,
+        ssm_kms_key_arn=ssm_kms_key_arn,
     )
 
 
@@ -98,6 +194,14 @@ def _cloud_connect(args: argparse.Namespace) -> int:
     st = ec2.describe(tag, profile, region)
     if not st.get("exists") or not st.get("instance_id"):
         ui.fail(f"No running instance for tag '{tag}'.")
+        # This verb addresses an EC2 crew, by tag, and a Fargate crew has no EC2
+        # instance to find -- so this lookup is also how an operator holding a
+        # Fargate crew arrives here. Name the surface that does reach one, rather
+        # than leaving a correct but terminal answer.
+        ui.detail(
+            "This reaches an EC2 crew. A Fargate crew is reached from Settings > Remote Crew: "
+            "its card opens the forward and shows the task's turn API URL."
+        )
         return 1
     open_browser = not getattr(args, "no_browser", False)
     local_port = getattr(args, "local_port", 0) or connect_mod.DEFAULT_LOCAL_PORT
@@ -159,14 +263,37 @@ def _cloud_login(args: argparse.Namespace) -> int:
         return 1
     instance_id = st["instance_id"]
 
-    if login_mod.is_logged_in(instance_id, profile, region):
-        ui.ok("kiro-cli is already signed in on the instance. Chats should work.")
-        return 0
+    try:
+        target = _resolve_login_target(args, inherit=False)
+    except LoginTargetError as exc:
+        ui.fail(f"Kiro identity target rejected: {exc}")
+        return 2
 
-    ui.info("Starting Kiro sign-in on the instance…")
+    if login_mod.is_logged_in(instance_id, profile, region, target=target):
+        ui.ok(
+            f"kiro-cli is already signed in on the instance as {target.describe()}. Chats should work."
+        )
+        return 0
+    # Every target, the Builder ID default included: kiro-cli ignores a login
+    # over a live session, so a flagless login onto an Identity Center session
+    # would do nothing and report nothing.
+    state = login_mod.remote_identity_state(instance_id, profile, region, target=target)
+    if state == "mismatch":
+        ui.warn(
+            f"The instance is signed in to a DIFFERENT Kiro identity than {target.describe()}. "
+            "Run `kirocrew cloud logout` first, then repeat this command — a "
+            "login attempt against an existing session is ignored by kiro-cli."
+        )
+        return 1
+
+    ui.info(f"Starting Kiro sign-in on the instance as {target.describe()}…")
     try:
         prompt = login_mod.start_device_login(
-            instance_id, profile, region, open_browser=not getattr(args, "no_browser", False)
+            instance_id,
+            profile,
+            region,
+            open_browser=not getattr(args, "no_browser", False),
+            target=target,
         )
     except AWSError as exc:
         ui.fail(str(exc))
@@ -176,16 +303,16 @@ def _cloud_login(args: argparse.Namespace) -> int:
         return 0
     if not prompt.url:
         ui.fail("Could not start device sign-in on the instance.")
-        ui.detail(login_mod.social_login_hint(prompt))
+        ui.detail(prompt.error or login_mod.social_login_hint(prompt))
         return 1
 
     ui.note(f"Open this URL and approve the code:\n    {ui.CYAN}{prompt.url}{ui.RESET}")
     if prompt.code:
         ui.detail(f"Verification code: {prompt.code}")
     # Keep the login daemon polling on the box so approval completes, then wait.
-    login_mod.resume_login_daemon(instance_id, profile, region)
+    login_mod.resume_login_daemon(instance_id, profile, region, target=target)
     with ui.Spinner("Waiting for sign-in approval…"):
-        signed = login_mod.wait_until_logged_in(instance_id, profile, region)
+        signed = login_mod.wait_until_logged_in(instance_id, profile, region, target=target)
     if signed:
         ui.ok(
             "Signed in. New chats will work now — restart the gateway if a chat "
@@ -197,6 +324,34 @@ def _cloud_login(args: argparse.Namespace) -> int:
         "`kirocrew cloud login`."
     )
     return 1
+
+
+def _cloud_logout(args: argparse.Namespace) -> int:
+    """Sign kiro-cli out on the instance — the way to switch Kiro accounts.
+
+    ``cloud login`` short-circuits when a session already exists, so switching
+    accounts otherwise means an SSM console round-trip to run ``kiro-cli
+    logout`` by hand. This is that round-trip, as one verb.
+    """
+    profile, region = _resolve(args)
+    tag = _resolve_tag(args)
+    st = ec2.describe(tag, profile, region)
+    if not st.get("exists") or not st.get("instance_id"):
+        ui.fail(f"No running instance for tag '{tag}'.")
+        return 1
+
+    with ui.Spinner("Signing kiro-cli out on the instance…"):
+        signed_out = login_mod.logout(st["instance_id"], profile, region)
+    if not signed_out:
+        ui.fail("Could not confirm the instance is signed out.")
+        ui.detail("The session may still be active — retry, or check with: kirocrew cloud connect")
+        return 1
+    ui.ok("Signed out on the instance.")
+    ui.detail(
+        "Any in-flight chats/cron sessions were stopped (their kiro-cli runtimes were killed)."
+    )
+    ui.detail("Sign in with another account: kirocrew cloud login")
+    return 0
 
 
 def _cloud_stop(args: argparse.Namespace) -> int:
@@ -287,10 +442,32 @@ def _cloud_destroy(args: argparse.Namespace) -> int:
             ui.detail(f"Remove it manually: aws s3 rm {src['uri']}")
         if src.get("error"):
             ui.detail(src["error"])
-    cfg = CloudConfig.load()
-    if cfg.last_tag == tag:
-        cfg.last_tag = ""
-        cfg.save()
+    # The launch RECORD, not the operator's configuration: this command owns the pointer to
+    # the stack it just deleted and owns nothing in `cloud.json`.
+    #
+    # The precondition travels with the clear because this command owns the pointer only
+    # while it still names the stack it deleted: a launch that recorded its own tag in
+    # between must not have that pointer wiped by a command which never saw it.
+    #
+    # The RETURN is deliberately ignored here, and by the same test that makes a declined
+    # clear abort a LAUNCH: if this command carries on, whose stack does a later no-tag
+    # destroy name? A declined clear means the pointer now names the concurrent launch's own
+    # live stack, which is the correct pointer for it -- so carrying on is right, and there is
+    # nothing after this line but the success message. On the launch side the answer is the
+    # opposite, because provisioning would then make the saved tag name someone else's stack.
+    #
+    # A write FAILURE is not an error here either, and it is the same decision
+    # `wizard._record_launch` already makes on the launch side. The stack is gone by now, so a
+    # full disk, a read-only filesystem or a lock that could not be taken must not turn a
+    # completed removal into a traceback and a non-zero exit: the AWS work cannot be retried,
+    # and automation reading that exit code would conclude the teardown failed while the
+    # resources are actually deleted. What is left behind is a stale pointer, so the warning
+    # names it rather than swallowing it.
+    try:
+        LaunchState.clear_tag(tag)
+    except OSError as exc:
+        ui.warn(f"Removed the stack, but could not clear the saved pointer to it: {exc}")
+        ui.detail("The pointer is stale, not harmful: `kirocrew cloud list` shows what exists.")
 
     ui.ok(f"Removed '{tag}' — all AWS resources deleted. You won't be billed for it.")
     return 0
@@ -302,32 +479,88 @@ def _cloud_iam_policy(_args: argparse.Namespace) -> int:
 
 
 def _cloud_iam_boundary(args: argparse.Namespace) -> int:
-    """Pre-create the shared, immutable instance permissions boundary (admin step).
+    """Pre-create the shared, immutable permissions boundaries (admin step).
 
-    Normally the first ``launch`` auto-creates this (the launcher policy grants
-    only ``iam:CreatePolicy`` on the fixed boundary name). Operators who want to
-    eliminate the first-write race entirely run this ONCE as an admin, then drop
-    the ``IamInstanceBoundaryCreateOnce`` statement from the applied launcher
-    policy — the launcher then only *references* the boundary ARN, never creates
-    it. Idempotent: an existing boundary is left untouched (immutability).
+    Creates all three boundaries the launcher policy's
+    ``IamInstanceBoundaryCreateOnce`` statement names: the EC2 instance ceiling
+    (``kirocrew-ec2-boundary``) and the two Fargate crew ceilings
+    (``kirocrew-crew-boundary`` for the task role, ``kirocrew-crew-exec-boundary``
+    for the execution role). Normally a launch auto-creates the boundary it needs
+    (the statement grants ``iam:CreatePolicy`` plus the two read verbs,
+    ``iam:GetPolicy`` and ``iam:GetPolicyVersion``, on those exact names).
+    Operators who want to eliminate the first-write race entirely run this ONCE as
+    an admin, then remove the ``iam:CreatePolicy`` action from that statement —
+    the launcher then only *references* the boundary ARNs, never creates them.
+    That removal is safe only once ALL three exist, because the one statement
+    covers all three names; a boundary still missing when the action goes would
+    have no principal left that may create it. The statement's ``iam:GetPolicy``
+    and ``iam:GetPolicyVersion`` grants stay: every launch reads its boundary to
+    verify the content before reusing it.
+
+    Each boundary goes through the same create-once-and-verify sequence a launch
+    uses, so the step is idempotent (an existing boundary whose content matches is
+    left untouched, never re-versioned) and refuses a drifted one the same way. The
+    three are attempted independently, so one refusal still reports the state of
+    the other two; the exit status is non-zero when any of them is not ready.
     """
     from kiro_crew.cloud import source as source_mod
 
     profile, region = _resolve(args)
-    try:
-        arn = source_mod.ensure_instance_boundary(profile, region)
-    except AWSError as exc:
-        ui.fail(str(exc))
-        if exc.missing_action:
-            ui.detail(f"Grant `{exc.missing_action}` and retry.")
+    boundaries = [
+        ("Instance permissions boundary", source_mod.ensure_instance_boundary),
+        ("Fargate crew task-role boundary", source_mod.ensure_crew_boundary),
+        ("Fargate crew execution-role boundary", source_mod.ensure_crew_exec_boundary),
+    ]
+    # Opt-in only: without --ssm-kms this step creates exactly the three
+    # boundaries above. This admin step is the one caller that may create the
+    # KMS-session boundary; a launch only verifies it.
+    if getattr(args, "ssm_kms", False):
+
+        def _ensure_kms(profile: str = "", region: str = "") -> str:
+            return source_mod.ensure_instance_kms_boundary(profile, region, create=True)
+
+        boundaries.append(("KMS-session instance boundary", _ensure_kms))
+    failed = False
+    for label, ensure in boundaries:
+        try:
+            arn = ensure(profile, region)
+        except AWSError as exc:
+            failed = True
+            ui.fail(str(exc))
+            if exc.missing_action:
+                ui.detail(f"Grant `{exc.missing_action}` and retry.")
+            # Every boundary ARN embeds the account id, so a failure to resolve it
+            # fails the remaining boundaries identically; say it once.
+            if exc.action == "sts:GetCallerIdentity":
+                break
+            continue
+        ui.ok(f"{label} ready: {arn}")
+    if failed:
+        ui.detail(
+            "Keep the iam:CreatePolicy action in the IamInstanceBoundaryCreateOnce "
+            "statement until every boundary above is ready, then re-run this step."
+        )
         return 1
-    ui.ok(f"Instance permissions boundary ready: {arn}")
     ui.detail(
-        "It is immutable and shared by every launch. To fully close the "
-        "first-write race, remove the IamInstanceBoundaryCreateOnce statement "
-        "from the applied launcher policy now that the boundary exists."
+        "They are immutable and shared by every launch. To fully close the "
+        "first-write race, remove the iam:CreatePolicy action from the "
+        "IamInstanceBoundaryCreateOnce statement in the applied launcher policy "
+        "now that all three boundaries exist. Keep the statement's read verbs — "
+        "every launch reads its boundary to verify it."
     )
     return 0
+
+
+#: The doctor's next step for a refused ``aws`` CLI, by ``ssm`` refusal code. A
+#: root gateway and the strict policy are not cleared by an ownership change.
+_REFUSAL_NEXT_STEP = {
+    "root_gateway": "Start the gateway from a regular account instead of root, then rerun.",
+    "strict_policy": (
+        "Install it where only root can change the file and its folders, at a path "
+        "with no symbolic links, then rerun."
+    ),
+    "": "Fix the file's ownership or permissions so the check passes, then rerun.",
+}
 
 
 def _cloud_doctor(args: argparse.Namespace) -> int:
@@ -336,13 +569,35 @@ def _cloud_doctor(args: argparse.Namespace) -> int:
 
     profile, region = _resolve(args)
     ui.note(f"{ui.BOLD}KiroCrew cloud — diagnostics{ui.RESET}")
-    # Client prerequisites.
-    if shutil.which("aws"):
+    # Client prerequisites. Probe the exact binary resolved spawn sites execute
+    # (the shared deploy-engine resolver), so the doctor's verdict agrees with
+    # what `kirocrew cloud` commands actually run under a GUI-launched
+    # gateway's minimal PATH.
+    cli_refusal = None
+    if shutil.which(resolve_aws_bin()):
         ui.ok("aws CLI found")
+    elif (cli_refusal := ssm.aws_cli_refusal()) is not None:
+        # Found but refused: the install link would put the same refused file back.
+        ui.fail(f"aws CLI found at {cli_refusal.path} but refused: {cli_refusal.reason}")
+        ui.detail(_REFUSAL_NEXT_STEP.get(cli_refusal.code, _REFUSAL_NEXT_STEP[""]))
     else:
         ui.fail("aws CLI not found — install it (https://aws.amazon.com/cli/)")
     if ssm.session_manager_plugin_installed():
         ui.ok("session-manager-plugin found")
+    elif (refusal := ssm.session_manager_plugin_refusal()) is not None:
+        ui.warn(f"session-manager-plugin found at {refusal.path} but refused: {refusal.reason}")
+        if refusal.remedy_command:
+            # Making the tree root-owned turns whatever binary is in it into an
+            # accepted credential receiver, so the user confirms it is AWS's first.
+            ui.detail(
+                "If you did not install it from AWS yourself, or are not sure, reinstall "
+                "it from AWS first."
+            )
+            ui.detail(
+                f"Then make its install directory root-owned and rerun: {refusal.remedy_command}"
+            )
+        else:
+            ui.detail("Fix the file's ownership or permissions so the check passes, then rerun.")
     else:
         ui.warn("session-manager-plugin not found — needed to connect over SSM")
         ui.detail(ssm.session_manager_plugin_install_hint())
@@ -357,7 +612,13 @@ def _cloud_doctor(args: argparse.Namespace) -> int:
             )
     else:
         ui.fail("AWS not reachable")
-        ui.detail(reach.get("note", ""))
+        # With the CLI refused, the profile was never checked: the note's
+        # credential or helper advice would send the user to the wrong fix.
+        ui.detail(
+            "The aws CLI above was refused, so the profile was not checked."
+            if cli_refusal is not None
+            else reach.get("note", "")
+        )
     return 0
 
 
@@ -389,6 +650,7 @@ _DISPATCH = {
     # SSM tunnel any time, independent of the launch/setup flow.
     "tunnel": _cloud_connect,
     "login": _cloud_login,
+    "logout": _cloud_logout,
     "stop": _cloud_stop,
     "start": _cloud_start,
     "destroy": _cloud_destroy,
@@ -410,10 +672,11 @@ def handle_cloud(args: argparse.Namespace) -> int:
         ui.detail("tunnel      Open the dashboard SSM tunnel (alias: connect)")
         ui.detail("connect     Open the dashboard over an SSM tunnel")
         ui.detail("login       Sign kiro-cli in on the instance (fixes chat errors)")
+        ui.detail("logout      Sign kiro-cli out on the instance (switch Kiro account)")
         ui.detail("stop|start  Pause / resume (save cost)")
         ui.detail("destroy     Remove everything from AWS")
         ui.detail("iam-policy  Print the least-privilege IAM policy to apply")
-        ui.detail("iam-boundary Pre-create the immutable instance permissions boundary (admin)")
+        ui.detail("iam-boundary Pre-create the EC2 + Fargate permissions boundaries (admin)")
         ui.detail("doctor      Check cloud prerequisites + AWS reachability")
         return 0
     fn = _DISPATCH.get(action)
@@ -422,6 +685,20 @@ def handle_cloud(args: argparse.Namespace) -> int:
         return 1
     try:
         return fn(args)
+    except SandboxCeilingUnsealable as exc:
+        # The launch record is reachable under a second name, refused where a verb consumes
+        # its tag (``LaunchState.load``). A real refusal and it stays -- the tag decides which
+        # stack ``destroy --yes`` deletes -- but it describes a HOST setup, so it belongs to
+        # the operator to fix and the message names the file, the shape and the one command.
+        # Caught for the whole dispatch table rather than per verb: every verb resolves the
+        # tag or the region through that read, ``launch`` re-attaches through it too, and a
+        # verb added later would otherwise print a traceback until someone noticed.
+        # Escaped here as well as in the builders, exactly as ``cli_chat`` does: this
+        # handler prints ANY builder of the exception, including ones in modules it does
+        # not own, and ``ui.fail`` writes straight to the terminal. Escaping at each
+        # builder keeps a new SINK safe; escaping at the sink keeps a new BUILDER safe.
+        ui.fail(safe_terminal_line(str(exc)))
+        return 1
     except CloudActionDenied as exc:
         # A mutating cloud verb was reached from an agent session (the in-layer
         # preflight fired). Human/installer action only.

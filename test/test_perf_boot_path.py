@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -75,20 +76,27 @@ class TestGatewayUpdateCheckIsBackgrounded:
 
     def test_update_check_is_not_awaited_inline(self) -> None:
         src = inspect.getsource(GatewayOrchestrator.run)
-        assert "await self._check_for_updates()" not in src, (
-            "the boot update check must not be inline-awaited — it blocks the "
-            "boot for up to ~70s on a stalled network"
+        assert "await self._run_update_checks()" not in src, (
+            "the update coordinator must not be inline-awaited — its first "
+            "network cycle can block boot for up to ~70s"
         )
-        assert "asyncio.create_task(self._check_for_updates())" in src
+        assert "asyncio.create_task(self._run_update_checks())" in src
 
     def test_signal_handlers_installed_before_update_check(self) -> None:
         src = inspect.getsource(GatewayOrchestrator.run)
-        handlers_at = src.index("loop.add_signal_handler(sig, _on_signal)")
-        check_at = src.index("asyncio.create_task(self._check_for_updates())")
+        handlers_at = src.index("self._install_shutdown_signal_handlers()")
+        preparation_at = src.index("await self._wait_for_memory_preparation()")
+        check_at = src.index("asyncio.create_task(self._run_update_checks())")
+        assert (
+            handlers_at < preparation_at
+        ), "SIGINT/SIGTERM handlers must be installed before waiting for memory preparation"
         assert handlers_at < check_at, (
             "SIGINT/SIGTERM handlers must be installed before the update check "
             "starts, or an early Ctrl-C is ignored"
         )
+        handlers_src = inspect.getsource(GatewayOrchestrator._install_shutdown_signal_handlers)
+        assert "for sig in (signal.SIGINT, signal.SIGTERM):" in handlers_src
+        assert "loop.add_signal_handler(sig, _on_signal)" in handlers_src
 
     def test_update_check_task_is_tracked_and_cancelled(self) -> None:
         run_src = inspect.getsource(GatewayOrchestrator.run)
@@ -96,8 +104,14 @@ class TestGatewayUpdateCheckIsBackgrounded:
             "the fire-and-forget task must be strongly referenced or it can be "
             "garbage-collected mid-flight"
         )
-        shutdown_src = inspect.getsource(GatewayOrchestrator._shutdown)
-        assert "self._update_check_task.cancel()" in shutdown_src
+        # Dedented, so the body reads the same whether the method is defined in the
+        # class body or composed from a gateway_runtime owner.
+        shutdown_src = textwrap.dedent(inspect.getsource(GatewayOrchestrator._shutdown))
+        assert "update_task = self._update_check_task" in shutdown_src
+        # Cancelled with the dashboard-started policy applies, as one set.
+        assert "installer_tasks.add(update_task)" in shutdown_src
+        assert "for task in installer_tasks:\n        task.cancel()" in shutdown_src
+        assert "_cancel_update_check()" in shutdown_src
 
 
 # ── Telemetry: no OTel SDK import while telemetry is off ───────────────────
@@ -118,9 +132,9 @@ class TestOtelSdkImportIsDeferred:
             "    'available': p._OTEL_AVAILABLE,\n"
             "}))\n"
         )
-        assert result["sdk"] is False, (
-            "importing metrics.provider must not import the OTel metrics SDK"
-        )
+        assert (
+            result["sdk"] is False
+        ), "importing metrics.provider must not import the OTel metrics SDK"
         # The availability probe must still work — it is what keeps a partial
         # install degrading to the no-op recorder instead of crashing.
         assert result["available"] is True
@@ -136,9 +150,7 @@ class TestOtelSdkImportIsDeferred:
             "}))\n"
         )
         assert result["enabled"] is False  # default-off consent gate
-        assert result["sdk"] is False, (
-            "a disabled recorder must not pay for the OTel SDK import"
-        )
+        assert result["sdk"] is False, "a disabled recorder must not pay for the OTel SDK import"
 
     def test_enabled_recorder_still_loads_the_sdk(self, tmp_path: Path) -> None:
         """The deferral must not break the opt-in path."""
@@ -163,9 +175,9 @@ class TestOtelSdkImportIsDeferred:
 class TestConfigDirMemo:
     """``config_dir()`` is called from 323 sites and measured 94.9us per call —
     a ``Path.resolve()`` + ``mkdir`` and, on the default path, a breadcrumb
-    read/write plus the leftover-archive sweep, every time."""
+    read/write, every time."""
 
-    def test_repeat_calls_do_not_redo_breadcrumb_or_sweep(
+    def test_repeat_calls_do_not_redo_breadcrumb(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
@@ -173,27 +185,20 @@ class TestConfigDirMemo:
         monkeypatch.setattr(paths, "_resolved_home", None)
         monkeypatch.setattr(paths, "_config_dir_memo", None, raising=False)
 
-        calls = {"breadcrumb": 0, "sweep": 0}
+        calls = {"breadcrumb": 0}
         real_breadcrumb = paths._write_recovery_breadcrumb
-        real_sweep = paths._sweep_ungated_archive_leftovers
 
         def _breadcrumb(d: Path) -> None:
             calls["breadcrumb"] += 1
             real_breadcrumb(d)
 
-        def _sweep() -> None:
-            calls["sweep"] += 1
-            real_sweep()
-
         monkeypatch.setattr(paths, "_write_recovery_breadcrumb", _breadcrumb)
-        monkeypatch.setattr(paths, "_sweep_ungated_archive_leftovers", _sweep)
 
         first = paths.config_dir()
         for _ in range(50):
             assert paths.config_dir() == first
 
         assert calls["breadcrumb"] == 1, "breadcrumb write must be once per resolution"
-        assert calls["sweep"] == 1, "archive sweep must be once per resolution"
 
     def test_override_change_is_honoured(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -252,6 +257,26 @@ class TestDashboardImportIsLeaf:
         assert result["aiohttp"] is False, "the URL leaf must stay stdlib-only"
         assert result["parsed"] == ["h", 9999]
 
+    def test_server_boot_leaves_mcp_apps_and_gateway_backend_unloaded(self) -> None:
+        """The MCP Apps handler is feature-gated and imports the gateway backend
+        at module scope, so it must stay off the dashboard boot path: the routes
+        bind through ``server._deferred`` and the module loads on first request
+        (no-new-work-on-gateway-boot-path clause 5 — gate the import, not just
+        the handler). A cold import of a low fan-out entry (``chat_folders``)
+        must also succeed: the eager handlers/__init__ re-export this test pins
+        against once closed a boot-order cycle through session_control."""
+        result = _probe(
+            "import json, sys\n"
+            "import kiro_crew.dashboard.server\n"
+            "import kiro_crew.dashboard.chat_folders\n"
+            "print(json.dumps({\n"
+            "    'mcp_apps': 'kiro_crew.dashboard.handlers.mcp_apps' in sys.modules,\n"
+            "    'backend': 'kiro_crew.mcp_gateway.backend' in sys.modules,\n"
+            "}))\n"
+        )
+        assert result["mcp_apps"] is False, "mcp_apps must load on first request, not at boot"
+        assert result["backend"] is False, "the gateway backend must not ride dashboard boot"
+
     def test_importing_origin_pulls_no_handler_tree(self) -> None:
         result = _probe(
             "import json, sys\n"
@@ -270,9 +295,7 @@ class TestDashboardImportIsLeaf:
             "    )),\n"
             "}))\n"
         )
-        assert result["server"] is False, (
-            "dashboard/__init__ must not eagerly import server"
-        )
+        assert result["server"] is False, "dashboard/__init__ must not eagerly import server"
         assert result["handlers"] is False
         assert result["aiohttp"] is False, (
             "origin's aiohttp import must stay under TYPE_CHECKING — the CSRF "
@@ -283,9 +306,9 @@ class TestDashboardImportIsLeaf:
             f"dashboard.origin pulled {result['modules']} modules; it was 1124 "
             "before the split and must stay a leaf"
         )
-        assert result["reexports_ok"] is True, (
-            "origin must keep re-exporting every name it used to define"
-        )
+        assert (
+            result["reexports_ok"] is True
+        ), "origin must keep re-exporting every name it used to define"
 
     def test_lazy_package_attributes_still_resolve(self) -> None:
         result = _probe(
@@ -327,7 +350,6 @@ class _CountingDb:
         self._db = db
         self.select_sources = 0
         self.last_seen_execute = 0
-        self.last_seen_executemany = 0
 
     def execute(self, sql, *args, **kwargs):
         if "FROM sources WHERE id" in sql:
@@ -336,24 +358,21 @@ class _CountingDb:
             self.last_seen_execute += 1
         return self._db.execute(sql, *args, **kwargs)
 
-    def executemany(self, sql, seq, *args, **kwargs):
-        seq = list(seq)
-        if "SET last_seen" in sql:
-            self.last_seen_executemany += 1
-        return self._db.executemany(sql, seq, *args, **kwargs)
-
     def __getattr__(self, name):
         return getattr(self._db, name)
 
 
 class TestFolderWatcherScanQueryCount:
     """A scan re-read ``sources.properties`` and issued a ``last_seen`` UPDATE
-    once per discovered file — up to 10,000 on-loop sqlite ops per scan."""
+    once per discovered file — up to 10,000 on-loop sqlite ops per scan.
+
+    Each store goes through ``test/conftest.py``'s ``opened`` fixture: the
+    batched ``last_seen`` flush runs on a worker connection, which a per-thread
+    ``close()`` from the test thread never reached.
+    """
 
     @pytest.mark.asyncio
-    async def test_pause_check_and_last_seen_are_not_per_file(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_pause_check_and_last_seen_are_not_per_file(self, tmp_path: Path, opened) -> None:
         from kiro_crew.knowledge.folder_watcher import (
             _PAUSE_RECHECK_FILES,
             FolderWatcher,
@@ -368,7 +387,7 @@ class TestFolderWatcherScanQueryCount:
         for i in range(n_files):
             (vault / f"note{i}.md").write_text(f"Note {i}", encoding="utf-8")
 
-        store = KnowledgeStore(tmp_path / "knowledge.db")
+        store = opened(KnowledgeStore(tmp_path / "knowledge.db"))
         pipeline = MagicMock()
         pipeline._dedup_enabled = False
         fw = FolderWatcher(store, pipeline)
@@ -382,7 +401,7 @@ class TestFolderWatcherScanQueryCount:
 
         # First pass records every file so the second pass takes the unchanged
         # (last_seen-only) branch for all of them.
-        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = ""):
+        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = "", **kw):
             return ["item-" + Path(file_path).name], "done"
 
         fw._ingest_file = _ingest  # type: ignore[assignment]
@@ -391,21 +410,33 @@ class TestFolderWatcherScanQueryCount:
 
         counting = _CountingDb(store.db)
         # ``KnowledgeStore.db`` is a read-only property backed by a per-thread
-        # connection; the scan runs on this thread, so swap the thread-local.
+        # connection. This wrapper covers the on-loop pause reads; the batched
+        # write now runs on a worker connection and is observed at its method
+        # boundary below instead.
         store._thread_local.conn = counting
+        batch_sizes: list[int] = []
+        original_flush = fw._flush_last_seen
+
+        def _counting_flush(batch):
+            batch_sizes.append(len(batch))
+            original_flush(batch)
+
+        fw._flush_last_seen = _counting_flush  # type: ignore[method-assign]
         await fw.scan_source(source)
 
         assert counting.select_sources <= 2, (
             f"{counting.select_sources} sources queries for {n_files} files — "
             "the pause check must not run per file"
         )
-        assert counting.last_seen_execute == 0, (
-            "last_seen touches must be batched, not issued one per file"
-        )
-        assert counting.last_seen_executemany == 1
+        assert (
+            counting.last_seen_execute == 0
+        ), "last_seen touches must be batched, not issued one per file"
+        assert batch_sizes == [
+            n_files
+        ], "all unchanged-file last_seen touches must land in one worker batch"
 
     @pytest.mark.asyncio
-    async def test_last_seen_is_still_written(self, tmp_path: Path) -> None:
+    async def test_last_seen_is_still_written(self, tmp_path: Path, opened) -> None:
         """The batching must not drop the touches it defers."""
         from kiro_crew.knowledge.folder_watcher import FolderWatcher
         from kiro_crew.knowledge.store import KnowledgeStore
@@ -414,12 +445,12 @@ class TestFolderWatcherScanQueryCount:
         vault.mkdir()
         (vault / "note.md").write_text("Note", encoding="utf-8")
 
-        store = KnowledgeStore(tmp_path / "knowledge.db")
+        store = opened(KnowledgeStore(tmp_path / "knowledge.db"))
         pipeline = MagicMock()
         pipeline._dedup_enabled = False
         fw = FolderWatcher(store, pipeline)
 
-        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = ""):
+        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = "", **kw):
             return ["item-1"], "done"
 
         fw._ingest_file = _ingest  # type: ignore[assignment]
@@ -446,7 +477,7 @@ class TestFolderWatcherScanQueryCount:
         assert row["last_seen"] != "1999-01-01", "batched last_seen was never flushed"
 
     @pytest.mark.asyncio
-    async def test_pause_still_stops_a_scan(self, tmp_path: Path) -> None:
+    async def test_pause_still_stops_a_scan(self, tmp_path: Path, opened) -> None:
         """Bounding the re-check must not remove the pause path."""
         from kiro_crew.knowledge.folder_watcher import FolderWatcher
         from kiro_crew.knowledge.store import KnowledgeStore
@@ -456,7 +487,7 @@ class TestFolderWatcherScanQueryCount:
         for i in range(5):
             (vault / f"note{i}.md").write_text(f"Note {i}", encoding="utf-8")
 
-        store = KnowledgeStore(tmp_path / "knowledge.db")
+        store = opened(KnowledgeStore(tmp_path / "knowledge.db"))
         fw = FolderWatcher(store, MagicMock())
         source_id = store.add_source(
             "t", "local_folder", str(vault), properties={"scan_paused": True}
@@ -510,9 +541,7 @@ class TestChangelogReadIsCached:
         assert reads["n"] == 1, f"CHANGELOG.md was read {reads['n']} times, expected 1"
 
     @pytest.mark.asyncio
-    async def test_edit_is_picked_up(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_edit_is_picked_up(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """The cache is keyed on the stat signature, so a dev-install edit must
         still be visible without a restart."""
         proj = tmp_path / "proj"
@@ -522,17 +551,16 @@ class TestChangelogReadIsCached:
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(updates, "_changelog_cache", None, raising=False)
 
-        assert json.loads((await updates.api_changelog(MagicMock())).body)[
-            "content"
-        ] == "first\n"
+        assert json.loads((await updates.api_changelog(MagicMock())).body)["content"] == "first\n"
 
         changelog.write_text("second edition\n", encoding="utf-8")
         st = changelog.stat()
         os.utime(changelog, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
 
-        assert json.loads((await updates.api_changelog(MagicMock())).body)[
-            "content"
-        ] == "second edition\n"
+        assert (
+            json.loads((await updates.api_changelog(MagicMock())).body)["content"]
+            == "second edition\n"
+        )
 
 
 class TestChannelPresetsReadIsCached:
@@ -566,9 +594,7 @@ class TestChannelPresetsReadIsCached:
         assert reads["n"] == 1, f"config.json was read {reads['n']} times, expected 1"
 
     @pytest.mark.asyncio
-    async def test_edit_is_picked_up(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_edit_is_picked_up(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cfg = tmp_path / "config.json"
         cfg.write_text(json.dumps({"channel_presets": [{"id": "a"}]}), encoding="utf-8")
         monkeypatch.setattr(handlers_channel, "config_path", lambda: cfg)
@@ -586,3 +612,63 @@ class TestChannelPresetsReadIsCached:
 
         resp = await handlers_channel.api_channel_presets(MagicMock())
         assert json.loads(resp.body)["presets"] == [{"id": "b"}, {"id": "c"}]
+
+
+# ── Optional MCP servers stay off the CLI import graph ─────────────────────
+
+
+class TestOptionalMcpServersAreNotImportedByTheCli:
+    """`kirocrew gateway` boots through ``cli``, so a module-scope import of an
+    optional, default-OFF subsystem runs on every gateway start and every other
+    command that will never dispatch to it. Each MCP server module is therefore
+    loaded inside its own dispatch branch.
+
+    An in-process ``sys.modules`` check cannot see this — pytest has already
+    imported the package — so the assertion runs in a clean interpreter.
+    """
+
+    def test_importing_cli_does_not_pull_the_mcp_server_modules(self) -> None:
+        got = _probe(
+            "import json, sys\n"
+            "import kiro_crew.cli\n"
+            "print(json.dumps({\n"
+            "    'dashboard': 'kiro_crew.mcp_dashboard' in sys.modules,\n"
+            "    'computer': 'kiro_crew.mcp_computer' in sys.modules,\n"
+            "}))\n"
+        )
+        assert got["dashboard"] is False, (
+            "kiro_crew.mcp_dashboard is imported at cli module scope — move it "
+            "into the mcp-dashboard dispatch branch (importlib) so a "
+            "default-disabled server costs gateway boot nothing"
+        )
+        assert got["computer"] is False
+
+
+# ── Gateway boot: the panel subsystem stays off the boot chain ──────────────
+
+
+class TestPanelSubsystemIsNotLoadedAtBoot:
+    """``dashboard/handlers/members.py`` is imported while the gateway boots, and
+    the panel subsystem is optional: a host that never assigns a panel would pay
+    for loading it before the socket is bound. Its one consumer imports it inside
+    the function, so the module must stay out of ``sys.modules``."""
+
+    def test_handlers_import_does_not_load_agent_panel(self) -> None:
+        result = _probe(
+            "import json, sys\n"
+            "import kiro_crew.dashboard.handlers  # noqa: F401\n"
+            "print(json.dumps({\n"
+            "    'panel': 'kiro_crew.agent_panel' in sys.modules,\n"
+            "    'members': 'kiro_crew.dashboard.handlers.members' in sys.modules,\n"
+            "}))\n"
+        )
+        # Pin the assumption the guard rests on: the boot chain really does pull
+        # the members handlers in. If that stops holding, this pin goes green for
+        # the wrong reason, so it must fail instead.
+        assert result["members"] is True, (
+            "the members handlers are no longer on the boot import chain; "
+            "move this pin to whatever imports agent_panel now"
+        )
+        assert (
+            result["panel"] is False
+        ), "importing the dashboard handlers must not load kiro_crew.agent_panel"

@@ -10,7 +10,9 @@ import { Send } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 import { api } from '../../../api/client'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { i18nT } from '../../../i18n/t'
+import { pullRequestErrorDetails } from '../../../utils/pullRequestErrors'
 
 const PUBLISH_EVENTS = ['COMMENT', 'REQUEST_CHANGES', 'APPROVE'] as const
 type PublishEvent = (typeof PUBLISH_EVENTS)[number]
@@ -76,7 +78,8 @@ export default function DraftReviewActions(
   // Only the PUBLISH failure belongs here. A failed READ is reported by the error
   // branch below in the user's own terms; echoing its raw provider text here too
   // would restate the same failure twice, once unreadably.
-  const err = publishMut.error instanceof Error ? publishMut.error.message : ''
+  const errDetails = publishMut.isError ? pullRequestErrorDetails(publishMut.error) : null
+  const err = errDetails?.message ?? ''
   // Publishing is refused server-side for either reason; mirror it here so the
   // buttons are absent rather than present-and-doomed.
   // Two further grounds, both about publishing findings that are not the ones on
@@ -213,7 +216,7 @@ export default function DraftReviewActions(
                   onKeyDown={e => { if (e.key === 'Escape') setConfirming(null) }}
                   onClick={() => { const ev = confirming; setConfirming(null); publishMut.mutate(ev) }}
                   disabled={publishMut.isPending}
-                  className="text-xs px-2.5 py-1.5 rounded-md border border-danger text-danger hover:bg-danger-subtle disabled:opacity-30 cursor-pointer bg-transparent"
+                  className="text-xs px-2.5 py-1.5 rounded-md border border-danger text-danger hover:text-danger-text hover:bg-danger-subtle disabled:opacity-30 cursor-pointer bg-transparent"
                 >
                   {i18nT(PUBLISH_LABEL_KEY[confirming])}
                 </button>
@@ -268,14 +271,18 @@ export default function DraftReviewActions(
         </>
       )}
       {err && (
-        <div className="text-danger text-xs mt-2">
-          {/* Lead with what failed, then the provider's words — the same shape as the
-              post button's failure, so an irreversible action is not the one place that
-              shows bare HTTP text. */}
-          <span className="font-medium">
-            {i18nT('apps.codeReviewSage.components.draftReviewActions.publish_failed')}
-          </span>{' '}
-          <span className="break-words font-normal opacity-90">{err}</span>
+        <div className="mt-2">
+          {/* The shared surface, not a hand-written red line: a publish rejection on
+              the one irreversible action here is exactly where the structured
+              context and the agent hand-off are worth having. Block, not inline:
+              the title, a provider sentence and the hand-off do not fit one row in
+              this bar's width — measured, they wrap to one word per line. */}
+          <ErrorNotice
+            title={i18nT('apps.codeReviewSage.components.draftReviewActions.publish_failed')}
+            message={err}
+            askAgent
+            askAgentLabel={i18nT('apps.codeReviewSage.components.draftReviewActions.ask_agent_about_this_failure')}
+          />
         </div>
       )}
     </div>

@@ -5,18 +5,42 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from kiro_crew.channel import ChannelManager, run_channel_agent
-from kiro_crew.config.loader import config_path
+from kiro_crew.channel import (
+    ApprovalPolicy,
+    ChannelManager,
+    ListenMode,
+    _offerable_base_binary,
+    run_channel_agent,
+)
+from kiro_crew.config.loader import coerce_config_field, config_path, read_config_text
 from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
 logger = logging.getLogger(__name__)
+
+
+def _deny_trust_grant(agent: Any, action: str, code: str, error: str) -> web.Response:
+    """Refuse a per-command trust request, SEL-logging the denial.
+
+    Every trust decision — grant OR refusal — must land in the audit trail;
+    an unlogged denial hides a stale-card click or a consent-proof mismatch
+    from the security record.
+    """
+    sel().log_tool_invocation(
+        session_key=agent.session_key,
+        agent=agent.agent_name,
+        source="channel",
+        tool_name=action,
+        outcome="trust_pattern_denied",
+        metadata={"code": code},
+    )
+    return web.json_response({"error": error, "code": code}, status=400)
 
 
 def _spawn_agent_task(agent, coro) -> asyncio.Task:
@@ -77,15 +101,46 @@ def _mgr(request: web.Request) -> ChannelManager:
     return mgr
 
 
+async def _json_object(request: web.Request) -> dict:
+    """Parse a JSON request body and require a top-level object.
+
+    Reads through :func:`read_bounded_json`, so a body without a JSON content
+    type is refused 415 before it is read. Raises instead of returning, which is
+    this module's contract: the refusal goes out as an ``HTTPException`` with the
+    helper's own status and ``code``.
+
+    Uncapped (``max_bytes=None``) on purpose: a channel message carries user
+    prose, and these routes never had a byte cap below the app-wide
+    ``client_max_size``. Adding one here would be a new limit, not a refactor.
+    """
+    # Body-scope import: importing ``handlers._shared`` runs the whole
+    # ``handlers`` package ``__init__``, which this module has never depended on
+    # at import time; only a body read needs it.
+    from kiro_crew.dashboard.handlers._shared import (
+        bounded_json_error_as_exception,
+        bounded_json_error_code,
+        read_bounded_json,
+    )
+
+    body, error = await read_bounded_json(request, max_bytes=None)
+    if error is not None:
+        if bounded_json_error_code(error) == "body_not_object":
+            # Same code as the helper; this module's message, kept for clients.
+            raise web.HTTPBadRequest(
+                text=('{"error":"request body must be a JSON object",' '"code":"body_not_object"}'),
+                content_type="application/json",
+            )
+        raise bounded_json_error_as_exception(error)
+    assert body is not None
+    return body
+
+
 async def _get_channel_body(request: web.Request):
     """Get channel + parsed JSON body, or raise web.HTTPException."""
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         raise web.HTTPNotFound(text='{"error":"not found"}', content_type="application/json")
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(text='{"error":"invalid JSON"}', content_type="application/json")
+    body = await _json_object(request)
     return ch, body
 
 
@@ -116,13 +171,13 @@ def _load_presets() -> object:
         return cached[1]
     config: dict = {}
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(read_config_text(path))
         if isinstance(parsed, dict):
             config = parsed
     except (OSError, json.JSONDecodeError):
         # Malformed config — fall through to defaults
         pass
-    presets = config.get("channel_presets", _DEFAULT_PRESETS)
+    presets = coerce_config_field(config, "channel_presets", list, _DEFAULT_PRESETS)
     _presets_cache = (key, presets)
     return presets
 
@@ -157,25 +212,75 @@ async def api_channel_get(request: web.Request) -> web.Response:
 
 
 async def api_channel_create(request: web.Request) -> web.Response:
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    topic = body.get("topic", "").strip()[:500]
+    body = await _json_object(request)
+    raw_topic = body.get("topic", "")
+    if not isinstance(raw_topic, str):
+        return web.json_response(
+            {"error": "topic must be a string", "code": "channel_topic_type_invalid"},
+            status=400,
+        )
+    topic = raw_topic.strip()[:500]
     if not topic:
-        return web.json_response({"error": "topic required"}, status=400)
+        return web.json_response(
+            {"error": "topic required", "code": "channel_topic_required"}, status=400
+        )
+
+    agents_def = body.get("agents", [])
+    if not isinstance(agents_def, list):
+        return web.json_response(
+            {"error": "agents must be an array", "code": "channel_agents_type_invalid"},
+            status=400,
+        )
+    valid_policies = {policy.value for policy in ApprovalPolicy}
+    for agent_def in agents_def:
+        if not isinstance(agent_def, dict):
+            return web.json_response(
+                {
+                    "error": "each agent must be an object",
+                    "code": "channel_agent_type_invalid",
+                },
+                status=400,
+            )
+        for field in ("role", "agent", "task"):
+            if field in agent_def and not isinstance(agent_def[field], str):
+                return web.json_response(
+                    {
+                        "error": f"agent {field} must be a string",
+                        "code": "channel_agent_field_type_invalid",
+                    },
+                    status=400,
+                )
+        if "is_orchestrator" in agent_def and not isinstance(agent_def["is_orchestrator"], bool):
+            return web.json_response(
+                {
+                    "error": "agent is_orchestrator must be a boolean",
+                    "code": "channel_agent_orchestrator_type_invalid",
+                },
+                status=400,
+            )
+        approval = agent_def.get("approval", "writes")
+        if not isinstance(approval, str) or approval not in valid_policies:
+            return web.json_response(
+                {
+                    "error": "invalid agent approval policy",
+                    "code": "channel_agent_approval_invalid",
+                },
+                status=400,
+            )
 
     ch = _mgr(request).create(topic)
     if not ch:
         return web.json_response(
-            {"error": "Channel limit reached. Close an existing channel first."},
+            {
+                "error": "Channel limit reached. Close an existing channel first.",
+                "code": "channel_limit_reached",
+            },
             status=429,
         )
 
     state: DashboardState = request.app["state"]
 
     # Spawn agents from preset
-    agents_def = body.get("agents", [])
     has_orchestrator = any(a.get("is_orchestrator") for a in agents_def)
     if not has_orchestrator:
         agents_def = [
@@ -209,18 +314,44 @@ async def api_channel_close(request: web.Request) -> web.Response:
 
 async def api_channel_post(request: web.Request) -> web.Response:
     ch, body = await _get_channel_body(request)
-    content = body.get("content", "").strip()[:10000]
+    raw_content = body.get("content", "")
+    if not isinstance(raw_content, str):
+        return web.json_response(
+            {
+                "error": "content must be a string",
+                "code": "channel_message_content_type_invalid",
+            },
+            status=400,
+        )
+    content = raw_content.strip()[:10000]
     if not content:
         return web.json_response({"error": "content required"}, status=400)
-    # Validate mentions
+    # Validate mentions. Membership is a dict lookup, so an unhashable value
+    # here raises TypeError rather than simply failing to match.
     raw_mention = body.get("mention")
-    if raw_mention:
+    if raw_mention is not None:
         if isinstance(raw_mention, list):
-            raw_mention = [m for m in raw_mention if m in ch.members]
+            if not all(isinstance(name, str) for name in raw_mention):
+                return _agent_field_error(
+                    "mention entries must be strings",
+                    "channel_message_mention_type_invalid",
+                )
+            raw_mention = [name for name in raw_mention if name in ch.members]
+        elif not isinstance(raw_mention, str):
+            return _agent_field_error(
+                "mention must be a string or an array of strings",
+                "channel_message_mention_type_invalid",
+            )
         elif raw_mention not in ch.members:
             raw_mention = None
     # Validate thread_id
     thread_id = body.get("thread_id")
+    if thread_id is not None:
+        if not isinstance(thread_id, str):
+            return _agent_field_error(
+                "thread_id must be a string",
+                "channel_message_thread_id_type_invalid",
+            )
     if thread_id and thread_id not in ch._msg_index:
         thread_id = None
     msg = await ch.post(
@@ -237,15 +368,41 @@ async def api_channel_post(request: web.Request) -> web.Response:
 # ── Agent management ──
 
 
+def _agent_field_error(error: str, code: str) -> web.Response:
+    return web.json_response({"error": error, "code": code}, status=400)
+
+
 async def api_channel_add_agent(request: web.Request) -> web.Response:
     ch, body = await _get_channel_body(request)
 
+    role = body.get("role", "Agent")
+    if not isinstance(role, str):
+        return _agent_field_error("role must be a string", "channel_agent_role_type_invalid")
+    agent_name = body.get("agent", "")
+    if not isinstance(agent_name, str):
+        return _agent_field_error("agent must be a string", "channel_agent_name_type_invalid")
+    task = body.get("task", ch.topic)
+    if not isinstance(task, str):
+        return _agent_field_error("task must be a string", "channel_agent_task_type_invalid")
+    is_orchestrator = body.get("is_orchestrator", False)
+    if not isinstance(is_orchestrator, bool):
+        return _agent_field_error(
+            "is_orchestrator must be a boolean",
+            "channel_agent_orchestrator_type_invalid",
+        )
+    try:
+        approval_policy = ApprovalPolicy(body.get("approval", "writes"))
+    except (TypeError, ValueError):
+        return _agent_field_error(
+            "approval must be a valid policy", "channel_agent_approval_invalid"
+        )
+
     agent = ch.add_agent(
-        role=body.get("role", "Agent")[:100],
-        agent_name=body.get("agent", ""),
-        task=body.get("task", ch.topic),
-        is_orchestrator=body.get("is_orchestrator", False),
-        approval_policy=body.get("approval", "writes"),
+        role=role[:100],
+        agent_name=agent_name,
+        task=task,
+        is_orchestrator=is_orchestrator,
+        approval_policy=approval_policy,
     )
     if not agent:
         return web.json_response(
@@ -254,7 +411,9 @@ async def api_channel_add_agent(request: web.Request) -> web.Response:
         )
 
     state: DashboardState = request.app["state"]
-    _spawn_agent_task(agent, run_channel_agent(agent, ch, state.sessions, is_yolo=lambda: state._yolo))
+    _spawn_agent_task(
+        agent, run_channel_agent(agent, ch, state.sessions, is_yolo=lambda: state._yolo)
+    )
     return web.json_response({"ok": True, "agent": agent.to_dict()})
 
 
@@ -264,20 +423,22 @@ async def api_channel_update_agent(request: web.Request) -> web.Response:
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
 
+    approval_policy = agent.approval_policy
+    listen_mode = agent.listen_mode
     if "approval" in body:
-        from kiro_crew.channel import ApprovalPolicy
-
         try:
-            agent.approval_policy = ApprovalPolicy(body["approval"])
-        except ValueError:
-            pass
+            approval_policy = ApprovalPolicy(body["approval"])
+        except (TypeError, ValueError):
+            return _agent_field_error(
+                "approval must be a valid policy", "channel_agent_approval_invalid"
+            )
     if "listen" in body:
-        from kiro_crew.channel import ListenMode
-
         try:
-            agent.listen_mode = ListenMode(body["listen"])
-        except ValueError:
-            pass
+            listen_mode = ListenMode(body["listen"])
+        except (TypeError, ValueError):
+            return _agent_field_error("listen must be a valid mode", "channel_agent_listen_invalid")
+    agent.approval_policy = approval_policy
+    agent.listen_mode = listen_mode
     ch._save()
     return web.json_response({"ok": True, "agent": agent.to_dict()})
 
@@ -305,7 +466,9 @@ async def api_channel_wake_agent(request: web.Request) -> web.Response:
         {"channel_id": ch.id, "agent_id": aid, "state": "listening"},
     )
     state: DashboardState = request.app["state"]
-    _spawn_agent_task(agent, run_channel_agent(agent, ch, state.sessions, is_yolo=lambda: state._yolo))
+    _spawn_agent_task(
+        agent, run_channel_agent(agent, ch, state.sessions, is_yolo=lambda: state._yolo)
+    )
     return web.json_response({"ok": True})
 
 
@@ -316,14 +479,89 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
     agent = ch.members.get(request.match_info["aid"])
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    action = body.get("action", "rejected")  # approved|rejected|trust
-    if action not in ("approved", "rejected", "trust"):
+    body = await _json_object(request)
+    action = body.get("action", "rejected")  # approved|rejected|trust|trust_command|trust_base
+    if action not in ("approved", "rejected", "trust", "trust_command", "trust_base"):
         return web.json_response({"error": "invalid action"}, status=400)
     if agent._approval_future and not agent._approval_future.done():
+        if action in ("trust_command", "trust_base"):
+            # Per-command grant scoped to THIS agent, derived SERVER-SIDE
+            # from the pending approval's canonical shell command (stashed by
+            # ``_stream_task`` from the provider's ``tool_input``). The
+            # request-body ``pattern`` is the CONSENT PROOF: it must agree
+            # with the pending command, so a click on a stale card (whose
+            # pattern describes an older command) or a card whose
+            # LLM-influenced title diverged from the real command fails
+            # closed instead of granting trust for a command the user never
+            # read. Grants are OPAQUE LITERALS (see ``ChannelAgent``): the
+            # exact tier stores the whole command text, matched by string
+            # equality; the base tier stores one shlex-derived binary name,
+            # refused outright for compound / quoted / env-prefixed /
+            # unparseable commands. No pattern language, no derived
+            # sub-patterns: a derived pattern widens scope beyond what the
+            # card displayed.
+            cmd = agent._pending_approval_command
+            if not cmd:
+                return _deny_trust_grant(
+                    agent,
+                    action,
+                    "pattern_underivable",
+                    "per-command trust needs a pending shell "
+                    "command; use approve or trust instead",
+                )
+            pattern = body.get("pattern", "")
+            if not isinstance(pattern, str) or not pattern:
+                return _deny_trust_grant(
+                    agent, action, "pattern_required", "pattern required for " + action
+                )
+            if action == "trust_command":
+                if pattern != cmd:
+                    return _deny_trust_grant(
+                        agent,
+                        action,
+                        "approval_superseded",
+                        "pattern does not match the pending " "command; the approval card is stale",
+                    )
+                agent._trusted_commands.add(cmd)
+                granted = f"command:{cmd}"
+            else:
+                # trust_base: the card consents to one binary ("Trust all
+                # <base> commands"). The binary must be derivable from the
+                # pending command as a SIMPLE invocation — a compound command
+                # has no single base to consent to, and its later standalone
+                # segment would run outside the shell context the user read
+                # ("cd /tmp/safe && rm target" does not license a bare
+                # "rm target" elsewhere).
+                base = _offerable_base_binary(cmd)
+                if base is None:
+                    return _deny_trust_grant(
+                        agent,
+                        action,
+                        "pattern_underivable",
+                        "per-command trust needs a pending shell "
+                        "command; use approve or trust instead",
+                    )
+                if pattern not in (base, f"{base} *"):
+                    return _deny_trust_grant(
+                        agent,
+                        action,
+                        "approval_superseded",
+                        "pattern does not match the pending " "command; the approval card is stale",
+                    )
+                agent._trusted_bases.add(base)
+                granted = f"base:{base}"
+            sel().log_tool_invocation(
+                session_key=agent.session_key,
+                agent=agent.agent_name,
+                source="channel",
+                tool_name=action,
+                outcome="trust_pattern_granted",
+                metadata={"granted": granted},
+            )
+            # The waiter maps "approved" to approving the pending tool; the
+            # grant above governs subsequent requests.
+            agent._approval_future.set_result("approved")
+            return web.json_response({"ok": True})
         agent._approval_future.set_result(action)
         if action == "trust":
             ch.trusted = True
@@ -367,18 +605,23 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         sel().log_api_access(
-            caller="dashboard", operation="channel.clear_context",
-            outcome="denied", source="dashboard",
+            caller="dashboard",
+            operation="channel.clear_context",
+            outcome="denied",
+            source="dashboard",
             resources=request.match_info["id"],
         )
         return web.json_response({"error": "not found"}, status=404)
 
     try:
-        body = await request.json()
-    except Exception:
+        body = await _json_object(request)
+    except web.HTTPBadRequest:
         sel().log_api_access(
-            caller="dashboard", operation="channel.clear_context",
-            outcome="denied", source="dashboard", resources=ch.id,
+            caller="dashboard",
+            operation="channel.clear_context",
+            outcome="denied",
+            source="dashboard",
+            resources=ch.id,
         )
         return web.json_response({"error": "invalid or missing request body"}, status=400)
 
@@ -388,8 +631,11 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
 
     if scope not in ("all", "agent"):
         sel().log_api_access(
-            caller="dashboard", operation="channel.clear_context",
-            outcome="denied", source="dashboard", resources=f"{ch.id}:{scope}",
+            caller="dashboard",
+            operation="channel.clear_context",
+            outcome="denied",
+            source="dashboard",
+            resources=f"{ch.id}:{scope}",
         )
         return web.json_response({"error": "invalid scope"}, status=400)
 
@@ -398,25 +644,34 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
     if scope == "agent":
         if not agent_id:
             sel().log_api_access(
-                caller="dashboard", operation="channel.clear_context",
-                outcome="denied", source="dashboard", resources=ch.id,
+                caller="dashboard",
+                operation="channel.clear_context",
+                outcome="denied",
+                source="dashboard",
+                resources=ch.id,
             )
             return web.json_response({"error": "agent_id required"}, status=400)
         agent = ch.members.get(agent_id)
         if not agent:
             sel().log_api_access(
-                caller="dashboard", operation="channel.clear_context",
-                outcome="denied", source="dashboard",
+                caller="dashboard",
+                operation="channel.clear_context",
+                outcome="denied",
+                source="dashboard",
                 resources=f"{ch.id}:{agent_id}",
             )
             return web.json_response({"error": "agent not found"}, status=404)
         if agent.session_key:
-            await state.sessions.reset(agent.session_key)
+            # ``ends_conversation``: the user asked this agent to forget the
+            # conversation, so its sub-agent runs have nothing left to report into. The
+            # default is the recycle, which is what the wedged-session and watchdog
+            # resets in `channel.py` want; this route is the opposite intent.
+            await state.sessions.reset(agent.session_key, ends_conversation=True)
             cleared.append(agent.role or agent.id)
     else:
         for agent in ch.members.values():
             if agent.session_key:
-                await state.sessions.reset(agent.session_key)
+                await state.sessions.reset(agent.session_key, ends_conversation=True)
                 cleared.append(agent.role or agent.id)
         ch.messages.clear()
         ch._msg_index.clear()
@@ -424,8 +679,10 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
         ch._save()
 
     sel().log_api_access(
-        caller="dashboard", operation="channel.clear_context",
-        outcome="allowed", source="dashboard",
+        caller="dashboard",
+        operation="channel.clear_context",
+        outcome="allowed",
+        source="dashboard",
         resources=f"{ch.id}:{scope}:{','.join(cleared)}",
     )
 

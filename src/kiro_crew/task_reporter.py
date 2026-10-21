@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import time
+from collections import Counter
 from pathlib import Path
+from typing import Awaitable, Callable, Protocol, Union, cast
 
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact_exfiltration_urls
 from kiro_crew.task_models import (
     PROGRESS_FILE,
     SESSION_PREFIX,
-    NotifyCallback,
     Project,
     Task,
     TaskStatus,
+    VerificationStatus,
 )
 from kiro_crew.task_planner import group_parallel_tasks
 
@@ -25,11 +28,58 @@ logger = logging.getLogger(__name__)
 # ── Notifications ──
 
 
+class SessionAwareNotify(Protocol):
+    """A notification sink that also accepts the run's originating conversation.
+
+    ``session_key`` is keyword-only **with a default** so a sink can adopt it
+    without changing its positional shape. It names the conversation the run was
+    started FROM, which is what lets a sink route a stall-worthy notice back to
+    the surface the operator is watching instead of one hard-wired destination.
+    Empty means "no originating conversation" (a dashboard or CLI start), never
+    "route it anywhere".
+    """
+
+    def __call__(
+        self, title: str, body: str, task_id: str = "", *, session_key: str = ""
+    ) -> Awaitable[None]: ...
+
+
+LegacyNotify = Callable[[str, str, str], Awaitable[None]]
+
+# A union, not one widened signature, because no single signature is satisfied by
+# both shapes: a Protocol declaring ``session_key`` rejects every sink that
+# predates it (the CLI's printer, a dozen test doubles), while
+# ``Callable[[str, str, str], ...]`` rejects the caller for passing the keyword.
+# Spelling the transition in the type keeps mypy checking the arity of both,
+# where a ``Callable[..., Awaitable[None]]`` escape hatch would check neither.
+NotifyCallback = Union[SessionAwareNotify, LegacyNotify]
+
+
+def _accepts_session_key(callback: NotifyCallback) -> bool:
+    """Whether *callback* takes the ``session_key`` keyword.
+
+    Probed rather than assumed, and probed rather than discovered by letting the
+    ``TypeError`` fly: :func:`notify` swallows sink failures at debug level, so
+    an unconditional keyword handed to a legacy three-argument sink would not
+    surface anywhere — that sink's notifications would simply stop arriving. A
+    ``TypeError`` retry is no better, since it cannot tell an arity mismatch
+    from one raised inside the sink's own body. An unintrospectable callable
+    (a C builtin) reads as legacy, which is the lossless direction.
+    """
+    try:
+        inspect.signature(callback).bind("", "", "", session_key="")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 async def notify(
     title: str,
     body: str,
     run: Project | None = None,
     callback: NotifyCallback | None = None,
+    *,
+    session_key: str = "",
 ) -> None:
     """Send notification via callback if registered."""
     if run:
@@ -38,8 +88,17 @@ async def notify(
     title = redact_exfiltration_urls(title)[0]
     body = redact_exfiltration_urls(body)[0]
     if callback:
+        task_id = run.task_id if run else ""
         try:
-            await callback(title, body, run.task_id if run else "")
+            # Widen the call only when there is a conversation to carry, so a
+            # notification with no origin reaches every sink through the exact
+            # call it received before this parameter existed.
+            if session_key and _accepts_session_key(callback):
+                await cast(SessionAwareNotify, callback)(
+                    title, body, task_id, session_key=session_key
+                )
+            else:
+                await cast(LegacyNotify, callback)(title, body, task_id)
         except Exception:
             logger.debug("Notification failed", exc_info=True)
 
@@ -48,7 +107,14 @@ async def notify(
 
 
 def save_progress(run: Project) -> None:
-    """Write TASK_PROGRESS.md next to the spec file."""
+    """Write TASK_PROGRESS.md next to the spec file, when the run has one."""
+    if run.execution_context and run.execution_context.memory_mode != "persistent":
+        return
+    if not run.spec_path:
+        # Ad-hoc plans have no spec directory.  Treating Path("").parent as a
+        # destination leaks TASK_PROGRESS.md into the gateway's current working
+        # directory (and into the repository during tests).
+        return
     spec_dir = Path(run.spec_path).parent
     progress_path = spec_dir / PROGRESS_FILE
     try:
@@ -93,7 +159,11 @@ def save_progress(run: Project) -> None:
 def load_checkpoint(spec_path: Path) -> set[str] | None:
     """Read TASK_PROGRESS.md and return set of completed task titles (lowercase).
 
-    Returns None if no checkpoint exists or it cannot be parsed.
+    Returns None if no checkpoint exists or it cannot be parsed. The progress file
+    is shared by every spec in one directory, and :func:`save_progress` records which
+    spec wrote it on its ``**Spec:**`` line, so a file written for a DIFFERENT spec is
+    no checkpoint for this one and also returns None. A file with no ``**Spec:**``
+    line is read as before.
     """
     progress = spec_path.parent / PROGRESS_FILE
     if not progress.exists():
@@ -105,6 +175,11 @@ def load_checkpoint(spec_path: Path) -> set[str] | None:
 
     completed: set[str] = set()
     for line in content.splitlines():
+        spec_match = re.match(r"^\*\*Spec:\*\* `(.+)`\s*$", line)
+        if spec_match:
+            if spec_match.group(1) != spec_path.name:
+                return None
+            continue
         match = re.match(r"^- ✅ \*\*Task \d+:\*\* (.+?)(?:\s*\(attempts:.*\))?$", line)
         if not match:
             # Backward compat: also match old "Step N:" format
@@ -172,6 +247,7 @@ def build_status(
                         "title": t.title,
                         "description": t.description if t.description != t.title else "",
                         "status": t.status.value,
+                        "verification": t.verification,
                         "error": t.error or "",
                         "result": (t.result or "")[:2000],
                         "attempts": t.attempts,
@@ -229,6 +305,11 @@ def format_completion_summary(run: Project) -> str:
         f"**{passed}/{len(run.tasks)}** tasks passed" + (f" · {failed} failed" if failed else ""),
         f"⏱ {time_str}",
     ]
+    # Execution passing is not verification: only an exit-0 test run counts.
+    verdicts = Counter((t.verification or "not run").replace("_", " ") for t in run.tasks)
+    verified = verdicts.pop(VerificationStatus.PASSED, 0)
+    others = "".join(f" · {n} {v}" for v, n in sorted(verdicts.items()))
+    lines.append(f"🧪 {verified}/{len(run.tasks)} verified{others}")
     if run.tokens_used:
         lines.append(f"🪙 ~{run.tokens_used // 1000}K tokens")
     if run.replan_count:

@@ -3,8 +3,8 @@
 The model picker loads its list once via React Query and caches the result. A
 successful (HTTP 200) empty list is cached as "there are zero models" and only a
 manual page refresh re-fires the request. The common trigger was a slow cold
-`kiro-cli --list-models` spawn: on timeout / spawn failure the handler used to
-return `[]` with HTTP 200, so the picker rendered empty until refresh.
+`kiro-cli --list-models` spawn: on timeout / spawn failure, returning
+`[]` with HTTP 200 leaves the picker rendered empty until refresh.
 
 These tests pin the fix: every DEGRADED branch (binary unresolved, timeout,
 unexpected exception) must return HTTP 503 so the frontend's fetch helper throws
@@ -16,14 +16,52 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from kiro_crew import sandbox
 from kiro_crew.dashboard.handlers import agents
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+
+def _drain_catalog_task():
+    # A degraded fetch that timed out at the request bound leaves its background
+    # task running; cancel and await it before clearing the slot so it cannot
+    # resume after this test's patches exit and run real sandbox / kiro-cli
+    # resolution against a later test (no-test-side-effects).
+    task = agents._catalog_cache.task
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        asyncio.get_event_loop().run_until_complete(asyncio.gather(task, return_exceptions=True))
+    except RuntimeError:
+        # No usable loop (closed/none): the task is detached from any live loop,
+        # so clearing the slot is enough — it has no loop to resume on.
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog_cache():
+    # The catalog is cached in a module-level singleton (one slow success warms
+    # every later poll). Reset it around each test so a success in one does not
+    # short-circuit the degraded-branch fetch another is pinning.
+    _drain_catalog_task()
+    agents._catalog_cache.models = None
+    agents._catalog_cache.fetched_at = 0.0
+    agents._catalog_cache.task = None
+    agents._catalog_cache.failure = None
+    yield
+    _drain_catalog_task()
+    agents._catalog_cache.models = None
+    agents._catalog_cache.fetched_at = 0.0
+    agents._catalog_cache.task = None
+    agents._catalog_cache.failure = None
 
 
 async def _no_audit(**kwargs: Any) -> None:
@@ -71,7 +109,12 @@ def _run(coro):
 
 async def _raise_timeout(awaitable, timeout):
     del timeout
-    awaitable.close()
+    # api_models awaits asyncio.shield(task) (a Future), while the background
+    # fetch awaits proc.communicate() (a coroutine). Close the coroutine so it
+    # does not warn; a Future has no close() and needs none.
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
     raise asyncio.TimeoutError
 
 
@@ -86,6 +129,8 @@ class _FakeProc:
         self._stdout = stdout
         self._stderr = stderr
         self.returncode = returncode
+        # Above every platform's pid_max: a timeout's group kill can reach no one.
+        self.pid = 99_999_999_999
 
     def kill(self):  # noqa: D401 - matches Process API
         pass
@@ -95,8 +140,9 @@ class _FakeProc:
 
 
 def test_kiro_binary_unresolved_returns_503(tmp_path):
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value=""
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value=""),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
@@ -104,133 +150,126 @@ def test_kiro_binary_unresolved_returns_503(tmp_path):
 
 
 def test_list_models_timeout_returns_503(tmp_path):
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=_FakeProc()
-    ), patch.object(
-        agents.asyncio, "wait_for", new=_raise_timeout
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=_FakeProc()),
+        patch.object(agents.asyncio, "wait_for", new=_raise_timeout),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert "error" in _body(resp)
+    # The timeout branch itself answered, not the generic exception handler.
+    assert _body(resp) == {"error": "model list timed out", "code": "model_list_unavailable"}
 
 
 def test_list_models_nonzero_exit_returns_503(tmp_path):
     proc = _FakeProc(stderr=b"sandbox initialization failed", returncode=71)
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch(
-        "kiro_crew.platform.redact_via_context", lambda text: text
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=proc
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch("kiro_crew.platform.redact_via_context", lambda text: text),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=proc),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list command failed"}
+    assert _body(resp) == {"error": "model list command failed", "code": "model_list_unavailable"}
 
 
 def test_list_models_empty_stdout_returns_503(tmp_path):
     proc = _FakeProc(returncode=0)
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=proc
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=proc),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list returned empty output"}
+    assert _body(resp) == {
+        "error": "model list returned empty output",
+        "code": "model_list_unavailable",
+    }
 
 
 def test_list_models_invalid_json_returns_503(tmp_path):
     proc = _FakeProc(stdout=b"not-json", returncode=0)
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=proc
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=proc),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list returned invalid JSON"}
+    assert _body(resp) == {
+        "error": "model list returned invalid JSON",
+        "code": "model_list_unavailable",
+    }
 
 
 def test_list_models_invalid_payload_returns_503(tmp_path):
     payload = json.dumps({"models": {"unexpected": "mapping"}}).encode()
     proc = _FakeProc(stdout=payload, returncode=0)
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=proc
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=proc),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list returned an invalid payload"}
+    assert _body(resp) == {
+        "error": "model list returned an invalid payload",
+        "code": "model_list_unavailable",
+    }
 
 
 def test_unexpected_exception_returns_503(tmp_path):
     # A failure inside the try (here: kiro-bin resolution raising) must be
     # caught and surfaced as 503, not a cached empty 200.
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", side_effect=RuntimeError("boom")
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", side_effect=RuntimeError("boom")),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
 
 
 def test_successful_list_returns_200_with_models(tmp_path):
-    payload = json.dumps({"models": [{"model_name": "claude-opus-4.8", "description": "x"}]}).encode()
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
+    payload = json.dumps(
+        {"models": [{"model_name": "claude-opus-4.8", "description": "x"}]}
+    ).encode()
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 200
@@ -238,13 +277,22 @@ def test_successful_list_returns_200_with_models(tmp_path):
     assert any(m["model_name"] == "claude-opus-4.8" for m in models)
 
 
-def test_successful_list_launches_resolved_binary_in_place(tmp_path):
+def test_successful_list_launches_resolved_binary_in_place(tmp_path, monkeypatch):
     # The resolved binary is exec'd at its own path with no inherited snapshot
     # descriptor: a copy/memfd would strand a multi-call CLI's sibling
     # subcommand executable and every spawn would fail with ENOENT.
     payload = json.dumps({"models": [{"model_name": "claude-opus-4.8"}]}).encode()
     resolved = "/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli"
     spawn = AsyncMock(return_value=_FakeProc(payload))
+    env_file = tmp_path / ".env"
+    env_file.write_text("KIRO_API_KEY=model-list-key\n", encoding="utf-8")
+    monkeypatch.delenv("KIRO_API_KEY", raising=False)
+    monkeypatch.setattr("kiro_crew.config.loader.env_path", lambda: env_file)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "FAKE-secret")
+    monkeypatch.setenv("PYTHONPATH", "/gateway/pythonpath")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-FAKE")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE-akid")
+    monkeypatch.setenv("KIROCREW_UNRELATED_KEEPME", "keep-this-value")
     with (
         patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
         patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value=resolved),
@@ -263,6 +311,13 @@ def test_successful_list_launches_resolved_binary_in_place(tmp_path):
     assert resolved in argv, argv
     assert not any("kiro-cli-snapshots" in str(a) for a in argv), argv
     assert "pass_fds" not in spawn.await_args.kwargs
+    env = spawn.await_args.kwargs["env"]
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "PYTHONPATH" not in env
+    assert "SLACK_BOT_TOKEN" not in env
+    assert env["KIRO_API_KEY"] == "model-list-key"
+    assert env["AWS_ACCESS_KEY_ID"] == "FAKE-akid"
+    assert env["KIROCREW_UNRELATED_KEEPME"] == "keep-this-value"
 
 
 def test_structured_context_window_seeds_central_authority(tmp_path):
@@ -293,25 +348,78 @@ def test_structured_context_window_seeds_central_authority(tmp_path):
             ]
         }
     ).encode()
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
-    ), patch.object(
-        agents.asyncio, "wait_for", return_value=(payload, b"")
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 200
     # The non-registry GPT window is now resolvable through the central authority.
     assert mr.model_window("gpt-5.6-terra") == 272000
+
+
+def test_catalog_warms_the_acp_advertised_cache_unfiltered(tmp_path, monkeypatch):
+    # The same --list-models rows that seed the window authority also warm the
+    # ``acp`` advertised-model cache, kiro's VOCABULARY, so model_scope can tell
+    # a pin chosen for another harness from a native one before any session
+    # exists. Fed from the UNFILTERED catalog: a deprecated row is still a kiro
+    # id, and a vocabulary that omitted it would make a native pin read as
+    # foreign. Both spellings of a row are collected, like refresh_kiro_windows.
+    import kiro_crew.model_registry as mr
+    from kiro_crew.dashboard import chat_utils
+
+    monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+    monkeypatch.setattr(
+        chat_utils, "_DEPRECATED_MODEL_MAP", {"claude-sonnet-4": "claude-sonnet-4.6"}
+    )
+    persisted: list[str] = []
+    monkeypatch.setattr(mr, "persist_advertised_models", lambda: persisted.append("acp"))
+    payload = json.dumps(
+        {
+            "models": [
+                {"model_name": "auto", "model_id": "auto", "context_window_tokens": 200000},
+                {
+                    "model_name": "claude-opus-4.8",
+                    "model_id": "claude-opus-4.8",
+                    "context_window_tokens": 1000000,
+                },
+                {
+                    "model_name": "claude-sonnet-4",
+                    "model_id": "sonnet-4-id",
+                    "context_window_tokens": 200000,
+                },
+            ]
+        }
+    ).encode()
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)),
+    ):
+        resp = _run(agents.api_models(_kiro_request(tmp_path)))
+    assert resp.status == 200
+    # The response still drops the deprecated row...
+    assert [m["model_name"] for m in _body(resp)] == ["auto", "claude-opus-4.8"]
+    # ...while the vocabulary keeps it, under both of its spellings.
+    assert mr.advertised_models("acp") == [
+        "auto",
+        "claude-opus-4.8",
+        "sonnet-4-id",
+        "claude-sonnet-4",
+    ]
+    # The disk persist was offloaded (through the executor), not skipped.
+    assert persisted == ["acp"]
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +433,9 @@ def test_list_models_spawns_at_the_configured_sandbox_tier(tmp_path):
     ``wrap_argv``'s mode parameter defaults to ``"auto"``, which ignores what the
     operator configured. Where ``agent.sandbox`` is an explicit ``"off"``
     (isolation deferred to kiro-cli's own internal sandbox, which cannot nest
-    inside Kiro Crew's), taking that default asked for a STRICTER tier than chat
-    itself runs under — and on a host with no backend at all (every Windows host,
-    macOS >= 26) it fail-closed while chat worked fine.
+    inside Kiro Crew's), taking that default asks for a STRICTER tier than chat
+    itself runs under. Explicit Windows Kiro classification delegates either
+    tier, but the configured-tier invariant remains cross-platform.
     """
     payload = json.dumps({"models": [{"model_name": "claude-opus-4.8"}]}).encode()
     seen: dict[str, Any] = {}
@@ -336,22 +444,16 @@ def test_list_models_spawns_at_the_configured_sandbox_tier(tmp_path):
         seen.update(kwargs)
         return argv, None
 
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
-        "kiro_crew.env.augmented_path", lambda p: p
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.configured_sandbox_mode", lambda: "off"
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _record
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
-    ), patch(
-        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
-    ), patch.object(
-        agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
-    ), patch.object(
-        agents.asyncio, "wait_for", return_value=(payload, b"")
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.configured_sandbox_mode", lambda: "off"),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _record),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)),
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
 
@@ -399,12 +501,12 @@ def test_sandbox_refusal_is_reported_with_a_machine_readable_code(tmp_path, capl
             detail="not Linux",
         )
 
-    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
-        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
-    ), patch("kiro_crew.env.augmented_path", lambda p: p), patch(
-        "kiro_crew.dashboard.handlers.agents.configured_sandbox_mode", lambda: "auto"
-    ), patch(
-        "kiro_crew.dashboard.handlers.agents.wrap_argv", _refuse
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.configured_sandbox_mode", lambda: "auto"),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _refuse),
     ):
         with caplog.at_level(logging.WARNING, logger=agents.logger.name):
             resp = _run(agents.api_models(_kiro_request(tmp_path)))
@@ -418,3 +520,42 @@ def test_sandbox_refusal_is_reported_with_a_machine_readable_code(tmp_path, capl
     }
     # The remedy reaches the operator rather than a bare traceback.
     assert any("not Linux" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_ssh_auth_sock_resolver_runs_off_the_event_loop(tmp_path):
+    """``_resolve_ssh_auth_sock`` globs ``/tmp/ssh-*/agent.*`` and ``os.stat``s
+    every hit, so its latency scales with the ``/tmp`` entry count. The frontend
+    polls this endpoint every 8s while the model list is degraded, so an on-loop
+    call stalls chat, cron and the liveness heartbeat on exactly the host where
+    the probe is slowest. Its sibling wrapper's docstring states the rule: never
+    on the event loop. Same shape as
+    ``test_acp_spawn_offload.py``'s resolver assertions.
+    """
+    payload = json.dumps({"models": [{"model_name": "claude-opus-4.8"}]}).encode()
+    seen: list[threading.Thread] = []
+
+    def _probe(env):
+        seen.append(threading.current_thread())
+        return None
+
+    async def _drive():
+        loop_thread = threading.current_thread()
+        resp = await agents.api_models(_kiro_request(tmp_path))
+        return loop_thread, resp
+
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
+        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch("kiro_crew.acp.client._resolve_ssh_auth_sock", _probe),
+        patch("kiro_crew.env.augmented_path", lambda p: p),
+        patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv),
+        patch("kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv),
+        patch("kiro_crew.sandbox.resource_limit_preexec", lambda: None),
+        patch.object(agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)),
+    ):
+        loop_thread, resp = _run(_drive())
+
+    assert resp.status == 200
+    assert seen, "_resolve_ssh_auth_sock was never called by api_models"
+    for thread in seen:
+        assert thread is not loop_thread, "ssh resolver ran on the event loop thread"

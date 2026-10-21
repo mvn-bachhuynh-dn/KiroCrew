@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { join } from 'node:path'
+import { readSource } from './readSource'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { OverflowMenu, breadcrumbSegments } from '../components/MarkdownPanel'
+import { store } from '../store'
+import { ThemeProvider } from '../hooks/useTheme'
+import { OverflowMenu, breadcrumbSegments, FileHeaderBreadcrumb } from '../components/MarkdownPanel'
 import { api } from '../api/client'
+import { i18nT } from '../i18n/t'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -11,19 +16,51 @@ vi.mock('../api/client', () => ({
     artifact: vi.fn(),
     createArtifact: vi.fn(),
     revealPath: vi.fn(),
+    // The contributed-row seam subscribes to `['apps']` without fetching, and
+    // dispatches an activation through `invokeFileMenuItem`.
+    listApps: vi.fn(),
+    invokeFileMenuItem: vi.fn().mockResolvedValue({}),
   },
+  // revealOrOpen branches its failure wording on `err instanceof ApiError`, so
+  // the mock must export a real class — a bare object would make `instanceof`
+  // throw before the alert fires.
+  ApiError: class ApiError extends Error {
+    status: number
+    authRequired: boolean
+    constructor(status: number, message: string, _body = '', authRequired = false) {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.authRequired = authRequired
+    }
+  },
+}))
+
+// The overflow's Open/Reveal entries gate on directLocal (a remote session
+// cannot usefully drive Finder on the gateway). Default to a local session so
+// the inventory/label assertions see them; the remote case is its own test.
+const brandingEnv = vi.hoisted(() => ({ directLocal: true }))
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: brandingEnv.directLocal }),
 }))
 
 const writeText = vi.fn()
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+// ThemeProvider mirrors the shipped tree (`main.tsx` mounts it above the whole
+// app): a contributed row's icon renders through `AppIcon`, which reads
+// `useTheme()` to pick its light/dark asset, so the harness needs the same
+// context the real mount sites already sit inside.
 const wrapper = ({ children }: { children: React.ReactNode }) => (
   <MemoryRouter>
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider>{children}</ThemeProvider>
+    </QueryClientProvider>
   </MemoryRouter>
 )
 
 beforeEach(() => {
   writeText.mockReset()
+  brandingEnv.directLocal = true
   queryClient.clear()
   // happy-dom's navigator.clipboard is getter-only; defineProperty replaces it.
   Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
@@ -33,10 +70,15 @@ beforeEach(() => {
   // Desktop present by default: the backend acted, nothing to copy back.
   vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true })
   vi.spyOn(window, 'alert').mockImplementation(() => {})
+  overflowError.mockReset()
 })
 
+/** Where a standalone OverflowMenu reports a failed row action (the panel
+ *  renders it through ErrorNotice in production). */
+const overflowError = vi.fn()
+
 function openMenu() {
-  render(<OverflowMenu filePath="/tmp/hello.txt" content={'line one\nline two\n'} />, { wrapper })
+  render(<OverflowMenu onError={overflowError} filePath="/tmp/hello.txt" content={'line one\nline two\n'} />, { wrapper })
   fireEvent.click(screen.getAllByRole('button')[0])
 }
 
@@ -67,7 +109,7 @@ describe('MarkdownPanel OverflowMenu', () => {
   })
 
   it('Copy content copies an empty string for an empty file without throwing', () => {
-    render(<OverflowMenu filePath="/tmp/empty.txt" content="" />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/empty.txt" content="" />, { wrapper })
     fireEvent.click(screen.getAllByRole('button')[0])
     fireEvent.click(screen.getByText('Copy content'))
     expect(writeText).toHaveBeenCalledExactlyOnceWith('')
@@ -102,20 +144,67 @@ describe('MarkdownPanel OverflowMenu', () => {
     expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
   })
 
-  it('tells the user the path was copied when the host has no desktop', async () => {
+  // A remote/tunneled session cannot usefully open Finder on the gateway, so
+  // the two desktop hand-off entries are gated on directLocal — matching the
+  // shared FilePathMenu, which self-gates on the same flag. The clipboard and
+  // download fallbacks stay.
+  it('hides both desktop hand-off entries on a remote session (directLocal false)', () => {
+    brandingEnv.directLocal = false
+    openMenu()
+    expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+    expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    expect(screen.getByText('Copy path')).toBeInTheDocument()
+    expect(screen.getByText('Copy content')).toBeInTheDocument()
+  })
+
+  /**
+   * The reveal entry names the GATEWAY's file manager: `/api/reveal` shells out
+   * there, so a dashboard opened from a Mac against a Linux gateway must not say
+   * Finder. `'gateway'` is the sentinel a non-owner dashboard user gets and must
+   * never be read as a platform we can name.
+   */
+  it.each([
+    ['darwin', 'Open in Finder'],
+    ['win32', 'Open in File Explorer'],
+    ['gateway', 'Show in file manager'],
+    ['linux', 'Show in file manager'],
+  ])('names the reveal entry for a %s gateway host', (platform, label) => {
+    queryClient.setQueryData(['kiro-prerequisite'], { platform })
+    openMenu()
+    expect(screen.getByText(label)).toBeInTheDocument()
+    fireEvent.click(screen.getByText(label))
+    expect(api.revealPath).toHaveBeenCalledExactlyOnceWith('/tmp/hello.txt', 'reveal')
+  })
+
+  it('never offers two spellings of the same reveal entry at once', () => {
+    queryClient.setQueryData(['kiro-prerequisite'], { platform: 'darwin' })
+    openMenu()
+    expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open in File Explorer')).not.toBeInTheDocument()
+  })
+
+  // The copy fallback is centralized in revealOrOpen (FilePathMenu.tsx),
+  // which calls api.revealPath and then copyToClipboard itself without an
+  // alert, so every call site — including this panel — is covered without a
+  // local alert. Asserting no local alert here keeps the panel from adding
+  // one once it resolves through the (mocked) real client.
+  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
     vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true, copy: '/tmp/hello.txt' })
     openMenu()
     fireEvent.click(screen.getByText('Show in file manager'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(
-      'Path copied to clipboard (no desktop available)',
-    ))
+    await waitFor(() => expect(api.revealPath).toHaveBeenCalled())
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('surfaces the server message when the reveal is refused', async () => {
+  it('shows the shared i18n failure message when the reveal is refused', async () => {
+    // The overflow funnels reveal failures through the shared FilePathMenu path,
+    // which shows a neutral catalog string rather than leaking the raw server
+    // message (which could name an internal path or reason).
     vi.mocked(api).revealPath = vi.fn().mockRejectedValue(new Error('access denied'))
     openMenu()
     fireEvent.click(screen.getByText('Open with default app'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('access denied'))
+    await waitFor(() => expect(overflowError).toHaveBeenCalledWith(i18nT('components.filePathMenu.reveal_failed')))
+    expect(window.alert).not.toHaveBeenCalled()
   })
 })
 
@@ -157,7 +246,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
 
   it('renders exactly six entries with no optional props and no library match', async () => {
     stubKnowledge({ enabled: false, alreadyAdded: false })
-    render(<OverflowMenu filePath="/tmp/hello.bin" content="x" />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/hello.bin" content="x" />, { wrapper })
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
     await waitFor(() => expect(screen.getByText('Add to artifacts')).toBeInTheDocument())
     expect(itemsInOrder()).toEqual([
@@ -175,7 +264,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
     vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [{ slug: 'notes-md', name: 'notes.md' }] })
     vi.mocked(api).artifact = vi.fn().mockResolvedValue({ live_dirty: false, pinned: false })
     render(
-      <OverflowMenu
+      <OverflowMenu onError={overflowError}
         filePath="/tmp/notes.md"
         content="x"
         onRefresh={vi.fn()}
@@ -203,7 +292,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
   it('swaps Full screen for Exit full screen without changing the rest of the list', async () => {
     stubKnowledge({ enabled: false, alreadyAdded: false })
     render(
-      <OverflowMenu filePath="/tmp/hello.bin" content="x" onFullscreen={vi.fn()} fullscreen />,
+      <OverflowMenu onError={overflowError} filePath="/tmp/hello.bin" content="x" onFullscreen={vi.fn()} fullscreen />,
       { wrapper },
     )
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
@@ -220,15 +309,83 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
     expect(screen.queryByText('Full screen')).not.toBeInTheDocument()
   })
 
+  /* Re-homed from the old Files tab, which had its own add-to-library control
+   * on each file row. That tab now lists links only, so this guard lives here —
+   * the file editor is the remaining way a plain file enters the library, and
+   * the failure it prevents is silent, permanent data loss. */
+  it('refuses to add a truncated read instead of persisting the prefix', async () => {
+    // /api/file-read caps very large files and says so in a header. Promoting
+    // that body would store the PREFIX as though it were the whole document,
+    // and a disposable file is COPIED, so the original is not referenced.
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'X-Truncated': 'true' }),
+      text: () => Promise.resolve('the first 512 KB only'),
+    }) as never
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/huge.txt" content={'prefix'} />, { wrapper })
+    fireEvent.click(screen.getAllByRole('button')[0])
+    fireEvent.click(await screen.findByText('Add to artifacts'))
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled())
+    expect(api.createArtifact).not.toHaveBeenCalled()
+  })
+
+  it('adds a complete read, so the refusal above is the header and not a dead path', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers(),
+      text: () => Promise.resolve('the whole file'),
+    }) as never
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/small.txt" content={'the whole file'} />, { wrapper })
+    fireEvent.click(screen.getAllByRole('button')[0])
+    fireEvent.click(await screen.findByText('Add to artifacts'))
+
+    await waitFor(() => expect(api.createArtifact).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(api.createArtifact).mock.calls[0][0]).toMatchObject({
+      content: 'the whole file', source_path: '/tmp/small.txt',
+    })
+  })
+
   it('renders the already-in-library row as a non-actionable status, not a menu item', async () => {
     stubKnowledge({ enabled: true, alreadyAdded: true })
-    render(<OverflowMenu filePath="/tmp/notes.md" content="x" />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/notes.md" content="x" />, { wrapper })
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
     await waitFor(() => expect(screen.getByText('In Library')).toBeInTheDocument())
     // It is a <span>: nothing happens when it is activated, so exposing it to
     // roving focus as a menuitem would be a dead stop on the keyboard path.
     expect(itemsInOrder()).not.toContain('In Library')
     expect(screen.queryByText('Add to Knowledge')).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * The menu opens with real DOM focus on its first row (`useListboxKeyboard`,
+ * WAI-ARIA menu pattern), so whichever tint marks the focused row is on screen
+ * from the moment the menu appears — before the pointer has gone anywhere near
+ * it. That tint must therefore be scoped to `focus-visible`, which a
+ * script-moved focus only matches when a keypress moved it: a bare `focus:`
+ * tint is the same colour as `hover:`, leaving the first row lit for the whole
+ * time the menu is open and two rows lit as soon as the pointer picks another.
+ *
+ * Asserted across the whole inventory, not just the first row: the way this
+ * regresses is a new entry pasted from an existing one.
+ */
+describe('OverflowMenu roving-focus tint', () => {
+  const rows = () => Array.from(document.querySelectorAll<HTMLElement>('[role="menu"] [role="menuitem"]'))
+
+  it('focuses the first row on open and tints rows only under :focus-visible', async () => {
+    render(
+      <OverflowMenu onError={overflowError} filePath="/tmp/notes.md" content="x" onRefresh={vi.fn()} onFullscreen={vi.fn()} />,
+      { wrapper },
+    )
+    fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
+    expect(rows()[0]).toHaveTextContent('Refresh')
+    // The hook moves focus in a 0ms timeout, so it lands after this tick.
+    await waitFor(() => expect(document.activeElement).toBe(rows()[0]))
+    for (const row of rows()) {
+      expect(row.className).toContain('focus-visible:bg-bg-hover')
+      expect(row.className).not.toMatch(/(^|\s)focus:bg-/)
+    }
   })
 })
 
@@ -262,5 +419,403 @@ describe('breadcrumbSegments', () => {
   it('handles a bare filename as a single file segment', () => {
     const crumbs = breadcrumbSegments('/README.md')
     expect(crumbs).toEqual([{ seg: 'README.md', path: '/README.md', isFile: true }])
+  })
+
+  it('splits a drive-rooted Windows path on backslash, either separator', () => {
+    // A Windows gateway names its files with `\`. The old split('/') read the
+    // whole string as one segment (no '/' to split on), so a directory on that
+    // gateway rendered as a single giant non-navigable breadcrumb.
+    const crumbs = breadcrumbSegments('C:\\Users\\me\\Documents\\notes.md')
+    expect(crumbs.map(c => c.seg)).toEqual(['me', 'Documents', 'notes.md'])
+    expect(crumbs.map(c => c.isFile)).toEqual([false, false, true])
+  })
+
+  it('reconstructs each Windows ancestor path with the drive letter intact', () => {
+    const crumbs = breadcrumbSegments('C:\\Users\\me\\Documents\\notes.md')
+    // The drive root ('C:') is not a separator, so it survives as the first
+    // segment and needs no leading-slash restoration the way POSIX does.
+    expect(crumbs[0].path).toBe('C:\\Users\\me')
+    expect(crumbs[1].path).toBe('C:\\Users\\me\\Documents')
+    expect(crumbs[2].path).toBe('C:\\Users\\me\\Documents\\notes.md')
+  })
+
+  it('accepts the forward-slash spelling of a drive-rooted path too', () => {
+    const crumbs = breadcrumbSegments('C:/Users/me/notes.md')
+    expect(crumbs.map(c => c.seg)).toEqual(['Users', 'me', 'notes.md'])
+    expect(crumbs[2].path).toBe('C:/Users/me/notes.md')
+  })
+
+  it('gives the drive crumb of a shallow Windows path the drive ROOT, not a bare drive letter', () => {
+    // With <= 3 segments the drive itself is a shown crumb. A bare `C:` is
+    // drive-RELATIVE on Windows (the drive's current directory), so the crumb
+    // must carry the root `C:\` to honour the absolute-path contract.
+    const crumbs = breadcrumbSegments('C:\\Users\\notes.md')
+    expect(crumbs.map(c => c.seg)).toEqual(['C:', 'Users', 'notes.md'])
+    expect(crumbs.map(c => c.path)).toEqual(['C:\\', 'C:\\Users', 'C:\\Users\\notes.md'])
+    expect(crumbs.map(c => c.isFile)).toEqual([false, false, true])
+  })
+
+  it('uses the input separator for the drive root of a forward-slash Windows path', () => {
+    const crumbs = breadcrumbSegments('C:/notes.md')
+    expect(crumbs.map(c => c.path)).toEqual(['C:/', 'C:/notes.md'])
+    expect(crumbs.map(c => c.isFile)).toEqual([false, true])
+  })
+
+  it('leaves a deep Windows path (drive not shown) unchanged by the drive-root rule', () => {
+    const crumbs = breadcrumbSegments('C:\\Users\\me\\Documents\\notes.md')
+    expect(crumbs.map(c => c.path)).toEqual([
+      'C:\\Users\\me',
+      'C:\\Users\\me\\Documents',
+      'C:\\Users\\me\\Documents\\notes.md',
+    ])
+  })
+
+  it('keeps a backslash inside a POSIX filename', () => {
+    // Legal on Linux and macOS (an archive unpacked from Windows makes these):
+    // the file is `we\ird.md`, and its folder is `/home/me`, not `/home\me\we`.
+    const crumbs = breadcrumbSegments('/home/me/we\\ird.md')
+    expect(crumbs.map(c => c.seg)).toEqual(['home', 'me', 'we\\ird.md'])
+    expect(crumbs.map(c => c.path)).toEqual(['/home', '/home/me', '/home/me/we\\ird.md'])
+  })
+})
+
+describe('FileHeaderBreadcrumb accessibility (#7900)', () => {
+  const path = '/home/user/project/src/PackageName/src/PackageName/index.ts'
+
+  it('shows the full path on pointer hover via title', () => {
+    // The breadcrumb only renders the last three segments, so a same-named file
+    // deep in a nested tree is ambiguous; the full path is the tooltip value.
+    render(<FileHeaderBreadcrumb filePath={path} />, { wrapper })
+    const group = screen.getByRole('group')
+    expect(group).toHaveAttribute('title', path)
+    // Only the tail three segments are visible text.
+    expect(group).toHaveTextContent('PackageName')
+    expect(group).not.toHaveTextContent('/home/user/project')
+  })
+
+  it('exposes the full path to keyboard and screen-reader users, not only pointer', () => {
+    // A native title is pointer-only. The regression this guards: without the
+    // aria-label + tabIndex the full path is unreachable without a mouse.
+    render(<FileHeaderBreadcrumb filePath={path} />, { wrapper })
+    const group = screen.getByRole('group')
+    // Named with the full path, so a screen reader announces it on focus.
+    expect(group).toHaveAttribute('aria-label', path)
+    // In the tab order, so a keyboard user can move focus onto it.
+    expect(group).toHaveAttribute('tabindex', '0')
+    // The path is genuinely reachable by focus, not merely present in the DOM.
+    ;(group as HTMLElement).focus()
+    expect(group).toHaveFocus()
+    // The accessible name a screen reader would read equals the full path.
+    expect(screen.getByRole('group', { name: path })).toBe(group)
+  })
+
+  it('shows the full path on screen while focused, for a sighted keyboard user', () => {
+    // A screen reader hears the aria-label, but a sighted keyboard-only user
+    // hears nothing and a native title does not open on focus. So the full path
+    // is also printed on screen while the breadcrumb holds focus, and not
+    // before (it would otherwise clutter the header for everyone).
+    render(<FileHeaderBreadcrumb filePath={path} />, { wrapper })
+    const group = screen.getByRole('group')
+    expect(screen.queryByTestId('file-header-full-path')).not.toBeInTheDocument()
+    fireEvent.focus(group)
+    const readout = screen.getByTestId('file-header-full-path')
+    expect(readout).toHaveTextContent(path)
+    // aria-hidden so the screen reader is not told the path twice.
+    expect(readout).toHaveAttribute('aria-hidden', 'true')
+    // Bound to BOTH edges of the header bar (its px-3 padding), so its right
+    // edge is the panel's inner edge and a long path wraps inside a narrow
+    // panel instead of running off it (the case the readout exists for).
+    expect(readout.className).toContain('left-3')
+    expect(readout.className).toContain('right-3')
+    expect(readout.className).toContain('break-all')
+    fireEvent.blur(group)
+    expect(screen.queryByTestId('file-header-full-path')).not.toBeInTheDocument()
+  })
+
+  it('distinguishes two same-named files in different directories by accessible name', () => {
+    const a = '/repo/alpha/index.ts'
+    const b = '/repo/beta/index.ts'
+    const { unmount } = render(<FileHeaderBreadcrumb filePath={a} />, { wrapper })
+    expect(screen.getByRole('group')).toHaveAttribute('aria-label', a)
+    unmount()
+    render(<FileHeaderBreadcrumb filePath={b} />, { wrapper })
+    expect(screen.getByRole('group')).toHaveAttribute('aria-label', b)
+  })
+})
+
+describe('FileHeaderBreadcrumb right-click menu: the in-app folder row', () => {
+  const path = '/repo/alpha/src/index.ts'
+
+  it('offers "Show folder in side panel" on a remote session, and no "Open in side panel"', async () => {
+    brandingEnv.directLocal = false
+    const onFolderOpen = vi.fn()
+    render(<FileHeaderBreadcrumb filePath={path} onFolderOpen={onFolderOpen} />, { wrapper })
+    fireEvent.contextMenu(screen.getByRole('group'))
+    const row = await screen.findByRole('menuitem', { name: i18nT('components.filePathMenu.show_folder_in_side_panel') })
+    // The file is already on screen in this panel, so the menu has no row to
+    // open it there again.
+    expect(screen.queryByRole('menuitem', { name: i18nT('components.filePathMenu.open_in_side_panel') })).toBeNull()
+    fireEvent.click(row)
+    expect(onFolderOpen).toHaveBeenCalledWith('/repo/alpha/src')
+  })
+
+  it('keeps the header menu native-only when the host passes no folder handler', async () => {
+    brandingEnv.directLocal = false
+    render(<FileHeaderBreadcrumb filePath={path} />, { wrapper })
+    fireEvent.contextMenu(screen.getByRole('group'))
+    await screen.findByRole('menuitem', { name: i18nT('components.filePathMenu.copy_path') })
+    expect(screen.queryByRole('menuitem', { name: i18nT('components.filePathMenu.show_folder_in_side_panel') })).toBeNull()
+  })
+})
+
+/**
+ * The line-reveal effect must declare its dependencies, and the editor handle
+ * it waits on must be state rather than a ref.
+ *
+ * This is a source-level guard on purpose. A dependency-less effect re-runs on
+ * every render, and the nonce guard inside this one makes those extra runs
+ * idempotent — so the defect has no rendered symptom to assert against, only a
+ * cost that grows with every unrelated re-render of the panel. What IS
+ * statically visible is the shape: the dependency array, the state-backed
+ * handle that re-runs the effect on the commit that mounts the editor (a ref
+ * attaches without a render and would strand a reveal requested before the
+ * editor exists), and the latest-value ref that keeps the host's inline
+ * `onRevealConsumed` arrow out of the dependency array.
+ */
+describe('MarkdownPanel line-reveal effect', () => {
+  // Read through `readSource`, which normalizes line endings to LF. This block
+  // asserts on the SOURCE TEXT with `$`-anchored patterns; `website/.gitattributes`
+  // now pins `*.tsx eol=lf` so a Windows checkout no longer carries the CRLF that
+  // used to defeat those anchors, and this read stays defensive for a working tree
+  // that predates that attribute or carries an unusual git config.
+  const src = readSource(join(__dirname, '..', 'components', 'MarkdownPanel.tsx'))
+
+  /** The reveal `useEffect` call, from `useEffect(` through its closing line.
+   *  Only the effect's own closer sits at two-space indentation. */
+  const effect = (() => {
+    const anchor = src.indexOf('lastRevealNonce.current === revealLine.nonce')
+    expect(anchor).toBeGreaterThan(-1)
+    const open = src.lastIndexOf('useEffect(', anchor)
+    const closerLine = src.indexOf('\n  }', anchor)
+    return src.slice(open, src.indexOf('\n', closerLine + 1))
+  })()
+
+  it('declares a dependency array', () => {
+    expect(effect).toMatch(/\}, \[[^\]]*\]\)$/)
+  })
+
+  it('depends on the reveal target, the source-mode predicate and the editor handle', () => {
+    const deps = (effect.match(/\}, \[([^\]]*)\]\)$/)?.[1] ?? '').split(',').map(d => d.trim())
+    expect(deps).toEqual(expect.arrayContaining(['revealLine', 'revealTargetsSource', 'revealEditor']))
+  })
+
+  it('keeps the nonce guard, which is what makes a repeat reveal need a new nonce', () => {
+    expect(effect).toContain('lastRevealNonce.current === revealLine.nonce')
+    expect(effect).toContain('lastRevealNonce.current = revealLine.nonce')
+  })
+
+  it('waits on a state-backed handle so a late editor mount still reveals', () => {
+    expect(src).toContain('const [revealEditor, setRevealEditor] = useState<PierreEditorHandle | null>(null)')
+    expect(src).not.toMatch(/editorRef=\{revealEditorRef\}/)
+    expect(src).toMatch(/editorRef=\{setRevealEditor\}/)
+  })
+
+  it('reads the host callback through a ref instead of depending on it', () => {
+    expect(effect).toContain('onRevealConsumedRef.current?.()')
+    expect(effect).not.toMatch(/\bonRevealConsumed\?\.\(\)/)
+  })
+})
+
+describe('OverflowMenu — app-contributed rows (contributes.fileMenuItems)', () => {
+  const DECL = {
+    id: 'send',
+    label: 'Send to store',
+    icon: 'Package',
+    endpoint: '/api/apps/doc-store/send',
+    surfaces: ['file-overflow'],
+  }
+  const seedApps = (decls: unknown = [DECL], over: Record<string, unknown> = {}) =>
+    queryClient.setQueryData(['apps'], [
+      { name: 'doc-store', enabled: true, manifest: { contributes: { fileMenuItems: decls } } , ...over },
+    ])
+
+  const openWith = (filePath = '/tmp/hello.txt') => {
+    render(<OverflowMenu filePath={filePath} content={'line one\n'} />, { wrapper })
+    fireEvent.click(screen.getAllByRole('button')[0])
+  }
+
+  it('adds no row and no separator when no app contributes — the stock build is inert', () => {
+    openWith()
+    expect(screen.queryByRole('menuitem', { name: /^Send to store\b/ })).not.toBeInTheDocument()
+  })
+
+  it('renders a contributed row and POSTs the PATH only, never the file content', () => {
+    seedApps()
+    openWith('/tmp/notes.md')
+
+    // The dispatcher reads the owning slot from the store, so name one for this case.
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-md' })
+
+    fireEvent.click(screen.getByRole('menuitem', { name: /^Send to store\b/ }))
+    expect(api.invokeFileMenuItem).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'send', app: 'doc-store' }),
+      { surface: 'file-overflow', path: '/tmp/notes.md', kind: 'file' },
+      // The owning slot, so the server's restricted-session gate applies to a
+      // contributed row exactly as it does to this menu's own save and promote rows.
+      // Asserted on EVERY surface, not just one: the placeholder it replaces fails open.
+      'dashboard:slot-md',
+    )
+    // The content prop is in scope at the call site; it must not be shipped.
+    expect(vi.mocked(api.invokeFileMenuItem).mock.calls[0][1]).not.toHaveProperty('content')
+  })
+
+  it('renders contributed rows LAST, after the core view/location groups', () => {
+    seedApps()
+    openWith()
+    const labels = screen.getAllByRole('menuitem').map(el => el.textContent?.trim())
+    const contributed = labels.findIndex(l => l?.startsWith('Send to store'))
+    expect(contributed).toBe(labels.length - 1)
+    // Specifically: below Copy path / Download rather than spliced above them.
+    expect(contributed).toBeGreaterThan(
+      labels.findIndex(l => l === i18nT('components.markdownPanel.copy_path')),
+    )
+  })
+
+  it('attributes the contributed row to its app, so it cannot pass as a core action', () => {
+    // A row's label is app-owned and never checked against the core vocabulary, so an app
+    // may call its row "Download" and sit one separator below the real Download. The
+    // visible owner is what lets a reader tell that clicking it POSTs the path elsewhere.
+    seedApps()
+    openWith()
+    const row = screen.getByRole('menuitem', { name: /^Send to store\b/ })
+    expect(row.textContent).toContain('doc-store')
+    // Part of the accessible NAME too, not decoration a screen reader skips.
+    expect(row).toHaveAccessibleName(/doc-store/)
+  })
+
+  it('is keyboard-navigable like every other row', () => {
+    seedApps()
+    openWith()
+    // `data-option` is what useListboxKeyboard treats as navigable; without it the
+    // row renders but arrows skip straight past it.
+    const row = screen.getByRole('menuitem', { name: /^Send to store\b/ })
+    expect(row).toHaveAttribute('data-option')
+  })
+
+  it('honours the when predicate, so a markdown-only row is absent on a .txt file', () => {
+    seedApps([{ ...DECL, when: { extensions: ['md'] } }])
+    openWith('/tmp/hello.txt')
+    expect(screen.queryByRole('menuitem', { name: /^Send to store\b/ })).not.toBeInTheDocument()
+  })
+
+  it('renders more than one contributed row', () => {
+    seedApps([DECL, { ...DECL, id: 'archive', label: 'Archive' }])
+    openWith()
+    expect(screen.getByRole('menuitem', { name: /^Send to store\b/ })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /^Archive\b/ })).toBeInTheDocument()
+  })
+
+  it('contributes nothing from a disabled app', () => {
+    seedApps([DECL], { enabled: false })
+    openWith()
+    expect(screen.queryByRole('menuitem', { name: /^Send to store\b/ })).not.toBeInTheDocument()
+  })
+
+  it('reports a rejected dispatch through the panel own onError', async () => {
+    // `errors-use-error-notice`: the menu closes on select, so an endpoint refusal that
+    // only reached the console would leave the reader with a row that did nothing. The
+    // panel renders this string through the shared ErrorNotice it already owns.
+    vi.mocked(api.invokeFileMenuItem).mockRejectedValueOnce(new Error('endpoint refused'))
+    const onError = vi.fn()
+    seedApps()
+    render(<OverflowMenu filePath="/tmp/notes.md" content={''} onError={onError} />, { wrapper })
+    fireEvent.click(screen.getAllByRole('button')[0])
+    fireEvent.click(screen.getByRole('menuitem', { name: /^Send to store\b/ }))
+    await waitFor(() => expect(onError).toHaveBeenCalledWith('endpoint refused'))
+  })
+})
+
+/**
+ * "Open in Files" — the ⋯ menu's hand-off to the Files app (`/file-explorer`),
+ * which opens the file in its own tabbed tree via the `?path=` deep link.
+ */
+describe('OverflowMenu — Open in Files', () => {
+  /** The Files builtin as `GET /api/apps` reports it: natively routed, no `ui.entry`. */
+  const FILES_APP = {
+    name: 'file-explorer',
+    displayName: 'Files',
+    enabled: true,
+    origin: 'builtin',
+    manifest: { ui: { pages: [{ route: '/file-explorer', label: 'Files', icon: 'FolderTree' }] } },
+  }
+  const seedApps = (apps: unknown[]) => queryClient.setQueryData(['apps'], apps)
+  const rowName = i18nT('components.markdownPanel.open_in_app', { app: i18nT('apps.fileExplorer.manifest.page_label') })
+
+  function UrlProbe() {
+    const loc = useLocation()
+    return <span data-testid="url">{loc.pathname + loc.search}</span>
+  }
+
+  const openWith = (filePath = '/tmp/hello.txt') => {
+    render(<><OverflowMenu onError={overflowError} filePath={filePath} content={'x'} /><UrlProbe /></>, { wrapper })
+    fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
+  }
+
+  it('is absent when the Files app is not installed or the list has not loaded', () => {
+    openWith()
+    expect(screen.queryByRole('menuitem', { name: rowName })).not.toBeInTheDocument()
+  })
+
+  it('is absent while the Files app is disabled — a disabled app has nowhere to go', () => {
+    seedApps([{ ...FILES_APP, enabled: false }])
+    openWith()
+    expect(screen.queryByRole('menuitem', { name: rowName })).not.toBeInTheDocument()
+  })
+
+  it('is absent for an orphaned app, whose route is its migration page and would swallow ?path=', () => {
+    seedApps([{ ...FILES_APP, orphaned: true }])
+    openWith()
+    expect(screen.queryByRole('menuitem', { name: rowName })).not.toBeInTheDocument()
+  })
+
+  it('is absent for an AppHost-routed build of the app, since only the native page reads ?path=', () => {
+    seedApps([{ ...FILES_APP, manifest: { ui: { ...FILES_APP.manifest.ui, entry: 'ui/index.js' } } }])
+    openWith()
+    expect(screen.queryByRole('menuitem', { name: rowName })).not.toBeInTheDocument()
+  })
+
+  it('is absent for a relative path — the Files backend has no project dir to resolve it against', () => {
+    seedApps([FILES_APP])
+    openWith('src/index.ts')
+    expect(screen.queryByRole('menuitem', { name: rowName })).not.toBeInTheDocument()
+    expect(screen.getByText('Copy path')).toBeInTheDocument()
+  })
+
+  it('navigates to the Files app with the path URL-encoded under ?path=', () => {
+    seedApps([FILES_APP])
+    openWith('/tmp/notes & drafts/a#1.md')
+    fireEvent.click(screen.getByRole('menuitem', { name: rowName }))
+    const url = new URL(screen.getByTestId('url').textContent || '', 'http://x')
+    expect(url.pathname).toBe('/file-explorer')
+    expect(url.searchParams.get('path')).toBe('/tmp/notes & drafts/a#1.md')
+    // Closed on select like every other navigating row.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('heads the file-location group, before the desktop hand-offs, and is keyboard-navigable', () => {
+    seedApps([FILES_APP])
+    openWith()
+    const labels = screen.getAllByRole('menuitem').map(el => el.textContent?.trim())
+    const files = labels.indexOf(rowName)
+    expect(files).toBeGreaterThan(labels.indexOf('Add to artifacts'))
+    expect(files).toBe(labels.indexOf('Open with default app') - 1)
+    // `data-option` is what useListboxKeyboard treats as navigable.
+    expect(screen.getByRole('menuitem', { name: rowName })).toHaveAttribute('data-option')
+  })
+
+  it('names the destination by the app page label, so the row and the sidebar agree', () => {
+    seedApps([FILES_APP])
+    openWith()
+    expect(screen.getByRole('menuitem', { name: 'Open in Files' })).toBeInTheDocument()
   })
 })

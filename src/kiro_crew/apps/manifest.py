@@ -12,825 +12,302 @@ app-specific fields.
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import re
-import sys
+import sys  # noqa: F401 -- callers patch manifest.sys.platform, which PlatformConfig reads
+import urllib.parse
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Nested manifest types
-# ---------------------------------------------------------------------------
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX  # noqa: F401
+from kiro_crew.apps.manifest_containment import (  # noqa: F401
+    _AGENT_TEMPLATE_PLACEHOLDER_RE,
+    PATH_SCREEN_REFUSAL,
+    PATH_TRAVERSAL_REFUSAL,
+    PATH_UNVERIFIED_REFUSAL,
+    Containment,
+    _app_path_refusal,
+    _declared_agent_names,
+    _has_dotdot_segment,
+    _is_rooted_path,
+    app_root_containment,
+    contain_command_agents,
+    contained_in_screened_root,
+    screen_app_path,
+)
+from kiro_crew.apps.manifest_contributes import (  # noqa: F401
+    _COMMAND_AGENT_RE,
+    _COMMAND_SLUG_RE,
+    _FILE_MENU_KINDS,
+    _HOST_RE,
+    _MAX_ARGUMENT_HOSTS,
+    _MAX_COMMANDS_PER_APP,
+    _MAX_FILE_MENU_ITEMS_PER_APP,
+    _MAX_KEYWORD,
+    _MAX_KEYWORDS,
+    _MAX_PANEL_TABS_PER_APP,
+    _MAX_PROMPT_TEMPLATE,
+    _MAX_TITLE,
+    _PANEL_TAB_ID_RE,
+    _SESSION_CONTROL_ID_RE,
+    _SESSION_CONTROL_STATUS_PATH_RE,
+    ARGUMENT_TOKEN,
+    FILE_MENU_SURFACES,
+    MAX_SESSION_CONTROLS_PER_APP,
+    CommandArgument,
+    CommandContribution,
+    Contributes,
+    FileMenuItemConfig,
+    FileMenuWhen,
+    PanelTabConfig,
+    SessionControlContribution,
+    _mirrored_len,
+    _normalize_status_path,
+)
+from kiro_crew.apps.manifest_names import (  # noqa: F401
+    KEBAB_RE,
+    RESERVED_APP_NAME_CODE,
+    RESERVED_APP_NAMES,
+    RESERVED_APP_PATH_SEGMENTS,
+    RESERVED_ROUTE_APP_NAMES,
+    SEMVER_RE,
+    UNPORTABLE_APP_NAMES,
+    app_name_error,
+    is_reserved_app_name,
+)
+from kiro_crew.apps.manifest_sections import (  # noqa: F401
+    _CHANNEL_PRIORITIES,
+    _OVERLAY_SLUG_RE,
+    MAX_NOTIFICATION_CHANNELS,
+    BackendConfig,
+    CapabilityDependencies,
+    ClientInstallConfig,
+    CronEntry,
+    Dependencies,
+    HooksConfig,
+    NotificationChannel,
+    NotificationsConfig,
+    Permissions,
+    PlatformConfig,
+    PublishProviderConfig,
+    SetupConfig,
+    UIConfig,
+    UIOverlay,
+    UIPage,
+    UISidebar,
+    _granted_list,
+)
+from kiro_crew.atomic_write import read_bytes_with_retry
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS  # noqa: F401
+from kiro_crew.cron import is_valid_skip_date, is_valid_timezone
+from kiro_crew.cron_service.fields import validate_create_timeouts
 
-KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+([+-]|$)")
+# This module is the facade of the app manifest: every name is reached through it as
+# ``kiro_crew.apps.manifest.<name>``. It keeps ``AppManifest`` itself, the cron grant rule
+# an admitted manifest must meet, the endpoint allowlist every app-declared URL is checked
+# against, and the predicates for what the runtime provisions out of process. The rest is
+# imported from sibling owners, which never import this module. New work goes to the owner
+# of its responsibility:
+#
+#   ``manifest_names`` -- the app-name contract and the version grammar
+#   ``manifest_containment`` -- app-root path containment and contributed-agent containment
+#   ``manifest_sections`` -- the typed ``app.json`` blocks other than ``contributes``
+#   ``manifest_contributes`` -- the ``contributes`` block and its caps
 
-# App names that would collide with reserved notification namespaces: an app
-# named "system" would produce channels "system.<id>", shadowing the bus's
-# reserved system channels (e.g. "system.approval"). Rejected at manifest
-# validation AND defense-in-depth at the push endpoint.
-RESERVED_APP_NAMES = frozenset({"system"})
+
+# Expected JSON type per CronEntry field that from_dict type-gates; turns a
+# recorded parse-time violation into a message an app author can act on.
+_CRON_FIELD_JSON_TYPES = {
+    "every": "a number of seconds",
+    "agent_sequence": "an array of agent names",
+    "command": "a string command",
+    "env": "an object of string keys to string values",
+    "script": "a string script path",
+    "timezone": "a string IANA zone name",
+    "skip_dates": "an array of YYYY-MM-DD strings",
+    "timeout": "a whole number of seconds",
+    "timeout_secs": "a whole number of seconds",
+}
+
+#: Refusal for a manifest that schedules ``crons`` without the ``permissions.cron``
+#: grant. A schedule runs agent prompts or commands unattended, so the
+#: ``permissions`` block an operator reads before installing must say so; the
+#: message carries the one-line fix because the install error is the channel an
+#: app author reads.
+CRON_PERMISSION_REQUIRED_ERROR = (
+    'crons is declared but permissions.cron is not: add "cron": true under '
+    '"permissions" in app.json'
+)
 
 
-def _is_rooted_path(rel_path: str) -> bool:
-    """Return True if ``rel_path`` is anything other than a purely relative path.
+def cron_permission_error(manifest: AppManifest) -> str:
+    """Return the missing-grant refusal for *manifest*, or ``""`` when it holds.
 
-    App-resource paths are joined onto the app root, so any path carrying a drive
-    or a root anchor can relocate that join and must be refused. ``is_absolute()``
-    is too narrow twice over:
-
-    - It is flavour-bound to the RUNNING host, and ``os.path`` IS ``ntpath`` on
-      Windows, so ``os.path.isabs(x) or ntpath.isabs(x)`` collapses to one
-      Windows-only test there. Windows' flavour does not consider ``/etc/passwd``
-      anchored (no drive), so a POSIX-absolute path passed validation on Windows.
-      The Windows flavour is a strict superset — it reads ``/`` and ``\\`` as a
-      root — so testing it alone covers both syntaxes on either host.
-    - A drive-relative path (``D:evil.py``) has a drive but no root, so
-      ``is_absolute()`` is False, yet joining it onto the app root yields
-      ``D:evil.py`` and escapes. Hence drive-OR-root, not ``is_absolute()``.
+    The rule applies wherever an app is admitted with a new manifest -- install,
+    update and self-registration -- and never at load time, so an app installed
+    before the rule keeps loading and firing its crons until its next update.
     """
-    win = PureWindowsPath(rel_path)
-    return bool(win.drive or win.root)
+    if manifest.crons and not manifest.permissions.cron:
+        return CRON_PERMISSION_REQUIRED_ERROR
+    return ""
 
 
-def _has_dotdot_segment(rel_path: str) -> bool:
-    """Return True if ``rel_path`` contains a ``..`` segment under EITHER flavour.
+#: First path segments under ``/api/apps/<app>/`` that CORE owns rather than the app.
+#: Being inside the app's own namespace is therefore NOT sufficient for an app-declared
+#: endpoint: core mounts its own handlers in that namespace, so a manifest naming one
+#: would pass the prefix test and have the host POST to a core handler with the reader's
+#: own session -- on a row the reader clicked, believing it belonged to the app.
+#:
+#: Enumerated from the core registrations of that namespace, which are the only place
+#: this list can be derived from:
+#:
+#: * ``apps/routes.py`` ``setup_routes`` -- ``manifest``, ``config``, and the lifecycle
+#:   verbs ``uninstall`` (whose ``uninstall/preview`` child is covered by the segment),
+#:   ``update``, ``enable``, ``disable``, ``open``, ``dev``, ``migrate-cleanup``
+#: * ``dashboard/routes/system.py`` -- ``token``
+#: * ``apps/job_routes.py`` -- ``_jobs``
+#:
+#: A NEW core route mounted under ``/api/apps/{name}/`` MUST be added here in the same
+#: commit, or an app can claim it; ``test_file_menu_items.py`` scans those sources and
+#: fails on a segment this set is missing. Mirrored by ``CORE_APP_ROUTE_SEGMENTS`` in
+#: ``website/src/apps/fileMenuContributions.tsx``, the dispatch-time floor for a manifest
+#: that reached the dashboard without passing install validation.
+CORE_APP_ROUTE_SEGMENTS = frozenset(
+    {
+        "_jobs",
+        "config",
+        "dev",
+        "disable",
+        "enable",
+        "manifest",
+        "migrate-cleanup",
+        "open",
+        "token",
+        "uninstall",
+        "update",
+    }
+)
 
-    Segmenting both ways is load-bearing: a POSIX host reads ``..\\evil`` as one
-    opaque filename, so a POSIX-only split lets a backslash traversal through —
-    and the manifest that declares it is portable data, validated on whichever
-    host happens to install the app. No legitimate resource path has a bare
-    ``..`` segment (``a..b`` and ``notes..md`` are single segments and unaffected).
+#: Splits a path tail at the first segment boundary, query, or fragment. The router
+#: matches on the PATH alone, so ``/api/apps/foo/uninstall?x=1`` reaches the core
+#: uninstall handler; comparing the raw tail would let a query smuggle a reserved
+#: segment past :data:`CORE_APP_ROUTE_SEGMENTS`.
+_SEGMENT_BOUNDARY_RE = re.compile(r"[/?#]")
+
+
+#: Characters an app-declared endpoint may contain, as an ALLOWLIST.
+#:
+#: A blocklist loses this argument one character at a time. Two separate bypasses of
+#: :func:`app_endpoint_allowed` were exactly that shape: the browser's URL parser STRIPS
+#: U+0009/000A/000D while ``fetch`` builds the request, so ``/api/apps/foo/uninstall\n``
+#: read as the segment ``"uninstall\n"`` here and arrived at core's uninstall handler;
+#: and it treats ``\`` as a path separator for http(s), so ``/api/apps/foo/.\uninstall``
+#: read as one opaque segment here and normalized to ``/api/apps/foo/uninstall`` there.
+#: Both are the same defect -- a character the PARSER reinterprets after this check
+#: accepted it -- and there is no reason to believe the set is now enumerated.
+#:
+#: So the shape is inverted: unreserved characters (:rfc:`3986` §2.3), the delimiters a
+#: real declared endpoint needs (``/``, ``?``, ``#``, ``=``, ``&``, ``+``, ``,``, ``:``,
+#: ``@``, ``!``, ``$``, ``'``, ``(``, ``)``, ``*``, ``;``), and nothing else. ``\``,
+#: every C0 control, DEL, space, and the characters a parser may rewrite or a header may
+#: fold on are all outside it without being named.
+#: ``\Z``, not ``$``: Python's ``$`` also matches immediately BEFORE a trailing newline,
+#: so ``"…/uninstall\n"`` would satisfy a ``$``-anchored pattern and sail through the one
+#: bypass this exists to close. The TypeScript mirror needs no equivalent -- JavaScript's
+#: ``$`` without the ``m`` flag is a true end anchor -- which is exactly the kind of
+#: per-language difference a "mirrored" pair hides, so it is stated on both sides.
+_ENDPOINT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9\-._~/?#=&+,:@!$'()*;]+\Z")
+
+
+def app_endpoint_allowed(
+    app_name: str, endpoint: str, *, allow_proxy_namespace: bool = False
+) -> bool:
+    """Whether an app-declared endpoint routes inside that app's own namespace (§9.3).
+
+    The one implementation of this allowlist. Every place a manifest hands the host a URL
+    to call -- ``publishProvider.endpoint``, ``contributes.fileMenuItems[].endpoint`` --
+    checks it here, because a second copy of a security control is free to drift from the
+    first and the drift is invisible until something is let through.
+
+    ``allow_proxy_namespace`` additionally admits ``/apps/<app>/api/``, the reverse-proxy
+    prefix a PROCESS-backed app is served under. It is the caller's decision because each
+    caller documents its own contract: a contributed row must reach a process-backed app,
+    while the publish-provider registry names ``/api/apps/<app>/`` in its refusal message
+    and keeps that narrower shape. Defaulting it off means adding a caller cannot widen an
+    existing surface by accident.
+
+    Three properties do the work, and each is easy to lose when rewritten from memory:
+    normalization happens BEFORE the prefix test, so ``/api/apps/foo/../../shutdown``
+    cannot escape the namespace; the prefix carries a trailing slash, so a sibling app
+    (``/api/apps/foobar/x``) cannot pass ``foo``'s allowlist on a bare ``startswith``;
+    and the first segment BELOW the prefix is refused when core owns it, because the app's
+    own namespace is where core mounts the lifecycle routes
+    (:data:`CORE_APP_ROUTE_SEGMENTS`).
     """
-    return ".." in PurePosixPath(rel_path).parts or ".." in PureWindowsPath(rel_path).parts
-
-
-def _path_escapes_app_root(rel_path: str, app_root: Path | None) -> bool:
-    """Return True if ``rel_path`` is an unsafe app-resource path.
-
-    Unsafe = rooted (drive-qualified, POSIX-absolute, or UNC), or containing a
-    ``..`` segment, or — resolved against ``app_root`` — escaping ``app_root``
-    (canonical containment, matching the runtime checks in ``module_loader`` /
-    ``bridges``).
-
-    The lexical checks run BEFORE the canonical one and regardless of whether
-    ``app_root`` is known, so a manifest is judged identically on every host.
-    Deferring them to ``resolve()`` would make the verdict host-dependent: on a
-    POSIX host ``app_root / "..\\evil.py"`` is a single odd filename that stays
-    inside the root and would be accepted, while the same manifest is rejected on
-    Windows. Canonical containment then adds what no lexical check can see — a
-    symlink or reparse point inside the root whose target leaves it.
-    """
-    if not rel_path:
+    if not app_name or not endpoint:
         return False
-    if _is_rooted_path(rel_path) or _has_dotdot_segment(rel_path):
-        return True
-    if app_root is not None:
-        try:
-            resolved = (app_root / rel_path).resolve()
-            return not resolved.is_relative_to(app_root.resolve())
-        except (OSError, ValueError):
-            return True
+    # A RESERVED path segment is never an app's own namespace, whatever an app is called.
+    # `/api/apps/registries/refresh` and `/api/apps/registry/install` are shared literal
+    # routes registered BEFORE the `/api/apps/{name}` catch-all, and the first segment
+    # below the prefix (`refresh`, `install`) is not a per-app lifecycle name, so
+    # :data:`CORE_APP_ROUTE_SEGMENTS` does not cover them.
+    #
+    # Reserving the NAME is explicitly forward-looking (see
+    # :data:`RESERVED_APP_PATH_SEGMENTS`): it stops new apps claiming one but leaves an
+    # already-published app so named, and the token_auth carve-out that constrains such an
+    # app governs an APP's own token, not a row a reader clicks with their own session.
+    # This is the check that has to refuse it.
+    if app_name in RESERVED_APP_PATH_SEGMENTS:
+        return False
+    decoded = urllib.parse.unquote(endpoint)
+    # Character allowlist FIRST, before anything else reads the path: see
+    # :data:`_ENDPOINT_ALLOWED_RE` for why this is an allowlist and not a set of named
+    # refusals. Applied after ``unquote`` so a percent-encoded ``%5c`` or ``%0a`` is
+    # judged as the character it becomes, not as the escape.
+    if not _ENDPOINT_ALLOWED_RE.match(decoded):
+        return False
+    normalized = posixpath.normpath(decoded)
+    if ".." in decoded or normalized != decoded.rstrip("/"):
+        return False
+    # BOTH documented app namespaces, but only when the CALLER's contract covers the
+    # second one: which namespace an app owns is not its choice — one declaring
+    # ``backend.entryPoint`` runs its own process and is reverse-proxied at
+    # ``/apps/<app>/api/`` (``routes.py`` ``handle_app_api_proxy``), while one declaring
+    # only ``backend.hooks.routes`` is registered in-gateway under ``/api/apps/<app>/``.
+    # Admitting just the in-gateway form refused every process-backed app's contribution
+    # at install, so those apps could not contribute a row at all.
+    #
+    # It is a per-caller flag rather than a blanket widening because this is the ONE
+    # shared endpoint check (see ``test_app_endpoint_allowed_is_the_one_shared_check``)
+    # and its other caller, the publish-provider registry in ``routes.py``, states
+    # ``/api/apps/<app>/`` as its contract in its own refusal message. Widening the
+    # helper for everyone would have broadened that surface silently.
+    #
+    # The core-owned reserved segments apply to the IN-GATEWAY prefix only: the proxy
+    # namespace forwards wholesale into the app's own process, so nothing core serves
+    # lives under it and a reserved name there is the app's own route.
+    prefixes: list[tuple[str, frozenset[str]]] = [
+        (f"/api/apps/{app_name}/", CORE_APP_ROUTE_SEGMENTS),
+    ]
+    if allow_proxy_namespace:
+        prefixes.append((f"/apps/{app_name}/api/", frozenset()))
+    for prefix, reserved in prefixes:
+        if not (normalized + "/").startswith(prefix):
+            continue
+        # The bare namespace root yields "" (removeprefix is a no-op on `/api/apps/foo`,
+        # whose split then starts with the leading slash), which no core route claims.
+        segment = _SEGMENT_BOUNDARY_RE.split(normalized.removeprefix(prefix), 1)[0]
+        return segment not in reserved
     return False
 
 
-@dataclass
-class CronEntry:
-    """A scheduled agent job declared by an app."""
-
-    name: str = ""
-    every: int = 0  # seconds between runs (0 = use cron_expr)
-    cron_expr: str = ""  # cron expression (alternative to every)
-    agent: str = ""  # agent name to run
-    message: str = ""  # prompt message for the agent
-    command: str = ""  # shell command for direct execution (bypasses LLM)
-    script: str = ""  # Python callable path (file.py:func) for direct execution (bypasses LLM)
-    # Extended fields for advanced scheduling
-    agent_sequence: list[str] = field(default_factory=list)  # ordered list of agents to run
-    env: dict[str, str] = field(default_factory=dict)  # environment variables for the job
-    persistent_session: bool = True  # whether to carry context between runs
-    silent: bool = False  # suppress dashboard notifications
-    # When False the cron is registered in a paused state (visible in the
-    # dashboard Schedule view, resumable) instead of firing on install/enable.
-    # Apps that need user configuration before their crons are useful ship
-    # them disabled and enable/resume once configured.
-    enabled: bool = True
-    # Parse-time type violation: manifest "enabled" was present but not a JSON
-    # boolean (e.g. the string "false", which bool() would coerce truthy —
-    # silently re-creating the fires-unconfigured bug). Reported as a
-    # validation error; never serialized.
-    enabled_type_invalid: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"name": self.name}
-        if self.every:
-            d["every"] = self.every
-        if self.cron_expr:
-            d["cron_expr"] = self.cron_expr
-        if self.agent:
-            d["agent"] = self.agent
-        if self.message:
-            d["message"] = self.message
-        if self.command:
-            d["command"] = self.command
-        if self.script:
-            d["script"] = self.script
-        if self.agent_sequence:
-            d["agent_sequence"] = self.agent_sequence
-        if self.env:
-            d["env"] = self.env
-        if not self.persistent_session:
-            d["persistent_session"] = False
-        if self.silent:
-            d["silent"] = True
-        if not self.enabled:
-            d["enabled"] = False
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> CronEntry:
-        def _str_or_empty(v: Any) -> str:
-            return v if isinstance(v, str) else ""
-
-        return cls(
-            name=_str_or_empty(data.get("name")),
-            every=int(data.get("every", 0)),
-            cron_expr=_str_or_empty(data.get("cron_expr")),
-            agent=_str_or_empty(data.get("agent")),
-            message=_str_or_empty(data.get("message")),
-            command=_str_or_empty(data.get("command")),
-            script=_str_or_empty(data.get("script")),
-            agent_sequence=[str(a) for a in data.get("agent_sequence", [])],
-            env={str(k): str(v) for k, v in data.get("env", {}).items()},
-            persistent_session=bool(data.get("persistent_session", True)),
-            silent=bool(data.get("silent", False)),
-            # STRICT boolean: "enabled" gates whether a cron fires at all, so a
-            # type slip (the string "false" is truthy) must not silently
-            # re-enable a disabled-by-design cron. Non-boolean values are
-            # flagged and rejected by AppManifest.validate(); the value falls
-            # back to True only so the flagged manifest still round-trips.
-            enabled=(data["enabled"] if isinstance(data.get("enabled"), bool) else True),
-            enabled_type_invalid=("enabled" in data and not isinstance(data["enabled"], bool)),
-        )
-
-
-@dataclass
-class UIPage:
-    """A frontend page contributed by an app."""
-
-    route: str = ""  # URL path, e.g. /apps/oncall-watchtower
-    label: str = ""  # sidebar display text
-    icon: str = ""  # lucide icon name or emoji
-    iconUrl: str = ""  # custom icon image path relative to ui/ dir  # noqa: N815
-    # Optional INACTIVE-state variant of iconUrl (a muted/dark rendering shown when
-    # the nav row is not the active route — matches how lucide nav icons gray out).
-    iconInactiveUrl: str = ""  # noqa: N815
-    entryPoint: str = ""  # path to JS bundle relative to app root  # noqa: N815
-    mountFunction: str = "mount"  # exported function name  # noqa: N815
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "route": self.route,
-            "label": self.label,
-        }
-        if self.icon:
-            d["icon"] = self.icon
-        if self.iconUrl:
-            d["iconUrl"] = self.iconUrl
-        if self.iconInactiveUrl:
-            d["iconInactiveUrl"] = self.iconInactiveUrl
-        if self.entryPoint:
-            d["entryPoint"] = self.entryPoint
-        if self.mountFunction != "mount":
-            d["mountFunction"] = self.mountFunction
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> UIPage:
-        return cls(
-            route=str(data.get("route", "")),
-            label=str(data.get("label", "")),
-            icon=str(data.get("icon", "")),
-            iconUrl=str(data.get("iconUrl", "")),  # noqa: N815
-            iconInactiveUrl=str(data.get("iconInactiveUrl", "")),  # noqa: N815
-            entryPoint=str(data.get("entryPoint", "")),  # noqa: N815
-            mountFunction=str(data.get("mountFunction", "mount")),  # noqa: N815
-        )
-
-
-@dataclass
-class UISidebar:
-    """Sidebar placement config for app pages."""
-
-    section: str = "Apps"
-    order: int = 10
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.section != "Apps":
-            d["section"] = self.section
-        if self.order != 10:
-            d["order"] = self.order
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> UISidebar:
-        return cls(
-            section=str(data.get("section", "Apps")),
-            order=int(data.get("order", 10)),
-        )
-
-
-@dataclass
-class UIConfig:
-    """Frontend configuration for an app."""
-
-    entry: str = ""  # ESM bundle path relative to app root, e.g. "dist/index.mjs"
-    pages: list[UIPage] = field(default_factory=list)
-    sidebar: UISidebar = field(default_factory=UISidebar)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.entry:
-            d["entry"] = self.entry
-        if self.pages:
-            d["pages"] = [p.to_dict() for p in self.pages]
-        sidebar_d = self.sidebar.to_dict()
-        if sidebar_d:
-            d["sidebar"] = sidebar_d
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> UIConfig:
-        pages = [UIPage.from_dict(p) for p in data.get("pages", []) if isinstance(p, dict)]
-        sidebar_raw = data.get("sidebar", {})
-        sidebar = UISidebar.from_dict(sidebar_raw) if isinstance(sidebar_raw, dict) else UISidebar()
-        return cls(entry=str(data.get("entry", "")), pages=pages, sidebar=sidebar)
-
-
-@dataclass
-class HooksConfig:
-    """Python entry points for gateway lifecycle integration.
-
-    Each field is a dotted module path in the format ``module.path:callable_name``,
-    resolved relative to the app's directory via the module_loader.
-    """
-
-    routes: str = ""  # e.g. "backend.routes:register_routes"
-    on_startup: str = ""  # e.g. "backend.hooks:on_startup"
-    on_shutdown: str = ""  # e.g. "backend.hooks:on_shutdown"
-
-    # Validation pattern: dotted identifiers separated by colon
-    _HOOK_PATH_RE = re.compile(
-        r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*:[a-zA-Z_][a-zA-Z0-9_]*$"
-    )
-
-    def validate(self) -> list[str]:
-        """Validate hook path formats. Returns list of errors."""
-        errors: list[str] = []
-        for field_name in ("routes", "on_startup", "on_shutdown"):
-            value = getattr(self, field_name)
-            if value and not self._HOOK_PATH_RE.match(value):
-                errors.append(
-                    f"backend.hooks.{field_name} must be in format "
-                    f"'module.path:callable_name', got: {value!r}"
-                )
-        return errors
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.routes:
-            d["routes"] = self.routes
-        if self.on_startup:
-            d["on_startup"] = self.on_startup
-        if self.on_shutdown:
-            d["on_shutdown"] = self.on_shutdown
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> HooksConfig:
-        return cls(
-            routes=str(data.get("routes", "")),
-            on_startup=str(data.get("on_startup", "")),
-            on_shutdown=str(data.get("on_shutdown", "")),
-        )
-
-
-@dataclass
-class BackendConfig:
-    """Backend process configuration for an app."""
-
-    entryPoint: str = ""  # e.g. backend/app.py or dist/main.js  # noqa: N815
-    port: str = "auto"  # "auto" or a specific port number
-    healthCheck: str = "/health"  # health check endpoint path  # noqa: N815
-    routes: str = ""  # base route path, e.g. /api/apps/oncall-watchtower
-    type: str = ""  # "python", "asgi", "node", "exec", or "" (auto-detect)
-    hooks: HooksConfig = field(default_factory=HooksConfig)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.entryPoint:
-            d["entryPoint"] = self.entryPoint
-        if self.port != "auto":
-            d["port"] = self.port
-        if self.healthCheck != "/health":
-            d["healthCheck"] = self.healthCheck
-        if self.routes:
-            d["routes"] = self.routes
-        if self.type:
-            d["type"] = self.type
-        hooks_d = self.hooks.to_dict()
-        if hooks_d:
-            d["hooks"] = hooks_d
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> BackendConfig:
-        hooks_raw = data.get("hooks", {})
-        hooks = HooksConfig.from_dict(hooks_raw) if isinstance(hooks_raw, dict) else HooksConfig()
-        return cls(
-            entryPoint=str(data.get("entryPoint", "")),  # noqa: N815
-            port=str(data.get("port", "auto")),
-            healthCheck=str(data.get("healthCheck", "/health")),  # noqa: N815
-            routes=str(data.get("routes", "")),
-            type=str(data.get("type", "")),
-            hooks=hooks,
-        )
-
-
-@dataclass
-class Permissions:
-    """Declared permissions for an app."""
-
-    api: list[str] = field(default_factory=list)  # allowed API path prefixes
-    events: list[str] = field(default_factory=list)  # allowed WebSocket event types
-    mcpTools: list[str] = field(default_factory=list)  # noqa: N815
-    storage: bool = False
-    network: bool = False
-    memory: str = ""  # "", "app-scoped", or "shared"
-    cron: bool = False
-    #: May spawn a background agent through the host's subagent manager.
-    #: Declared rather than implicit so "which apps can start an agent" is
-    #: auditable from the manifest instead of from an app's import graph.
-    spawn: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.api:
-            d["api"] = self.api
-        if self.events:
-            d["events"] = self.events
-        if self.mcpTools:
-            d["mcpTools"] = self.mcpTools
-        if self.storage:
-            d["storage"] = True
-        if self.network:
-            d["network"] = True
-        if self.memory:
-            d["memory"] = self.memory
-        if self.cron:
-            d["cron"] = True
-        if self.spawn:
-            d["spawn"] = True
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Permissions:
-        # `is True`, not `bool(...)`, for every CAPABILITY GRANT below. `bool()` on a
-        # JSON value that is not a boolean grants on anything truthy — and the
-        # string `"false"` is truthy, so a manifest that writes `"spawn": "false"`
-        # meaning to DENY would have been handed the capability to launch
-        # unattended agents. Requiring the literal `true` means a malformed or
-        # unexpected value denies, which is the direction a grant must fail in.
-        #
-        # Note this is the opposite coercion from a RESTRICTION (see
-        # `admission.require_signature`): there, an unexpected value must keep the
-        # restriction ON. Same defect class, mirrored fix — the safe default
-        # follows what the field grants or withholds, not the field's type.
-        return cls(
-            api=[str(p) for p in data.get("api", []) if p],
-            events=[str(e) for e in data.get("events", []) if e],
-            mcpTools=[str(t) for t in data.get("mcpTools", []) if t],  # noqa: N815
-            storage=data.get("storage") is True,
-            network=data.get("network") is True,
-            memory=str(data.get("memory", "")),
-            cron=data.get("cron") is True,
-            spawn=data.get("spawn") is True,
-        )
-
-
-@dataclass
-class SetupConfig:
-    """Installation and setup configuration for an app."""
-
-    onInstall: str = ""  # shell command run after first install  # noqa: N815
-    onUpdate: str = ""  # shell command run after update (new code in place)  # noqa: N815
-    onUninstall: str = ""  # shell command run before removing app files  # noqa: N815
-    onEnable: str = ""  # shell command run when app is enabled  # noqa: N815
-    onDisable: str = ""  # shell command run when app is disabled  # noqa: N815
-    onEnableTimeout: int = 30  # seconds; configurable per-app  # noqa: N815
-    onDisableTimeout: int = 30  # seconds; configurable per-app  # noqa: N815
-    configSchema: dict[str, Any] = field(default_factory=dict)  # noqa: N815
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.onInstall:
-            d["onInstall"] = self.onInstall
-        if self.onUpdate:
-            d["onUpdate"] = self.onUpdate
-        if self.onUninstall:
-            d["onUninstall"] = self.onUninstall
-        if self.onEnable:
-            d["onEnable"] = self.onEnable
-        if self.onDisable:
-            d["onDisable"] = self.onDisable
-        if self.onEnableTimeout != 30:
-            d["onEnableTimeout"] = self.onEnableTimeout
-        if self.onDisableTimeout != 30:
-            d["onDisableTimeout"] = self.onDisableTimeout
-        if self.configSchema:
-            d["configSchema"] = self.configSchema
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SetupConfig:
-        return cls(
-            onInstall=str(data.get("onInstall", "")),  # noqa: N815
-            onUpdate=str(data.get("onUpdate", "")),  # noqa: N815
-            onUninstall=str(data.get("onUninstall", "")),  # noqa: N815
-            onEnable=str(data.get("onEnable", "")),  # noqa: N815
-            onDisable=str(data.get("onDisable", "")),  # noqa: N815
-            onEnableTimeout=int(data.get("onEnableTimeout", 30)),  # noqa: N815
-            onDisableTimeout=int(data.get("onDisableTimeout", 30)),  # noqa: N815
-            configSchema=dict(data.get("configSchema", {})),  # noqa: N815
-        )
-
-
-@dataclass
-class CapabilityDependencies:
-    """Capability-manager-provided dependencies (MCP servers, skills, agents).
-
-    Resolved through the ``CapabilityManager`` CPP seam, NOT a named external
-    binary — the edition owns which package manager (if any) backs these and its
-    invocation grammar.  The public edition ships no capability manager, so these
-    entries are reported as unresolved rather than installed.
-    """
-
-    mcp: list[Any] = field(default_factory=list)  # str or {"id": str, "managedBy": str}
-    skills: list[Any] = field(default_factory=list)
-    agents: list[Any] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.mcp:
-            d["mcp"] = self.mcp
-        if self.skills:
-            d["skills"] = self.skills
-        if self.agents:
-            d["agents"] = self.agents
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> CapabilityDependencies:
-        return cls(
-            mcp=list(data.get("mcp", [])),
-            skills=list(data.get("skills", [])),
-            agents=list(data.get("agents", [])),
-        )
-
-
-@dataclass
-class Dependencies:
-    """External dependencies that KiroCrew should resolve during install.
-
-    ``managedBy`` controls the default installation strategy:
-      - ``"gateway"``: KiroCrew resolves each dependency through the edition's
-        ``CapabilityManager`` seam
-      - ``"app"``: KiroCrew only checks existence, does not install
-
-    Individual entries can override via object format:
-    ``{"id": "some-mcp", "managedBy": "app"}``
-
-    The wire key is ``capabilities``.  ``aim`` is accepted as a DEPRECATED read
-    alias so manifests authored against the pre-rename schema keep loading; it is
-    never re-emitted by :meth:`to_dict`, so a round-trip migrates the manifest.
-
-    ``commands`` are REQUIRED host executables — a missing one is reported as a
-    missing dependency.  ``optionalCommands`` are probed and reported but never
-    block: an app that works without them, or that can provision its own copy,
-    declares them here.  Two manifests in-tree already used the key while the
-    dataclass silently dropped it (``papyrus`` round-tripped to ``{}``,
-    ``issue_radar`` lost ``glab``), so the requirement was invisible to every
-    consumer — that is the bug this field closes, not a new feature.
-    """
-
-    managedBy: str = "gateway"  # noqa: N815
-    capabilities: CapabilityDependencies = field(default_factory=CapabilityDependencies)
-    commands: list[str] = field(default_factory=list)
-    optionalCommands: list[str] = field(default_factory=list)  # noqa: N815
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.managedBy != "gateway":
-            d["managedBy"] = self.managedBy
-        cap_d = self.capabilities.to_dict()
-        if cap_d:
-            d["capabilities"] = cap_d
-        if self.commands:
-            d["commands"] = self.commands
-        if self.optionalCommands:
-            d["optionalCommands"] = self.optionalCommands
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Dependencies:
-        raw = data.get("capabilities")
-        if not isinstance(raw, dict):
-            # Deprecated alias — read-only, never written back.
-            raw = data.get("aim")
-        capabilities = (
-            CapabilityDependencies.from_dict(raw)
-            if isinstance(raw, dict)
-            else CapabilityDependencies()
-        )
-        return cls(
-            managedBy=str(data.get("managedBy", "gateway")),  # noqa: N815
-            capabilities=capabilities,
-            # `or []`, not just a `[]` default: an explicit `"commands": null` in a
-            # manifest satisfies `.get`'s default and then fails to iterate, so the
-            # install endpoint answered an unhandled TypeError as a 500 rather than a
-            # validation error. A hand-written or generated app.json can carry a JSON
-            # null for an absent list, and a manifest parser reads UNTRUSTED input —
-            # it must degrade to "empty", never crash. Both lines, since the
-            # pre-existing `commands` had the identical shape.
-            commands=[str(c) for c in (data.get("commands") or [])],
-            optionalCommands=[  # noqa: N815
-                str(c) for c in (data.get("optionalCommands") or [])
-            ],
-        )
-
-
-@dataclass
-class ClientInstallConfig:
-    """Instructions for installing an app on the user's local machine.
-
-    Used when KiroCrew runs remotely (e.g. cloud desktop) and the app
-    requires a specific local platform (e.g. macOS for Electron apps).
-    """
-
-    shell: str = ""  # one-liner for the user to run in their terminal
-    postInstall: str = (
-        ""  # command to run after install (e.g. "open ~/Applications/Mochi.app")  # noqa: N815
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.shell:
-            d["shell"] = self.shell
-        if self.postInstall:
-            d["postInstall"] = self.postInstall
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ClientInstallConfig:
-        return cls(
-            shell=str(data.get("shell", "")),
-            postInstall=str(data.get("postInstall", "")),  # noqa: N815
-        )
-
-
-@dataclass
-class PlatformConfig:
-    """Platform requirements and install mode for an app.
-
-    ``os`` declares which platforms the app can run on.
-    ``installMode`` controls how the App Store handles installation:
-
-    - ``"server"`` (default): KiroCrew clones + installs on the server.
-    - ``"client"``: Must be installed on the user's local machine.
-      When KiroCrew is on an incompatible platform, the App Store shows
-      copy-paste terminal instructions instead of running the install.
-
-    ``requiresDesktopApp`` is a different axis from ``os``: ``os`` constrains
-    the machine the GATEWAY runs on, while this constrains the SURFACE the user
-    is viewing from. An app sets it when its UI needs capabilities only the
-    Electron shell provides (native always-on-top windows, global shortcuts,
-    tray, screen capture) and would be broken or pointless in a browser tab.
-    The App Store surfaces the requirement and withholds the enable action from
-    browser sessions.
-
-    It is a UX gate, not a security boundary: the browser marker
-    (``window.kirocrew.isElectron``, set by the shell's preload) is client-side
-    and therefore spoofable. Nothing security-relevant may depend on it — an app
-    whose BACKEND must not run outside the desktop needs a real server-side
-    check, not this flag.
-    """
-
-    os: list[str] = field(default_factory=lambda: ["macos", "linux"])
-    arch: list[str] = field(default_factory=list)  # empty = any arch
-    installMode: str = "server"  # "server" | "client"  # noqa: N815
-    clientInstall: ClientInstallConfig = field(default_factory=ClientInstallConfig)  # noqa: N815
-    requiresDesktopApp: bool = False  # noqa: N815
-
-    # Map user-friendly OS names to sys.platform values.
-    #
-    # ``windows`` is in both directions because KiroCrew itself supports Windows
-    # natively (see ``docs/guides/windows-install.md``): without the row, ``"windows"``
-    # was not even EXPRESSIBLE in a manifest — a declaring app silently never
-    # matched — and ``current_os()`` fell through to the raw ``"win32"``, which is
-    # not one of the user-friendly names any manifest or UI compares against.
-    #
-    # The default below stays ``["macos", "linux"]``. Widening it would silently
-    # promise Windows on behalf of every existing app, and an app opts in by
-    # naming ``windows`` itself.
-    _OS_TO_PLATFORM = {"macos": "darwin", "linux": "linux", "windows": "win32"}
-    _PLATFORM_TO_OS = {"darwin": "macos", "linux": "linux", "win32": "windows"}
-
-    def supports_platform(self, sys_platform: str) -> bool:
-        """Check if this platform config supports the given sys.platform value."""
-        return sys_platform in {self._OS_TO_PLATFORM.get(o, o) for o in self.os}
-
-    @staticmethod
-    def current_os() -> str:
-        """Return the user-friendly OS name for the current platform."""
-        return PlatformConfig._PLATFORM_TO_OS.get(sys.platform, sys.platform)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.os != ["macos", "linux"]:
-            d["os"] = self.os
-        if self.arch:
-            d["arch"] = self.arch
-        if self.installMode != "server":
-            d["installMode"] = self.installMode
-        ci = self.clientInstall.to_dict()
-        if ci:
-            d["clientInstall"] = ci
-        if self.requiresDesktopApp:
-            d["requiresDesktopApp"] = True
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> PlatformConfig:
-        ci_raw = data.get("clientInstall", {})
-        ci = (
-            ClientInstallConfig.from_dict(ci_raw)
-            if isinstance(ci_raw, dict)
-            else ClientInstallConfig()
-        )
-        return cls(
-            os=[str(o) for o in data.get("os", ["macos", "linux"])],
-            arch=[str(a) for a in data.get("arch", [])],
-            installMode=str(data.get("installMode", "server")),  # noqa: N815
-            requiresDesktopApp=bool(data.get("requiresDesktopApp", False)),  # noqa: N815
-            clientInstall=ci,  # noqa: N815
-        )
-
-
-@dataclass
-class PublishProviderConfig:
-    """Declares an external publish destination this app contributes to the core
-    artifact-page publish registry (design §1.3, Route B).
-
-    Core aggregates the **enabled + configured** providers via
-    ``GET /api/publish-providers`` and renders a publish action per provider on the
-    artifact page. Core never imports app code — it only reads this declaration and
-    calls ``endpoint``. ``configFile`` / ``configuredField`` let core resolve the
-    "configured" state by reading the app's own persisted config (under the app's
-    ``data/`` dir) without invoking the app.
-    """
-
-    id: str = ""  # stable provider id, e.g. "deploy-web-aws"
-    label: str = ""  # action label, e.g. "Publish to public web (your AWS)"
-    icon: str = ""  # lucide icon name
-    endpoint: str = (
-        ""  # app backend route the artifact page posts to (e.g. /api/apps/deploy-web/deploy)
-    )
-    kinds: list[str] = field(default_factory=list)  # supported artifact kinds (empty = all)
-    setupRoute: str = ""  # UI route to the app's setup/console page  # noqa: N815
-    configFile: str = "config.json"  # relative to <app_dir>/data/  # noqa: N815
-    configuredField: str = (
-        ""  # field in configFile that must be non-empty to count as configured  # noqa: N815
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.id:
-            d["id"] = self.id
-        if self.label:
-            d["label"] = self.label
-        if self.icon:
-            d["icon"] = self.icon
-        if self.endpoint:
-            d["endpoint"] = self.endpoint
-        if self.kinds:
-            d["kinds"] = self.kinds
-        if self.setupRoute:
-            d["setupRoute"] = self.setupRoute
-        if self.configFile != "config.json":
-            d["configFile"] = self.configFile
-        if self.configuredField:
-            d["configuredField"] = self.configuredField
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> PublishProviderConfig:
-        return cls(
-            id=str(data.get("id", "")),
-            label=str(data.get("label", "")),
-            icon=str(data.get("icon", "")),
-            endpoint=str(data.get("endpoint", "")),
-            kinds=[str(k) for k in data.get("kinds", []) if k],
-            setupRoute=str(data.get("setupRoute", "")),  # noqa: N815
-            configFile=str(data.get("configFile", "config.json")),  # noqa: N815
-            configuredField=str(data.get("configuredField", "")),  # noqa: N815
-        )
-
-
-# ---------------------------------------------------------------------------
-# Main AppManifest
-# ---------------------------------------------------------------------------
-
-
-# Fields that are parsed into typed dataclass attributes
-@dataclass
-class NotificationChannel:
-    """A producer-declared notification channel (RFC local notification bus, Phase 2)."""
-
-    id: str = ""  # kebab-case, unique within the app
-    name: str = ""  # human-readable display name for settings UI
-    icon: str = ""  # lucide icon name (optional)
-    defaultPriority: str = "default"  # "critical" | "default" | "passive"  # noqa: N815
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"id": self.id, "name": self.name}
-        if self.icon:
-            d["icon"] = self.icon
-        if self.defaultPriority != "default":
-            d["defaultPriority"] = self.defaultPriority
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> NotificationChannel:
-        return cls(
-            id=str(data.get("id", "")),
-            name=str(data.get("name", "")),
-            icon=str(data.get("icon", "")),
-            defaultPriority=str(data.get("defaultPriority", "default")),  # noqa: N815
-        )
-
-
-# Maximum declared channels per app (RFC "Channel registry"): keeps the
-# per-channel settings surface bounded; raising later is free, lowering after
-# apps ship with more is a breaking change.
-MAX_NOTIFICATION_CHANNELS = 8
-
-_CHANNEL_PRIORITIES = ("critical", "default", "passive")
-
-
-@dataclass
-class NotificationsConfig:
-    """Notification channel declarations for an app."""
-
-    channels: list[NotificationChannel] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        if not self.channels:
-            return {}
-        return {"channels": [c.to_dict() for c in self.channels]}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> NotificationsConfig:
-        raw = data.get("channels", [])
-        channels = [NotificationChannel.from_dict(c) for c in raw if isinstance(c, dict)]
-        return cls(channels=channels)
-
-    def validate(self) -> list[str]:
-        errors: list[str] = []
-        if len(self.channels) > MAX_NOTIFICATION_CHANNELS:
-            errors.append(
-                f"notifications.channels: at most {MAX_NOTIFICATION_CHANNELS} channels "
-                f"per app, got {len(self.channels)}"
-            )
-        seen: set[str] = set()
-        for ch in self.channels:
-            if not ch.id:
-                errors.append("notifications.channels: channel missing required field: id")
-                continue
-            if not KEBAB_RE.match(ch.id):
-                errors.append(f"notifications.channels: channel id must be kebab-case: {ch.id!r}")
-            if ch.id in seen:
-                errors.append(f"notifications.channels: duplicate channel id: {ch.id!r}")
-            seen.add(ch.id)
-            if not ch.name:
-                errors.append(f"notifications.channels: channel {ch.id!r} missing name")
-            if ch.defaultPriority not in _CHANNEL_PRIORITIES:
-                errors.append(
-                    f"notifications.channels: channel {ch.id!r} defaultPriority must be "
-                    f"one of {_CHANNEL_PRIORITIES}, got {ch.defaultPriority!r}"
-                )
-        return errors
-
+#: Bounds for top-level config ownership declarations. These mirror the generic
+#: foreign-manifest container and key bounds in ``apps.plugin_import`` so every
+#: manifest-facing parser retains the same maximum amount of untrusted input.
+_MAX_CONFIG_KEYS = 200
+_MAX_CONFIG_KEY_CHARS = 200
 
 _KNOWN_FIELDS = frozenset(
     {
@@ -847,6 +324,7 @@ _KNOWN_FIELDS = frozenset(
         "skills",
         "sops",
         "mcpServers",
+        "config_keys",
         "crons",
         "ui",
         "backend",
@@ -858,6 +336,7 @@ _KNOWN_FIELDS = frozenset(
         "dependencies",
         "publishProvider",
         "notifications",
+        "contributes",
     }
 )
 
@@ -890,6 +369,10 @@ class AppManifest:
     sops: list[str] = field(default_factory=list)  # paths to SOP files
     mcpServers: dict[str, Any] = field(default_factory=dict)  # MCP server configs  # noqa: N815
 
+    # --- Config ownership ---
+    config_keys: list[str] = field(default_factory=list)
+    config_keys_error: str = field(default="", repr=False)
+
     # --- Scheduling ---
     crons: list[CronEntry] = field(default_factory=list)
 
@@ -919,6 +402,15 @@ class AppManifest:
     # --- Notifications (RFC local notification bus, Phase 2) ---
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 
+    # --- Contributions to host-owned surfaces ---
+    #
+    # Typed rather than left to ``extra``, even though an unknown top-level key
+    # already round-trips to the dashboard through ``extra``: a contribution that
+    # ends up as the text of an instruction sent to an agent has to be CHECKED, and
+    # ``extra`` is by definition the un-checked bucket. Being a known field is what
+    # makes ``validate()`` see it on every parse.
+    contributes: Contributes = field(default_factory=Contributes)
+
     # --- Discovery ---
     tags: list[str] = field(default_factory=list)
     jobFamilies: list[str] = field(default_factory=list)  # noqa: N815
@@ -930,27 +422,41 @@ class AppManifest:
     # Validation
     # -----------------------------------------------------------------
 
-    def validate(self, app_root: Path | None = None) -> list[str]:
+    def validate(
+        self, app_root: Path | None = None, *, unchecked: list[str] | None = None
+    ) -> list[str]:
         """Return list of validation errors (empty list means valid).
 
         When ``app_root`` is provided, resource paths are checked for canonical
-        containment (resolve + is_relative_to) against it; otherwise a lexical
-        check (reject absolute paths and ``..`` segments) is applied.
+        containment (screened canonicalisation + is_relative_to) against it;
+        otherwise a lexical check (reject absolute paths and ``..`` segments) is
+        applied.
+
+        When ``unchecked`` is a list, a resource path the shared screen did not
+        answer for (:data:`PATH_UNVERIFIED_REFUSAL`) is appended there instead of
+        to the returned errors, so a caller can tell "not checked" from "invalid"
+        without parsing messages.
         """
         errors: list[str] = []
+
+        screened_root = screen_app_path(app_root) if app_root is not None else None
+
+        def path_refusal(rel_path: str) -> str:
+            return _app_path_refusal(rel_path, app_root, screened_root)
+
+        def report_path(refusal: str, message: str) -> None:
+            if refusal == PATH_UNVERIFIED_REFUSAL and unchecked is not None:
+                unchecked.append(message)
+            else:
+                errors.append(message)
 
         # Required fields
         if not self.name:
             errors.append("missing required field: name")
-        elif not KEBAB_RE.match(self.name):
-            errors.append(
-                f"name must be kebab-case (lowercase alphanumeric + hyphens), got: {self.name!r}"
-            )
-        elif self.name in RESERVED_APP_NAMES:
-            errors.append(
-                f"app name {self.name!r} is reserved (would shadow the "
-                f"{self.name}.* notification channel namespace)"
-            )
+        else:
+            name_error = app_name_error(self.name)
+            if name_error:
+                errors.append(name_error)
 
         if not self.version:
             errors.append("missing required field: version")
@@ -963,25 +469,39 @@ class AppManifest:
         if not self.description:
             errors.append("missing required field: description")
 
+        if self.config_keys_error:
+            errors.append(self.config_keys_error)
+
         # Path containment check on all app-root-relative resource paths.
-        # Canonical (resolve + is_relative_to) when app_root is known; lexical
+        # Canonical (screened canonicalisation + is_relative_to) when app_root is known; lexical
         # (reject absolute + '..' segments) otherwise. Applied uniformly to
         # agents/skills/sops, ui.entry, ui.pages[].entryPoint AND
         # backend.entryPoint. (A module-style dotted backend.entryPoint such as
         # 'kiro_crew.apps.builtins.x.server' has no '..' and is not absolute, so
         # the helper never false-positives on it.)
+        agent_refusals: dict[str, str] = {}
         for path_list_name in ("agents", "skills", "sops"):
             for p in getattr(self, path_list_name):
-                if _path_escapes_app_root(str(p), app_root):
-                    errors.append(f"{path_list_name} path contains path traversal: {p!r}")
+                refusal = path_refusal(str(p))
+                if path_list_name == "agents":
+                    agent_refusals[str(p)] = refusal
+                if refusal:
+                    report_path(refusal, f"{path_list_name} path {refusal}: {p!r}")
 
-        if self.ui.entry and _path_escapes_app_root(self.ui.entry, app_root):
-            errors.append(f"ui.entry contains path traversal: {self.ui.entry!r}")
+        refusal = path_refusal(self.ui.entry)
+        if refusal:
+            report_path(refusal, f"ui.entry {refusal}: {self.ui.entry!r}")
 
-        if self.backend.entryPoint and _path_escapes_app_root(self.backend.entryPoint, app_root):
-            errors.append(
-                f"backend.entryPoint contains path traversal: {self.backend.entryPoint!r}"
-            )
+        refusal = path_refusal(self.backend.entryPoint)
+        if refusal:
+            report_path(refusal, f"backend.entryPoint {refusal}: {self.backend.entryPoint!r}")
+
+        # A panel-tab entry is mounted by the same ESM host as ui.pages, so it is
+        # subject to the same path-containment check.
+        for tab in self.contributes.panelTabs:
+            refusal = path_refusal(tab.entry)
+            if refusal:
+                report_path(refusal, f"contributes.panelTabs entry {refusal}: {tab.entry!r}")
 
         # UI page validation
         for page in self.ui.pages:
@@ -989,8 +509,70 @@ class AppManifest:
                 errors.append("ui page missing required field: route")
             if not page.label:
                 errors.append("ui page missing required field: label")
-            if page.entryPoint and _path_escapes_app_root(page.entryPoint, app_root):
-                errors.append(f"ui page entryPoint contains path traversal: {page.entryPoint!r}")
+            refusal = path_refusal(page.entryPoint)
+            if refusal:
+                report_path(refusal, f"ui page entryPoint {refusal}: {page.entryPoint!r}")
+
+        # UI overlay validation
+        seen_overlay_ids: set[str] = set()
+        for overlay in self.ui.overlays:
+            if not overlay.id:
+                errors.append("ui overlay missing required field: id")
+                continue
+            if not _OVERLAY_SLUG_RE.match(overlay.id):
+                errors.append(f"ui overlay id must be kebab-case: {overlay.id!r}")
+            if overlay.id in seen_overlay_ids:
+                errors.append(f"ui overlay duplicate id: {overlay.id!r}")
+            seen_overlay_ids.add(overlay.id)
+            if not overlay.replaces:
+                errors.append(f"ui overlay {overlay.id!r} missing required field: replaces")
+            elif not _OVERLAY_SLUG_RE.match(overlay.replaces):
+                errors.append(
+                    f"ui overlay {overlay.id!r}: replaces must be kebab-case: "
+                    f"{overlay.replaces!r}"
+                )
+
+        # Session control validation.
+        #
+        # Stricter than page validation on purpose: a control renders inside the
+        # composer on the path of every turn, so a malformed one must be refused
+        # at install time rather than discovered as a broken chat.
+        if len(self.contributes.sessionControls) > MAX_SESSION_CONTROLS_PER_APP:
+            errors.append(
+                f"contributes.sessionControls: at most {MAX_SESSION_CONTROLS_PER_APP} per app "
+                f"(declared {len(self.contributes.sessionControls)}) — use a page for further config"
+            )
+        seen_control_ids: set[str] = set()
+        for ctl in self.contributes.sessionControls:
+            if not ctl.id:
+                errors.append("session control contribution missing required field: id")
+            elif not _SESSION_CONTROL_ID_RE.fullmatch(ctl.id):
+                errors.append(f"session control contribution id must be kebab-case: {ctl.id!r}")
+            elif ctl.id in seen_control_ids:
+                # Duplicate ids would make the rendered controls indistinguishable
+                # to React's key and to any per-control persistence.
+                errors.append(f"session control contribution id is duplicated: {ctl.id!r}")
+            else:
+                seen_control_ids.add(ctl.id)
+            if not ctl.entryPoint:
+                errors.append(
+                    f"session control contribution {ctl.id or '<unnamed>'} missing required field: entryPoint"
+                )
+            elif refusal := path_refusal(ctl.entryPoint):
+                report_path(
+                    refusal,
+                    f"session control contribution entryPoint {refusal}: {ctl.entryPoint!r}",
+                )
+            if ctl.statusPath and not _SESSION_CONTROL_STATUS_PATH_RE.fullmatch(
+                ctl.statusPath
+            ):
+                # Refused rather than ignored: a status route the dashboard
+                # declines to call would leave the chip permanently stateless
+                # with nothing saying why.
+                errors.append(
+                    f"session control contribution {ctl.id or '<unnamed>'} statusPath must be a relative "
+                    f"backend route (lowercase, no scheme, host or query): {ctl.statusPath!r}"
+                )
 
         # Cron validation
         for cron in self.crons:
@@ -1004,6 +586,39 @@ class AppManifest:
                 errors.append(
                     f"cron entry {cron.name!r}: 'command' and 'script' are mutually exclusive"
                 )
+            # Calendar fields are validated HERE as well as at the persistence
+            # owner. register_app_crons_with_service catches a per-job
+            # ValueError, logs it and moves on, so a bad zone shipped in a
+            # manifest would otherwise register nothing and say so only in the
+            # gateway log -- the app author sees a cron that silently does not
+            # exist. Surfacing it as a manifest validation error reports it at
+            # install/validate time instead.
+            for _bad in cron.type_invalid_fields:
+                errors.append(
+                    f"cron entry {cron.name!r}: {_bad!r} has the wrong JSON type "
+                    f"(expected {_CRON_FIELD_JSON_TYPES.get(_bad, 'a different type')}); "
+                    f"the value was ignored"
+                )
+            if cron.timezone and not is_valid_timezone(cron.timezone):
+                errors.append(
+                    f"cron entry {cron.name!r}: unknown timezone: {cron.timezone!r} "
+                    f"(expected an IANA zone name such as 'America/New_York')"
+                )
+            for _skip in cron.skip_dates:
+                if not is_valid_skip_date(_skip):
+                    errors.append(
+                        f"cron entry {cron.name!r}: invalid skip_date: {_skip!r} "
+                        f"(expected zero-padded YYYY-MM-DD)"
+                    )
+            # Same create-time rule build_job enforces, so a bad pair is
+            # reported at install/validate time instead of only as a logged
+            # per-job registration failure.
+            try:
+                validate_create_timeouts(
+                    cron.timeout, cron.timeout_secs, command=cron.command, script=cron.script
+                )
+            except ValueError as exc:
+                errors.append(f"cron entry {cron.name!r}: {exc}")
             if cron.enabled_type_invalid:
                 errors.append(
                     f"cron entry {cron.name!r}: 'enabled' must be a JSON boolean "
@@ -1016,12 +631,66 @@ class AppManifest:
                     f"cron entry {cron.name!r}: must specify at least one of "
                     "'agent', 'agent_sequence', 'message', 'command', or 'script'"
                 )
+        cron_grant_error = cron_permission_error(self)
+        if cron_grant_error:
+            errors.append(cron_grant_error)
 
         # Backend hooks validation
         errors.extend(self.backend.hooks.validate())
 
+        # Platform names the install and enable gates compare against
+        errors.extend(self.platform.validate())
+
         # Notification channel validation (RFC Phase 2: 8-channel cap, kebab ids)
         errors.extend(self.notifications.validate())
+
+        # Contributed commands, panel tabs and file-menu rows: ids, caps,
+        # prompt/argument agreement, matcher kind, entry paths, and the file-menu
+        # surfaces / when-filter grammar.
+        errors.extend(self.contributes.validate())
+
+        # A contributed command's `agent` is contained to the agents THIS app ships.
+        # The prompt is app-authored, so letting it name any host agent would let an
+        # app run its text under an agent carrying broader tool grants and
+        # auto-approvals than the default. Refused at install, where the app's own
+        # `agents` are known, rather than clamped later where nobody sees it.
+        commands_with_agent = [c for c in self.contributes.commands if c.agent]
+        if commands_with_agent:
+            unchecked_agents: list[str] = []
+            own = _declared_agent_names(
+                self.agents, app_root, unchecked_agents, known_refusals=agent_refusals
+            )
+            for cmd in commands_with_agent:
+                if cmd.agent in own:
+                    continue
+                if unchecked_agents:
+                    # An agent path the screen could not check may be the one that
+                    # declares this name, so the miss is not a verdict yet.
+                    report_path(
+                        PATH_UNVERIFIED_REFUSAL,
+                        f"contributes.commands[{cmd.id or '?'}]: agent {cmd.agent!r} "
+                        f"{PATH_UNVERIFIED_REFUSAL}: {', '.join(unchecked_agents)}",
+                    )
+                    continue
+                errors.append(
+                    f"contributes.commands[{cmd.id or '?'}]: agent {cmd.agent!r} is "
+                    "not one of this app's own agents (declared in `agents`)"
+                )
+
+        # A contributed row's endpoint is checked against the app's OWN namespace here,
+        # where the name is known -- refusing it at install is what keeps a declaration
+        # naming a core route (`/api/shutdown`) from ever reaching the dashboard, which
+        # would POST to it with the reader's session on a row the reader clicked.
+        for item in self.contributes.fileMenuItems:
+            if item.endpoint and not app_endpoint_allowed(
+                self.name, item.endpoint, allow_proxy_namespace=True
+            ):
+                errors.append(
+                    f"contributes.fileMenuItems[{item.id or '?'}]: endpoint "
+                    f"{item.endpoint!r} must route under /api/apps/{self.name}/ "
+                    f"or /apps/{self.name}/api/ "
+                    "(no traversal, no other app's namespace, no core route)"
+                )
 
         return errors
 
@@ -1037,6 +706,8 @@ class AppManifest:
             "signer": self.signer,
             "permissions": self.permissions.to_dict(),
         }
+        if self.config_keys:
+            body["config_keys"] = sorted(self.config_keys)
         if self.notifications.channels:
             # Channel declarations gate what an app may push and at which
             # default priority -- tampering must invalidate the signature.
@@ -1054,6 +725,146 @@ class AppManifest:
             # command/script/env. Included only when non-empty so manifests
             # signed before crons existed keep producing the identical payload.
             body["crons"] = [c.to_dict() for c in self.crons]
+        if (
+            self.contributes.commands
+            or self.contributes.sessionControls
+            or self.contributes.panelTabs
+            or self.contributes.fileMenuItems
+        ):
+            # A contributed command's `prompt` is sent to an agent with tools as if
+            # the reader typed it, and `autoSend` fires it without a further
+            # keystroke -- the same class of surface as a cron's `command`/`script`
+            # one clause up, and for the same reason: vetting bounds the SHAPE of a
+            # contribution, but only the signature authenticates PUBLISHER INTENT.
+            # Left out, a signed app's rows would be the one part of it an attacker
+            # could rewrite with the signature still verifying, and the reader's
+            # trust in the signature is precisely what would carry the tampered
+            # prompt into a session.
+            #
+            # `argument` rides along inside each entry's canonical to_dict(), which
+            # matters as much as the prompt: widening a matcher (`kind: url` with a
+            # host allowlist -> `text`) does not change a single visible character of
+            # the row, and it is what decides whether the value spliced into that
+            # prompt was checked at all.
+            #
+            # List order preserved, so reordering is a signature-relevant change.
+            # Included only when non-empty, so manifests signed before contributions
+            # existed keep producing the identical payload -- and an app contributing
+            # only commands produces the same bytes it did before panel tabs and file
+            # menus existed.
+            #
+            # `panelTabs` is in the guard for a sharper version of the same reason: a
+            # tab's `entry` names an ESM module the AppHost imports and RUNS in the
+            # dashboard's own origin. Guarding on commands/sessionControls alone left a
+            # panelTabs-ONLY manifest out of the payload entirely, so its `entry` was
+            # the one part of a signed app an attacker could repoint with the signature
+            # still verifying.
+            #
+            # A contributed file-menu row is covered for the same reason at one remove:
+            # its `endpoint` is where the host POSTs the path of a file the reader picked,
+            # so rewriting it on a signed app redirects that dispatch while every visible
+            # character of the row, and the signature, stay exactly as published.
+            body["contributes"] = self.contributes.to_dict()
+        setup_d = self.setup.to_dict()
+        if setup_d:
+            # `onInstall`/`onUpdate`/`onUninstall`/`onEnable`/`onDisable` are shell
+            # text `run_lifecycle_script` hands to `/bin/bash -c`. The string IS the
+            # program -- no file in the package has to exist for it to run -- so a
+            # manifest-only rewrite of a published app buys execution outright. Same
+            # reason `crons` is covered one clause up: vetting bounds the SYNTAX of
+            # what runs, only the signature authenticates PUBLISHER INTENT.
+            # Included only when non-empty so manifests signed before setup was
+            # covered keep producing the identical payload.
+            body["setup"] = setup_d
+        if self.mcpServers:
+            # Each entry's `command`/`args`/`env` is written into the agent config
+            # kiro-cli reads and SPAWNS (`bridges._register_mcp_servers`). Like
+            # `setup`, the executed argv lives in the manifest itself, so this is the
+            # one part of a signed app whose program an attacker could swap with the
+            # signature still verifying.
+            # Included only when non-empty so manifests signed before mcpServers was
+            # covered keep producing the identical payload.
+            body["mcpServers"] = dict(self.mcpServers)
+        backend_d = self.backend.to_dict()
+        if backend_d:
+            # `hooks.*` names a module:callable `module_loader.load_app_module`
+            # imports INTO THE GATEWAY PROCESS, and `entryPoint` + `type` select the
+            # file and interpreter `_start_app_backend_body` spawns. These are
+            # selectors rather than literal argv, so repointing one at a module that
+            # already sits in an otherwise untouched package is enough -- and a
+            # manifest-only tamper is precisely what the signature is the sole
+            # detector for.
+            # The whole canonical dict, not the executed keys alone: cherry-picking
+            # leaves `port`/`healthCheck`/`routes` as residue an attacker may still
+            # move, and one guard is smaller than four.
+            # Included only when non-empty so manifests signed before backend was
+            # covered keep producing the identical payload.
+            body["backend"] = backend_d
+        ui_d = self.ui.to_dict()
+        if ui_d:
+            # `entry` and every `pages[].entryPoint` name an ESM module the dashboard
+            # builds `/apps/<name>/ui/<path>` from and dynamic-`import()`s in its OWN
+            # origin (`website/src/components/AppHost.tsx`) -- the same surface
+            # `contributes.panelTabs[].entry` is covered for one clause up. Outside the
+            # payload, the derivative is signed and the original is not.
+            # The whole canonical dict, not the two executed keys alone: a
+            # `pages[].route` decides which URL serves that bundle, and a page's
+            # `label`/`icon` plus `sidebar` are the whole of what the reader sees
+            # before clicking it -- so cherry-picking the entry paths leaves the
+            # routing and the presentation of an attacker-chosen bundle as residue.
+            # Included only when non-empty so manifests signed before ui was covered
+            # keep producing the identical payload.
+            body["ui"] = ui_d
+        if self.agents:
+            # Each path names a JSON agent spec `bridges._register_agents` writes into
+            # the user's agents dir, carrying its own `tools`/`allowedTools`/`model`/
+            # `prompt`. APPENDING one entry is enough to get an attacker-authored agent
+            # materialized, and the same guard covers that: the payload is recomputed
+            # from the manifest as received, so a package that GAINS an `agents` key
+            # gains it in the signed bytes too and the signature stops matching.
+            # Included only when non-empty so manifests signed before agents was
+            # covered keep producing the identical payload. List order preserved.
+            body["agents"] = list(self.agents)
+        if self.skills:
+            # `bridges._register_skills` symlinks each directory into the skills root,
+            # both namespaced and flat, so a repointed entry puts attacker-authored
+            # skill instructions where an agent reads them as its own.
+            # Included only when non-empty so manifests signed before skills was
+            # covered keep producing the identical payload. List order preserved.
+            body["skills"] = list(self.skills)
+        if self.sops:
+            # Same shape as `skills` one clause up: the file's text becomes procedure an
+            # agent follows, and only the signature authenticates whose text it is.
+            # Included only when non-empty so manifests signed before sops was covered
+            # keep producing the identical payload. List order preserved.
+            body["sops"] = list(self.sops)
+        dependencies_d = self.dependencies.to_dict()
+        if dependencies_d:
+            # `capabilities.mcp` is an id `dependencies.resolve_dependencies` hands to
+            # `CapabilityManager.install_mcp` AT INSTALL TIME, so a swapped id installs
+            # an attacker's MCP server -- whose command an agent then spawns -- under
+            # the publisher's signature.
+            # The whole canonical dict, not `capabilities` alone: `managedBy` is the
+            # switch deciding whether the gateway installs the capability at all, and
+            # `commands`/`optionalCommands` name host executables the install chain
+            # probes and reports as missing.
+            # Included only when non-empty so manifests signed before dependencies was
+            # covered keep producing the identical payload.
+            body["dependencies"] = dependencies_d
+        platform_d = self.platform.to_dict()
+        if platform_d:
+            # `clientInstall.shell` is a one-liner the App Store hands the reader to
+            # PASTE INTO A TERMINAL -- `install_from_registry` returns the whole `clientInstall`
+            # dict with `needsClientInstall: True`, under a signature-verified publisher badge.
+            # No file in the package has to exist for it to run, which is the property
+            # that put `setup` in the payload.
+            # The whole canonical dict, not `clientInstall` alone: `installMode:
+            # "client"` is what makes that block reach the reader at all, so signing the
+            # one-liner without the switch that surfaces it is the cherry-pick this
+            # method avoids everywhere else.
+            # Included only when non-empty so manifests signed before platform was
+            # covered keep producing the identical payload.
+            body["platform"] = platform_d
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     # -----------------------------------------------------------------
@@ -1086,6 +897,8 @@ class AppManifest:
             d["sops"] = self.sops
         if self.mcpServers:
             d["mcpServers"] = self.mcpServers
+        if self.config_keys:
+            d["config_keys"] = self.config_keys
         if self.crons:
             d["crons"] = [c.to_dict() for c in self.crons]
         ui_d = self.ui.to_dict()
@@ -1112,6 +925,9 @@ class AppManifest:
         notif_d = self.notifications.to_dict()
         if notif_d:
             d["notifications"] = notif_d
+        contrib_d = self.contributes.to_dict()
+        if contrib_d:
+            d["contributes"] = contrib_d
         if self.tags:
             d["tags"] = self.tags
         if self.jobFamilies:
@@ -1132,6 +948,25 @@ class AppManifest:
     def from_dict(cls, data: dict[str, Any]) -> AppManifest:
         """Parse from dict, preserving unknown fields in ``extra``."""
         extra = {k: v for k, v in data.items() if k not in _KNOWN_FIELDS}
+
+        config_keys_raw = data.get("config_keys", [])
+        if not isinstance(config_keys_raw, list):
+            config_keys: list[str] = []
+            config_keys_error = "config_keys must be an array"
+        elif len(config_keys_raw) > _MAX_CONFIG_KEYS:
+            config_keys = []
+            config_keys_error = f"config_keys must contain at most {_MAX_CONFIG_KEYS} entries"
+        elif not all(isinstance(key, str) and key for key in config_keys_raw):
+            config_keys = []
+            config_keys_error = "config_keys entries must be non-empty strings"
+        elif any(len(key) > _MAX_CONFIG_KEY_CHARS for key in config_keys_raw):
+            config_keys = []
+            config_keys_error = (
+                f"config_keys entries must be at most {_MAX_CONFIG_KEY_CHARS} characters"
+            )
+        else:
+            config_keys = list(config_keys_raw)
+            config_keys_error = ""
 
         crons_raw = data.get("crons", [])
         crons = [CronEntry.from_dict(c) for c in crons_raw if isinstance(c, dict)]
@@ -1178,6 +1013,17 @@ class AppManifest:
             else NotificationsConfig()
         )
 
+        contrib_raw = data.get("contributes", {})
+        contributes = (
+            Contributes.from_dict(contrib_raw)
+            if isinstance(contrib_raw, dict)
+            # Not silently erased: a non-object `contributes` is the outermost case of the
+            # fail-open shape already closed for `commands` and `hosts` -- it validates as
+            # "contributes nothing" and vanishes from `to_dict`, so the author sees no
+            # error and no rows. `bad_block` carries it to `validate`.
+            else Contributes(bad_block=True)
+        )
+
         return cls(
             name=str(data.get("name", "")),
             version=str(data.get("version", "")),
@@ -1196,6 +1042,8 @@ class AppManifest:
             ],
             sops=[str(s) for s in data.get("sops", []) if s],
             mcpServers=dict(data.get("mcpServers", {})),  # noqa: N815
+            config_keys=config_keys,
+            config_keys_error=config_keys_error,
             crons=crons,
             ui=ui,
             backend=backend,
@@ -1205,6 +1053,7 @@ class AppManifest:
             platform=platform_cfg,
             publishProvider=publish_provider,
             notifications=notifications,
+            contributes=contributes,
             tags=[str(t) for t in data.get("tags", []) if t],
             jobFamilies=[str(j) for j in data.get("jobFamilies", []) if j],  # noqa: N815
             extra=extra,
@@ -1213,7 +1062,218 @@ class AppManifest:
     @classmethod
     def from_json_file(cls, path: Path) -> AppManifest:
         """Parse from an ``app.json`` file."""
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_bytes_with_retry(path).decode("utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"app.json must be a JSON object, got {type(data).__name__}")
         return cls.from_dict(data)
+
+
+# ---------------------------------------------------------------------------
+# What the runtime provisions out of process
+# ---------------------------------------------------------------------------
+#
+# The app runtime installs an app's root ``requirements.txt`` with
+# ``pip install --target`` into the app's own deps directory, a tree that
+# reaches processes spawned on the app's behalf and never the gateway's own
+# import path. Exactly two paths do it, and each decides from the typed
+# manifest plus the app root. The predicates below ARE that decision, imported
+# by both provisioners (``backend.py`` at the spawn of a backend entry point,
+# ``bridges_mcp.py`` at the registration of a stdio ``mcpServers`` entry) and by
+# the install-time desktop gate that mirrors them, so the three sites cannot
+# drift: ``test_apps_provisioning_predicate.py`` pins each site to these names.
+
+#: A ``backend.entryPoint`` ending in one of these is a script FILE even when
+#: it contains dots (``run.server.py``); anything else dotted is a module path.
+SCRIPT_ENTRY_POINT_SUFFIXES: tuple[str, ...] = (".py", ".js", ".ts", ".mjs", ".cjs", ".sh")
+
+#: Suffixes the backend spawn launches with ``node`` (``backend.type: "node"``
+#: chooses the same branch by declaration).
+NODE_ENTRY_POINT_SUFFIXES: tuple[str, ...] = (".js", ".mjs", ".cjs")
+
+#: The suffix the backend spawn launches as a shell script (``backend.type:
+#: "exec"`` chooses the same branch by declaration, and so does an extensionless
+#: executable whose first line is a shebang naming no ``python``).
+SHELL_ENTRY_POINT_SUFFIX = ".sh"
+
+
+def spawn_launches_entry_point_as_python(manifest: AppManifest, app_root: Path) -> bool:
+    """True when the backend spawn would run ``backend.entryPoint`` as a PYTHON child.
+
+    The one file-style shape the provisioned deps tree REACHES. ``backend.py``
+    pip-installs the root ``requirements.txt`` at the spawn of any file-style
+    entry, but hands the tree to a Python child only -- through the ``deps_boot``
+    shim when the child runs the gateway interpreter, through the shim under an
+    ABI-matched shebang, or on ``PYTHONPATH`` for an ABI-matched interpreter (the
+    transport block after the launch is built) -- and a node or shell child gets
+    none of the three: its dependencies land beside it, unreachable. Mirrors the
+    spawn's own dispatch (``_start_app_backend_body``, ``_is_shell_entry``): an
+    explicit ``backend.type`` of ``node`` or ``exec``, a node suffix, or ``.sh``
+    is not Python; an extensionless EXECUTABLE whose first line is a shebang
+    naming no ``python`` is a shell launcher; everything else -- ``.py``, a dotted
+    file name such as ``server.main``, an extensionless script the spawn feeds
+    to the interpreter -- is Python. Asked of the tree the spawn will resolve
+    the name under, like :func:`file_entry_point_refusal`; an extensionless
+    entry that is not there yet is judged by name alone.
+    """
+    entry_point = manifest.backend.entryPoint
+    if manifest.backend.type in ("node", "exec"):
+        return False
+    if entry_point.endswith(NODE_ENTRY_POINT_SUFFIXES) or entry_point.endswith(
+        SHELL_ENTRY_POINT_SUFFIX
+    ):
+        return False
+    if "." in entry_point.rsplit("/", 1)[-1]:
+        return True
+    entry = app_root / entry_point
+    try:
+        if not os.access(entry, os.X_OK):
+            return True
+        with open(entry, "rb") as fh:
+            first_line = fh.readline(256)
+    except OSError:
+        return True
+    return not (first_line.startswith(b"#!") and b"python" not in first_line)
+
+
+def is_module_style_entry_point(entry_point: str, app_root: Path) -> bool:
+    """True when ``backend.entryPoint`` names a dotted Python module, not a file.
+
+    The backend spawn runs such an entry with ``python -m`` from the trusted
+    package (a built-in app living inside the Kiro Crew package itself), never
+    from the writable app directory, so nothing found in that directory -- a
+    ``requirements.txt`` included -- is provisioned for it. Four conditions
+    together decide the shape: no path separator, no script suffix, at least
+    one dot, and no file of that literal name under *app_root* (a file named
+    ``server.main`` is a file). An empty entry point is not module-style.
+    """
+    return (
+        "/" not in entry_point
+        and not entry_point.endswith(SCRIPT_ENTRY_POINT_SUFFIXES)
+        and "." in entry_point
+        and not (app_root / entry_point).exists()
+    )
+
+
+def has_stdio_mcp_server(manifest: AppManifest) -> bool:
+    """True when the manifest declares a stdio ``mcpServers`` entry: one without ``url``.
+
+    A ``url`` server is remote and spawns nothing on the app's behalf. A stdio
+    server is a process the gateway launches, and its Python imports resolve
+    from the app's provisioned deps tree, which is why its presence is what
+    makes ``bridges_mcp.py`` provision at registration.
+    """
+    return any(
+        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
+    )
+
+
+def file_entry_point_refusal(entry_point: str, app_root: Path) -> str:
+    """Why the backend spawn would refuse *entry_point* as a FILE-style entry,
+    or ``""`` when it would spawn it.
+
+    The spawn's own precondition (``backend.py::_start_app_backend_body``),
+    spelled once: the entry must be a regular file under *app_root* whose
+    resolution stays inside the root. Returns the spawn's reason -- ``"not
+    found"``, ``"escapes app root"``, ``"refused by the path screen"``, ``"path
+    resolution failed"`` (the screen could not finish checking it) -- so the
+    spawn can log it and :func:`runtime_provisions_requirements` can treat any
+    reason as "the backend provisioner never runs for this entry".
+    """
+    entry = app_root / entry_point
+    # Containment is asked of the shared screen before anything follows the
+    # entry's links, ``is_file`` included.
+    contained = app_root_containment(entry, app_root)
+    if contained is Containment.UNCHECKED:
+        return "path resolution failed"
+    if contained is Containment.REFUSED:
+        return "refused by the path screen"
+    if contained is Containment.OUTSIDE:
+        return "escapes app root"
+    if not entry.is_file():
+        return "not found"
+    return ""
+
+
+def runtime_provisions_requirements(manifest: AppManifest, app_root: Path) -> bool:
+    """True when the runtime installs the app's root ``requirements.txt`` out of
+    process FOR A PROCESS THAT RECEIVES IT.
+
+    Composed from the same predicates the two provisioners call, plus the one
+    fact the provisioners do not decide by -- which child the installed tree
+    reaches:
+
+    - ``backend.py`` provisions at the spawn of any FILE-style ``backend.entryPoint``
+      -- the spawn runs only for an entry that IS a regular file inside the app
+      root (:func:`file_entry_point_refusal`); a declared file the spawn refuses
+      is returned before provisioning -- but hands the tree to a PYTHON child
+      only (:func:`spawn_launches_entry_point_as_python`): a shell or node entry is
+      spawned with the deps installed beside it and no way to import them, so it
+      counts here as no consumer. Never for a module-style entry, which executes
+      trusted package code;
+    - ``bridges_mcp.py`` provisions at the registration of a stdio ``mcpServers``
+      entry for an app whose entry point is absent or file-style -- the same
+      module-style exclusion, and no existence requirement of its own: the
+      stdio server is the consumer it provisions for, and the one that can still
+      make this true beside a shell or node entry.
+
+    So a module-style entry point is never provisioned, whatever else the
+    manifest declares; a ``.py`` entry point that would spawn always is; a
+    non-Python file entry, or a declared file the spawn would refuse, leaves only
+    a stdio server to make it true; without an entry point, a stdio server is.
+    Says nothing about ``backend.hooks``: a hook is imported into the gateway
+    process, which the deps tree never reaches, so a gate that waives an
+    install-time refusal on this predicate must exclude hooks itself.
+    """
+    entry_point = manifest.backend.entryPoint
+    if entry_point:
+        if is_module_style_entry_point(entry_point, app_root):
+            return False
+        if spawn_launches_entry_point_as_python(
+            manifest, app_root
+        ) and not file_entry_point_refusal(entry_point, app_root):
+            return True
+    return has_stdio_mcp_server(manifest)
+
+
+#: Read cap for an app's ``requirements.txt``: the provisioner buffers it in the
+#: GATEWAY's memory, so an oversized, app-controlled file must exhaust a bounded
+#: buffer, not the gateway. 1 MiB is orders of magnitude beyond any real
+#: requirements.txt. Owned here so the one acceptance rule below can apply the
+#: same cap the provisioner's bounded read enforces.
+REQUIREMENTS_TXT_MAX_BYTES = 1024 * 1024
+
+
+def requirements_in_tree(app_root: Path, req_file: Path) -> tuple[Path, Path] | None:
+    """The strictly-resolved ``(app_root, requirements.txt)`` pair when *req_file*
+    is one the runtime will read, else ``None``.
+
+    The provisioner's own acceptance rule for the file, spelled once: the entry
+    must strictly resolve (a dangling link is ``None``) to a regular file (a
+    directory is ``None``) inside the strictly-resolved app root (a link that
+    escapes it is ``None``), no larger than :data:`REQUIREMENTS_TXT_MAX_BYTES`
+    (an oversized file is ``None``; the provisioner's bounded read refuses it).
+    ``requirements.txt -> requirements/prod.txt`` is legitimate layout and
+    resolves.
+
+    Three callers, one rule. ``backend_runtime/provisioning.py``'s provisioning read and its
+    activation gate use it as the fast refusal before their descriptor-pinned,
+    every-component-no-follow open of the returned target -- that open, and the
+    bounded read through it, are the security boundary; this is not, and it
+    stays where it is. ``registry_pipeline/install_desktop_gate.py``'s install-time desktop
+    gate uses it to predict what those two will do, so it never waives a file the
+    provisioner would refuse. ``None`` on any resolution error, so no caller catches here.
+    """
+    try:
+        root_resolved = app_root.resolve(strict=True)
+        target = req_file.resolve(strict=True)
+        if not target.is_file() or not target.is_relative_to(root_resolved):
+            return None
+        if target.stat().st_size > REQUIREMENTS_TXT_MAX_BYTES:
+            return None
+    except (OSError, RuntimeError):
+        # RuntimeError: a symlink loop, which Path.resolve raises as such before
+        # Python 3.13 (ELOOP, an OSError, from then on). Either way "not a file
+        # the runtime will read", never an exception for a caller to turn into a
+        # 500.
+        return None
+    return root_resolved, target

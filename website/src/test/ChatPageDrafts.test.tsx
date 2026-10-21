@@ -1,7 +1,7 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ReactNode } from 'react'
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import type { RootState } from '../store'
@@ -11,8 +11,16 @@ import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
 import chatReducer, { setActiveSlot, switchSlot, createSlot } from '../store/chatSlice'
-import dashboardReducer from '../store/dashboardSlice'
+import dashboardReducer, { sseConnected, sseDisconnected } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
+import {
+  consumeChatHandoff,
+  handoffToChat,
+  installSoftNavigate,
+  sendErrorToChat,
+  __resetNavSeamForTests,
+} from '../utils/errorReport'
+import { PREFILL_STORAGE_KEY, writePrefill } from '../utils/navIntent'
 
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
@@ -112,8 +120,296 @@ async function renderAndWaitForInput(store: ReturnType<typeof makeStore>, mode?:
 }
 
 beforeEach(() => {
+  vi.clearAllMocks()
   sessionStorage.clear()
   localStorage.clear()
+  __resetNavSeamForTests()
+  installSoftNavigate(() => {})
+})
+
+afterEach(() => {
+  __resetNavSeamForTests()
+  vi.restoreAllMocks()
+})
+
+describe('ChatPage error handoff', { timeout: 15_000 }, () => {
+  it('opens a staged hard-reload handoff in a fresh seeded session', async () => {
+    const prompt = 'Diagnose the browser installation failure'
+    localStorage.setItem('mc-chat-drafts', JSON.stringify({ 'slot-a': 'keep this draft' }))
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    const originalMessages = store.getState().chat.messages
+    handoffToChat(prompt)
+
+    await renderAndWaitForInput(store)
+
+    const { api } = await import('../api/client')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('new-slot'))
+    expect(api.createChatSlot).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe(prompt)
+    })
+    // The seed raises the prefill hint: it is what lifts the composer to the
+    // prefill height cap and says the box was pre-filled. Without it a 13-line
+    // error report sat in the ~6-line typing box, showing only its tail.
+    expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
+    expect(JSON.parse(localStorage.getItem('mc-chat-drafts') || '{}')['slot-a']).toBe('keep this draft')
+    expect(store.getState().chat.slotMessages['slot-a']).toEqual(originalMessages)
+  })
+
+  it('opens an already-mounted handoff in a fresh session without changing the current draft', async () => {
+    const prompt = 'Diagnose the failed PR action'
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+    fireEvent.change(screen.getByLabelText('Message input'), { target: { value: 'question in progress' } })
+
+    act(() => { sendErrorToChat(prompt) })
+
+    const { api } = await import('../api/client')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('new-slot'))
+    expect(api.createChatSlot).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe(prompt)
+    })
+    // Same hint on the in-chat path (an error surface inside chat hands off
+    // with no route change).
+    expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
+    expect(JSON.parse(localStorage.getItem('mc-chat-drafts') || '{}')['slot-a']).toBe('question in progress')
+  })
+
+  it('re-stages a failed handoff without retrying against the mounted subscriber', async () => {
+    const prompt = 'Diagnose the persistent session creation failure'
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+    const { api } = await import('../api/client')
+    vi.mocked(api.createChatSlot).mockRejectedValueOnce(new Error('gateway unavailable'))
+
+    act(() => { sendErrorToChat(prompt) })
+
+    await waitFor(() => {
+      expect(store.getState().notifications.items).toEqual([
+        expect.objectContaining({
+          kind: 'agent',
+          priority: 'critical',
+          body: expect.stringContaining('Your message was restored'),
+        }),
+      ])
+    })
+    expect(api.createChatSlot).toHaveBeenCalledTimes(1)
+    expect(store.getState().chat.activeSlot).toBe('slot-a')
+    expect(consumeChatHandoff()).toBe(prompt)
+  })
+
+  it('re-stages the full FIFO when keyed prefill persistence fails', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+    const { api } = await import('../api/client')
+    vi.mocked(api.createChatSlot).mockResolvedValueOnce({
+      key: 'unseeded-slot', title: 'unseeded-slot', messages: 0, running: false,
+    })
+    const originalSetItem = Storage.prototype.setItem
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (key, value) {
+      if (this === sessionStorage && key === PREFILL_STORAGE_KEY) {
+        throw new DOMException('quota exceeded', 'QuotaExceededError')
+      }
+      return originalSetItem.call(this, key, value)
+    })
+
+    act(() => {
+      sendErrorToChat('failed prefill diagnostic')
+      sendErrorToChat('queued successor')
+    })
+
+    await waitFor(() => expect(store.getState().notifications.items).toHaveLength(1))
+    expect(api.createChatSlot).toHaveBeenCalledTimes(1)
+    expect(store.getState().chat.activeSlot).toBe('slot-a')
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+    expect(consumeChatHandoff()).toBe('failed prefill diagnostic')
+    expect(consumeChatHandoff()).toBe('queued successor')
+    expect(consumeChatHandoff()).toBeNull()
+  })
+
+  it('opens rapid handoffs sequentially and keeps each prompt with its fresh slot', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+    const { api } = await import('../api/client')
+    vi.mocked(api.createChatSlot)
+      .mockResolvedValueOnce({ key: 'error-one', title: 'error-one', messages: 0, running: false })
+      .mockResolvedValueOnce({ key: 'error-two', title: 'error-two', messages: 0, running: false })
+
+    act(() => {
+      sendErrorToChat('first diagnostic')
+      sendErrorToChat('second diagnostic')
+    })
+
+    // The second handoff is not processed until the first has finished its
+    // seed confirmation: `processErrorHandoffs` polls up to 300 x 10ms for the
+    // composer to take the prompt (or the slot to move on), and only then
+    // schedules the next item on a 0ms timer. That is up to ~3s of legitimate
+    // internal waiting before `createChatSlot` can be called a second time, so
+    // `waitFor`'s 1000ms default was asserting on a moment the code had not
+    // reached yet. The widened ceilings name that boundary; nothing sleeps.
+    await waitFor(() => expect(api.createChatSlot).toHaveBeenCalledTimes(2), { timeout: 5000 })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('error-two'), { timeout: 5000 })
+    await waitFor(() => {
+      expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('second diagnostic')
+    }, { timeout: 5000 })
+    await waitFor(() => {
+      const drafts = JSON.parse(localStorage.getItem('mc-chat-drafts') || '{}')
+      expect(drafts['error-one']).toBe('first diagnostic')
+    }, { timeout: 5000 })
+    expect(consumeChatHandoff()).toBeNull()
+  })
+
+  it('does not overwrite edits typed while the fresh slot detail is loading', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+    const { api } = await import('../api/client')
+    let resolveDetail!: (detail: Awaited<ReturnType<typeof api.chatSlotDetail>>) => void
+    const pendingDetail = new Promise<Awaited<ReturnType<typeof api.chatSlotDetail>>>(resolve => {
+      resolveDetail = resolve
+    })
+    vi.mocked(api.createChatSlot).mockResolvedValueOnce({
+      key: 'slow-error-slot', title: 'slow-error-slot', messages: 0, running: false,
+    })
+    vi.mocked(api.chatSlotDetail).mockImplementationOnce(() => pendingDetail)
+
+    act(() => { sendErrorToChat('original diagnostic') })
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('slow-error-slot'))
+    await waitFor(() => {
+      expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('original diagnostic')
+    })
+    fireEvent.change(screen.getByLabelText('Message input'), {
+      target: { value: 'original diagnostic with user edits' },
+    })
+
+    await act(async () => {
+      resolveDetail({ messages: [], running: false, has_more: false, total: 0 })
+      await pendingDetail
+    })
+
+    expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value)
+      .toBe('original diagnostic with user edits')
+  })
+
+  it('re-stages the full FIFO after the first create failure and stops processing', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+    const { api } = await import('../api/client')
+    let rejectFirst!: (reason?: unknown) => void
+    const firstCreate = new Promise<Awaited<ReturnType<typeof api.createChatSlot>>>((_, reject) => {
+      rejectFirst = reject
+    })
+    vi.mocked(api.createChatSlot).mockImplementationOnce(() => firstCreate)
+
+    act(() => {
+      sendErrorToChat('first diagnostic')
+      sendErrorToChat('second diagnostic')
+    })
+
+    await waitFor(() => expect(api.createChatSlot).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      rejectFirst(new Error('first gateway failure'))
+      await firstCreate.catch(() => undefined)
+    })
+    await waitFor(() => expect(store.getState().notifications.items).toHaveLength(1))
+    // The successor stays behind the failed head in one ingress FIFO, and the
+    // mounted processor does not immediately retry either item.
+    expect(api.createChatSlot).toHaveBeenCalledTimes(1)
+    expect(consumeChatHandoff()).toBe('first diagnostic')
+    expect(consumeChatHandoff()).toBe('second diagnostic')
+    expect(consumeChatHandoff()).toBeNull()
+  })
+
+  it('prevents an unmounted processor from clearing a remounted FIFO or stealing focus', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    const firstPage = await renderAndWaitForInput(store)
+    const { api } = await import('../api/client')
+    let resolveAbandoned!: (slot: Awaited<ReturnType<typeof api.createChatSlot>>) => void
+    const abandonedCreate = new Promise<Awaited<ReturnType<typeof api.createChatSlot>>>(resolve => {
+      resolveAbandoned = resolve
+    })
+    vi.mocked(api.createChatSlot).mockImplementationOnce(() => abandonedCreate)
+
+    act(() => {
+      sendErrorToChat('active diagnostic')
+      sendErrorToChat('queued diagnostic')
+    })
+    await waitFor(() => expect(api.createChatSlot).toHaveBeenCalledTimes(1))
+
+    firstPage.unmount()
+
+    let resolveReplacement!: (slot: Awaited<ReturnType<typeof api.createChatSlot>>) => void
+    const replacementCreate = new Promise<Awaited<ReturnType<typeof api.createChatSlot>>>(resolve => {
+      resolveReplacement = resolve
+    })
+    vi.mocked(api.createChatSlot).mockImplementationOnce(() => replacementCreate)
+    const replacementPage = await renderAndWaitForInput(store)
+    await waitFor(() => expect(api.createChatSlot).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      resolveAbandoned({ key: 'abandoned-slot', title: 'abandoned-slot', messages: 0, running: false })
+      await abandonedCreate
+    })
+
+    // The stale processor neither switches the live view nor erases the newer
+    // component's active + queued crash snapshot.
+    expect(store.getState().chat.activeSlot).toBe('slot-a')
+    expect(JSON.parse(sessionStorage.getItem('kirocrew_error_handoff_claimed') || '[]'))
+      .toEqual([{ prompt: 'active diagnostic' }, { prompt: 'queued diagnostic' }])
+
+    replacementPage.unmount()
+    expect(consumeChatHandoff()).toBe('active diagnostic')
+    expect(consumeChatHandoff()).toBe('queued diagnostic')
+    expect(consumeChatHandoff()).toBeNull()
+
+    await act(async () => {
+      resolveReplacement({ key: 'replacement-slot', title: 'replacement-slot', messages: 0, running: false })
+      await replacementCreate
+    })
+    expect(store.getState().chat.activeSlot).toBe('slot-a')
+  })
+
+  it('re-stages locally claimed handoffs if ChatPage unmounts before reconnect', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    store.dispatch(sseDisconnected())
+    handoffToChat('first disconnected diagnostic')
+    handoffToChat('second disconnected diagnostic')
+
+    const page = await renderAndWaitForInput(store)
+    expect(consumeChatHandoff()).toBeNull()
+
+    page.unmount()
+
+    expect(consumeChatHandoff()).toBe('first disconnected diagnostic')
+    expect(consumeChatHandoff()).toBe('second disconnected diagnostic')
+    expect(consumeChatHandoff()).toBeNull()
+  })
+
+  it('claims a disconnected handoff before its storage TTL and opens it after reconnect', async () => {
+    const prompt = 'Diagnose a gateway connection failure'
+    const now = Date.now()
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now)
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    store.dispatch(sseDisconnected())
+    handoffToChat(prompt)
+
+    await renderAndWaitForInput(store)
+
+    const { api } = await import('../api/client')
+    expect(api.createChatSlot).not.toHaveBeenCalled()
+    // Claimed into ChatPage's local FIFO: it is no longer aging in storage.
+    expect(consumeChatHandoff()).toBeNull()
+    nowSpy.mockReturnValue(now + 10 * 60_000)
+
+    act(() => { store.dispatch(sseConnected()) })
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('new-slot'))
+    expect(api.createChatSlot).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe(prompt)
+    })
+  })
 })
 
 // the per-slot draft fix relies on a load-bearing effect ORDER --
@@ -127,25 +423,58 @@ beforeEach(() => {
 // someone reorders the effects or moves the advance up. All three persist
 // writes are asserted (not just text) because the advance now guards all three.
 describe('ChatPage composerSlotRef effect ordering', () => {
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
+  // so the pins read the page and those owners; `skip` drops an owner a test reads alone.
+  const pageAndOwners = (here: string, skip: readonly string[] = []): string => {
+    const pagesDir = resolve(here, '../pages')
+    const ownerDir = resolve(pagesDir, 'chat/page')
+    const read = (dir: string, name: RegExp) => readdirSync(dir)
+      .filter(f => name.test(f) && !/\.test\./.test(f) && !skip.includes(f)).sort()
+      .map(f => readFileSync(resolve(dir, f), 'utf8'))
+    return [readFileSync(resolve(pagesDir, 'ChatPage.tsx'), 'utf8'), ...read(ownerDir, /\.tsx?$/), ...read(pagesDir, /^useChatPage.*\.tsx?$/)].join('\n')
+  }
   it('declares all three composer-persist effects before advancing composerSlotRef', () => {
     // Deliberately brittle: this matches exact code substrings from ChatPage.tsx
-    // to lock a load-bearing effect-declaration order. An innocuous rename/reformat
-    // will trip it. The fix is to UPDATE the substrings below to the new form,
-    // never to delete the guard (the ordering invariant it protects is real).
+    // and its draft owner (pages/chat/page/composerDrafts.ts) to lock a
+    // load-bearing effect-declaration order. An innocuous rename/reformat will
+    // trip it. The fix is to UPDATE the substrings below to the new form, never
+    // to delete the guard (the ordering invariant it protects is real).
     const here = dirname(fileURLToPath(import.meta.url))
-    const src = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
-    const textIdx = src.indexOf('setDraft(drafts.current, s, input)')
-    const fileIdx = src.indexOf('setFileDraft(fileDrafts.current, s, pendingFiles)')
-    const pasteIdx = src.indexOf('setPasteDraft(pasteDrafts.current, s, pasteBlocks)')
-    const advanceIdx = src.indexOf('composerSlotRef.current = activeSlot')
-    expect(textIdx, 'text-persist effect (setDraft off composerSlotRef) not found').toBeGreaterThan(-1)
+    // composerDrafts.ts defines both hooks and holds the one advance, so it is read alone as `owner`.
+    const src = pageAndOwners(here, ['composerDrafts.ts'])
+    const owner = readFileSync(resolve(here, '../pages/chat/page/composerDrafts.ts'), 'utf8')
+    // The text draft persists from `onComposerDraftCommit`, which the
+    // `ComposerDraftSync` CHILD calls from its effect: a child's effects run
+    // before its parent's in the same commit, so the text write lands ahead
+    // of the advance whatever the declaration order. The declaration-order
+    // check still applies to the file, paste and session-ref effects below.
+    expect(src, 'ComposerDraftSync must stay a child of the page').toContain('<ComposerDraftSync store={composerDraft}')
+    // The page runs the slot-change restore, then the persistence hook that
+    // ends with the advance; the advance itself lives only in that hook.
+    const lifecycleCall = src.indexOf('useComposerDraftLifecycle({')
+    const persistCall = src.indexOf('useStagedDraftPersistence({')
+    expect(lifecycleCall, 'the draft lifecycle hook call not found').toBeGreaterThan(-1)
+    expect(persistCall, 'the staged persistence hook must be called AFTER the draft lifecycle hook').toBeGreaterThan(lifecycleCall)
+    expect(src, 'the page must not advance composerSlotRef itself').not.toContain('composerSlotRef.current = activeSlot')
+    expect(owner.split('composerSlotRef.current = activeSlot').length - 1, 'exactly one composerSlotRef advance').toBe(1)
+    const persistStart = owner.indexOf('export function useStagedDraftPersistence(')
+    expect(persistStart, 'useStagedDraftPersistence not found').toBeGreaterThan(-1)
+    const persist = owner.slice(persistStart)
+    const textIdx = owner.indexOf('setDraft(drafts.current, s, text)')
+    const fileIdx = persist.indexOf('setFileDraft(fileDrafts.current, s, pendingFiles)')
+    const pasteIdx = persist.indexOf('setPasteDraft(pasteDrafts.current, s, pasteBlocks)')
+    const refsIdx = persist.indexOf('setSessionRefDraft(sessionRefDrafts.current, s, pendingSessions)')
+    const advanceIdx = persist.indexOf('composerSlotRef.current = activeSlot')
+    expect(textIdx, 'text-persist (setDraft off composerSlotRef) not found').toBeGreaterThan(-1)
+    expect(textIdx, 'the text-persist sink belongs to the lifecycle hook, ahead of the persistence hook').toBeLessThan(persistStart)
     expect(fileIdx, 'file-persist effect (setFileDraft off composerSlotRef) not found').toBeGreaterThan(-1)
     expect(pasteIdx, 'paste-persist effect (setPasteDraft off composerSlotRef) not found').toBeGreaterThan(-1)
+    expect(refsIdx, 'session-ref-persist effect (setSessionRefDraft off composerSlotRef) not found').toBeGreaterThan(-1)
     expect(advanceIdx, 'composerSlotRef advance not found').toBeGreaterThan(-1)
     const order = 'persist effect must be declared BEFORE the composerSlotRef advance (draft-smear guard). If effects moved, UPDATE the substrings; do not delete this guard.'
-    expect(textIdx, order).toBeLessThan(advanceIdx)
     expect(fileIdx, order).toBeLessThan(advanceIdx)
     expect(pasteIdx, order).toBeLessThan(advanceIdx)
+    expect(refsIdx, order).toBeLessThan(advanceIdx)
   })
 
   // Symptom B (send routing to the slot the user already left) can't be covered
@@ -159,7 +488,7 @@ describe('ChatPage composerSlotRef effect ordering', () => {
     // Same brittle-by-design string match: if the send-target lines are renamed,
     // UPDATE the substrings to the new form; do not delete this guard.
     const here = dirname(fileURLToPath(import.meta.url))
-    const src = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+    const src = pageAndOwners(here)
     expect(src, 'uiSlot must be read from the activeSlot ref').toContain('const uiSlot = activeSlotRef.current')
     expect(src, 'send target must resolve from uiSlot').toContain('let slot = targetSlot ?? uiSlot')
     expect(src, 'send target must NOT fall back to the stale closure activeSlot').not.toContain('let slot = targetSlot ?? activeSlot')
@@ -167,6 +496,81 @@ describe('ChatPage composerSlotRef effect ordering', () => {
 })
 
 describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
+  it('leaves the draft alone when a staged prefill belongs to another slot', async () => {
+    // A prefill is addressed to ONE slot. Landing on a different slot must not
+    // seed the composer with it, and must not consume it either — the slot it
+    // was written for may become active next.
+    localStorage.setItem('mc-chat-drafts', JSON.stringify({ 'slot-a': 'mine, still here' }))
+    writePrefill('slot-b', 'prompt for B')
+    const store = makeStore('slot-a', [{ key: 'slot-a' }, { key: 'slot-b' }])
+    await renderAndWaitForInput(store)
+
+    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('mine, still here'))
+    expect(JSON.parse(sessionStorage.getItem(PREFILL_STORAGE_KEY)!).slotKey).toBe('slot-b')
+  })
+
+  it('discards an unreadable prefill and restores the persisted draft', async () => {
+    localStorage.setItem('mc-chat-drafts', JSON.stringify({ 'slot-a': 'mine, still here' }))
+    sessionStorage.setItem(PREFILL_STORAGE_KEY, '{not json')
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+
+    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('mine, still here'))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('stops the browser navigating away when files are dragged over the page', async () => {
+    // Chrome opens a dropped file as a new document unless dragover/drop are
+    // cancelled at the document level; the page installs that guard on mount.
+    // Fired on `document` directly — the composer's own drop target stops
+    // propagation, so a drop there never reaches this listener.
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+
+    // fireEvent returns dispatchEvent's verdict: false once preventDefault ran.
+    expect(fireEvent.dragOver(document, { dataTransfer: { types: ['Files'] } })).toBe(false)
+    // A text drag is not a file: nothing to guard, the default stays.
+    expect(fireEvent.dragOver(document, { dataTransfer: { types: ['text/plain'] } })).toBe(true)
+  })
+
+  it('holds the prefill hint until the user edits the seed, then lets it expire', async () => {
+    // A seeded error report is a dozen lines the user reads before typing. The
+    // hint (and the taller cap it drives) must not collapse on a clock started at
+    // the seed; the first edit is what arms the 10s expiry.
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    writePrefill('slot-a', 'seeded report')
+    await renderAndWaitForInput(store)
+    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('seeded report'))
+    expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
+
+    vi.useFakeTimers()
+    try {
+      act(() => { vi.advanceTimersByTime(30_000) })
+      // Untouched for 30s: still up.
+      expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
+
+      fireEvent.change(screen.getByLabelText('Message input'), { target: { value: 'seeded report\nplus context' } })
+      act(() => { vi.advanceTimersByTime(9_000) })
+      expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
+      act(() => { vi.advanceTimersByTime(1_500) })
+      expect(screen.queryByText(/Prompt pre-filled/)).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops the prefill hint when the user switches to a session with a plain draft', async () => {
+    // The hint describes the seeded composer. It no longer expires on its own,
+    // so a switch that restores an ordinary draft has to take it down.
+    const store = makeStore('slot-a', [{ key: 'slot-a' }, { key: 'slot-b' }])
+    writePrefill('slot-a', 'seeded report')
+    await renderAndWaitForInput(store)
+    await waitFor(() => expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument())
+
+    act(() => { store.dispatch(setActiveSlot('slot-b')) })
+    expect(screen.queryByText(/Prompt pre-filled/)).not.toBeInTheDocument()
+  })
+
   it('preserves draft when switching sessions', async () => {
     const store = makeStore('slot-a', [{ key: 'slot-a' }, { key: 'slot-b' }])
     await renderAndWaitForInput(store)
@@ -342,16 +746,25 @@ describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
     // Switch to slot-b while the upload is still pending.
     act(() => { store.dispatch(setActiveSlot('slot-b')) })
 
-    // Now resolve the upload — the file must be diverted to slot-a.
+    // Now resolve the upload — the file must wait for slot-a, persisted.
     await act(async () => {
       resolveUpload({ paths: ['/tmp/uploaded.png'] })
       await deferred
     })
 
     await waitFor(() => {
+      const waiting = JSON.parse(sessionStorage.getItem('mc-composer-arrivals') || '{}')
+      expect(waiting['slot-a']).toEqual(['/tmp/uploaded.png'])
+      expect(waiting['slot-b']).toBeUndefined()
+      const saved = JSON.parse(sessionStorage.getItem('mc-chat-file-drafts') || '{}')
+      expect(saved['slot-b']).toBeUndefined()
+    })
+
+    // Back on slot-a, its composer takes the file.
+    act(() => { store.dispatch(setActiveSlot('slot-a')) })
+    await waitFor(() => {
       const saved = JSON.parse(sessionStorage.getItem('mc-chat-file-drafts') || '{}')
       expect(saved['slot-a']).toEqual(['/tmp/uploaded.png'])
-      expect(saved['slot-b']).toBeUndefined()
     })
   })
 
@@ -376,14 +789,14 @@ describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
       })
     })
     // The textarea now holds the token, not the raw content.
-    await waitFor(() => expect(input.value).toMatch(/\[ Paste #1 · 5 lines \]/))
+    await waitFor(() => expect(input.value).toMatch(/\[ Paste #1(?:\u2063[\u200b\u200c]+\u2063)? · 5 lines \]/))
 
     // Switch away and back WITHOUT sending.
     act(() => { store.dispatch(setActiveSlot('slot-b')) })
     act(() => { store.dispatch(setActiveSlot('slot-a')) })
 
     // Token text is restored AND still backed by its block.
-    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toMatch(/\[ Paste #1 · 5 lines \]/))
+    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toMatch(/\[ Paste #1(?:\u2063[\u200b\u200c]+\u2063)? · 5 lines \]/))
 
     // Send — the LLM must receive the EXPANDED content, never the literal token.
     await act(async () => { fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' }) })
@@ -391,7 +804,7 @@ describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
     await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
     const llmText = vi.mocked(api.sendChat).mock.calls[0][0] as string
     expect(llmText).toContain('line1\nline2\nline3\nline4\nline5')
-    expect(llmText).not.toContain('[ Paste #1 · 5 lines ]')
+    expect(llmText).not.toMatch(/\[ Paste #/)
   })
 
   it('restores paste blocks to the active slot on connection error', async () => {
@@ -410,7 +823,7 @@ describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
         clipboardData: { items: [], getData: (t: string) => (t === 'text' ? pasted : '') },
       })
     })
-    await waitFor(() => expect(input.value).toMatch(/\[ Paste #1 · 4 lines \]/))
+    await waitFor(() => expect(input.value).toMatch(/\[ Paste #1(?:\u2063[\u200b\u200c]+\u2063)? · 4 lines \]/))
 
     await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }) })
 
@@ -431,7 +844,7 @@ describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
     const { api } = await import('../api/client')
     let resolveCreate!: (v: { key: string; title: string; messages: number; running: boolean }) => void
     const deferred = new Promise<{ key: string; title: string; messages: number; running: boolean }>(r => { resolveCreate = r })
-    vi.mocked(api.createChatSlot).mockReturnValueOnce(deferred as any)
+    vi.mocked(api.createChatSlot).mockReturnValueOnce(deferred as ReturnType<typeof api.createChatSlot>)
 
     const store = makeStore('slot-a', [{ key: 'slot-a' }, { key: 'slot-b' }])
     await renderAndWaitForInput(store)

@@ -4,23 +4,36 @@ Rendering text for Slack is NOT this module's job. ``slack.format`` owns that â€
 ``render_for_slack`` for bodies and ``build_options_blocks`` for the control,
 which redacts every choice through ``redact_for_display`` so a key split by ANSI,
 emphasis, backticks or link markup is caught in the form Slack actually shows.
-This module deliberately holds no second copy of that pipeline: an earlier
-version did, and the two drifted apart until the same credential-exposure bug
-had to be fixed twice, three review rounds apart.
+This module deliberately holds no second copy of that pipeline: two copies
+drift apart, and the same credential-exposure bug then has to be fixed in
+both.
 
-What is left here is the part ``slack.format`` has no opinion about: a posted
-control stays answerable until something spends it. ``PostedOptions`` carries
-enough to find the control again, and ``expire_options`` renders it spent once
-the conversation has moved past the question it asked.
+What is left here is the part ``slack.format`` has no opinion about: whether a
+posted control is still answering the question the conversation is on.
+
+That is decided when a click ARRIVES, not on the turn before. A control goes out
+carrying a token -- the conversation that asked, and how far it had got (see
+:func:`encode_options_token`) -- and the click is judged by comparing that token
+against the transcript on disk. Both halves outlive the process, so a gateway
+restart cannot turn a superseded button back into a live one; nothing here is
+remembered between clicks.
+
+``expire_options`` still strikes a spent control through, but only as
+presentation: a click on an un-struck control is refused on its own terms, so the
+edit failing leaves the thread untidy rather than unsafe. ``_ANSWERED`` is the one
+piece of memory that remains, and it is not about staleness at all -- it stops a
+double-click from dispatching the same answer twice, a race that is entirely
+within one process by construction.
 """
 
 from __future__ import annotations
 
-import asyncio
+import base64
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.slack.format import build_options_selected_blocks, replace_options_blocks
 from kiro_crew.slack.retry import is_retryable_slack_error
 
@@ -51,13 +64,73 @@ class PostedOptions:
 
 
 _MAX_EDIT_LOCKS = 512
-_EDIT_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+# LoopBoundLock, not asyncio.Lock: the registry is a module global, so
+# a value created on one event loop would otherwise be handed to a later loop
+# for the same key and raise RuntimeError on acquire.
+_EDIT_LOCKS: dict[tuple[str, str], LoopBoundLock] = {}
 _ANSWERED: dict[tuple[str, str], bool] = {}
-# Threads with an OPTIONS answer currently routing: thread_ts -> the dispatch
-# tasks carrying it. See :func:`track_answer_routing`.
-_ANSWER_ROUTING: dict[str, set[asyncio.Task[Any]]] = {}
 # Interested parties per edit-lock key: holders plus coroutines waiting to hold.
 _LOCK_USERS: dict[tuple[str, str], int] = {}
+
+#: Marks a ``block_id`` as carrying an OPTIONS staleness token, and versions the
+#: encoding so a control posted by an older build is recognised as untokened
+#: (and therefore honoured) rather than mis-parsed.
+OPTIONS_TOKEN_PREFIX = "kcopt1:"
+
+#: Slack rejects a ``block_id`` over 255 characters. A token that would not fit
+#: is not emitted at all, which reads downstream as "cannot prove staleness" and
+#: honours the click -- the same abstain-rather-than-refuse direction every other
+#: unreadable input takes.
+_MAX_BLOCK_ID = 255
+
+
+def encode_options_token(session_key: str, row_ts: str) -> str | None:
+    """Pack *session_key* + *row_ts* into a ``block_id``, or ``None`` if it won't fit.
+
+    The token rides in the Slack message rather than in gateway memory, which is
+    what makes the staleness check stateless: Slack hands it back on every click,
+    so a restart cannot lose it. *row_ts* is the asker's last transcript row at
+    post time -- a persisted, strictly increasing value (see
+    :func:`kiro_crew.history.monotonic_transcript_ts`), so it stays comparable
+    across a restart.
+
+    Both fields are base64url-encoded so neither can contain the ``:`` used as
+    the separator: a session key is itself colon-shaped (``slack:<ts>``) and an
+    ISO timestamp carries both ``:`` and ``+``.
+    """
+    if not session_key or not row_ts:
+        return None
+    packed = (
+        OPTIONS_TOKEN_PREFIX
+        + base64.urlsafe_b64encode(session_key.encode()).decode().rstrip("=")
+        + ":"
+        + base64.urlsafe_b64encode(row_ts.encode()).decode().rstrip("=")
+    )
+    return packed if len(packed) <= _MAX_BLOCK_ID else None
+
+
+def decode_options_token(block_id: str | None) -> tuple[str, str] | None:
+    """Unpack a ``block_id`` into ``(session_key, row_ts)``, or ``None``.
+
+    Returns ``None`` for anything that is not a token this build wrote -- an
+    absent id, a foreign one, a truncated one, or one whose payload is not valid
+    base64. Every such case means the click cannot be *proven* stale, and the
+    callers honour it rather than refusing on a guess.
+    """
+    if not block_id or not block_id.startswith(OPTIONS_TOKEN_PREFIX):
+        return None
+    body = block_id[len(OPTIONS_TOKEN_PREFIX) :]
+    parts = body.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        decoded = [base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)).decode() for p in parts]
+    except (ValueError, UnicodeDecodeError):
+        return None
+    session_key, row_ts = decoded
+    if not session_key or not row_ts:
+        return None
+    return session_key, row_ts
 
 
 def claim_options_answer(channel: str, ts: str) -> bool:
@@ -85,11 +158,11 @@ def claim_options_answer(channel: str, ts: str) -> bool:
     the in-place edit landed, the original was deleted, or the expiry's
     strike-through succeeded. Only such settled entries are evictable.
 
-    An earlier version evicted the oldest entry outright, justified as "a dropped
+    Evicting the oldest entry outright would be justified as "a dropped
     entry can only re-admit a click on a control old enough to have aged out of a
     512-message window, which the turn-start expiry has long since struck
-    through". That is wrong, and wrong in the same way this PR's other bounds
-    were: eviction here is by insertion order across the WHOLE workspace, not by
+    through". That is wrong: eviction here is by insertion order across the WHOLE
+    workspace, not by
     age within one conversation, so traffic in busy channels can evict the claim
     on a control still sitting unanswered in a quiet thread. When the render or
     the strike-through failed those buttons are genuinely still on screen, and
@@ -131,57 +204,6 @@ def settle_options_answer(channel: str, ts: str) -> None:
     """
     if (channel, ts) in _ANSWERED:
         _ANSWERED[(channel, ts)] = True
-
-
-def track_answer_routing(thread_ts: str, task: asyncio.Task[Any]) -> None:
-    """Remember that an OPTIONS answer for *thread_ts* is on its way to a session.
-
-    A click that succeeds does two things: it FORGETS the record (the control is
-    spent) and it dispatches the answer as a task. Between those, the record --
-    which is what the unlink handler consults to decide whether the thread is
-    still needed -- is already gone, while the answer has not yet resolved which
-    session it belongs to. An unlink landing in that window pops the thread from
-    the reverse index and the answer starts a BRAND-NEW Slack session carrying the
-    user's selection: the same corruption the unlink ordering was built to
-    prevent, reached from the other side.
-
-    Registered by task, not by a counter, so nothing can leak: a task that
-    finishes -- or raises, or is cancelled -- stops counting as in flight by
-    itself, and a stuck counter that made unlink refuse forever would be a worse
-    bug than the one being fixed.
-    """
-    bucket = _ANSWER_ROUTING.setdefault(thread_ts, set())
-    bucket.add(task)
-
-    def _done(finished: asyncio.Task[Any]) -> None:
-        live = _ANSWER_ROUTING.get(thread_ts)
-        if live is None:
-            return
-        live.discard(finished)
-        if not live:
-            _ANSWER_ROUTING.pop(thread_ts, None)
-
-    task.add_done_callback(_done)
-
-
-def answer_routing_in_flight(thread_ts: str) -> bool:
-    """Is an OPTIONS answer for *thread_ts* still finding its session?
-
-    Prunes finished tasks on the way past, so a missed callback cannot pin a
-    thread as busy forever.
-    """
-    if not thread_ts:
-        return False
-    live = _ANSWER_ROUTING.get(thread_ts)
-    if not live:
-        return False
-    for task in list(live):
-        if task.done():
-            live.discard(task)
-    if not live:
-        _ANSWER_ROUTING.pop(thread_ts, None)
-        return False
-    return True
 
 
 def release_options_answer(channel: str, ts: str) -> None:
@@ -244,7 +266,7 @@ def options_edit_lock(channel: str, ts: str) -> "_OptionsEditLock":
     key = (channel, ts)
     lock = _EDIT_LOCKS.get(key)
     if lock is None:
-        lock = _EDIT_LOCKS[key] = asyncio.Lock()
+        lock = _EDIT_LOCKS[key] = LoopBoundLock()
     _prune_edit_locks(key)
     return _OptionsEditLock(key, lock)
 
@@ -281,7 +303,7 @@ class _OptionsEditLock:
 
     __slots__ = ("_key", "_lock")
 
-    def __init__(self, key: tuple[str, str], lock: asyncio.Lock) -> None:
+    def __init__(self, key: tuple[str, str], lock: LoopBoundLock) -> None:
         self._key = key
         self._lock = lock
 

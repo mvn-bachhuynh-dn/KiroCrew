@@ -10,8 +10,10 @@ import zipfile
 import pytest
 
 from kiro_crew.doc_parser import (
+    extract_slides,
     extract_text,
     is_parseable_document,
+    join_slides,
 )
 
 # ── Helpers ──
@@ -375,3 +377,318 @@ def test_missing_defusedxml_leaves_pdf_parsing_alone(monkeypatch, caplog):
     finally:
         os.unlink(path)
     assert not any("defusedxml" in r.message for r in caplog.records)
+
+
+class TestArchiveInventoryBound:
+    """doc_parser gains an inventory bound it did not have before.
+
+    This is the one intended behaviour change of the shared-vet extraction: the
+    two OOXML sites would otherwise open any archive, however many members it
+    declares, because the per-entry size cap cannot bound the inventory.
+    """
+
+    def _many_member_docx(self, tmp_path, members: int):
+        import zipfile
+
+        path = tmp_path / "many.docx"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr(
+                "word/document.xml",
+                b'<?xml version="1.0"?><w:document '
+                b'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                b"<w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body></w:document>",
+            )
+            for i in range(members):
+                z.writestr(f"word/media/f{i}.bin", b"x")
+        return path
+
+    def test_an_over_cap_inventory_degrades_to_empty(self, tmp_path, monkeypatch):
+        from kiro_crew import doc_parser
+
+        path = self._many_member_docx(tmp_path, members=40)
+        # Under the real cap the document parses -- the bound does not narrow
+        # legitimate documents.
+        assert doc_parser._extract_docx(str(path)) == "hello"
+        # Over the cap it is refused before ZipFile is constructed. Without the
+        # vet this same archive parses fine, which is the red-before.
+        monkeypatch.setattr(doc_parser, "_MAX_ARCHIVE_MEMBERS", 10)
+        assert doc_parser._extract_docx(str(path)) == ""
+
+    def test_a_forged_directory_size_is_refused_before_zipfile(self, tmp_path, monkeypatch):
+        """The binding field: entry count stays honest and low, declared
+        central-directory size does not. ZipFile allocates from the size."""
+        import zipfile
+
+        from kiro_crew import doc_parser
+
+        path = self._many_member_docx(tmp_path, members=2)
+        data = bytearray(path.read_bytes())
+        eocd = data.rfind(b"PK\x05\x06")
+        data[eocd + 12: eocd + 16] = (0xFFFFFFF0).to_bytes(4, "little")
+        path.write_bytes(bytes(data))
+
+        def _explode(*a, **kw):
+            raise AssertionError("ZipFile was constructed for a refused archive")
+
+        monkeypatch.setattr(zipfile, "ZipFile", _explode)
+        assert doc_parser._extract_docx(str(path)) == ""
+
+    def test_pptx_is_bounded_too(self, tmp_path, monkeypatch):
+        import zipfile
+
+        from kiro_crew import doc_parser
+
+        path = tmp_path / "many.pptx"
+        with zipfile.ZipFile(path, "w") as z:
+            for i in range(20):
+                z.writestr(f"ppt/media/f{i}.bin", b"x")
+        monkeypatch.setattr(doc_parser, "_MAX_ARCHIVE_MEMBERS", 5)
+        assert doc_parser._extract_pptx(str(path)) == ""
+
+
+# ── Aggregate extraction budget (max_chars) ──
+
+
+class TestMaxCharsBudget:
+    """extract_text(max_chars=...) bounds AGGREGATE retained text.
+
+    Added for the office-preview endpoint: a .pptx with thousands of slides,
+    each under the per-entry decompression cap, must not accumulate unbounded
+    text. Budget met => later slides are never decompressed or parsed.
+    """
+
+    def test_pptx_budget_stops_slide_iteration(self):
+        path = _make_pptx([["s" * 1000] for _ in range(50)])
+        try:
+            text = extract_text(path, filename="deck.pptx", max_chars=3000)
+        finally:
+            os.unlink(path)
+        assert len(text) < 10 * 1000, "budget must bound aggregate extraction"
+        assert "--- Slide 1 ---" in text
+        assert "--- Slide 50 ---" not in text
+
+    def test_docx_budget_bounds_paragraphs(self):
+        path = _make_docx(["p" * 1000 for _ in range(50)])
+        try:
+            text = extract_text(path, filename="long.docx", max_chars=3000)
+        finally:
+            os.unlink(path)
+        assert len(text) < 10 * 1000
+
+    # The budget is a WHOLE-UNIT soft budget: extraction stops after the
+    # paragraph or slide that meets it, never inside one. The office preview
+    # redacts the extraction before cutting it to its cap, and that
+    # redaction only sees every token whole because of this contract -- a budget
+    # applied at a character position would hand it a severed credential, whose
+    # unmatched prefix would then be served. These tests pin the contract where
+    # it lives.
+
+    def test_docx_budget_keeps_the_paragraph_it_lands_in_whole(self):
+        """The paragraph that crosses the budget comes back whole, not cut at it."""
+        paragraphs = ["a" * 100, "b" * 100, "c" * 100 + "MARKER-END", "d" * 100]
+        path = _make_docx(paragraphs)
+        try:
+            # 250 lands 50 characters into the third paragraph.
+            text = extract_text(path, filename="doc.docx", max_chars=250)
+        finally:
+            os.unlink(path)
+        assert text == "\n".join(paragraphs[:3])
+        assert text.endswith("MARKER-END")
+
+    def test_docx_budget_met_exactly_at_a_paragraph_end_adds_no_partial_next(self):
+        """A budget that lands exactly on a paragraph end stops there, whole."""
+        paragraphs = ["a" * 100, "b" * 100, "c" * 100]
+        path = _make_docx(paragraphs)
+        try:
+            # 201 = len("a"*100 + "\n" + "b"*100): met at the end of paragraph 2.
+            text = extract_text(path, filename="doc.docx", max_chars=201)
+        finally:
+            os.unlink(path)
+        assert text == "\n".join(paragraphs[:2])
+
+    def test_pptx_budget_keeps_the_slide_it_lands_in_whole(self):
+        """Every slide returned is that slide's whole text, the last one included."""
+        decks = [["a" * 100], ["b" * 50, "c" * 50 + "MARKER-END"], ["d" * 100]]
+        path = _make_pptx(decks)
+        try:
+            # 150 lands inside slide 2.
+            slides = extract_slides(path, filename="deck.pptx", max_chars=150)
+            text = extract_text(path, filename="deck.pptx", max_chars=150)
+        finally:
+            os.unlink(path)
+        assert slides == [(1, "a" * 100), (2, "b" * 50 + "\n" + "c" * 50 + "MARKER-END")]
+        assert text == join_slides(slides)
+
+    def test_budget_of_one_still_returns_the_first_unit_whole(self):
+        """The smallest budget cannot sever: it returns the whole first unit."""
+        docx = _make_docx(["x" * 500 + "MARKER-END", "later"])
+        pptx = _make_pptx([["y" * 500 + "MARKER-END"], ["later"]])
+        try:
+            doc_text = extract_text(docx, filename="doc.docx", max_chars=1)
+            slides = extract_slides(pptx, filename="deck.pptx", max_chars=1)
+        finally:
+            os.unlink(docx)
+            os.unlink(pptx)
+        assert doc_text == "x" * 500 + "MARKER-END"
+        assert slides == [(1, "y" * 500 + "MARKER-END")]
+
+    def test_no_budget_extracts_everything(self):
+        """Without max_chars behavior is unchanged (existing callers unaffected)."""
+        path = _make_pptx([["alpha"], ["beta"], ["gamma"]])
+        try:
+            text = extract_text(path, filename="deck.pptx")
+        finally:
+            os.unlink(path)
+        assert "alpha" in text and "beta" in text and "gamma" in text
+
+    def test_docx_cap_sized_first_paragraph_does_not_stop_extraction(self):
+        """Separator accounting must not charge the FIRST paragraph.
+
+        Regression: `collected += len(joined) + 1` counted a "\n" separator
+        for the first paragraph too, so a document whose opening paragraph
+        exactly filled the budget stopped extraction there — the caller's
+        length check then read the result as un-truncated and the rest of
+        the document was silently dropped.
+        """
+        first = "a" * 100
+        path = _make_docx([first, "TAIL-MARKER"])
+        try:
+            # Budget = len(first) + 1: the first paragraph alone is 100, with
+            # no phantom separator added, so 100 < 101 and extraction must
+            # continue into the second paragraph.
+            text = extract_text(path, filename="doc.docx", max_chars=101)
+        finally:
+            os.unlink(path)
+        assert "TAIL-MARKER" in text, "cap-sized first paragraph dropped the rest"
+        # And the returned length now exceeds the budget, so a caller
+        # passing cap+1 sees the truncation instead of missing content.
+        assert len(text) > 101
+
+
+class TestFileobjExtraction:
+    """extract_text(fileobj=...) parses the already-open handle.
+
+    Added for the office-preview endpoint's open-once discipline: the
+    handler fstat-gates the size on an O_NOFOLLOW fd and hands the SAME
+    handle here, so the bytes parsed are exactly the bytes measured (no
+    stat→open TOCTOU window).
+    """
+
+    def test_docx_fileobj_matches_path_result(self):
+        path = _make_docx(["hello", "world"])
+        try:
+            via_path = extract_text(path, filename="a.docx")
+            with open(path, "rb") as f:
+                via_fileobj = extract_text(path, filename="a.docx", fileobj=f)
+        finally:
+            os.unlink(path)
+        assert via_fileobj == via_path == "hello\nworld"
+
+    def test_pptx_fileobj_matches_path_result(self):
+        path = _make_pptx([["alpha"], ["beta"]])
+        try:
+            via_path = extract_text(path, filename="d.pptx")
+            with open(path, "rb") as f:
+                via_fileobj = extract_text(path, filename="d.pptx", fileobj=f)
+        finally:
+            os.unlink(path)
+        assert via_fileobj == via_path
+        assert "alpha" in via_fileobj and "beta" in via_fileobj
+
+    def test_fileobj_is_read_instead_of_path(self):
+        """The handle's bytes win — proves parsing never re-opens the path."""
+        real = _make_docx(["FROM-FILEOBJ"])
+        decoy = _make_docx(["FROM-PATH"])
+        try:
+            with open(real, "rb") as f:
+                # Pass the DECOY path with the REAL handle: a re-open of the
+                # path would surface the decoy text.
+                text = extract_text(decoy, filename="a.docx", fileobj=f)
+        finally:
+            os.unlink(real)
+            os.unlink(decoy)
+        assert text == "FROM-FILEOBJ"
+
+
+# ── Per-slide extraction (extract_slides) ──
+
+
+class TestExtractSlides:
+    """The structured form the office-preview endpoint renders a deck from.
+
+    Its contract is "the same slides extract_text flattens, kept apart": the
+    numbers are the deck's own, the order is deck order, and joining them
+    reproduces extract_text byte for byte, so the two can never disagree.
+    """
+
+    def test_returns_numbered_slides_in_deck_order(self):
+        path = _make_pptx([["Title", "Body text"], ["Second"]])
+        try:
+            slides = extract_slides(path, filename="deck.pptx")
+        finally:
+            os.unlink(path)
+        assert slides == [(1, "Title\nBody text"), (2, "Second")]
+
+    def test_join_reproduces_extract_text(self):
+        path = _make_pptx([["alpha"], ["beta"], ["gamma"]])
+        try:
+            slides = extract_slides(path, filename="deck.pptx")
+            text = extract_text(path, filename="deck.pptx")
+        finally:
+            os.unlink(path)
+        assert join_slides(slides) == text
+        assert text == "--- Slide 1 ---\nalpha\n\n--- Slide 2 ---\nbeta\n\n--- Slide 3 ---\ngamma"
+
+    def test_slide_without_text_keeps_the_deck_numbering(self):
+        # Slide 2 carries no runs; the gap in the numbering is the reader's
+        # signal that a slide was skipped, so it must not be renumbered.
+        path = _make_pptx([["one"], [], ["three"]])
+        try:
+            slides = extract_slides(path, filename="deck.pptx")
+        finally:
+            os.unlink(path)
+        assert [n for n, _ in slides] == [1, 3]
+
+    def test_non_pptx_is_an_empty_list(self):
+        path = _make_docx(["a paragraph"])
+        try:
+            assert extract_slides(path, filename="report.docx") == []
+        finally:
+            os.unlink(path)
+
+    def test_budget_stops_slide_iteration(self):
+        path = _make_pptx([["s" * 1000] for _ in range(50)])
+        try:
+            slides = extract_slides(path, filename="deck.pptx", max_chars=3000)
+        finally:
+            os.unlink(path)
+        # 3 slides meet the 3000-char budget; the other 47 are never parsed.
+        assert len(slides) == 3
+
+    def test_fileobj_matches_path_result(self):
+        path = _make_pptx([["alpha"], ["beta"]])
+        try:
+            via_path = extract_slides(path, filename="d.pptx")
+            with open(path, "rb") as f:
+                via_fileobj = extract_slides(path, filename="d.pptx", fileobj=f)
+        finally:
+            os.unlink(path)
+        assert via_fileobj == via_path == [(1, "alpha"), (2, "beta")]
+
+    def test_sensitive_path_is_refused_and_audited(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from kiro_crew import doc_parser
+
+        monkeypatch.setattr(doc_parser, "is_sensitive_path", lambda p: True)
+        sel_instance = MagicMock()
+        monkeypatch.setattr(doc_parser, "sel", lambda: sel_instance)
+        assert extract_slides("/home/u/.ssh/deck.pptx", filename="deck.pptx") == []
+        kwargs = sel_instance.log_api_access.call_args.kwargs
+        assert kwargs["operation"] == "extract_slides"
+        assert kwargs["error"] == "sensitive_path_rejected"
+
+    def test_parse_failure_is_an_empty_list(self, tmp_path):
+        path = tmp_path / "broken.pptx"
+        path.write_bytes(b"PK\x03\x04 not really a zip")
+        assert extract_slides(str(path), filename="broken.pptx") == []

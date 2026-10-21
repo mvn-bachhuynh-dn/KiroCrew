@@ -58,6 +58,7 @@ vi.mock('../api/client', async (importOriginal) => {
           'renameSlot', 'forkSession',
         ].map(k => [k, vi.fn().mockResolvedValue({})]),
       ),
+      setPinnedOrder: vi.fn(async (keys: string[]) => ({ ok: true, order: keys })),
       chatFolders: vi.fn().mockResolvedValue([]),
       sessionsSearch: sessionsSearchMock,
     },
@@ -76,6 +77,7 @@ Object.defineProperty(window, 'matchMedia', {
 globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as unknown as typeof fetch
 
 import ChatSidebar from '../pages/ChatSidebar'
+import { api } from '../api/client'
 import type { ChatSlot } from '../types'
 import type { RootState } from '../store'
 
@@ -88,7 +90,7 @@ const slot = (key: string, title: string, lastTs: string, pinned = false): ChatS
 const SLOTS = [
   slot('chat-target', 'Managing session overload strategies', '2026-01-01T00:00:00Z'),
   slot('chat-pinned', 'Pinned unrelated title', '2026-03-01T00:00:00Z', true),
-  slot('chat-fresh', 'Fresh unrelated title', '2026-02-01T00:00:00Z'),
+  slot('chat-fresh', 'Fresh unrelated title', '2026-02-01T00:00:00Z', true),
 ]
 
 function renderSidebar() {
@@ -138,7 +140,9 @@ function renderSidebar() {
 describe('ChatSidebar – active-session search preserves backend relevance order', () => {
   beforeEach(() => {
     sessionsSearchMock.mockClear()
+    vi.mocked(api.setPinnedOrder).mockClear()
     localStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
   })
 
   it('renders search results in backend order, not re-sorted by pin/date', async () => {
@@ -161,6 +165,24 @@ describe('ChatSidebar – active-session search preserves backend relevance orde
       expect(target.compareDocumentPosition(pinnedDecoy) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
       expect(pinnedDecoy.compareDocumentPosition(fresh) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     })
+  })
+
+  it('disables pinned reordering while backend relevance rank is active', async () => {
+    renderSidebar()
+
+    fireEvent.change(screen.getByPlaceholderText(/search sessions/i), {
+      target: { value: 'session overload' },
+    })
+    await waitFor(() => expect(sessionsSearchMock).toHaveBeenCalledWith('session overload'))
+
+    const pinnedRow = () => document.querySelector<HTMLElement>(
+      '[data-session-row="chat-pinned"][data-session-scope="list"]',
+    )
+    await waitFor(() => expect(pinnedRow()).not.toHaveAttribute('aria-keyshortcuts'))
+    fireEvent.keyDown(pinnedRow()!, { key: 'ArrowDown', altKey: true })
+
+    // Only the first-load seed (onlyIfUnset) may go out; no reorder does.
+    expect(vi.mocked(api.setPinnedOrder).mock.calls.filter(call => call[1] !== true)).toEqual([])
   })
 
   it('pin-first + date-desc re-sort would have inverted this fixture (guards fixture validity)', () => {

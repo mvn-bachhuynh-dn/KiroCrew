@@ -139,7 +139,7 @@ def test_flush_file_changes_marks_slot_dirty() -> None:
     the success path, is not followed by an explicit `save_slot_off_loop`) the
     `file_changes` would never reach disk.
 
-    `state.py`'s in-place-mutation contract states it directly: "the periodic
+    `state_parts/transcript_rows.py`'s in-place-mutation contract states it directly: "the periodic
     flush skips non-dirty slots, so an unflagged in-place mutation can be lost on
     restart."
     """
@@ -185,6 +185,12 @@ def _flush_harness(save_fn):
 
     class _State:
         conversation_log = True
+
+        # The dirty-bit bookkeeping these tests pin now lives in
+        # ``flush_slot_now``, which ``_flush_dirty_slots`` calls per slot. Bind
+        # the REAL method so they still exercise production logic rather than a
+        # reimplementation of it.
+        flush_slot_now = DashboardState.flush_slot_now
 
         def __init__(self) -> None:
             self._slots = {"chat-1-test": slot}

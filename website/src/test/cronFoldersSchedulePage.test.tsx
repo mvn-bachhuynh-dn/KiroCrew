@@ -3,6 +3,7 @@ import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import SchedulePage from '../pages/SchedulePage'
 import type { CronJob } from '../types'
+import { selectedName, selectionState } from '../guide/guidePredicates'
 
 const mkJob = (id: string, name: string, folderId?: string): CronJob => ({
   id,
@@ -27,7 +28,10 @@ vi.mock('../api/client', () => ({
     cancelCron: vi.fn().mockResolvedValue({}),
     cronToChat: vi.fn().mockResolvedValue({}),
     kirocrewAgents: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
-    syncKirocrewAgents: vi.fn().mockResolvedValue({}),
+    agentCatalog: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
+    // The page now SAYS when the default-agent read fails; an unmocked
+    // `api.defaultAgent` would surface that notice in every case here.
+    defaultAgent: vi.fn().mockResolvedValue({ default_agent: '' }),
     cronFolders: vi.fn().mockResolvedValue([]),
     createCronFolder: vi.fn().mockResolvedValue({ id: 'new-folder', name: 'Test', order: 1 }),
     updateCronFolder: vi.fn().mockResolvedValue({}),
@@ -138,6 +142,24 @@ describe('SchedulePage cron folders', () => {
     await waitFor(() => expect(screen.getByText('Move to folder')).toBeInTheDocument())
   })
 
+  it('tells a one-job move guide which single job is ticked, and nothing while two are', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob('j1', 'Job A'), mkJob('j2', 'Job B')] })
+    vi.mocked(api).cronFolders.mockResolvedValue([])
+    renderWithProviders(<SchedulePage />)
+    await waitFor(() => expect(screen.getByText('Job A')).toBeInTheDocument())
+    // Each row carries its own job's name for a guide's pick, never the row's text.
+    expect(document.querySelectorAll('[data-guide-pick="Job A"]')).toHaveLength(1)
+    expect(selectionState('one_job_checked')).toBe('none')
+    fireEvent.click(screen.getByLabelText('Select Job A'))
+    await waitFor(() => expect(selectionState('one_job_checked')).toBe('selected'))
+    expect(selectedName('one_job_checked')).toBe('Job A')
+    // Two ticked: the folder button would move both, so the one-job step is not done.
+    fireEvent.click(screen.getByLabelText('Select Job B'))
+    await waitFor(() => expect(selectionState('one_job_checked')).toBe('none'))
+    expect(selectedName('one_job_checked')).toBeUndefined()
+  })
+
   it('delete folder shows inline confirmation row', async () => {
     const { api } = await import('../api/client')
     vi.mocked(api).crons.mockResolvedValue({
@@ -157,7 +179,7 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByText('Delete folder'))
 
     // Confirm row should appear
-    await waitFor(() => expect(screen.getByText(/Delete "My Folder"\? Jobs will be ungrouped\./)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/Delete “My Folder”\? Jobs will be ungrouped\./)).toBeInTheDocument())
   })
 
   it('hides empty folders when filter is active (omitEmpty)', async () => {
@@ -306,8 +328,10 @@ describe('SchedulePage cron folders', () => {
     // Jobs should render despite folders failure
     await waitFor(() => expect(screen.getByText('Resilient Job')).toBeInTheDocument())
     expect(screen.getByText('Also Visible')).toBeInTheDocument()
-    // No page-level error shown
-    expect(screen.queryByText('Folders API down')).not.toBeInTheDocument()
+    // The failure is SAID, not swallowed: a folder-level notice sits above the
+    // still-rendered list (targeted by testId — the page can show more than
+    // one notice) instead of the page-level load error replacing the jobs.
+    expect(await screen.findByTestId('schedule-folders-error')).toHaveTextContent('Folders API down')
   })
 
   it('auto-expands target folder when moving a job into a collapsed folder (#3)', async () => {
@@ -450,7 +474,7 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByText('Delete folder'))
 
     // Confirm row should appear (not immediately deleted)
-    await waitFor(() => expect(screen.getByText(/Delete "DeleteMe"\? Jobs will be ungrouped\./)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/Delete “DeleteMe”\? Jobs will be ungrouped\./)).toBeInTheDocument())
     expect(vi.mocked(api).deleteCronFolder).not.toHaveBeenCalled()
 
     // Confirm the delete
@@ -479,7 +503,7 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByText('Delete folder'))
 
     // Confirm
-    await waitFor(() => expect(screen.getByText(/Delete "ErrFolder"\? Jobs will be ungrouped\./)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/Delete “ErrFolder”\? Jobs will be ungrouped\./)).toBeInTheDocument())
     const confirmDeleteBtn = screen.getAllByRole('button').find(b => b.textContent === 'Delete "ErrFolder"' && b.className.includes('danger'))
     fireEvent.click(confirmDeleteBtn!)
 
@@ -571,11 +595,12 @@ describe('SchedulePage cron folders', () => {
       fireEvent.click(targetItem!)
     })
 
-    // Error should render near the toolbar
+    // Error should render near the toolbar, through the shared ErrorNotice
+    // (role="alert"; the message no longer sits on a text-danger span of its own).
     await waitFor(() => {
-      const errorEl = screen.getByText(/could not be moved/)
-      expect(errorEl).toBeInTheDocument()
-      expect(errorEl.className).toContain('text-danger')
+      const errorEl = screen.getByTestId('schedule-batch-move-error')
+      expect(errorEl).toHaveAttribute('role', 'alert')
+      expect(errorEl).toHaveTextContent(/could not be moved/)
     })
   })
 })

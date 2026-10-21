@@ -8,7 +8,7 @@
  * load-bearing path here is double-click → inline input → Enter commit.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, fireEvent, waitFor, within } from '@testing-library/react'
+import { render, fireEvent, createEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -86,7 +86,9 @@ const folders: ChatFolder[] = [{ id: FOLDER_ID, name: 'CDF', order: 0 }]
 function renderWith(cols: TagColumn[]) {
   const store = createTestStore({
     dashboard: {
-      status: {}, connected: false, slots: [], approvalMode: 'normal',
+      // Load-bearing: rename is guarded on a live gateway, and these cases
+      // exercise the online mechanics rather than the offline refusal.
+      status: {}, connected: true, slots: [], approvalMode: 'normal',
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -134,6 +136,16 @@ function colHeader(container: HTMLElement, colId: string): HTMLElement {
 
 function colFolderHeader(container: HTMLElement): HTMLElement {
   return colHeader(container, COL_A)
+}
+
+/** The INNER row inside the folder block — the element that actually carries
+ *  role="button", aria-expanded and the Space/Enter collapse handler. The
+ *  data-testid wrapper around it is the drag drop-zone and has neither, so
+ *  asserting aria-expanded on that wrapper silently compares null to null. */
+function colFolderRow(container: HTMLElement, colId = COL_A): HTMLElement {
+  const row = colHeader(container, colId).querySelector('[role="button"][aria-expanded]')
+  expect(row).toBeTruthy()
+  return row as HTMLElement
 }
 
 beforeEach(() => {
@@ -188,5 +200,34 @@ describe('board view: folder rename', () => {
     const renameInputs = Array.from(container.querySelectorAll('input'))
       .filter(i => (i as HTMLInputElement).value === 'CDF')
     expect(renameInputs.length).toBe(1)
+  })
+
+  // Regression: the folder row is role="button" with a Space/Enter collapse
+  // toggle, and the rename input is a DESCENDANT of that row. Space typed in
+  // the input bubbled to the row, which called preventDefault() (dropping the
+  // character) and collapsed the folder — so folder names could not contain a
+  // space. The row's onKeyDown now ignores events whose target is not the row.
+  it('lets Space type a space in the rename input instead of collapsing the folder', () => {
+    const { container } = renderSidebar()
+    fireEvent.doubleClick(within(colFolderHeader(container)).getByText('CDF'))
+    const expandedBefore = colFolderRow(container).getAttribute('aria-expanded')
+    expect(expandedBefore).not.toBeNull()
+    const input = within(colFolderHeader(container)).getByRole('textbox')
+
+    // The character survives only if nothing up the tree preventDefault()s the
+    // keydown — that is the half of the bug that ate the space.
+    const ev = createEvent.keyDown(input, { key: ' ' })
+    fireEvent(input, ev)
+    expect(ev.defaultPrevented).toBe(false)
+
+    // ...and the folder must not have folded — the visible half of the bug.
+    expect(colFolderRow(container).getAttribute('aria-expanded')).toBe(expandedBefore)
+  })
+
+  it('still toggles the folder when Space is pressed on the row itself', () => {
+    const { container } = renderSidebar()
+    const before = colFolderRow(container).getAttribute('aria-expanded')
+    fireEvent.keyDown(colFolderRow(container), { key: ' ' })
+    expect(colFolderRow(container).getAttribute('aria-expanded')).not.toBe(before)
   })
 })

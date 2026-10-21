@@ -33,10 +33,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.paths import config_dir
+from kiro_crew.constants import AWS_PROFILE_NAME_RE
 from kiro_crew.deploy import engine
-from kiro_crew.platform_compat import file_lock
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.platform_compat import file_lock, open_lock_file
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,13 @@ _NOTE_MAX = 256
 
 # Same shapes handlers.py enforces for the legacy single-profile config — these
 # values flow into subprocess argv (--profile/--region) on every aws call.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# The profile shape ('+' admitted for IAM Identity Center derived names;
+# first char excludes '-' so a name is never option-shaped; \Z rejects trailing
+# newlines) is constants.AWS_PROFILE_NAME_RE — the single source of truth,
+# aliased rather than re-spelled here. Also used by
+# discover_aws_profiles() to filter `aws configure list-profiles` lines
+# (stripped before matching, so the anchor is behavior-neutral there).
+_PROFILE_RE = AWS_PROFILE_NAME_RE
 PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
 # Multi-segment to admit GovCloud (us-gov-west-1) alongside standard regions;
 # max_len=32 keeps the backtracking surface negligible.
@@ -115,8 +122,10 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
     # required=True: a lost profile write is silent data loss, so refuse to
     # proceed without cross-process exclusion. flock_compat is a Windows no-op,
     # so this uses platform_compat's real msvcrt lock.
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    # open_lock_file opens writable and never truncates; its docstring carries
+    # the Windows rationale.
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             reg = load_registry()
             yield reg
             # Persist on clean exit (exceptions skip save, lock still releases)
@@ -129,7 +138,7 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
                 tmp_fd.flush()
                 os.fsync(tmp_fd.fileno())
                 tmp_fd.close()
-                os.replace(tmp_fd.name, str(_registry_path()))
+                replace_with_retry(tmp_fd.name, _registry_path())
             except BaseException:
                 tmp_fd.close()
                 try:
@@ -152,6 +161,16 @@ def load_registry() -> dict[str, Any]:
     v2 shape (``profiles.json``): ``{"version": 2, "profiles": [...], "default": "x"}``.
     Migration is read-through: a v1 config becomes a one-entry registry; the
     legacy file is left in place (GET /config keeps serving the default entry).
+
+    Valid JSON of the WRONG SHAPE degrades exactly like unparseable JSON. This
+    file is agent-writable, so ``[]``, ``"x"`` or ``{"profiles": 5}`` are all
+    reachable contents, and each of them would otherwise escape as an ``AttributeError``
+    or ``TypeError`` from ``raw.get`` / the comprehension -- past the caller and
+    out as an HTTP 500 on every route that reads the registry. Catching them
+    here routes a mis-shaped file into the fallback chain the function already
+    implements (try the legacy registry, then the v1 config, then an empty
+    registry) rather than inventing a second recovery, and it fixes every reader
+    at once instead of asking each call site to guard a shape it did not parse.
     """
     try:
         raw = json.loads(_registry_path().read_text(encoding="utf-8"))
@@ -166,7 +185,7 @@ def load_registry() -> dict[str, Any]:
         if default and not any(p["name"] == default for p in profiles):
             default = profiles[0]["name"] if profiles else ""
         return {"version": 2, "profiles": profiles, "default": default}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     # Legacy app-dir registry migration (apps/deploy-web/data/profiles.json)
     try:
@@ -182,7 +201,7 @@ def load_registry() -> dict[str, Any]:
         if default and not any(p["name"] == default for p in profiles):
             default = profiles[0]["name"] if profiles else ""
         return {"version": 2, "profiles": profiles, "default": default}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     # v1 single-profile migration path (apps/deploy-web/data/config.json)
     try:
@@ -191,7 +210,7 @@ def load_registry() -> dict[str, Any]:
         if name:
             return {"version": 2, "default": name,
                     "profiles": [make_entry(name, str(legacy.get("region", "")))]}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     return {"version": 2, "profiles": [], "default": ""}
 
@@ -199,8 +218,9 @@ def load_registry() -> dict[str, Any]:
 def save_registry(reg: dict[str, Any]) -> dict[str, Any]:
     _data_dir().mkdir(parents=True, exist_ok=True)
     lock_path = _registry_path().with_suffix(".lock")
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    # open_lock_file: writable but non-truncating; see locked_registry above.
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             tmp_fd = tempfile.NamedTemporaryFile(
                 mode="w", dir=str(_data_dir()), suffix=".json.tmp",
                 delete=False, encoding="utf-8",
@@ -210,7 +230,7 @@ def save_registry(reg: dict[str, Any]) -> dict[str, Any]:
                 tmp_fd.flush()
                 os.fsync(tmp_fd.fileno())
                 tmp_fd.close()
-                os.replace(tmp_fd.name, str(_registry_path()))
+                replace_with_retry(tmp_fd.name, _registry_path())
             except BaseException:
                 tmp_fd.close()
                 try:
@@ -247,22 +267,34 @@ def resolve_profile(requested: str = "") -> tuple[str, str] | None:
 
 # --- discovery (read-only, names only) --------------------------------------
 
-def discover_aws_profiles() -> list[str]:
+def discover_aws_profiles() -> list[str] | None:
     """Profile names known to the AWS CLI (``aws configure list-profiles``).
 
     Names only — the CLI enumerates sections itself; we never read the files.
 
-    On native Windows the sandboxed subprocess backend is unavailable (deploy
-    features are POSIX-only, fail-loud policy) — degrade to an empty list
-    instead of surfacing a sandbox error through the profiles endpoint.
+    ``None`` means could not ask, and it is deliberately not ``[]``. "Asked, and
+    there are none" is a fact about the machine, "could not ask" is a fact about
+    this process, and a caller handed the same empty list for both reports the
+    second as the first. That is not a corner case: ``configure list-profiles``
+    arrived in AWS CLI v2 and exits non-zero on v1, so an ordinary host with
+    profiles configured takes the failing branch, and a route that compares a
+    requested name against an empty set then answers that the operator's own
+    profiles are not on this machine. ``cli_doctor._aws_profile_names`` draws the
+    same line for the doctor report, for the same reason.
+
+    Windows is the other ``None``: the sandboxed subprocess backend deploy needs
+    is POSIX-only (fail-loud policy), so discovery cannot run there rather than
+    running and finding nothing. A caller with something more useful to say about
+    the platform than about the failure branches on ``os.name`` itself, which is
+    how the aws-control listing gets to name WSL.
     """
     if os.name == "nt":
         logger.debug("deploy-web: profile discovery unsupported on Windows")
-        return []
+        return None
     rc, out, err = engine.run_aws(["configure", "list-profiles"], "")
     if rc != 0:
         logger.debug("deploy-web: list-profiles failed: %s", (err or "")[:200])
-        return []
+        return None
     names: list[str] = []
     for line in (out or "").splitlines():
         line = line.strip()
@@ -280,8 +312,8 @@ def _configure_set(key: str, value: str, profile: str) -> str | None:
     rc, _out, err = engine.run_aws(["configure", "set", key, value], profile)
     if rc != 0:
         raw = (err or f"aws configure set {key} failed").strip()[:200]
-        raw, _ = redact_credentials(raw)
-        raw, _ = redact_exfiltration_urls(raw)
+        from kiro_crew.security import redact
+        raw = redact(raw)
         return raw
     return None
 
@@ -292,7 +324,8 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
 
     With ``account``+``role`` this is an iam-identity-style profile whose
     ``credential_process`` mints short-lived creds from the ambient IAM
-    session (``aws sts get-session-token``) — the profile block itself contains no
+    session (``aws sts assume-role --role-arn arn:aws:iam::<account>:role/<role>``,
+    session name ``kirocrew-deploy``) — the profile block itself contains no
     secret material. Without them, only ``region`` is written (the profile's
     credentials come from however the user otherwise configures it).
     Returns an error string, or None on success.
@@ -334,6 +367,14 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
                 "or environment variables."
             )
         python_bin = sys.executable or "python3"
+        # Deliberately a bare "aws" (NOT the deploy engine's absolute resolver):
+        # this command is persisted into ~/.aws/config and later run by
+        # whichever AWS CLI/SDK reads that profile — possibly a different user
+        # shell, possibly long after the CLI was reinstalled elsewhere. An
+        # absolute path resolved in the gateway's environment today can be
+        # wrong or stale in that consumer's environment, and would turn a
+        # PATH-configurable lookup into a frozen location. The consumer
+        # resolves "aws" against its own PATH.
         script = (
             "import json,subprocess;"
             'r=subprocess.run(["aws","sts","assume-role","--role-arn",'

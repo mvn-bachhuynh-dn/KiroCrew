@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import FolderConfigModal from '../components/FolderConfigModal'
+import { ApiError } from '../api/apiError'
 import { ChatFolder } from '../types'
 
 vi.mock('../api/client', () => ({
   api: {
     // ProjectPicker fetches these on open; the modal itself never calls them.
     recentProjects: vi.fn().mockResolvedValue({ dirs: [] }),
+    favoriteProjects: vi.fn().mockResolvedValue({ dirs: [] }),
     browseDirs: vi.fn().mockResolvedValue({ path: '/', parent: '', dirs: [] }),
   },
 }))
@@ -28,43 +30,48 @@ function open(props: Partial<React.ComponentProps<typeof FolderConfigModal>> = {
       installedAgents={AGENTS}
       onClose={onClose}
       onSubmit={onSubmit}
+      onRetryTags={vi.fn()}
       {...props}
     />
   )
   return { onSubmit, onClose, ...utils }
 }
 
-/* The agent picker is a Radix Select (SimpleSelect), not a native <select>, so
- * it is addressed by its accessible name — the `aria-label` that carries the
- * "Default agent" heading's key, since a <button> cannot be reached by an
- * external <label htmlFor>. Its options live in a portal that only exists while
- * the popup is open, so any assertion about them has to open it first.
+/* The agent picker is a SearchableSelect (Radix Popover), not a native
+ * <select>, so it is addressed by its accessible name — the `aria-label` that
+ * carries the "Default agent" heading's key, since a <button> cannot be reached
+ * by an external <label htmlFor>. Its options live in a portal that only exists
+ * while the popup is open, so any assertion about them has to open it first.
  *
- * NOTE ON THE HARNESS: a Radix Select nested in a Radix Dialog cannot be driven
- * in jsdom (Radix's flushSync inside Testing Library's act() throws "Should not
- * already be working"), which is why CrewEditorSelect.test.tsx and
- * WorkspaceModal.test.tsx stub SimpleSelect out. That does NOT apply here:
  * `Modal` is hand-rolled (createPortal + framer-motion), so there is no Radix
- * layer above the select and the real component is driven directly. Keep it
+ * layer above the picker and the real component is driven directly. Keep it
  * that way — a stub here would stop testing the shipped dropdown. */
 function agentTrigger() {
-  return screen.getByRole('combobox', { name: 'Default agent' })
+  return screen.getByRole('button', { name: 'Default agent' })
+}
+
+/** Open the agent popup and return its filter box. The modal focuses its name
+ *  field one animation frame after opening, and that focus move dismisses a
+ *  popup already open, so wait it out first: a user cannot click inside it. */
+async function openAgentPopup(): Promise<HTMLElement> {
+  // Queued after the modal's own rAF, so this resolves once that focus has run.
+  await new Promise(resolve => requestAnimationFrame(resolve))
+  fireEvent.click(agentTrigger())
+  return screen.findByPlaceholderText('Type to filter…')
 }
 
 /** Open the agent popup and return its option labels in render order. */
 async function openAgents(): Promise<string[]> {
-  fireEvent.click(agentTrigger())
+  await openAgentPopup()
   // findAllByRole, not findByRole: the latter throws on more than one match, and
   // every case here has at least the inherit/None row plus an agent.
   const opts = await screen.findAllByRole('option')
   return opts.map(o => o.textContent ?? '')
 }
 
-/** Pick an agent by its visible label, then wait for the popup to unmount —
- *  Radix marks the rest of the page inert while it is up, so a later click on
- *  Submit would be swallowed. */
+/** Pick an agent by its visible label, then wait for the popup to unmount. */
 async function pickAgent(label: string | RegExp) {
-  fireEvent.click(agentTrigger())
+  await openAgentPopup()
   fireEvent.click(await screen.findByRole('option', { name: label }))
   await waitFor(() => expect(screen.queryByRole('option')).toBeNull())
 }
@@ -76,7 +83,7 @@ describe('FolderConfigModal', () => {
     open({ parentId: '' })
     // A picker for the parent would let the user contradict where they clicked.
     // The only dropdown in the modal is the agent picker.
-    expect(screen.getAllByRole('combobox')).toHaveLength(1)
+    expect(document.querySelectorAll('[aria-haspopup="listbox"]')).toHaveLength(1)
     expect(agentTrigger()).toBeTruthy()
   })
 
@@ -129,13 +136,30 @@ describe('FolderConfigModal', () => {
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ color: '#ef4444' }))
   })
 
-  it('has no icon preview — a folder carries no icon, only a palette color', () => {
+  it('renders the icon controls with the default glyph preview', () => {
     open()
-    // The emoji/icon system was removed; the palette swatch row is the only
-    // identity affordance, so a glyph preview would advertise a control that
-    // does not exist.
-    expect(screen.queryByTestId('folder-config-preview')).toBeNull()
+    // Preview shows the default folder glyph until an emoji is typed; the
+    // input is empty (empty = keep the default glyph, no generation).
+    expect(screen.getByTestId('folder-config-icon-preview')).toBeTruthy()
+    expect((screen.getByTestId('folder-config-icon') as HTMLInputElement).value).toBe('')
+    // Auto-generate is an edit-mode affordance; the create modal has no
+    // generation path — an empty icon keeps the default glyph.
+    expect(screen.queryByTestId('folder-config-icon-regenerate')).toBeNull()
     expect(screen.getByTestId('folder-config-color-reset')).toBeTruthy()
+  })
+
+  it('submits a typed emoji as the icon', () => {
+    const { onSubmit } = open()
+    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Rockets' } })
+    fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '🚀' } })
+    fireEvent.click(screen.getByTestId('folder-config-submit'))
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '🚀', regenerateIcon: false }))
+  })
+
+  it('previews the typed emoji in place of the default glyph', () => {
+    open()
+    fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '🚀' } })
+    expect(screen.getByTestId('folder-config-icon-preview').textContent).toBe('🚀')
   })
 
 
@@ -171,11 +195,43 @@ describe('FolderConfigModal', () => {
     expect(screen.queryByText(/not installed/i)).toBeNull()
   })
 
+  describe('orphan agent notice', () => {
+    // Item 1: a disabled/misconfigured control that does not say why IS the
+    // defect. An orphan selection is round-tripped (Save is NOT blocked — that
+    // would let a folder rename wipe a temporarily-uninstalled agent), so the
+    // notice explains why the SELECTED AGENT will not run and is bound to the
+    // control with aria-describedby so a screen reader reaches it.
+
+    it('shows a field-bound notice while an orphan agent is selected', () => {
+      const f = folder('f1', { name: 'Payments', default_agent: 'retired-agent' })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      const notice = screen.getByTestId('folder-config-agent-notice')
+      expect(notice.textContent).toMatch(/isn.t installed/i)
+      // The reason is programmatically associated with the control, not merely
+      // placed near it: the combobox's aria-describedby names the notice's id.
+      expect(agentTrigger().getAttribute('aria-describedby')).toBe(notice.id)
+    })
+
+    it('does not disable Save for an orphan — the orphan round-trips instead', () => {
+      const f = folder('f1', { name: 'Payments', default_agent: 'retired-agent' })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      // A folder whose agent is temporarily uninstalled must still be renamable.
+      expect((screen.getByTestId('folder-config-submit') as HTMLButtonElement).disabled).toBe(false)
+    })
+
+    it('shows the hint and no notice, unassociated, when the agent is installed', () => {
+      const f = folder('f1', { name: 'Payments', default_agent: 'kirocrew-dev' })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      expect(screen.queryByTestId('folder-config-agent-notice')).toBeNull()
+      expect(agentTrigger().getAttribute('aria-describedby')).toBeNull()
+      expect(screen.getByText(/Pre-selected for new chats/i)).toBeTruthy()
+    })
+  })
+
   it('clearing the agent back to inherit submits an empty string', async () => {
-    // SimpleSelect routes '' through an internal sentinel because Radix reserves
-    // '' for "no selection". '' is a real instruction here — it restores the
-    // fall-back to the global default — so it has to survive the round trip
-    // rather than arriving as the sentinel or as undefined.
+    // '' is a real instruction here — it restores the fall-back to the global
+    // default — so it has to survive the round trip rather than arriving as
+    // undefined.
     const f = folder('f1', { name: 'Payments', default_agent: 'kirocrew-dev' })
     const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f], globalDefaultAgent: 'kirocrew' })
     // With a global default the top row names it, so the user can see what
@@ -189,6 +245,70 @@ describe('FolderConfigModal', () => {
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
       defaultAgent: '', touched: ['defaultAgent'],
     }))
+  })
+
+  it('names the nearest ANCESTOR agent in the inherit row, not the global default', async () => {
+    // `default_agent: ''` inherits from the nearest ancestor that pins one, the
+    // same way `project_dir` does. A row hardcoded to the global default reads
+    // "Inherit (kirocrew)" over a subfolder whose chats will in fact run
+    // kirocrew-dev — the label contradicting the behaviour it describes.
+    const folders = [
+      folder('a', { name: 'Kiro', default_agent: 'kirocrew-dev' }),
+      folder('b', { name: 'Backend', parent_id: 'a' }),
+    ]
+    open({ folders, parentId: 'b', globalDefaultAgent: 'kirocrew' })
+    expect(await openAgents()).toEqual(['Inherit (kirocrew-dev)', 'kirocrew', 'kirocrew-dev'])
+  })
+
+  it('names what clearing WOULD inherit in edit mode, ignoring the folder own pin', async () => {
+    // Clearing removes this folder's own value, so the row must name the parent's
+    // agent — never the value the picker is about to drop.
+    const parent = folder('a', { name: 'Kiro', default_agent: 'kirocrew-dev' })
+    const self = folder('b', { name: 'Backend', parent_id: 'a', default_agent: 'kirocrew' })
+    open({ mode: 'edit', folder: self, folders: [parent, self], globalDefaultAgent: 'kirocrew' })
+    expect(await openAgents()).toEqual(['Inherit (kirocrew-dev)', 'kirocrew', 'kirocrew-dev'])
+  })
+
+  describe('agent filter box', () => {
+    // A long agent roster is unscannable in a plain list, so the popup carries the
+    // same "Type to filter…" box as the composer's agent picker.
+    const MANY = [
+      { name: 'kirocrew' },
+      { name: 'kirocrew-dev' },
+      { name: 'gpu-autosde-analyzer' },
+    ]
+
+    it('narrows the list to the agents matching the typed text', async () => {
+      open({ installedAgents: MANY })
+      fireEvent.change(await openAgentPopup(), { target: { value: 'dev' } })
+      const names = screen.getAllByRole('option').map(o => o.textContent)
+      expect(names).toEqual(['kirocrew-dev'])
+    })
+
+    it('commits the top match on Enter and submits it', async () => {
+      const { onSubmit } = open({ installedAgents: MANY })
+      const box = await openAgentPopup()
+      fireEvent.change(box, { target: { value: 'gpu' } })
+      fireEvent.keyDown(box, { key: 'Enter' })
+      await waitFor(() => expect(screen.queryByRole('option')).toBeNull())
+      expect(agentTrigger()).toHaveTextContent('gpu-autosde-analyzer')
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Payments' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ defaultAgent: 'gpu-autosde-analyzer' }))
+    })
+  })
+
+  it('Enter on a typed agent name picks that agent, not the inherit row naming it', async () => {
+    // "Inherit (kirocrew)" sits first and contains "kirocrew", so a top-row
+    // commit would save '' (inherit) when the user typed the agent to pin.
+    const { onSubmit } = open({ globalDefaultAgent: 'kirocrew' })
+    const box = await openAgentPopup()
+    fireEvent.change(box, { target: { value: 'kirocrew' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByRole('option')).toBeNull())
+    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Payments' } })
+    fireEvent.click(screen.getByTestId('folder-config-submit'))
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ defaultAgent: 'kirocrew' }))
   })
 
   it('labels the inherited directory as inherited, not as a value', () => {
@@ -287,6 +407,76 @@ describe('FolderConfigModal', () => {
       await screen.findByTestId('folder-config-error')
       fireEvent.click(screen.getByTestId('folder-config-submit'))
       await waitFor(() => expect(screen.queryByTestId('folder-config-error')).toBeNull())
+    })
+  })
+
+  describe('icon rejection is field-anchored (issue #7992)', () => {
+    // The server 400s a non-single-emoji icon with code `icon_invalid`. That
+    // used to render as the raw English server text in the modal's TOP alert,
+    // naming no field. It now renders localized, AT the Icon field.
+    const iconReject = () => vi.fn().mockRejectedValue(
+      new ApiError(400, 'icon must be a single emoji',
+        '{"error": "icon must be a single emoji", "code": "icon_invalid"}'))
+
+    it('renders the localized error at the Icon field, not the top alert', async () => {
+      render(
+        <FolderConfigModal open={true} mode="create" parentId="" folders={[]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={iconReject()} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Payments' } })
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: 'abc' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      const fieldErr = await screen.findByTestId('folder-config-icon-error')
+      // The localized catalog string, not the server's raw body text.
+      expect(fieldErr.textContent).toContain('Use a single emoji, or leave the field empty for the default folder icon.')
+      // The generic top alert stays down: this failure has a field to point at.
+      expect(screen.queryByTestId('folder-config-error')).toBeNull()
+    })
+
+    it('clears the field error as soon as the user edits the icon', async () => {
+      render(
+        <FolderConfigModal open={true} mode="create" parentId="" folders={[]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={iconReject()} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Payments' } })
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: 'abc' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await screen.findByTestId('folder-config-icon-error')
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '🚀' } })
+      expect(screen.queryByTestId('folder-config-icon-error')).toBeNull()
+    })
+
+    it('routes regenerate_icon_invalid to the top alert, not the field', async () => {
+      // A request-shape error (non-boolean `regenerate_icon`) the modal can
+      // never produce — but if it ever arrives, the field hint "must be a
+      // single emoji" would misdescribe an empty field the user never typed
+      // in. It stays in the generic top alert.
+      const onSubmit = vi.fn().mockRejectedValue(
+        new ApiError(400, 'regenerate_icon must be a boolean',
+          '{"error": "regenerate_icon must be a boolean", "code": "regenerate_icon_invalid"}'))
+      const f = folder('f1', { name: 'Payments' })
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.click(screen.getByTestId('folder-config-icon-regenerate'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await screen.findByTestId('folder-config-error')
+      expect(screen.queryByTestId('folder-config-icon-error')).toBeNull()
+    })
+
+    it('keeps every other failure in the top alert with no field error', async () => {
+      const onSubmit = vi.fn().mockRejectedValue(
+        new ApiError(400, 'project_dir must be an existing directory',
+          '{"error": "project_dir must be an existing directory", "code": "project_dir_invalid"}'))
+      render(
+        <FolderConfigModal open={true} mode="create" parentId="" folders={[]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Payments' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await screen.findByTestId('folder-config-error')
+      expect(screen.queryByTestId('folder-config-icon-error')).toBeNull()
     })
   })
 
@@ -417,6 +607,87 @@ describe('FolderConfigModal', () => {
       expect(t).not.toContain('name')
     })
 
+    it('seeds the icon from the folder and reports an icon edit', async () => {
+      const iconFolder = folder('f2', { name: 'Rockets', icon: '🚀' })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={iconFolder} folders={[iconFolder]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      expect((screen.getByTestId('folder-config-icon') as HTMLInputElement).value).toBe('🚀')
+      // Clearing falls back to the default glyph — '' is a real instruction.
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      const draft = onSubmit.mock.calls[0][0]
+      expect(draft.touched).toEqual(['icon'])
+      expect(draft.icon).toBe('')
+      expect(draft.regenerateIcon).toBe(false)
+    })
+
+    it('Auto-generate arms regenerateIcon and restores the seeded icon value', async () => {
+      // The backend rejects icon + regenerate_icon in one request, so arming
+      // regenerate must also discard a manual edit — and vice versa.
+      const iconFolder = folder('f2', { name: 'Rockets', icon: '🚀' })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={iconFolder} folders={[iconFolder]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '🧪' } })
+      fireEvent.click(screen.getByTestId('folder-config-icon-regenerate'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      const draft = onSubmit.mock.calls[0][0]
+      expect(draft.regenerateIcon).toBe(true)
+      // The manual edit was discarded, so a caller keying on touched cannot
+      // accidentally send both icon and regenerate_icon.
+      expect(draft.icon).toBe('🚀')
+      expect(draft.touched).toContain('icon')
+    })
+
+    it('typing after Auto-generate disarms the pending regenerate', async () => {
+      const iconFolder = folder('f2', { name: 'Rockets', icon: '🚀' })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={iconFolder} folders={[iconFolder]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.click(screen.getByTestId('folder-config-icon-regenerate'))
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '🧪' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      const draft = onSubmit.mock.calls[0][0]
+      expect(draft.regenerateIcon).toBe(false)
+      expect(draft.icon).toBe('🧪')
+    })
+
+    it('an armed regenerate renders an empty input, matching the default-glyph preview', () => {
+      // While armed, the preview falls back to the default glyph; if the input
+      // kept showing the old emoji the preview would stop previewing the input.
+      const iconFolder = folder('f2', { name: 'Rockets', icon: '🚀' })
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={iconFolder} folders={[iconFolder]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={vi.fn()} />
+      )
+      fireEvent.click(screen.getByTestId('folder-config-icon-regenerate'))
+      expect((screen.getByTestId('folder-config-icon') as HTMLInputElement).value).toBe('')
+    })
+
+    it('edit mode shows the cleared-state hint only when the field is emptied', () => {
+      // Empty means the default glyph in both modes; the edit-mode cleared
+      // state keeps its own hint so clearing an existing icon is visibly
+      // acknowledged rather than silently reverting.
+      const iconFolder = folder('f2', { name: 'Rockets', icon: '🚀' })
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={iconFolder} folders={[iconFolder]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={vi.fn()} />
+      )
+      expect(screen.queryByText(/Empty keeps the default folder icon/)).toBeNull()
+      fireEvent.change(screen.getByTestId('folder-config-icon'), { target: { value: '' } })
+      expect(screen.getByText(/Empty keeps the default folder icon/)).toBeTruthy()
+    })
+
   })
 
   it('associates every label with its control', () => {
@@ -528,5 +799,443 @@ describe('FolderConfigModal', () => {
     fireEvent.click(screen.getByTestId('folder-config-browse'))
     const { api } = await import('../api/client')
     await waitFor(() => expect(api.recentProjects).toHaveBeenCalled())
+  })
+
+  it('routes a Browse pick to projectDir even after a steering pick armed the target', async () => {
+    // Regression (GPT review F2): the steering "Add directory" button sets the
+    // shared picker target to 'steering'; if Project Browse does not reset it,
+    // the project selection is appended to steeringDirs and projectDir stays
+    // empty. Open steering first, then Project Browse, and assert the pick
+    // lands in projectDir with steeringDirs untouched.
+    const { onSubmit } = open()
+    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Payments' } })
+    // Arm the steering target, then close the picker without selecting.
+    fireEvent.click(screen.getByTestId('folder-config-steering-add'))
+    const { api } = await import('../api/client')
+    await waitFor(() => expect(api.browseDirs).toHaveBeenCalled())
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    // Now open Project Browse and commit a path.
+    fireEvent.click(screen.getByTestId('folder-config-browse'))
+    const combo = await screen.findByRole('combobox', { name: /project directory path/i })
+    fireEvent.change(combo, { target: { value: '/proj/root' } })
+    fireEvent.mouseDown(screen.getByText('Select'))
+    fireEvent.click(screen.getByTestId('folder-config-submit'))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+    const submitted = onSubmit.mock.calls[0][0]
+    expect(submitted.projectDir).toBe('/proj/root')
+    expect(submitted.steeringDirs).toEqual([])
+  })
+
+  describe('tag picker', () => {
+    const TAGS = [
+      { id: 't1', name: 'Payments', color: '#ef4444', order: 0 },
+      { id: 't2', name: 'Urgent', color: '#3b82f6', order: 1 },
+    ]
+
+    // Chips are labels wrapping a visually-hidden checkbox (AUTOSDE
+    // max-two-buttons-per-row: a multi-select is not an action row).
+    const tagCheckbox = (id: string) =>
+      within(screen.getByTestId(`folder-config-tag-${id}`)).getByRole('checkbox')
+
+    it('renders a loading placeholder while the vocabulary is unresolved', () => {
+      // UX round-4 chose `undefined` = unresolved so the onboarding hint
+      // cannot lie to a user who HAS tags; this round replaces the bare
+      // nothing with a muted placeholder under the section heading, so a
+      // failed `chat-tags` query no longer silently erases the feature and
+      // the section resolving after open does not shift the layout.
+      open()
+      expect(screen.queryByTestId('folder-config-tags')).toBeNull()
+      expect(screen.queryByTestId('folder-config-tags-empty')).toBeNull()
+      expect(screen.getByTestId('folder-config-tags-loading')).toBeTruthy()
+      expect(screen.queryByTestId('folder-config-tags-error')).toBeNull()
+    })
+
+    it('renders an error line, not the loading hint, when the vocabulary query failed', () => {
+      // UX round-5: a dead query must not assert an in-progress state
+      // indefinitely — "Loading tags…" on a failed fetch misstates what
+      // happened and offers no way out.
+      open({ availableTagsFailed: true })
+      expect(screen.queryByTestId('folder-config-tags-loading')).toBeNull()
+      expect(screen.getByTestId('folder-config-tags-error')).toBeTruthy()
+    })
+
+    it('recovers a failed vocabulary in place via the inline Retry — no modal dismissal', () => {
+      // UX round-7: the previous "close and reopen to retry" copy told users
+      // to destroy their own draft (Escape is dismiss-guarded while dirty;
+      // X discards typed input). The retry must happen INSIDE the modal.
+      const onRetryTags = vi.fn()
+      open({ availableTagsFailed: true, onRetryTags })
+      const retry = screen.getByTestId('folder-config-tags-retry')
+      fireEvent.click(retry)
+      expect(onRetryTags).toHaveBeenCalledTimes(1)
+      // The modal stayed open — the form is still there.
+      expect(screen.getByTestId('folder-config-name')).toBeTruthy()
+    })
+
+    it('shows the onboarding hint when the vocabulary is empty', () => {
+      open({ availableTags: [] })
+      expect(screen.queryByTestId('folder-config-tags')).toBeNull()
+      expect(screen.getByTestId('folder-config-tags-empty')).toBeTruthy()
+    })
+
+    it('a dangling persisted tag id is filtered out of the seed', () => {
+      // A failed best-effort folder strip during tag deletion can leave a
+      // deleted id on the folder. Seeding it into the draft would make every
+      // save 400 (tags_invalid) — the folder becomes permanently uneditable
+      // (GPT round-1 blocker). The seed keeps only ids the vocabulary knows.
+      const f = folder('f1', { name: 'Payments', tags: ['gone', 't1'] })
+      const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f], availableTags: TAGS })
+      expect(tagCheckbox('t1')).toBeChecked()
+      // Touch the selection: the submitted list must not carry the dangler.
+      fireEvent.click(tagCheckbox('t2'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        tags: ['t1', 't2'], touched: expect.arrayContaining(['tags']),
+      }))
+    })
+
+    it('a dangling id alone does not mark tags as touched', async () => {
+      // Renaming a folder that carries a dangler must succeed: the seed and the
+      // draft agree (both filtered), so `tags` stays out of touched and the
+      // PATCH never sends the stale reference that would 400.
+      const f = folder('f1', { name: 'Payments', tags: ['gone'] })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={TAGS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Renamed' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      expect(onSubmit.mock.calls[0][0].touched).not.toContain('tags')
+    })
+
+    it('a cold load cannot delete existing tags (unknown vocabulary keeps the seed)', async () => {
+      // GPT round-2 blocker: the tags query is unresolved when the modal opens
+      // (availableTags === undefined), so filtering against it as an EMPTY
+      // vocabulary would seed [], and a save after the query resolves would
+      // silently delete the folder's existing tags. Unknown vocabulary must
+      // preserve the persisted ids.
+      const f = folder('f1', { name: 'Payments', tags: ['t1'] })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      const { rerender } = render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={undefined} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      // The vocabulary resolves while the modal is open; chips render.
+      rerender(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={TAGS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      expect(tagCheckbox('t1')).toBeChecked()
+      // The user toggles ANOTHER tag — t1 must survive the save.
+      fireEvent.click(tagCheckbox('t2'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      expect(onSubmit.mock.calls[0][0].tags.sort()).toEqual(['t1', 't2'])
+    })
+
+    it('submits the draft list as-is — dangling-id filtering is the SERVER\'s job', async () => {
+      // The folder endpoint silently filters unknown ids exactly like the
+      // slot-tags endpoint it mirrors (FP round-4 subtraction), so the modal
+      // ships no client-side prune: a dangler that survived into the draft
+      // under an unknown-vocabulary seed is shed by the server on save and
+      // can never 400 the folder.
+      const f = folder('f1', { name: 'Payments', tags: ['gone', 't1'] })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      const { rerender } = render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={undefined} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      rerender(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={TAGS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.click(tagCheckbox('t2'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      // The raw draft goes through — 'gone' included; the server drops it.
+      expect(onSubmit.mock.calls[0][0].tags.sort()).toEqual(['gone', 't1', 't2'])
+      expect(onSubmit.mock.calls[0][0].touched).toContain('tags')
+    })
+
+    it('a rename-only save never sends tags, even when the seed carries a dangler', async () => {
+      // GPT round-3 blocker: pruning must piggyback on a genuine tag edit,
+      // never on a rename. A rename that sent a "corrected" tag list would
+      // overwrite tags another client added to the folder while this modal
+      // sat open — vocabulary pruning is not a user edit.
+      const f = folder('f1', { name: 'Payments', tags: ['gone', 't1'] })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      const { rerender } = render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={undefined} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      // Vocabulary resolves while the modal is open; the seed kept raw ids.
+      rerender(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={TAGS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Renamed' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      const call = onSubmit.mock.calls[0][0]
+      expect(call.touched).not.toContain('tags')
+      // The payload list is the untouched draft — no pruned "correction" that
+      // the backend could mistake for an intentional replacement.
+      expect(call.tags.sort()).toEqual(['gone', 't1'])
+    })
+
+    it('marks selected chips with a check glyph, not just a ring', () => {
+      // UX round-2: selection must not hinge on a 1px ring-width difference
+      // from the same-colored keyboard-focus ring. Same glyph SlotTagPopover
+      // uses for the same "tag is on" state.
+      const f = folder('f1', { name: 'Payments', tags: ['t1'] })
+      open({ mode: 'edit', folder: f, folders: [f], availableTags: TAGS })
+      expect(screen.getByTestId('folder-config-tag-t1').querySelector('svg')).toBeTruthy()
+      expect(screen.getByTestId('folder-config-tag-t2').querySelector('svg.lucide-check')).toBeNull()
+    })
+
+    it('renders a chip for every tag in the vocabulary', () => {
+      open({ availableTags: TAGS })
+      const picker = screen.getByTestId('folder-config-tags')
+      expect(picker).toBeTruthy()
+      expect(screen.getByTestId('folder-config-tag-t1')).toHaveTextContent('Payments')
+      expect(screen.getByTestId('folder-config-tag-t2')).toHaveTextContent('Urgent')
+    })
+
+    it('pre-selects the folder’s existing tags in edit mode', () => {
+      const f = folder('f1', { name: 'Payments', tags: ['t2'] })
+      open({ mode: 'edit', folder: f, folders: [f], availableTags: TAGS })
+      expect(tagCheckbox('t2')).toBeChecked()
+      expect(tagCheckbox('t1')).not.toBeChecked()
+    })
+
+    it('toggling a chip updates the draft and submits the selected ids', () => {
+      const { onSubmit } = open({ availableTags: TAGS })
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Tagged' } })
+      fireEvent.click(tagCheckbox('t1'))
+      fireEvent.click(tagCheckbox('t2'))
+      // Second click on t1 removes it — toggle, not add-only.
+      fireEvent.click(tagCheckbox('t1'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        tags: ['t2'], touched: expect.arrayContaining(['tags']),
+      }))
+    })
+
+    it('reports tags in touched only when the selection changed', async () => {
+      const f = folder('f1', { name: 'Payments', tags: ['t1'] })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} availableTags={TAGS} onClose={vi.fn()} onSubmit={onSubmit} />
+      )
+      // Open and save without touching the selection.
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      expect(onSubmit.mock.calls[0][0].touched).not.toContain('tags')
+    })
+
+    it('a tag-only change arms the dismiss guard', () => {
+      const { onClose } = open({ availableTags: TAGS })
+      fireEvent.click(tagCheckbox('t1'))
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(onClose).not.toHaveBeenCalled()
+    })
+
+    it('deselecting back to the original set is not a change', () => {
+      const f = folder('f1', { name: 'Payments', tags: ['t1'] })
+      const { onClose } = open({ mode: 'edit', folder: f, folders: [f], availableTags: TAGS })
+      // Add t2 then remove it — draft equals the seed again.
+      fireEvent.click(tagCheckbox('t2'))
+      fireEvent.click(tagCheckbox('t2'))
+      fireEvent.keyDown(window, { key: 'Escape' })
+      // Order-insensitive set equality means Escape still dismisses cleanly.
+      expect(onClose).toHaveBeenCalled()
+    })
+  })
+
+  describe('steering directories', () => {
+    // The "Add directory" button opens the SAME ProjectPicker the project-dir
+    // Browse button uses, routed to push into an ordered array. The mock picker
+    // (recentProjects/browseDirs above) resolves the Browse tab at path '/', so
+    // clicking its "Select" button commits a path we can assert on.
+    const addDir = async (path: string) => {
+      fireEvent.click(screen.getByTestId('folder-config-steering-add'))
+      const { api } = await import('../api/client')
+      await waitFor(() => expect(api.browseDirs).toHaveBeenCalled())
+      // Type an absolute path into the picker's combobox and commit it.
+      const combo = await screen.findByRole('combobox', { name: /project directory path/i })
+      fireEvent.change(combo, { target: { value: path } })
+      fireEvent.mouseDown(screen.getByText('Select'))
+    }
+
+    it('renders no directory rows for a folder with none', () => {
+      open()
+      expect(screen.queryByTestId('folder-config-steering-dirs')).toBeNull()
+      expect(screen.getByTestId('folder-config-steering-add')).toBeTruthy()
+    })
+
+    it('prefills existing steering dirs in edit mode', () => {
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/std/a', '/std/b'] })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      const list = screen.getByTestId('folder-config-steering-dirs')
+      expect(list.textContent).toContain('/std/a')
+      expect(list.textContent).toContain('/std/b')
+    })
+
+    it('adds a directory via the picker and submits it under steering_dirs', async () => {
+      const { onSubmit } = open()
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Standards' } })
+      await addDir('/org/standards')
+      await waitFor(() =>
+        expect(screen.getByTestId('folder-config-steering-dir-0').textContent).toContain('/org/standards'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        steeringDirs: ['/org/standards'],
+        touched: expect.arrayContaining(['steeringDirs']),
+      }))
+    })
+
+    it('removes a directory row', async () => {
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/std/a', '/std/b'] })
+      const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f] })
+      fireEvent.click(screen.getByTestId('folder-config-steering-dir-remove-0'))
+      // /std/a removed, /std/b shifts to index 0.
+      await waitFor(() =>
+        expect(screen.getByTestId('folder-config-steering-dir-0').textContent).toContain('/std/b'))
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        steeringDirs: ['/std/b'],
+        touched: expect.arrayContaining(['steeringDirs']),
+      }))
+    })
+
+    it('clearing every directory submits an empty array (PATCH [] clears)', async () => {
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/only'] })
+      const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f] })
+      fireEvent.click(screen.getByTestId('folder-config-steering-dir-remove-0'))
+      await waitFor(() => expect(screen.queryByTestId('folder-config-steering-dirs')).toBeNull())
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        steeringDirs: [],
+        touched: expect.arrayContaining(['steeringDirs']),
+      }))
+    })
+
+    it('does not report steeringDirs in touched when unchanged', async () => {
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/std/a'] })
+      const onSubmit = vi.fn().mockResolvedValue(undefined)
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} onRetryTags={vi.fn()} />
+      )
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Renamed' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      expect(onSubmit.mock.calls[0][0].touched).not.toContain('steeringDirs')
+    })
+
+    it('shows ancestor steering dirs read-only, accumulative and root-first', () => {
+      // A parent folder's dirs are always in effect for a child; the modal
+      // shows them read-only so the effective set is visible without letting
+      // the child edit the parent's contribution.
+      const folders = [
+        folder('org', { name: 'Org', steering_dirs: ['/org/standards'] }),
+        folder('repo', { name: 'Repo', parent_id: 'org' }),
+      ]
+      open({ folders, parentId: 'repo' })
+      const inherited = screen.getByTestId('folder-config-steering-inherited')
+      expect(inherited.textContent).toContain('/org/standards')
+      // Read-only: no editable control (remove button) inside the inherited group.
+      expect(inherited.querySelector('button')).toBeNull()
+    })
+
+    it('does not list an ancestor owned by another principal as inherited', () => {
+      // The backend never delivers an app-owned ancestor's dirs to a
+      // person-owned child's chats, so the modal must not present them as
+      // inherited. A folder created from this dashboard is the person's.
+      const folders = [
+        folder('app-root', { name: 'Radar', owner_app: 'radar', steering_dirs: ['/radar/rules'] }),
+        folder('org', { name: 'Org', parent_id: 'app-root', steering_dirs: ['/org/standards'] }),
+      ]
+      open({ folders, parentId: 'org' })
+      const inherited = screen.getByTestId('folder-config-steering-inherited')
+      expect(inherited.textContent).toContain('/org/standards')
+      expect(inherited.textContent).not.toContain('/radar/rules')
+    })
+
+    it('lists an ancestor owned by the SAME principal as the folder being edited', () => {
+      const parent = folder('app-root', { name: 'Radar', owner_app: 'radar', steering_dirs: ['/radar/rules'] })
+      const child = folder('app-child', { name: 'Radar child', parent_id: 'app-root', owner_app: 'radar' })
+      render(
+        <FolderConfigModal open={true} mode="edit" folder={child} folders={[parent, child]}
+          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={vi.fn()} onRetryTags={vi.fn()} />
+      )
+      expect(screen.getByTestId('folder-config-steering-inherited').textContent).toContain('/radar/rules')
+    })
+
+    it('shows no inherited group when every ancestor with dirs belongs to another principal', () => {
+      const folders = [folder('app-root', { name: 'Radar', owner_app: 'radar', steering_dirs: ['/radar/rules'] })]
+      open({ folders, parentId: 'app-root' })
+      expect(screen.queryByTestId('folder-config-steering-inherited')).toBeNull()
+    })
+
+    it('adding a steering dir arms the dismiss guard', async () => {
+      const { onClose } = open()
+      await addDir('/org/standards')
+      await waitFor(() =>
+        expect(screen.getByTestId('folder-config-steering-dir-0')).toBeTruthy())
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(onClose).not.toHaveBeenCalled()
+    })
+
+    it('closing the picker without a selection leaves the list unchanged', async () => {
+      // Req 8.2: a cancelled pick must neither add a row nor mark the field
+      // touched. Escape on the picker's path field is its no-selection close.
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/std/a'] })
+      const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f] })
+      fireEvent.click(screen.getByTestId('folder-config-steering-add'))
+      const { api } = await import('../api/client')
+      await waitFor(() => expect(api.browseDirs).toHaveBeenCalled())
+      const combo = await screen.findByRole('combobox', { name: /project directory path/i })
+      fireEvent.change(combo, { target: { value: '/never/picked' } })
+      fireEvent.keyDown(combo, { key: 'Escape' })
+      await waitFor(() =>
+        expect(screen.queryByRole('combobox', { name: /project directory path/i })).toBeNull())
+      const list = screen.getByTestId('folder-config-steering-dirs')
+      expect(list.textContent).toContain('/std/a')
+      expect(list.textContent).not.toContain('/never/picked')
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Renamed' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+      expect(onSubmit.mock.calls[0][0].steeringDirs).toEqual(['/std/a'])
+      expect(onSubmit.mock.calls[0][0].touched).not.toContain('steeringDirs')
+    })
+
+    it('surfaces the server steering_dirs_invalid message in the error area', async () => {
+      // Req 8.5: the server's own wording reaches the modal so the user learns
+      // WHICH directory was refused, not just that the save failed.
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/std/a'] })
+      const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f] })
+      onSubmit.mockRejectedValueOnce(
+        new Error('Steering directory must be an existing directory: /std/a'))
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Renamed' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      const err = await screen.findByTestId('folder-config-error')
+      expect(err.textContent).toContain('Steering directory must be an existing directory: /std/a')
+    })
+
+    it('falls back to the generic save-failed string when the rejection carries no message', async () => {
+      // Req 8.5: a bare rejection (no message) must still tell the user the
+      // save did not land, via the modal's generic string.
+      const f = folder('f1', { name: 'Payments', steering_dirs: ['/std/a'] })
+      const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f] })
+      onSubmit.mockRejectedValueOnce(new Error(''))
+      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Renamed' } })
+      fireEvent.click(screen.getByTestId('folder-config-submit'))
+      const err = await screen.findByTestId('folder-config-error')
+      expect(err.textContent).toContain('Could not save the folder.')
+    })
   })
 })

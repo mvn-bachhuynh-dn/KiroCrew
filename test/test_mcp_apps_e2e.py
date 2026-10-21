@@ -58,18 +58,11 @@ def apps_flag_on(monkeypatch):
 def _pool_key() -> PoolKey:
     return PoolKey(
         server_name="fake-mcp-app",
-        agent_name="test-agent",
         command_args_hash="abc123",
         effective_env_hash="def456",
         work_dir="/tmp/test",
         binary_version="1.0",
         os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="ghi789",
-        approval_mode="reads",
-        trust_all_tools=False,
-        user_identity="testuser",
-        config_snapshot_hash="jkl012",
     )
 
 
@@ -140,21 +133,105 @@ _DRAW_FRAME = {
 }
 
 
-async def _handshake_and_draw(live: _LiveServer) -> dict:
+async def _handshake_and_draw(
+    live: _LiveServer,
+    *,
+    stub_uuid: str = "s1",
+    agent: str = "",
+    session_key: str = "dashboard:sess-e2e",
+) -> dict:
     """Drive initialize + tools/call draw through the stub seam; return the
-    delivered tools/call response."""
-    inbox = await live.backend.attach_stub("s1")
+    delivered tools/call response.
 
-    await live.backend.forward_from_stub("s1", dict(_INIT_FRAME))
+    ``agent`` is what the stub declared on its Register frame, which is the
+    value the interception stamps onto the spool record.
+    """
+    inbox = await live.backend.attach_stub(stub_uuid, agent=agent)
+
+    await live.backend.forward_from_stub(stub_uuid, dict(_INIT_FRAME))
     init = await _recv(inbox)
     assert init["id"] == 1
     assert init["result"]["serverInfo"]["name"] == "fake-mcp-app"
 
-    caller = CallerContext(session_key="dashboard:sess-e2e")
-    await live.backend.forward_from_stub("s1", dict(_DRAW_FRAME), caller=caller)
+    caller = CallerContext(session_key=session_key)
+    await live.backend.forward_from_stub(stub_uuid, dict(_DRAW_FRAME), caller=caller)
     reply = await _recv(inbox)
     assert reply["id"] == 2
     return reply
+
+
+@pytest.mark.parametrize(
+    "session_key",
+    [
+        # An ORDINARY owner dashboard session: no member binding, so no durable
+        # vouch is ever written for it.
+        "dashboard:chat-1234",
+        # A subagent run, which returns before the vouch write entirely.
+        "subagent:run-abcdef",
+        # And a render the producer could not attribute at all.
+        "",
+    ],
+)
+async def test_the_interception_stamps_the_producing_stubs_agent(
+    apps_flag_on, spool_tmp, session_key
+):
+    """The spool record names the agent the producing STUB declared.
+
+    This is the governance identity every app callback is held to
+    (``app_call._agent_for_call``), so where it comes from decides which
+    sessions can use apps at all. Driven through the REAL interception -- a real
+    server, a real ``resources/read`` round-trip, a real spool write -- so the
+    value is the one the Register frame carried and not one the test placed.
+
+    Parameterised over the session shapes that have NO durable vouch and never
+    get one: an ordinary non-member dashboard session, a subagent run, and an
+    unattributed render. Each must still carry its producing agent, which is the
+    whole reason the stamp lives on the record rather than in a session store.
+    """
+    live = await _spawn_live_server()
+    try:
+        reply = await _handshake_and_draw(live, agent="gpu-dev", session_key=session_key)
+        spool_id = find_marker(reply["result"]["content"][0]["text"])
+        assert spool_id is not None
+        record = load_spool(spool_id)
+        assert record is not None
+        assert record["agent"] == "gpu-dev", (
+            "the interception did not stamp the producing stub's declared agent, "
+            "so this render's callbacks would be refused"
+        )
+        assert record["session_key"] == session_key
+    finally:
+        await live.aclose()
+
+
+async def test_two_agents_sharing_one_backend_stamp_their_own_renders(
+    apps_flag_on, spool_tmp
+):
+    """One backend, two attached stubs, two agents, two correctly-labelled renders.
+
+    The case a PoolKey field could not represent, and the reason the value is
+    per stub: both renders come out of the SAME backend process, and each must
+    name the agent that actually produced it rather than whichever agent
+    registered first.
+    """
+    live = await _spawn_live_server()
+    try:
+        first = await _handshake_and_draw(
+            live, stub_uuid="s-gpu", agent="gpu-dev", session_key="dashboard:a"
+        )
+        second = await _handshake_and_draw(
+            live, stub_uuid="s-kc", agent="kirocrew", session_key="dashboard:b"
+        )
+        got = {}
+        for reply in (first, second):
+            spool_id = find_marker(reply["result"]["content"][0]["text"])
+            assert spool_id is not None
+            record = load_spool(spool_id)
+            assert record is not None
+            got[record["session_key"]] = record["agent"]
+        assert got == {"dashboard:a": "gpu-dev", "dashboard:b": "kirocrew"}
+    finally:
+        await live.aclose()
 
 
 async def test_full_pipeline_marker_and_spool(apps_flag_on, spool_tmp):
@@ -272,9 +349,15 @@ async def test_declared_only_without_tools_list_no_interception(apps_flag_on, sp
         await live.aclose()
 
 
-async def test_app_only_tool_listed_with_visibility(apps_flag_on, spool_tmp):
-    """tools/list exposes save_state as an app-only tool — the shape the
-    callback endpoint's visibility enforcement consumes."""
+async def test_app_only_tool_withheld_from_agent_listing(apps_flag_on, spool_tmp):
+    """The agent's tools/list omits save_state (visibility ["app"]) but keeps
+    draw, while the app-call path's own listing still sees both.
+
+    Both halves matter and they pull in opposite directions: the model must not
+    be offered an app-only tool (SEP-1865 MUST), and app_call's authorization
+    snapshot must still contain it or every app-only call would be refused as
+    non-existent.
+    """
     live = await _spawn_live_server()
     try:
         inbox = await live.backend.attach_stub("s1")
@@ -287,6 +370,17 @@ async def test_app_only_tool_listed_with_visibility(apps_flag_on, spool_tmp):
         reply = await _recv(inbox)
         tools = {t["name"]: t for t in reply["result"]["tools"]}
         assert tools["draw"]["_meta"]["ui"]["visibility"] == ["model", "app"]
-        assert tools["save_state"]["_meta"]["ui"]["visibility"] == ["app"]
+        assert "save_state" not in tools
+
+        # The app-call stub prefix is what exempts a listing from the filter.
+        app_inbox = await live.backend.attach_stub("__app_call__e2e0")
+        await live.backend.forward_from_stub(
+            "__app_call__e2e0",
+            {"jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": {}},
+        )
+        app_reply = await _recv(app_inbox)
+        app_tools = {t["name"]: t for t in app_reply["result"]["tools"]}
+        assert app_tools["save_state"]["_meta"]["ui"]["visibility"] == ["app"]
+        assert "draw" in app_tools
     finally:
         await live.aclose()

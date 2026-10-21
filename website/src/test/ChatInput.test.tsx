@@ -1,28 +1,38 @@
+// The composer's core: rendering, offline state, send keys, attachments,
+// resizing, caret-follow scroll, prompt history, the model chip and the
+// reasoning effort it carries, and the prompt optimizer.
+// ChatInput.busyAndUndo.test.tsx holds the rest of this suite; defaultProps lives
+// in ChatInputTestUtils.tsx.
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
-import { safeSetItem } from '../utils/safeStorage'
 import ChatInput from '../components/ChatInput'
+import { PREVIEW_STRIP_H, stubStripHeights } from './stripHeights'
+
+// The composer's own drag floor.
+const INPUT_DRAG_MIN_H = 93
 import { SlotProvider } from '../providers/SlotContext'
-import type { PasteBlock } from '../utils/pasteTokens'
+import { defaultProps } from './ChatInputTestUtils'
 
 // isTouchDevice gates the autoFocusKey effect (tapping a session must not pop
-// the soft keyboard). Default false so the desktop-focus tests below behave as
-// before; the touch-device case flips it on per-test.
+// the soft keyboard). Default false so the desktop cases behave as before; a
+// touch-device case flips it on per-test.
 const touchEnv = vi.hoisted(() => ({ touch: false }))
 vi.mock('../utils/isTouchDevice', () => ({ isTouchDevice: () => touchEnv.touch }))
 
-const defaultProps = {
-  value: '',
-  onChange: vi.fn(),
-  onSend: vi.fn(),
-}
+const mobileEnv = vi.hoisted(() => ({ mobile: false }))
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mobileEnv.mobile }))
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  // After restoreAllMocks: it would otherwise undo the layout stub. jsdom does
+  // no layout, and the composer MEASURES its strips, so a strip with no stubbed
+  // box measures 0 and reads as no strip at all.
+  stubStripHeights()
   localStorage.clear()
   touchEnv.touch = false
+  mobileEnv.mobile = false
 })
 
 describe('ChatInput', () => {
@@ -52,9 +62,29 @@ describe('ChatInput', () => {
       expect(screen.getByPlaceholderText('Stopping…')).toBeInTheDocument()
     })
 
+    it('keeps Stopping over a caller placeholder, and shows lockedPlaceholder instead when given', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} disabled placeholder="Type here…" />)
+      expect(screen.getByPlaceholderText('Stopping…')).toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} disabled placeholder="Type here…" lockedPlaceholder="Locked for now" />)
+      expect(screen.getByPlaceholderText('Locked for now')).toBeInTheDocument()
+    })
+
     it('shows offline placeholder when connected=false', () => {
       renderWithProviders(<ChatInput {...defaultProps} connected={false} />)
       expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
+    })
+
+    it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
+      touchEnv.touch = true
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+
+      const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
+      const mobilePlus = screen.getByTitle('Attach files').closest('label')
+      expect(input).toBeDefined()
+      expect(mobilePlus).toHaveAttribute('for', input?.id)
+      expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
     })
   })
 
@@ -128,13 +158,16 @@ describe('ChatInput', () => {
 
     it('disables Optimize button when connected=false even with text', () => {
       renderWithProviders(<ChatInput {...defaultProps} value="hello" connected={false} />)
-      const btn = screen.getByRole('button', { name: /Optimize disabled/ })
+      // "Optimize prompt", not "Optimize": the offline name now reuses this
+      // control's own online accessible name instead of a second raw literal, so
+      // the two agree. It was the only offline name here that disagreed.
+      const btn = screen.getByRole('button', { name: /Optimize prompt disabled/ })
       expect(btn).toBeDisabled()
     })
 
     it('exposes offline-aware aria-label and tooltip on Optimize button', () => {
       renderWithProviders(<ChatInput {...defaultProps} value="hi" connected={false} />)
-      const btn = screen.getByLabelText('Optimize disabled — gateway offline')
+      const btn = screen.getByLabelText('Optimize prompt disabled — gateway offline')
       expect(btn).toHaveAttribute('title', 'Gateway offline — reconnect to optimize')
     })
 
@@ -255,6 +288,52 @@ describe('ChatInput', () => {
       }
     })
 
+    // jsdom has no CompositionEvent, so carry the committed text the way a browser does.
+    const compositionEnd = (el: HTMLElement, data: string) => {
+      const event = new Event('compositionend', { bubbles: true })
+      Object.defineProperty(event, 'data', { value: data })
+      fireEvent(el, event)
+    }
+
+    it('sends on the first Enter after a Hangul commit (Korean has no candidate step)', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="안녕" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      // The keydown that ends the composition is still flagged as composing.
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+      compositionEnd(ta, '녕')
+      // The browser's follow-up Enter is the user's own and must send.
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(onSend).toHaveBeenCalledOnce()
+    })
+
+    it('still guards the Enter right after a Japanese commit', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="にほん" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+      compositionEnd(ta, 'にほん')
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('consumes the swallowed Enter so no newline lands in the draft', () => {
+      // The reported symptom: pick a candidate, press Enter to send, and the draft
+      // gains a line break instead. The guard is allowed to decline the submit; it is
+      // not allowed to let the textarea's default action edit the text. `fireEvent`
+      // returns false when a handler called preventDefault.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="你好" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.compositionEnd(ta)
+      const notCancelled = fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(notCancelled).toBe(false)
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
     it('does not call onSend on Enter when sendOnEnter is false', () => {
       const onSend = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="ctrl-enter" />)
@@ -299,12 +378,12 @@ describe('ChatInput', () => {
   describe('prefill hint', () => {
     it('shows prefill hint when enabled', () => {
       renderWithProviders(<ChatInput {...defaultProps} prefillHint />)
-      expect(screen.getByText(/Plan pre-filled/)).toBeInTheDocument()
+      expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
     })
 
     it('does not show prefill hint by default', () => {
       renderWithProviders(<ChatInput {...defaultProps} />)
-      expect(screen.queryByText(/Plan pre-filled/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/Prompt pre-filled/)).not.toBeInTheDocument()
     })
   })
 
@@ -338,6 +417,131 @@ describe('ChatInput', () => {
     it('disables the + menu button when uploading', () => {
       renderWithProviders(<ChatInput {...defaultProps} isMac onUploadFiles={vi.fn()} onScreenshot={vi.fn()} uploading />)
       expect(screen.getByTitle('Add files & options')).toBeDisabled()
+    })
+
+    /* #5744: while an upload is in flight every attach entry point is
+     * disabled, so without this control the only way out of a slow transfer
+     * is reloading the page. */
+    it('offers a cancel control only while uploading', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    it('renders no cancel control when the host passes no onCancelUpload', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+    })
+
+    it('calls onCancelUpload when the cancel control is pressed', () => {
+      const onCancelUpload = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
+      expect(onCancelUpload).toHaveBeenCalledTimes(1)
+    })
+
+    /* #13071: one press aborts every upload in flight, so with two or more the
+     * label says how many stop rather than claiming a single one. */
+    it('names the count on the cancel control only when more than one upload is live', () => {
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={1} />)
+      const single = screen.getByRole('button', { name: 'Cancel upload' })
+      expect(single).toHaveAttribute('title', 'Cancel upload')
+
+      rerender(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={2} />)
+      const counted = screen.getByRole('button', { name: 'Cancel 2 uploads' })
+      expect(counted).toHaveAttribute('title', 'Cancel 2 uploads')
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+
+      rerender(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={1} />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    /* A send fired mid-upload left without the file, and the file then landed
+     * in the emptied composer as a stray attachment for the next message. */
+    it('holds Send and Enter while an attachment is on its way', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="look at this" onSend={onSend} onUploadFiles={vi.fn()} uploading holdSend />)
+      const send = screen.getByRole('button', { name: 'Send' })
+      expect(send).toBeDisabled()
+      expect(send).toHaveAttribute('title', 'Waiting for the attachment to finish')
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('holds the busy steer/queue send while an attachment is on its way', () => {
+      const onSend = vi.fn()
+      const onSteer = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} value="look at this" onSend={onSend} onSteer={onSteer} canSteer isRunning onStop={vi.fn()} onUploadFiles={vi.fn()} uploading holdSend />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSteer).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      // The split button's fire half says why it is dimmed, like the other sends.
+      const held = screen.getByTestId('busy-send-button')
+      expect(held).toHaveAttribute('title', 'Steer — Waiting for the attachment to finish')
+      expect(held).toBeDisabled()
+    })
+
+    it('keeps Queue message in the held queue tooltip before the wait reason', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          value="look at this"
+          isRunning
+          onStop={vi.fn()}
+          onUploadFiles={vi.fn()}
+          uploading
+          holdSend
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Queue message' })).toHaveAttribute(
+        'title',
+        'Queue message — Waiting for the attachment to finish',
+      )
+    })
+
+    it('says in words why a held draft is waiting', () => {
+      // The Send tooltip reaches no touch or screen-reader user, and a held
+      // Enter would otherwise do nothing visible.
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} value="look at this" onUploadFiles={vi.fn()} uploading holdSend />)
+      expect(screen.getByTestId('composer-send-held')).toHaveTextContent('Waiting for the attachment to finish')
+      expect(screen.getByTestId('composer-send-held')).toHaveAttribute('role', 'status')
+      unmount()
+      // No draft: the upload spinner already says enough.
+      const empty = renderWithProviders(<ChatInput {...defaultProps} value="" onUploadFiles={vi.fn()} uploading holdSend />)
+      expect(screen.queryByTestId('composer-send-held')).not.toBeInTheDocument()
+      empty.unmount()
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByTestId('composer-send-held')).not.toBeInTheDocument()
+    })
+
+    it('says why a refs-only composer is waiting', () => {
+      // The idle Send counts a staged session ref as a payload, so it dims for
+      // the hold; the row explaining it must not go by the text-or-files draft.
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          value=""
+          pendingSessions={[{ key: 'chat-9', title: 'Release notes', messages: 12 }]}
+          onUploadFiles={vi.fn()}
+          uploading
+          holdSend
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      expect(screen.getByTestId('composer-send-held')).toHaveTextContent('Waiting for the attachment to finish')
+    })
+
+    it('keeps Send live when the upload belongs to another composer', () => {
+      // `uploading` alone only drives the attach controls: an upload started in
+      // another slot lands in that slot's draft and must not hold this send.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" onSend={onSend} onUploadFiles={vi.fn()} uploading />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).toHaveBeenCalled()
     })
   })
 
@@ -376,7 +580,7 @@ describe('ChatInput', () => {
   // caret is at the end, so typing past the ~6-line cap keeps the caret visible.
   // jsdom has no layout, so we stub the relevant props (and make height='0' zero
   // scrollTop, as a real browser does) and stub document.activeElement rather
-  // than calling ta.focus() — real focus leaks into the autoFocusKey suite.
+  // than calling ta.focus().
   describe('caret-follow scroll', () => {
     afterEach(() => {
       delete (document as unknown as { activeElement?: unknown }).activeElement
@@ -443,6 +647,61 @@ describe('ChatInput', () => {
       instrument(ta, { initialScrollTop: 0, scrollHeight: 100, clientHeight: 140 })
       fireEvent.input(ta)
       expect(ta.scrollTop).toBe(0)
+    })
+
+    // The snap is for a caret the user placed. A value the PARENT set -- an error
+    // hand-off's report seeded into a fresh session, a slot's draft restore -- is
+    // not that, and the same focused + caret-at-end + overflowing state yanked
+    // the view to the last line of the seed, hiding the sentence that says what
+    // broke. The caret is not at risk there: it only moves on a real edit, and a
+    // real edit arrives through the `input` event above.
+    it('does not snap for a parent-driven value change (a seeded prompt is read from its first line)', () => {
+      const seed = 'This error just came up.\n\n```error-report\n- Route: /apps/x\n- Request: /api/apps/x -> HTTP 500\n- Message: boom\n```'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 352, clientHeight: 140 })
+      // Programmatic value set: the browser leaves the caret at the end.
+      ta.setSelectionRange(seed.length, seed.length)
+      rerender(<ChatInput {...defaultProps} value={seed} prefillHint />)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    // The other half of the rule: a re-measure at an UNCHANGED value (the hint
+    // expiring after the user typed, which drops the cap from 320 to 140) is a
+    // viewport change under a caret the user placed, so the caret is followed --
+    // otherwise the line they just typed would be below the fold.
+    it('follows the caret when the cap shrinks under an unchanged value', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={value} prefillHint />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(value.length, value.length)
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 289, clientHeight: 140 })
+      rerender(<ChatInput {...defaultProps} value={value} />)
+      expect(ta.scrollTop).toBe(289)
+    })
+
+    it('resets the scroll offset when a seed replaces the box, so it starts at its first line', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={value} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      // The box was scrolled for the previous text; the seed swaps the value under it.
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 352, clientHeight: 140 })
+      rerender(<ChatInput {...defaultProps} value={'This error just came up.\n\n```error-report\n- Message: boom\n```'} prefillHint />)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    it('keeps the scroll offset when the seed was appended to the draft the user was writing', () => {
+      // The widget send path joins its text onto the trimmed draft and raises
+      // the same hint; the appended tail is the new text, so the offset the user
+      // had is the right one and a jump to the top would hide what just arrived.
+      const draft = 'a\nb\nc\nd\ne\nf\ng\nh  '
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={draft} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 352, clientHeight: 320 })
+      rerender(<ChatInput {...defaultProps} value={`${draft.trimEnd()}\nwidget text`} prefillHint />)
+      expect(ta.scrollTop).toBe(120)
     })
   })
 
@@ -517,16 +776,17 @@ describe('ChatInput', () => {
       localStorage.setItem('mc-input-height', '150')
       const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
       const wrapper = container.firstElementChild as HTMLElement
-      // With files: minHeight should be INPUT_DRAG_MIN_H (93) + FILE_PREVIEW_H (81) = 174
-      expect(wrapper.style.minHeight).toBe('174px')
+      // The drag floor plus whatever the strip MEASURED -- not a restatement of
+      // a predicted constant, which is what this used to assert.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H + PREVIEW_STRIP_H}px`)
     })
 
     it('uses base minHeight when no files attached and manually sized', () => {
       localStorage.setItem('mc-input-height', '150')
       const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={[]} />)
       const wrapper = container.firstElementChild as HTMLElement
-      // Without files: minHeight should be INPUT_DRAG_MIN_H (93)
-      expect(wrapper.style.minHeight).toBe('93px')
+      // No strip mounted, so it measures nothing and reserves nothing.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H}px`)
     })
 
     it('wrapper uses flex-col layout for proper space distribution with file strip', () => {
@@ -541,28 +801,64 @@ describe('ChatInput', () => {
       const wrapper = screen.getByTestId('input-wrapper')
       expect(wrapper.style.height).toBe('200px')
       rerender(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
-      // 200 + FILE_PREVIEW_H (81) = 281
-      expect(wrapper.style.height).toBe('281px')
+      expect(wrapper.style.height).toBe(`${200 + PREVIEW_STRIP_H}px`)
     })
 
     it('shrinks wrapper height when files are removed with manual sizing', () => {
-      localStorage.setItem('mc-input-height', '281')
+      localStorage.setItem('mc-input-height', String(200 + PREVIEW_STRIP_H))
       const { rerender } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
       rerender(<ChatInput {...defaultProps} pendingFiles={[]} />)
       const wrapper = screen.getByTestId('input-wrapper')
-      // 281 - FILE_PREVIEW_H (81) = 200
       expect(wrapper.style.height).toBe('200px')
     })
   })
 
   describe('prompt history', () => {
-    const sent = ['first', 'second', 'third']
+    const sent = [{ text: 'first' }, { text: 'second' }, { text: 'third' }]
+
+    it('keeps the recalled prompt when older history loads in front mid-browse', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('second')
+      const grown = [{ text: 'older-a' }, { text: 'older-b' }, ...sent]
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={grown} value="second" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('first')
+    })
 
     it('ArrowUp on empty input recalls newest message', () => {
       const onChange = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
       fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp' })
       expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('Ctrl+Up on empty input fires the edit-last request instead of recalling (#11402)', () => {
+      const onChange = vi.fn()
+      const onEditLastRequest = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} onEditLastRequest={onEditLastRequest} />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', ctrlKey: true })
+      expect(onEditLastRequest).toHaveBeenCalledTimes(1)
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('Ctrl+Up with composer content is unclaimed (no edit request, no recall)', () => {
+      const onChange = vi.fn()
+      const onEditLastRequest = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} value="draft text" onChange={onChange} sentMessages={sent} onEditLastRequest={onEditLastRequest} />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', ctrlKey: true })
+      expect(onEditLastRequest).not.toHaveBeenCalled()
+      expect(onChange).not.toHaveBeenCalled()
     })
 
     it('repeated ArrowUp walks from newest to oldest', () => {
@@ -642,6 +938,36 @@ describe('ChatInput', () => {
       expect(onChange).not.toHaveBeenCalled()
     })
 
+    it('ignores an auto-repeat ArrowUp that reaches the start of a typed draft', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="my long draft" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp', repeat: true })
+      expect(onChange).not.toHaveBeenCalled()
+      // Letting go and pressing again is a deliberate recall.
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('keeps walking history on auto-repeat once a prompt is recalled', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp', repeat: true })
+      expect(onChange).toHaveBeenLastCalledWith('second')
+    })
+
+    it('recalls on an auto-repeat ArrowUp from an empty composer', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', repeat: true })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
     it('ArrowDown is ignored when not in history mode', () => {
       const onChange = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
@@ -694,7 +1020,7 @@ describe('ChatInput', () => {
 
     it('ArrowDown in history mode is ignored when caret is not at end', () => {
       const onChange = vi.fn()
-      const multiLine = ['first', 'line1\nline2', 'third']
+      const multiLine = [{ text: 'first' }, { text: 'line1\nline2' }, { text: 'third' }]
       const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value="" />)
       const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
       fireEvent.keyDown(ta, { key: 'ArrowUp' })
@@ -734,12 +1060,11 @@ describe('ChatInput', () => {
   // ── Reasoning effort merged into model button ──
   describe('reasoning effort button', () => {
     it('renders for acp provider', () => {
-      const onClick = vi.fn()
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="high"
-          onReasoningEffortClick={onClick}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
         />
@@ -747,25 +1072,25 @@ describe('ChatInput', () => {
       expect(screen.getByText('High')).toBeInTheDocument()
     })
 
-    it('renders Default label when effort is empty', () => {
+    it('leaves the level out when effort is empty', () => {
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort=""
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
         />
       )
-      expect(screen.getByText('Default')).toBeInTheDocument()
+      expect(screen.getByTestId('composer-model-chip')).toHaveTextContent(/^claude-opus-4\.7$/)
     })
 
-    it('shown when onReasoningEffortClick provided regardless of providerId', () => {
+    it('shown when hasEffort is set regardless of providerId', () => {
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="high"
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
         />
@@ -773,33 +1098,89 @@ describe('ChatInput', () => {
       expect(screen.getByText('High')).toBeInTheDocument()
     })
 
-    it('hidden when handler missing even on supported provider', () => {
+    it('hidden when hasEffort is unset even on supported provider', () => {
       renderWithProviders(
         <ChatInput {...defaultProps} providerId="acp" reasoningEffort="high" modelName="claude-opus-4.7" onModelClick={vi.fn()} />
       )
       expect(screen.queryByText('High')).not.toBeInTheDocument()
     })
 
-    it('shown when providerId is undefined but callback provided', () => {
+    it('shown when providerId is undefined but hasEffort is set', () => {
       renderWithProviders(
-        <ChatInput {...defaultProps} reasoningEffort="high" onReasoningEffortClick={vi.fn()} modelName="claude-opus-4.7" onModelClick={vi.fn()} />
+        <ChatInput {...defaultProps} reasoningEffort="high" hasEffort modelName="claude-opus-4.7" onModelClick={vi.fn()} />
       )
       expect(screen.getByText('High')).toBeInTheDocument()
     })
+
+    // Model + effort are ONE control (docs/decisions/2026-06-14): the effort
+    // level rides inside the model chip and is edited inside the model
+    // picker. The composer never grows a second, standalone effort button.
+    it.each(['claude-opus-4.7', 'gpt-6-sol', 'global.anthropic.claude-opus-4-8[1m]'])(
+      'never renders a standalone effort button for %s', modelName => {
+        renderWithProviders(
+          <ChatInput {...defaultProps}
+            providerId="acp"
+            reasoningEffort="high"
+            hasEffort
+            modelName={modelName}
+            onModelClick={vi.fn()}
+          />
+        )
+        expect(screen.queryByTestId('composer-effort-chip')).toBeNull()
+        expect(screen.queryByRole('button', { name: 'Reasoning effort' })).toBeNull()
+        expect(screen.getByTestId('composer-model-chip')).toHaveTextContent('High')
+      },
+    )
 
     it('disabled while running', () => {
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="medium"
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
           isRunning
         />
       )
-      const btn = screen.getByTitle('Stop the current response to switch model')
+      // The chip still shows the level while running, so the title (the only
+      // readout on a narrow shelf) and the accessible name keep carrying it.
+      const btn = screen.getByTitle('Stop the current response to switch model · Reasoning effort: Medium')
       expect(btn).toBeDisabled()
+      expect(btn).toHaveAccessibleName('Stop the current response to switch model · Reasoning effort: Medium')
+    })
+
+    it('carries the effort level on the routed chip too', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          hasEffort
+          modelName="auto"
+          modelIsJevRouted
+          onModelClick={vi.fn()}
+        />
+      )
+      const chip = screen.getByTestId('composer-model-chip')
+      expect(chip).toHaveTextContent('High')
+      expect(chip).toHaveAccessibleName(/ · Reasoning effort: High$/)
+      expect(chip).toHaveAttribute('title', chip.getAttribute('aria-label'))
+    })
+
+    it('marks a model picked for the user as auto, never as default', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          modelName="claude-sonnet-5"
+          modelIsAutoChosen
+          onModelClick={vi.fn()}
+        />
+      )
+      const chip = screen.getByTestId('composer-model-chip')
+      expect(chip).toHaveTextContent('claude-sonnet-5·auto')
+      expect(chip).not.toHaveTextContent('default')
+      expect(chip).toHaveAccessibleName('Model: claude-sonnet-5 · auto')
+      expect(chip).toHaveAttribute('title', 'Model: claude-sonnet-5 · auto')
     })
 
     it('invokes onModelClick with click rect', () => {
@@ -808,15 +1189,51 @@ describe('ChatInput', () => {
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="low"
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={onModelClick}
         />
       )
-      fireEvent.click(screen.getByTitle('Model: claude-opus-4.7'))
+      fireEvent.click(screen.getByTitle('Model: claude-opus-4.7 · Reasoning effort: Low'))
       expect(onModelClick).toHaveBeenCalledOnce()
       // First arg should be a DOMRect-like object
       expect(onModelClick.mock.calls[0][0]).toBeTruthy()
+    })
+
+    it('opens the model and agent pickers on the mouse press, once per press', () => {
+      const onModelClick = vi.fn()
+      const onAgentClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          modelName="claude-opus-4.7"
+          onModelClick={onModelClick}
+          agentName="kirocrew"
+          onAgentClick={onAgentClick}
+        />
+      )
+      const model = screen.getByTestId('composer-model-chip')
+      fireEvent.pointerDown(model, { pointerType: 'mouse', button: 0 })
+      expect(onModelClick).toHaveBeenCalledOnce()
+      fireEvent.click(model, { detail: 1 })
+      expect(onModelClick).toHaveBeenCalledOnce()
+
+      const agent = screen.getByRole('button', { name: 'Agent: kirocrew' })
+      fireEvent.pointerDown(agent, { pointerType: 'mouse', button: 0 })
+      expect(onAgentClick).toHaveBeenCalledOnce()
+      fireEvent.click(agent, { detail: 1 })
+      expect(onAgentClick).toHaveBeenCalledOnce()
+    })
+
+    it('reports composer focus captured at the press, before focus moves to the chip', () => {
+      const onModelClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} providerId="acp" modelName="claude-opus-4.7" onModelClick={onModelClick} />
+      )
+      const editor = screen.getByRole('textbox')
+      editor.focus()
+      fireEvent.pointerDown(screen.getByTestId('composer-model-chip'), { pointerType: 'mouse', button: 0 })
+      expect(onModelClick.mock.calls[0][2]).toBe(true)
     })
   })
 
@@ -859,6 +1276,37 @@ describe('ChatInput', () => {
           <ChatInput {...defaultProps} {...props} />
         </SlotProvider>,
       )
+
+    it('starts no optimize while the composer is locked, from the button or the chord', async () => {
+      // A memory-mode switch locks the composer (disabled) while it moves the
+      // draft; an optimize started then would write into the deleted slot.
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() => new Promise<Response>(() => {}))
+      const optimizeCalls = () => fetchSpy.mock.calls.filter(c => String(c[0]).includes('optimize'))
+      // The same settle step for both halves: the unlocked half proves an
+      // optimize reaches fetch within it, so the locked half's empty list is
+      // an absence and not a request that had not got there yet.
+      const settle = async () => { for (let i = 0; i < 5; i++) await act(async () => { await Promise.resolve() }) }
+      const chord = () => fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', metaKey: true, shiftKey: true })
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange, disabled: true })
+        const btn = screen.getByRole('button', { name: 'Optimize prompt' })
+        expect(btn).toBeDisabled()
+        await act(async () => {
+          fireEvent.click(btn)
+          chord()
+        })
+        await settle()
+        expect(optimizeCalls()).toEqual([])
+
+        rerenderInSlot(rerender, 'slot-A', { value: 'fix bug', onChange, disabled: false })
+        await act(async () => { chord() })
+        await settle()
+        expect(optimizeCalls()).toHaveLength(1)
+      } finally {
+        fetchSpy.mockRestore()
+      }
+    })
 
     it('routes optimize result to the originating session when the user switched away', async () => {
       // The originating session (slot A) starts an optimize, then the user
@@ -1054,615 +1502,5 @@ describe('ChatInput', () => {
         fetchSpy.mockRestore()
       }
     })
-  })
-
-  describe('autoFocusKey', () => {
-    it('focuses textarea on first non-null key', () => {
-      renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
-      expect(screen.getByLabelText('Message input')).toHaveFocus()
-    })
-
-    it('focuses textarea when key changes', () => {
-      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
-      const ta = screen.getByLabelText('Message input')
-      ta.blur()
-      expect(ta).not.toHaveFocus()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="B" />)
-      expect(ta).toHaveFocus()
-    })
-
-    it('does not re-focus on a re-render with the same key', () => {
-      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
-      const ta = screen.getByLabelText('Message input')
-      ta.blur()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="A" />)
-      expect(ta).not.toHaveFocus()
-    })
-
-    it('does not focus on a touch device, even when the key changes', () => {
-      // Tapping a session on a phone/tablet must not pop the soft keyboard.
-      touchEnv.touch = true
-      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
-      const ta = screen.getByLabelText('Message input')
-      expect(ta).not.toHaveFocus()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="B" />)
-      expect(ta).not.toHaveFocus()
-    })
-
-    it('does not re-focus when disabled flips false on the same key (e.g. AI finishes responding)', () => {
-      // Once a key has been focused, subsequent disabled flips for the SAME key
-      // must not steal focus back from a user who is reading or scrolling.
-      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
-      const ta = screen.getByLabelText('Message input')
-      expect(ta).toHaveFocus()
-      ta.blur()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="A" disabled />)
-      expect(ta).not.toHaveFocus()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="A" disabled={false} />)
-      expect(ta).not.toHaveFocus()
-    })
-
-    it('defers focus when key changes while disabled, then applies it once disabled clears', () => {
-      // User picks a different session while it is still stopping (disabled=true).
-      // Focus must NOT be lost — it should land once disabled flips false.
-      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" disabled />)
-      const ta = screen.getByLabelText('Message input')
-      ta.blur()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="B" disabled />)
-      expect(ta).not.toHaveFocus()
-      rerender(<ChatInput {...defaultProps} autoFocusKey="B" disabled={false} />)
-      expect(ta).toHaveFocus()
-    })
-
-    it('does not steal focus from another input element', () => {
-      const { rerender } = renderWithProviders(
-        <>
-          <input data-testid="other" aria-label="Other input" />
-          <ChatInput {...defaultProps} autoFocusKey="A" />
-        </>,
-      )
-      const other = screen.getByTestId('other')
-      other.focus()
-      expect(other).toHaveFocus()
-      rerender(
-        <>
-          <input data-testid="other" aria-label="Other input" />
-          <ChatInput {...defaultProps} autoFocusKey="B" />
-        </>,
-      )
-      expect(other).toHaveFocus()
-    })
-  })
-
-  describe('Quick Send', () => {
-    it('passes quickSend to FollowUpBar when options present', () => {
-      renderWithProviders(<ChatInput {...defaultProps} followUpOptions={['A', 'B']} followUpPicked={new Set()} onFollowUpSelect={vi.fn()} quickSend={true} />)
-      expect(screen.getAllByTitle(/Click to send instantly/).length).toBeGreaterThan(0)
-    })
-
-    it('fires onFollowUpSelect with MouseEvent on option click', () => {
-      const onSelect = vi.fn()
-      renderWithProviders(<ChatInput {...defaultProps} followUpOptions={['Go']} followUpPicked={new Set()} onFollowUpSelect={onSelect} quickSend={true} />)
-      fireEvent.click(screen.getByRole('button', { name: 'Go' }))
-      expect(onSelect).toHaveBeenCalledWith('Go', expect.any(Object))
-    })
-  })
-
-  describe('stop button', () => {
-    it('shows armed Stop button while running, click calls onStop', () => {
-      const onStop = vi.fn()
-      renderWithProviders(<ChatInput {...defaultProps} isRunning onStop={onStop} />)
-      const btn = screen.getByTestId('stop-button-armed')
-      expect(btn).toHaveAttribute('aria-label', 'Stop generation')
-      fireEvent.click(btn)
-      expect(onStop).toHaveBeenCalled()
-    })
-
-    it('shows pulsing force-kill button when soft_pending, click calls onStop', () => {
-      const onStop = vi.fn()
-      renderWithProviders(<ChatInput {...defaultProps} isRunning onStop={onStop} stopState="soft_pending" />)
-      const btn = screen.getByTestId('stop-button-pulsing')
-      expect(btn).toHaveAttribute('aria-label', 'Force kill session (discards in-progress work and queued messages)')
-      fireEvent.click(btn)
-      expect(onStop).toHaveBeenCalled()
-    })
-
-    it('keeps showing the stop affordance when soft_pending even after isRunning flips false', () => {
-      // Regression: the chat_done event clears isRunning before the backend
-      // flips stop_state back to idle. The button must NOT revert to Send mid-stop.
-      const onStop = vi.fn()
-      renderWithProviders(<ChatInput {...defaultProps} isRunning={false} onStop={onStop} stopState="soft_pending" />)
-      expect(screen.getByTestId('stop-button-pulsing')).toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument()
-    })
-
-    it('shows disabled killing spinner when stopState is killing (after isRunning false)', () => {
-      const onStop = vi.fn()
-      renderWithProviders(<ChatInput {...defaultProps} isRunning={false} onStop={onStop} stopState="killing" />)
-      const btn = screen.getByRole('button', { name: 'Killing session' })
-      expect(btn).toBeDisabled()
-      fireEvent.click(btn)
-      expect(onStop).not.toHaveBeenCalled()
-    })
-
-    it('shows Queue message button (calls onSend) when running with pending text', () => {
-      const onSend = vi.fn()
-      const onStop = vi.fn()
-      renderWithProviders(<ChatInput {...defaultProps} value="more" isRunning onStop={onStop} onSend={onSend} />)
-      const btn = screen.getByRole('button', { name: 'Queue message' })
-      fireEvent.click(btn)
-      expect(onSend).toHaveBeenCalled()
-      expect(onStop).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('a staged session reference does not arm the mid-turn button', () => {
-    // Regression guard for a dead click this feature briefly introduced. A
-    // staged reference correctly enables the IDLE send button, but the mid-turn
-    // split button must stay out of it: its steer mode refuses a payload of refs
-    // alone, so enabling it produced an enabled primary button whose press did
-    // nothing. Before session refs existed, an empty composer mid-turn rendered
-    // the stop button — that is the behaviour to preserve.
-    const refProps = (overrides: Record<string, unknown> = {}) => ({
-      ...defaultProps,
-      value: '',
-      pendingSessions: [{ key: 'chat-9', title: 'Release notes', messages: 12 }],
-      isRunning: true,
-      canSteer: true,
-      onStop: vi.fn(),
-      onSend: vi.fn(),
-      onSteer: vi.fn(),
-      ...overrides,
-    })
-
-    it('renders the stop button, not the split send button, with only a ref staged', () => {
-      renderWithProviders(<ChatInput {...refProps()} />)
-      expect(screen.queryByTestId('busy-send-button')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('busy-send-caret')).not.toBeInTheDocument()
-    })
-
-    it('still shows the chip so the reference is visibly staged, not lost', () => {
-      renderWithProviders(<ChatInput {...refProps()} />)
-      expect(screen.getByTestId('session-ref-chip')).toHaveAttribute('data-session-ref', 'chat-9')
-    })
-
-    it('arms the mid-turn button again as soon as there is real text to steer', () => {
-      renderWithProviders(<ChatInput {...refProps({ value: 'also look at this' })} />)
-      expect(screen.getByTestId('busy-send-button')).toBeInTheDocument()
-    })
-
-    it('does enable the IDLE send button with only a ref staged', () => {
-      const p = refProps({ isRunning: false, canSteer: false })
-      renderWithProviders(<ChatInput {...p} />)
-      const send = screen.getByLabelText('Send')
-      expect(send).not.toBeDisabled()
-      fireEvent.click(send)
-      expect(p.onSend).toHaveBeenCalledTimes(1)
-    })
-  })
-
-  describe('split send button while running (steer default)', () => {
-    const runningProps = () => ({
-      ...defaultProps,
-      value: 'more',
-      isRunning: true,
-      canSteer: true,
-      onStop: vi.fn(),
-      onSend: vi.fn(),
-      onSteer: vi.fn(),
-    })
-
-    it('renders Steer as the default main action with a dropdown caret', () => {
-      renderWithProviders(<ChatInput {...runningProps()} />)
-      expect(screen.getByTestId('busy-send-button')).toHaveAttribute('aria-label', 'Steer')
-      expect(screen.getByTestId('busy-send-caret')).toBeInTheDocument()
-    })
-
-    it('main button fires onSteer (not onSend) in steer mode', () => {
-      const p = runningProps()
-      renderWithProviders(<ChatInput {...p} />)
-      fireEvent.click(screen.getByTestId('busy-send-button'))
-      expect(p.onSteer).toHaveBeenCalledTimes(1)
-      expect(p.onSend).not.toHaveBeenCalled()
-    })
-
-    it('Enter steers while running in steer mode', () => {
-      const p = runningProps()
-      renderWithProviders(<ChatInput {...p} />)
-      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
-      expect(p.onSteer).toHaveBeenCalledTimes(1)
-      expect(p.onSend).not.toHaveBeenCalled()
-    })
-
-    it('dropdown switches to Queue — main button and Enter then queue, choice persists', () => {
-      const p = runningProps()
-      renderWithProviders(<ChatInput {...p} />)
-      fireEvent.click(screen.getByTestId('busy-send-caret'))
-      fireEvent.click(screen.getByTestId('busy-send-mode-queue'))
-      expect(localStorage.getItem('mc-busy-send-mode')).toBe('queue')
-      const main = screen.getByTestId('busy-send-button')
-      expect(main).toHaveAttribute('aria-label', 'Queue message')
-      fireEvent.click(main)
-      expect(p.onSend).toHaveBeenCalledTimes(1)
-      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
-      expect(p.onSend).toHaveBeenCalledTimes(2)
-      expect(p.onSteer).not.toHaveBeenCalled()
-    })
-
-    it('restores persisted queue mode from localStorage', () => {
-      safeSetItem('mc-busy-send-mode', 'queue')
-      renderWithProviders(<ChatInput {...runningProps()} />)
-      expect(screen.getByTestId('busy-send-button')).toHaveAttribute('aria-label', 'Queue message')
-    })
-
-    it('dropdown is keyboard operable: focus on open, arrows roam, Escape returns to caret', async () => {
-      renderWithProviders(<ChatInput {...runningProps()} />)
-      fireEvent.click(screen.getByTestId('busy-send-caret'))
-      // useListboxKeyboard focuses the first option on open (setTimeout 0)
-      await waitFor(() => expect(screen.getByTestId('busy-send-mode-steer')).toHaveFocus())
-      const menu = screen.getByRole('menu')
-      fireEvent.keyDown(menu, { key: 'ArrowDown' })
-      expect(screen.getByTestId('busy-send-mode-queue')).toHaveFocus()
-      fireEvent.keyDown(menu, { key: 'ArrowUp' })
-      expect(screen.getByTestId('busy-send-mode-steer')).toHaveFocus()
-      fireEvent.keyDown(menu, { key: 'Escape' })
-      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
-      expect(screen.getByTestId('busy-send-caret')).toHaveFocus()
-    })
-
-    it('shows split button with only pending files (image-only steer)', () => {
-      const p = { ...runningProps(), value: '', pendingFiles: ['/tmp/shot.png'] }
-      renderWithProviders(<ChatInput {...p} />)
-      fireEvent.click(screen.getByTestId('busy-send-button'))
-      expect(p.onSteer).toHaveBeenCalledTimes(1)
-    })
-
-    it('Enter falls back to queue while stopping (soft_pending) even in steer mode', () => {
-      const p = { ...runningProps(), stopState: 'soft_pending' as const }
-      renderWithProviders(<ChatInput {...p} />)
-      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
-      expect(p.onSend).toHaveBeenCalledTimes(1)
-      expect(p.onSteer).not.toHaveBeenCalled()
-    })
-
-    it('Enter sends normally when not running even if onSteer is provided', () => {
-      const p = { ...runningProps(), isRunning: false, onStop: undefined }
-      renderWithProviders(<ChatInput {...p} />)
-      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
-      expect(p.onSend).toHaveBeenCalledTimes(1)
-      expect(p.onSteer).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('global "/" focus shortcut', () => {
-    it('focuses textarea when "/" is pressed outside any input', () => {
-      renderWithProviders(<ChatInput {...defaultProps} />)
-      const ta = screen.getByLabelText('Message input')
-      ;(ta as HTMLElement).blur()
-      fireEvent.keyDown(document, { key: '/' })
-      expect(document.activeElement).toBe(ta)
-    })
-
-    it('does not intercept "/" when already typing in the textarea', () => {
-      renderWithProviders(<ChatInput {...defaultProps} />)
-      const ta = screen.getByLabelText('Message input')
-      ta.focus()
-      fireEvent.keyDown(ta, { key: '/' })
-      expect(document.activeElement).toBe(ta)
-    })
-  })
-
-  describe('Project chip', () => {
-    it('does NOT render the project chip when onProjectClick is undefined', () => {
-      renderWithProviders(<ChatInput {...defaultProps} />)
-      expect(screen.queryByLabelText(/Project:/)).not.toBeInTheDocument()
-      expect(screen.queryByLabelText('Select project')).not.toBeInTheDocument()
-    })
-
-    it('renders "Project" label when project prop is empty', () => {
-      renderWithProviders(<ChatInput {...defaultProps} onProjectClick={vi.fn()} />)
-      const btn = screen.getByLabelText('Select project')
-      expect(btn).toBeInTheDocument()
-      expect(btn.getAttribute('title')).toBe('Select project')
-      expect(btn.textContent).toContain('Project')
-    })
-
-    it('renders the project basename as label when project is set', () => {
-      renderWithProviders(
-        <ChatInput {...defaultProps} onProjectClick={vi.fn()} project="/home/u/workplace/KiroCrew" />
-      )
-      const btn = screen.getByLabelText('Project: /home/u/workplace/KiroCrew')
-      expect(btn).toBeInTheDocument()
-      expect(btn.getAttribute('title')).toBe('Project: /home/u/workplace/KiroCrew')
-      expect(btn.textContent).toContain('KiroCrew')
-      expect(btn.textContent).not.toContain('/home/u/workplace')
-    })
-
-    it('falls back to full path label when project has no basename', () => {
-      // project = "/" → split('/').filter(Boolean) = [] → pop() = undefined → falls back to project itself
-      renderWithProviders(
-        <ChatInput {...defaultProps} onProjectClick={vi.fn()} project="/" />
-      )
-      const btn = screen.getByLabelText('Project: /')
-      expect(btn.textContent).toContain('/')
-    })
-
-    it('strips trailing slashes when computing the basename label', () => {
-      // project = "/home/u/foo/" → filter(Boolean) drops empty trailing chunk → 'foo'
-      renderWithProviders(
-        <ChatInput {...defaultProps} onProjectClick={vi.fn()} project="/home/u/foo/" />
-      )
-      const btn = screen.getByLabelText('Project: /home/u/foo/')
-      expect(btn.textContent).toContain('foo')
-    })
-
-    it('calls onProjectClick with the chip\'s bounding rect when clicked', () => {
-      const onProjectClick = vi.fn()
-      renderWithProviders(
-        <ChatInput {...defaultProps} onProjectClick={onProjectClick} project="/home/u/proj" />
-      )
-      const btn = screen.getByLabelText('Project: /home/u/proj')
-      fireEvent.click(btn)
-      expect(onProjectClick).toHaveBeenCalledTimes(1)
-      const arg = onProjectClick.mock.calls[0][0]
-      // jsdom returns a 0,0,0,0 rect but it MUST be a DOMRect-shaped object
-      expect(arg).toBeDefined()
-      expect(typeof arg.top).toBe('number')
-      expect(typeof arg.left).toBe('number')
-      expect(typeof arg.right).toBe('number')
-      expect(typeof arg.bottom).toBe('number')
-      expect(typeof arg.width).toBe('number')
-      expect(typeof arg.height).toBe('number')
-    })
-
-    it('still calls onProjectClick when no project is set (chip in placeholder mode)', () => {
-      const onProjectClick = vi.fn()
-      renderWithProviders(
-        <ChatInput {...defaultProps} onProjectClick={onProjectClick} />
-      )
-      fireEvent.click(screen.getByLabelText('Select project'))
-      expect(onProjectClick).toHaveBeenCalledTimes(1)
-    })
-  })
-})
-
-// --- Prompt undo/redo ---
-// A controlled harness so onChange -> value round-trips exactly like ChatPage,
-// which is what makes the explicit undo history observable end-to-end.
-function ControlledInput({ initial = '', extra = {} }: { initial?: string; extra?: Record<string, unknown> }) {
-  const [v, setV] = React.useState(initial)
-  return <ChatInput {...defaultProps} value={v} onChange={setV} {...extra} />
-}
-
-describe('ChatInput undo/redo', () => {
-  const undo = (ta: HTMLElement) => fireEvent.keyDown(ta, { key: 'z', ctrlKey: true })
-  const redoShift = (ta: HTMLElement) => fireEvent.keyDown(ta, { key: 'z', ctrlKey: true, shiftKey: true })
-
-  it('restores text with Ctrl+Z after an accidental full erase', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'hello world' } })
-    fireEvent.change(ta, { target: { value: '' } }) // select-all + delete
-    expect(ta.value).toBe('')
-    undo(ta)
-    expect(ta.value).toBe('hello world')
-  })
-
-  it('supports Cmd+Z on macOS (metaKey)', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'draft text here' } })
-    fireEvent.change(ta, { target: { value: '' } })
-    fireEvent.keyDown(ta, { key: 'z', metaKey: true })
-    expect(ta.value).toBe('draft text here')
-  })
-
-  it('Ctrl+Shift+Z redoes an undone change', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'redo me please' } })
-    fireEvent.change(ta, { target: { value: '' } })
-    undo(ta)
-    expect(ta.value).toBe('redo me please')
-    redoShift(ta)
-    expect(ta.value).toBe('')
-  })
-
-  it('Ctrl+Y redoes (Windows convention)', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'windows redo' } })
-    fireEvent.change(ta, { target: { value: '' } })
-    undo(ta)
-    expect(ta.value).toBe('windows redo')
-    fireEvent.keyDown(ta, { key: 'y', ctrlKey: true })
-    expect(ta.value).toBe('')
-  })
-
-  it('collapses a rapid typing burst into a single undo step', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    // Incremental keystrokes within the coalesce window merge into one entry.
-    for (const v of ['a', 'ab', 'abc', 'abcd']) fireEvent.change(ta, { target: { value: v } })
-    undo(ta)
-    expect(ta.value).toBe('') // one undo clears the whole burst
-  })
-
-  it('is a no-op at the base of the history (nothing to undo)', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    undo(ta)
-    expect(ta.value).toBe('')
-  })
-
-  it('does not undo while an IME composition is active', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'こんにちは' } })
-    fireEvent.compositionStart(ta)
-    fireEvent.keyDown(ta, { key: 'z', ctrlKey: true })
-    expect(ta.value).toBe('こんにちは') // composition guard suppressed undo
-  })
-
-  it('discards the redo branch after a new edit following undo', () => {
-    renderWithProviders(<ControlledInput />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'first version' } })
-    fireEvent.change(ta, { target: { value: '' } })
-    undo(ta)
-    expect(ta.value).toBe('first version')
-    fireEvent.change(ta, { target: { value: 'different text' } }) // drops redo branch
-    redoShift(ta)
-    expect(ta.value).toBe('different text') // redo is now a no-op
-  })
-
-  it('reseeds across a deferred slot draft restore (no cross-slot bleed)', () => {
-    const drafts: Record<string, string> = { 'slot-a': 'slot A draft', 'slot-b': '' }
-    function Lagged() {
-      const [afk, setAfk] = React.useState('slot-a')
-      const [v, setV] = React.useState(drafts['slot-a'])
-      // Mimic ChatPage: activeSlot changes first; the draft is restored in a
-      // SEPARATE commit by an [activeSlot]-keyed effect — so `value` lags
-      // `autoFocusKey` by one commit.
-      React.useEffect(() => { setV(drafts[afk]) }, [afk])
-      return (
-        <>
-          <button onClick={() => setAfk('slot-b')}>switch</button>
-          <ChatInput {...defaultProps} value={v} onChange={setV} autoFocusKey={afk} />
-        </>
-      )
-    }
-    renderWithProviders(<Lagged />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    expect(ta.value).toBe('slot A draft')
-    fireEvent.click(screen.getByText('switch'))
-    expect(ta.value).toBe('') // slot B's draft settled in the second commit
-    undo(ta)
-    expect(ta.value).toBe('') // MUST NOT restore slot A's draft
-  })
-
-  it('reseeds synchronously when the draft lands in the same commit as the switch', () => {
-    // if ChatPage ever restores the draft in the SAME commit as the
-    // slot switch (no lag), the first keystroke must not be folded into the undo
-    // base — Ctrl+Z must still reach the restored draft.
-    const drafts: Record<string, string> = { 'slot-a': 'alpha draft', 'slot-b': 'beta draft' }
-    function SyncSwitch() {
-      const [afk, setAfk] = React.useState('slot-a')
-      const [v, setV] = React.useState(drafts['slot-a'])
-      // Both activeSlot and the draft change in one commit (synchronous restore).
-      const go = () => { setAfk('slot-b'); setV(drafts['slot-b']) }
-      return (
-        <>
-          <button onClick={go}>switch</button>
-          <ChatInput {...defaultProps} value={v} onChange={setV} autoFocusKey={afk} />
-        </>
-      )
-    }
-    renderWithProviders(<SyncSwitch />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    expect(ta.value).toBe('alpha draft')
-    fireEvent.click(screen.getByText('switch'))
-    expect(ta.value).toBe('beta draft')
-    fireEvent.change(ta, { target: { value: 'beta draft!' } }) // user's first keystroke (real DOM edit)
-    undo(ta)
-    expect(ta.value).toBe('beta draft') // first edit is undoable back to the restored draft (no fold)
-  })
-
-  it('starts a new undo step after a pause longer than the coalesce window', () => {
-    vi.useFakeTimers()
-    try {
-      renderWithProviders(<ControlledInput />)
-      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-      fireEvent.change(ta, { target: { value: 'aa' } })
-      vi.advanceTimersByTime(450) // past UNDO_COALESCE_MS (400)
-      fireEvent.change(ta, { target: { value: 'aabb' } })
-      undo(ta)
-      expect(ta.value).toBe('aa') // the pause made 'aabb' its own undo step
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-})
-
-// --- Undo restores deleted/expanded paste content ---
-// A `[ Paste #N ]` token in the text is just a pointer; its content lives in a
-// separate PasteBlock the parent owns. Deleting or expanding a token drops the
-// block, so the undo snapshot must carry the blocks to make the paste
-// recoverable — restoring only the text would resurrect a dead token literal.
-describe('ChatInput undo/redo: paste content', () => {
-  const undo = (ta: HTMLElement) => fireEvent.keyDown(ta, { key: 'z', ctrlKey: true })
-  const redoShift = (ta: HTMLElement) => fireEvent.keyDown(ta, { key: 'z', ctrlKey: true, shiftKey: true })
-
-  // Harness mirroring ChatPage: value and pasteBlocks are separate controlled
-  // state, wired to the two callbacks the way the real parent wires them.
-  function PasteHarness({ initial, initialBlocks }: { initial: string; initialBlocks: PasteBlock[] }) {
-    const [v, setV] = React.useState(initial)
-    const [blocks, setBlocks] = React.useState<PasteBlock[]>(initialBlocks)
-    return (
-      <ChatInput
-        {...defaultProps}
-        value={v}
-        onChange={setV}
-        pasteBlocks={blocks}
-        onPasteBlocksChange={setBlocks}
-      />
-    )
-  }
-
-  const block: PasteBlock = { id: 'p1', seq: 1, lines: 40, content: 'TRACEBACK: boom\n...40 lines...' }
-  const token = '[ Paste #1 · 40 lines ]'
-
-  it('recovers the paste content after a Backspace-delete of the token', () => {
-    // Caret just past the token; Backspace removes the token AND its block.
-    renderWithProviders(<PasteHarness initial={`${token}`} initialBlocks={[block]} />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    ta.setSelectionRange(token.length, token.length)
-    fireEvent.keyDown(ta, { key: 'Backspace' })
-    expect(ta.value).toBe('') // token gone
-
-    undo(ta)
-    expect(ta.value).toBe(token) // token text back...
-    // ...and its content is recoverable: copy of a full selection expands it.
-    ta.setSelectionRange(0, ta.value.length)
-    const clip = { data: '' as string, setData: (_t: string, d: string) => { clip.data = d } }
-    fireEvent.copy(ta, { clipboardData: { setData: clip.setData } })
-    expect(clip.data).toBe(block.content) // block was restored, not a dead literal
-  })
-
-  it('recovers the paste after expanding the token, then undo re-collapses it', () => {
-    // Double-click expands the token to full content and drops the block.
-    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    ta.setSelectionRange(2, 2) // caret inside the token
-    fireEvent.click(ta, { detail: 2 })
-    expect(ta.value).toBe(block.content) // expanded inline
-
-    undo(ta)
-    expect(ta.value).toBe(token) // collapsed token restored
-    ta.setSelectionRange(0, ta.value.length)
-    const clip = { data: '' as string, setData: (_t: string, d: string) => { clip.data = d } }
-    fireEvent.copy(ta, { clipboardData: { setData: clip.setData } })
-    expect(clip.data).toBe(block.content)
-  })
-
-  it('redo re-drops the block so an undone delete can be redone', () => {
-    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    ta.setSelectionRange(token.length, token.length)
-    fireEvent.keyDown(ta, { key: 'Backspace' })
-    expect(ta.value).toBe('')
-    undo(ta)
-    expect(ta.value).toBe(token)
-    redoShift(ta)
-    expect(ta.value).toBe('') // deletion reinstated
-  })
-
-  it('leaves plain-text undo untouched when no pastes exist', () => {
-    renderWithProviders(<PasteHarness initial="" initialBlocks={[]} />)
-    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
-    fireEvent.change(ta, { target: { value: 'hello world' } })
-    fireEvent.change(ta, { target: { value: '' } })
-    undo(ta)
-    expect(ta.value).toBe('hello world')
   })
 })

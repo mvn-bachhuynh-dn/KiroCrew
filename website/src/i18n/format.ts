@@ -18,9 +18,13 @@
  * two are used side by side without ceremony: formatting happens inside
  * `.map()` callbacks, in comparator functions passed to `.sort()`, and in plain
  * helper modules with no component around them — all positions a hook cannot
- * legally go. A language switch remounts the tree (`<App>` is keyed on the
- * active language in `main.tsx`), so a function that reads the language at call
- * time re-evaluates on switch without subscribing to anything.
+ * legally go. A language switch repaints the tree (`LanguageProvider` re-renders
+ * via `cloneElement` after the catalog swap — an update, not a remount), so a
+ * function that reads the language at call time re-evaluates on switch without
+ * subscribing to anything. The one shape that repaint cannot reach is a
+ * `React.memo` boundary, whose props-equality bailout swallows it —
+ * `MemoI18nSubscriptionRatchet.test.ts` pins the subscription every such
+ * boundary needs.
  *
  * ## Why `localeMatcher: 'lookup'`
  *
@@ -155,6 +159,15 @@ export function fmtNumber(value: number, options?: NumberOptions): string {
   ).format(value)
 }
 
+/** Trim credit noise: 2 decimals under 10, 1 decimal beyond ("0.25", "12.5"). */
+export function fmtCredits(credits: number): string {
+  const digits = credits >= 10 ? 1 : 2
+  return fmtNumber(credits, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })
+}
+
 /**
  * A ratio in 0..1 as a percentage.
  *
@@ -192,7 +205,18 @@ export type FormatUnit =
 
 export function fmtUnit(value: number, unit: FormatUnit, options?: NumberOptions): string {
   if (!Number.isFinite(value)) return '—'
-  return fmtNumber(value, { style: 'unit', unit, unitDisplay: 'narrow', ...options })
+  // A quantity is one atom: never let a line break fall between the number and
+  // its unit, or inside the digit grouping. CLDR does not guarantee this for us
+  // and is not even self-consistent about it — measured with `narrow`, en emits
+  // `5,289MB` (no separator at all), fr uses U+202F, ru uses U+00A0 for bytes but
+  // a plain U+0020 for hours, and de uses U+0020 for MB yet U+00A0 for GB. zh-CN
+  // uses a plain U+0020, which is a UAX #14 break opportunity, so `1,280 GB`
+  // could render with `GB` orphaned on its own line while the same value in
+  // English could not. Promoting every plain space in the formatted quantity to
+  // U+00A0 (class GL: breaks prohibited on both sides) makes the behaviour the
+  // same in all 12 locales. Only plain spaces are touched; U+202F and U+00A0 are
+  // already non-breaking.
+  return fmtNumber(value, { style: 'unit', unit, unitDisplay: 'narrow', ...options }).replace(/ /g, '\u00A0')
 }
 
 /**
@@ -241,6 +265,40 @@ export function fmtDuration(
   return memo('durationList', locale, null, () =>
     new Intl.ListFormat(locale, { localeMatcher: 'lookup', type: 'unit', style: 'narrow' }),
   ).format(rendered)
+}
+
+/**
+ * A settled elapsed time — `4.2s`, `37s`, `6m 38s`, `1h 7m 11s`.
+ *
+ * Three bands under an hour, because the useful precision changes with magnitude: a sub-10s
+ * step is interesting to a tenth, a sub-minute one is not, and past a minute the
+ * minutes place carries the meaning. Rounds to whole seconds BEFORE splitting so
+ * a value like 119.6s reads `2m 0s` and never the invalid `1m 60s` — flooring
+ * minutes first and rounding the remainder can push it to 60.
+ *
+ * A fourth band starts at an hour (`1h 7m 11s`), so a long run never reads as
+ * `67m 11s`.
+ *
+ * The seconds place is kept above a minute rather than dropped, so a series
+ * steps `2m 1s` -> `2m 0s` -> `59s` instead of collapsing to a bare `2m`.
+ *
+ * Non-finite input renders the same em dash `fmtDuration` uses, so a caller can
+ * hand over an unmeasurable span without branching.
+ *
+ * `fmtTurnElapsed` (chat) delegates here. The remaining-time label in
+ * `ToolCallLine` is a countdown, not an elapsed figure, and keeps its own bands.
+ */
+export function fmtElapsed(ms: number, options?: { wholeSeconds?: boolean }): string {
+  if (!Number.isFinite(ms)) return '—'
+  const s = ms / 1000
+  // `wholeSeconds` drops the tenths band for a live 1 Hz counter, whose input is
+  // already whole seconds and would otherwise read `4.0s`, `5.0s`, ...
+  if (s < 10 && !options?.wholeSeconds) return fmtUnit(s, 'second', { maximumFractionDigits: 1, minimumFractionDigits: 1 })
+  if (s < 60) return fmtUnit(Math.round(s), 'second', { maximumFractionDigits: 0 })
+  const total = Math.round(s)
+  // Past an hour the hours place carries the meaning: `1h 7m 11s`, not `67m 11s`.
+  if (total < 3600) return fmtDuration([[Math.floor(total / 60), 'minute'], [total % 60, 'second']])
+  return fmtDuration([[Math.floor(total / 3600), 'hour'], [Math.floor((total % 3600) / 60), 'minute'], [total % 60, 'second']])
 }
 
 /**
@@ -510,6 +568,26 @@ export function fmtList(
 }
 
 /* ----------------------------------------------------------------- collation */
+
+/**
+ * The name of a BCP-47 locale code in the app language: `vi-VN` reads
+ * "Vietnamese (Vietnam)" in English and "越南语（越南）" in Chinese.
+ *
+ * For a list of codes a person picks from. Returns the code itself when `Intl`
+ * has no name for it or rejects it, so an unusual code is still shown rather
+ * than dropped.
+ */
+export function fmtLanguageName(code: string): string {
+  const locale = activeLocale()
+  try {
+    const names = memo('languageName', locale, null, () =>
+      new Intl.DisplayNames(locale, { type: 'language', fallback: 'code' }),
+    )
+    return names.of(code) || code
+  } catch {
+    return code
+  }
+}
 
 /**
  * A collator for the active language.

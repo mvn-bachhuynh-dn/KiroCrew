@@ -15,18 +15,28 @@
  *  (7) The flyout occupies the panel rect's origin and width, so expanding
  *      moves only its bottom edge and the corner stays pinned.
  */
-import { describe, it, expect, vi } from 'vitest'
-import { render, fireEvent, within } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, fireEvent, within, act } from '@testing-library/react'
 import type { ChatSlot } from '../types'
-import SessionFlyout, { FLYOUT_MAX_ROWS, TOGGLE_RECT, toggleClip, FULL_CLIP } from '../pages/chat/SessionFlyout'
+import SessionFlyout, { FLYOUT_MAX_ROWS, toggleClip, FULL_CLIP } from '../pages/chat/SessionFlyout'
+
+/** The framer-motion props this mock READS; every other prop is copied through
+ *  to the plain DOM element untouched, which is what the index signature is for. */
+interface MotionMockProps {
+  [prop: string]: unknown
+  children?: React.ReactNode
+  animate?: { clipPath?: string | string[] }
+  transition?: { duration?: number }
+  onAnimationComplete?: () => void
+}
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
   const React = await import('react')
-  const FRAMER_PROPS = new Set(['layout', 'layoutId', 'initial', 'animate', 'exit', 'transition', 'variants'])
+  const FRAMER_PROPS = new Set(['layout', 'layoutId', 'initial', 'animate', 'exit', 'transition', 'variants', 'onAnimationComplete'])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: MotionMockProps, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children' || FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
@@ -37,13 +47,26 @@ vi.mock('framer-motion', async () => {
       if (Array.isArray(clip)) {
         clean['data-clip-from'] = clip[0]
         clean['data-clip-to'] = clip[clip.length - 1]
+      } else if (typeof clip === 'string') {
+        // The settled (non-keyframe) resting clip target, e.g. 'none'.
+        clean['data-clip-rest'] = clip
       }
       if (props.transition?.duration != null) clean['data-anim-dur'] = String(props.transition.duration)
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      // Framer fires this once the target is reached; the component uses it to
+      // flip into its clip-free resting state. Expose it on the node so a test
+      // can trigger the post-settle render deterministically (rather than this
+      // mock auto-firing it and perturbing every other assertion).
+      const onDone = props.onAnimationComplete
+      const setRef = (node: (HTMLElement & { __onAnimationComplete?: () => void }) | null) => {
+        if (node) node.__onAnimationComplete = onDone
+        if (typeof ref === 'function') ref(node)
+        else if (ref) (ref as React.MutableRefObject<unknown>).current = node
+      }
+      return React.createElement(tag, { ...clean, ref: setRef }, props.children)
     })
   return {
     motion: new Proxy({}, { get: (_t, tag: string) => make(tag) }),
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
     useReducedMotion: () => false,
   }
 })
@@ -79,6 +102,8 @@ function mount(over: Partial<React.ComponentProps<typeof SessionFlyout>> = {}) {
 const rowKeys = (c: HTMLElement) =>
   Array.from(c.querySelectorAll('[data-slot-key]')).map(el => el.getAttribute('data-slot-key'))
 
+beforeEach(() => localStorage.clear())
+
 describe('SessionFlyout ordering', () => {
   it('lists sessions most-recent-first', () => {
     const { container } = mount()
@@ -87,9 +112,18 @@ describe('SessionFlyout ordering', () => {
 
   it('puts a pinned session first even when it is the least recent', () => {
     const { container } = mount({
-      slots: [...SLOTS.slice(0, 2), slot({ ...SLOTS[2], pinned: true } as any)],
+      slots: [...SLOTS.slice(0, 2), slot({ ...SLOTS[2], pinned: true })],
     })
     expect(rowKeys(container)).toEqual(['k-mid', 'k-new', 'k-old'])
+  })
+
+  it('ranks pinned rows by the gateway pin order and follows a new order', () => {
+    const ranked = (order: string[]) => SLOTS.map(item => slot({ ...item, pinned: true, pin_rank: order.indexOf(item.key) }))
+    const { container, rerender, props } = mount({ slots: ranked(['k-old', 'k-mid', 'k-new']) })
+    expect(rowKeys(container)).toEqual(['k-old', 'k-mid', 'k-new'])
+
+    rerender(<SessionFlyout {...props} slots={ranked(['k-new', 'k-old', 'k-mid'])} />)
+    expect(rowKeys(container)).toEqual(['k-new', 'k-old', 'k-mid'])
   })
 
   it('ranks a slot with only `created` behind slots with real activity', () => {
@@ -192,7 +226,9 @@ describe('SessionFlyout status markers', () => {
     })
     expect(marker(container, 'a')).toContain('bg-warn')
     expect(marker(container, 'r')).toContain('animate-pulse')
-    expect(marker(container, 'u')).toContain('bg-accent')
+    // Unread reads the status token, not the brand accent -- and no longer
+    // shares a hue with `running`'s `bg-accent` (#10479).
+    expect(marker(container, 'u')).toContain('bg-ok')
     expect(marker(container, 'u')).not.toContain('animate-pulse')
   })
 
@@ -363,6 +399,31 @@ describe('SessionFlyout open clip', () => {
       // OverlayDrawer's clip morph is 0.24s. A different number here would make
       // hover-open and click-expand feel like two unrelated animations.
       expect(surface).toHaveAttribute('data-anim-dur', '0.24')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('releases the clip to none once the open morph settles — one clean corner', () => {
+    // The bug: the morph's final keyframe `inset(0px round 12px)` stayed applied
+    // at rest and re-rounded the `rounded-xl` (16px) border box at a 12px radius,
+    // so the border arc and the clip arc diverged into TWO concentric strokes at
+    // the top-left. At rest the clip must be gone so the CSS border is the sole
+    // corner. framer's onAnimationComplete flips the component into its clip-free
+    // state; `data-clip-rest` is the single (non-keyframe) clipPath it then hands
+    // framer, and the keyframe array is gone.
+    const spy = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(379)
+    try {
+      const { container } = mount({ panelWidth: 260 })
+      const surface = container.querySelector('[role="menu"]') as HTMLElement & { __onAnimationComplete?: () => void }
+      // While morphing, the clip is a keyframe ladder and there is no rest value.
+      expect(surface.getAttribute('data-clip-to')).toBe(FULL_CLIP)
+      expect(surface.getAttribute('data-clip-rest')).toBeNull()
+      // Settle: framer reports the open morph complete.
+      act(() => { surface.__onAnimationComplete?.() })
+      const settled = container.querySelector('[role="menu"]')!
+      expect(settled.getAttribute('data-clip-rest')).toBe('none')
+      expect(settled.getAttribute('data-clip-to')).toBeNull()
     } finally {
       spy.mockRestore()
     }

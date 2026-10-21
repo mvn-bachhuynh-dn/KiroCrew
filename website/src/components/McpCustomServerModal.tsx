@@ -15,18 +15,25 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Trans } from 'react-i18next'
 import { AlertTriangle, Check, Loader2 } from 'lucide-react'
 import { api, ApiError } from '../api/client'
 import Modal from './Modal'
+import ErrorNotice from './ErrorNotice'
+import AgentSpecNotRewrittenNotice, { agentSpecNotRewritten } from './AgentSpecNotRewrittenNotice'
 import { Btn } from './ui'
 import type { McpCustomSpec } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { guideAnchor, maybe } from '../uiLocations/targetRegistry'
 interface Props {
   open: boolean
   onClose: () => void
   /** When set, the modal edits this installed server instead of adding. */
   editName?: string | null
+  /** Whether the not-applied notice may offer the agent hand-off; the host turns it
+   *  off while it holds unsaved state the hand-off's navigation would discard. */
+  askAgent?: boolean
 }
 
 /** Result of client-side parsing of the pasted JSON. */
@@ -85,28 +92,40 @@ function specSummary(spec: McpCustomSpec): string {
 }
 
 /** Textarea placeholder showing the shape of an `mcpServers` config block.
- *  A CODE SAMPLE, not prose — do not translate. Every token is a protocol key
- *  (`mcpServers`, `command`, `args`, `env`), an executable name (`npx`), a
- *  package specifier, or an env-var name, and the whole thing must stay valid
- *  JSON the user can paste back. `my-server` is an illustrative server id, in
- *  the same class: the user replaces it with their own. */
-const PLACEHOLDER = `{
-  "mcpServers": {
-    "my-server": {
-      "command": "npx",
-      "args": ["-y", "@example/mcp-server"],
-      "env": { "API_KEY": "" }
-    }
-  }
-}`
+ *  A CODE SAMPLE, not prose — never translated, so it is built from data
+ *  rather than written as display text. Every token is a protocol key
+ *  (`mcpServers`, `command`, `args`, `env`, `url`, `headers`), an executable
+ *  name (`npx`), a package specifier, an env-var name, or an HTTP header
+ *  name, and the rendered JSON must stay valid for the user to paste back.
+ *  `my-server` / `my-remote` are illustrative server ids, in the same class:
+ *  the user replaces them with their own. */
+const PLACEHOLDER = JSON.stringify(
+  {
+    mcpServers: {
+      'my-server': {
+        command: 'npx',
+        args: ['-y', '@example/mcp-server'],
+        env: { API_KEY: '' },
+      },
+      'my-remote': {
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer ' },
+      },
+    },
+  },
+  null,
+  2,
+)
 
-export default function McpCustomServerModal({ open, onClose, editName }: Props) {
+export default function McpCustomServerModal({ open, onClose, editName, askAgent = true }: Props) {
   const queryClient = useQueryClient()
   const editing = !!editName
   const [text, setText] = useState('')
   const [bareName, setBareName] = useState('')
   const [enableNow, setEnableNow] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
+  // The save landed but the agent spec did not follow: stay open to say so.
+  const [notApplied, setNotApplied] = useState(false)
 
   // Reset per open so a reopened modal never carries stale state.
   useEffect(() => {
@@ -115,6 +134,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
       setBareName('')
       setEnableNow(false)
       setSubmitError(null)
+      setNotApplied(false)
     }
   }, [open, editName])
 
@@ -156,9 +176,10 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
 
   const addMutation = useMutation({
     mutationFn: () => api.mcpCustomAdd(parsed!.ok ? parsed!.servers : {}, enableNow),
-    onSuccess: () => {
+    onSuccess: (r) => {
       queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
-      onClose()
+      if (agentSpecNotRewritten(r)) setNotApplied(true)
+      else onClose()
     },
     onError: (err) => {
       if (err instanceof ApiError && err.status === 409) {
@@ -171,9 +192,10 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
 
   const updateMutation = useMutation({
     mutationFn: () => api.mcpCustomUpdate(editName!, parsed!.ok ? parsed!.servers[editName!] : {}),
-    onSuccess: () => {
+    onSuccess: (r) => {
       queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
-      onClose()
+      if (agentSpecNotRewritten(r)) setNotApplied(true)
+      else onClose()
     },
     onError: (err) => setSubmitError(err instanceof Error ? err.message : String(err)),
   })
@@ -181,7 +203,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
   const busy = addMutation.isPending || updateMutation.isPending
   const submit = () => {
     setSubmitError(null)
-    if (!canSubmit || busy) return
+    if (!canSubmit || busy || notApplied) return
     if (editing) updateMutation.mutate()
     else addMutation.mutate()
   }
@@ -195,13 +217,13 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
         : i18nT('components.mcpCustomServerModal.add_custom_server')}
       maxWidth={640}
     >
-      <div className="flex flex-col gap-3 p-1">
+      <div className="flex flex-col gap-3 p-1" {...maybe(editing ? undefined : 'mcp.custom-form', guideAnchor)}>
         {!editing && (
           <p className="text-xs text-muted m-0">
             {i18nT('components.mcpCustomServerModal.paste_an')} <code>{i18nT('components.mcpCustomServerModal.mcpservers')}</code> {i18nT('components.mcpCustomServerModal.block_from_a_readme_a')}{' '}
             <code>{'{name: spec}'}</code> {i18nT('components.mcpCustomServerModal.map_or_a_single_spec_specs_take')}{' '}
             <code>{i18nT('components.mcpCustomServerModal.command')}</code>/<code>{i18nT('components.mcpCustomServerModal.args')}</code>/<code>{i18nT('components.mcpCustomServerModal.env')}</code> {i18nT('components.mcpCustomServerModal.stdio_or')}{' '}
-            <code>{i18nT('components.mcpCustomServerModal.url')}</code> {i18nT('components.mcpCustomServerModal.remote')}
+            <code>{i18nT('components.mcpCustomServerModal.url')}</code>/<code>{i18nT('components.mcpCustomServerModal.headers')}</code> {i18nT('components.mcpCustomServerModal.remote')}
           </p>
         )}
         {editing && specQuery.isLoading && (
@@ -209,11 +231,25 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
             <Loader2 size={13} className="animate-spin" aria-hidden="true" /> {i18nT('components.mcpCustomServerModal.loading_current_spec')}
           </span>
         )}
+        {/* No hand-off: the spec JSON textarea below is unsaved. */}
         {editing && specQuery.isError && (
-          <span className="flex items-center gap-1 text-xs text-amber-400" role="alert">
-            <AlertTriangle size={13} aria-hidden="true" />
-            {specQuery.error instanceof Error ? specQuery.error.message : i18nT('components.mcpCustomServerModal.failed_to_load_spec')}
-          </span>
+          <ErrorNotice
+            variant="inline"
+            className="text-xs"
+            message={specQuery.error instanceof Error && specQuery.error.message ? specQuery.error.message : i18nT('components.mcpCustomServerModal.failed_to_load_spec')}
+            testId="mcp-custom-spec-load-error"
+          />
+        )}
+        {editing && !!specQuery.data && Object.keys(specQuery.data.spec.headers ?? {}).length > 0 && (
+          <p className="text-xs text-text m-0" role="note">
+            <Trans
+              i18nKey="components.mcpCustomServerModal.stored_header_values_are_hidden"
+              // The value the read put in place of every stored header value:
+              // a save that sends it back unchanged keeps the stored value.
+              values={{ marker: Object.values(specQuery.data.spec.headers ?? {})[0] }}
+              components={{ marker: <code className="font-mono" /> }}
+            />
+          </p>
         )}
 
         <textarea
@@ -222,11 +258,12 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
           placeholder={editing ? '' : PLACEHOLDER}
           spellCheck={false}
           aria-label={editing ? i18nT('components.mcpCustomServerModal.server_spec_json') : i18nT('components.mcpCustomServerModal.servers_json')}
-          className="w-full min-h-[220px] rounded-md border border-border bg-bg px-3 py-2 font-mono text-[12px] text-text focus:outline-none focus:ring-1 focus:ring-accent resize-y"
+          {...maybe(editing ? undefined : 'mcp.custom-json', guideAnchor)}
+          className={`w-full ${editing ? 'min-h-[220px]' : 'min-h-[400px]'} rounded-md border border-border bg-bg px-3 py-2 font-mono text-[12px] text-text focus-ring-accent resize-y`}
         />
 
         {parsed && !parsed.ok && (
-          <span className="flex items-center gap-1 text-xs text-amber-400" role="alert">
+          <span className="flex items-center gap-1 text-xs text-warn" role="alert">
             <AlertTriangle size={13} aria-hidden="true" /> {parsed.error}
           </span>
         )}
@@ -240,7 +277,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
             onChange={(e) => setBareName(e.target.value)}
             placeholder={i18nT('components.mcpCustomServerModal.server_name')}
             aria-label={i18nT('components.mcpCustomServerModal.server_name_2')}
-            className="w-60 rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-text focus:outline-none focus:ring-1 focus:ring-accent"
+            className="w-60 rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-text focus-ring-accent"
           />
         )}
 
@@ -258,11 +295,16 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
           </div>
         )}
 
-        {submitError && (
-          <span className="flex items-center gap-1 text-xs text-amber-400" role="alert">
-            <AlertTriangle size={13} aria-hidden="true" /> {submitError}
-          </span>
-        )}
+        {/* No hand-off: the spec JSON textarea (and the bare-server name) is
+            unsaved — the save that failed is exactly what it holds. The
+            client-side parse hint above stays plain validation text. */}
+        <ErrorNotice
+          variant="inline"
+          className="text-xs"
+          message={submitError}
+          testId="mcp-custom-submit-error"
+        />
+        {notApplied && <AgentSpecNotRewrittenNotice askAgent={askAgent} />}
 
         <div className="flex items-center justify-between gap-3 pt-1">
           {!editing ? (
@@ -270,6 +312,11 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
               <input
                 type="checkbox"
                 checked={enableNow}
+                // Named from the SAME key as the visible text beside it: the
+                // wrapping label makes that text a click target, this names the
+                // control, and the muted sentence after it is elaboration the
+                // name deliberately leaves out.
+                aria-label={i18nT('components.mcpCustomServerModal.enable_immediately')}
                 onChange={(e) => setEnableNow(e.target.checked)}
                 className="accent-[var(--accent)]"
               />
@@ -280,7 +327,12 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
             <span className="text-xs text-muted">{i18nT('components.mcpCustomServerModal.saving_keeps_the_server_s_enabled_disabled_state')}</span>
           )}
           <div className="flex items-center gap-2 shrink-0">
-            <Btn onClick={onClose}>{i18nT('components.mcpCustomServerModal.cancel')}</Btn>
+            {/* After a save that landed, "Cancel" would read as discarding it. */}
+            <Btn onClick={onClose}>
+              {notApplied ? i18nT('app.close') : i18nT('components.mcpCustomServerModal.cancel')}
+            </Btn>
+            {/* Once the save landed, Close is the only action left. */}
+            {!notApplied && (
             <Btn primary onClick={submit} disabled={!canSubmit || busy}>
               {busy ? (
                 <Loader2 size={14} className="animate-spin" aria-hidden="true" />
@@ -289,6 +341,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
               )}
               {editing ? i18nT('components.mcpCustomServerModal.save') : `Add${previewNames.length > 1 ? ` ${previewNames.length} servers` : ''}`}
             </Btn>
+            )}
           </div>
         </div>
       </div>

@@ -7,6 +7,8 @@
  * The listbox rows are plain <button role="option">, so they are addressable
  * without a portal-aware query helper once the popup is open.
  */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import SearchableSelect, { type SearchableSelectOption } from '../components/SearchableSelect'
@@ -209,5 +211,231 @@ describe('TimezoneSelect', () => {
     expect(opts).toHaveLength(1)
     fireEvent.click(opts[0])
     expect(onChange).toHaveBeenCalledWith('America/Los_Angeles')
+  })
+})
+
+describe('SearchableSelect — free-text values', () => {
+  function openFonts(props: Partial<React.ComponentProps<typeof SearchableSelect>> = {}) {
+    const onChange = vi.fn()
+    render(
+      <SearchableSelect
+        options={[{ value: 'Menlo', label: 'Menlo' }, { value: 'Hack', label: 'Hack' }]}
+        value=""
+        onChange={onChange}
+        aria-label="Font"
+        customValueOption={typed => ({ label: `Use “${typed}”` })}
+        {...props}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    return onChange
+  }
+
+  it('offers the typed text as a row when nothing matches, and commits it verbatim', async () => {
+    const onChange = openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Berkeley Mono' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts).toHaveLength(1)
+    expect(opts[0]).toHaveTextContent('Use “Berkeley Mono”')
+    fireEvent.click(opts[0])
+    expect(onChange).toHaveBeenCalledWith('Berkeley Mono')
+  })
+
+  it('puts the free-text row LAST so Enter still commits the top real match', async () => {
+    const onChange = openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Men' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts).toHaveLength(2)
+    expect(opts[0]).toHaveTextContent('Menlo')
+    expect(opts[1]).toHaveTextContent('Use “Men”')
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('Menlo')
+  })
+
+  it('ignores Enter on an UNFILTERED list, so opening the picker cannot overwrite the saved value', async () => {
+    // The first row of an unfiltered list matches nothing the user expressed;
+    // committing it would silently replace their choice with whatever sits on top.
+    const onChange = vi.fn()
+    render(
+      <SearchableSelect
+        options={[{ value: '', label: 'Default' }, { value: 'Hack', label: 'Hack' }]}
+        value="Hack"
+        onChange={onChange}
+        aria-label="Font"
+        customValueOption={typed => ({ label: `Use “${typed}”` })}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('commits an exact match on Enter even when a broader row sits above it', async () => {
+    // "Inherit (Hack)" contains "hack" and is first; typing the full name must
+    // still pick Hack itself rather than the row that merely mentions it.
+    const onChange = vi.fn()
+    render(
+      <SearchableSelect
+        options={[{ value: '', label: 'Inherit (Hack)' }, { value: 'Hack', label: 'Hack' }]}
+        value=""
+        onChange={onChange}
+        aria-label="Font"
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'hack' } })
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('Hack')
+  })
+
+  it('never treats the free-text row as the exact match', async () => {
+    // The free-text row's value IS the typed text, so an exact-match rule that
+    // counted it would always commit the free text over the top real option.
+    const onChange = openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Men' } })
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('Menlo')
+    expect(onChange).not.toHaveBeenCalledWith('Men')
+  })
+
+  it('previews the typed row the way the caller shapes it', async () => {
+    openFonts({
+      customValueOption: typed => ({
+        label: `Use “${typed}”`,
+        sublabel: '0O1lI',
+        previewFontFamily: `'${typed}', monospace`,
+      }),
+    })
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Berkeley Mono' } })
+    expect(screen.getByText('Use “Berkeley Mono”'))
+      .toHaveStyle({ fontFamily: "'Berkeley Mono', monospace" })
+  })
+
+  it('does not offer a free-text row duplicating an option, whatever the casing', async () => {
+    openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'hack' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts).toHaveLength(1)
+    expect(opts[0]).toHaveTextContent(/^Hack$/)
+  })
+
+  it('offers no free-text row without a customValueOption — its presence IS the opt-in', async () => {
+    openFonts({ customValueOption: undefined })
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Berkeley Mono' } })
+    expect(screen.queryAllByRole('option')).toHaveLength(0)
+    expect(screen.getByText('No matches')).toBeInTheDocument()
+  })
+
+})
+
+describe('SearchableSelect — action row', () => {
+  function renderWithAction(onSelect: () => void, actionStatus?: string) {
+    render(
+      <SearchableSelect
+        options={[{ value: 'Menlo', label: 'Menlo' }]}
+        value=""
+        onChange={() => {}}
+        aria-label="Font"
+        action={{ label: 'List all installed fonts…', onSelect }}
+        actionStatus={actionStatus}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+  }
+
+  it('fires the action and leaves the popup open, so a repopulating list stays visible', async () => {
+    const onSelect = vi.fn()
+    renderWithAction(onSelect)
+    await screen.findByRole('listbox')
+    fireEvent.click(screen.getByRole('button', { name: 'List all installed fonts…' }))
+    expect(onSelect).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('listbox')).toBeInTheDocument()
+  })
+
+  it('is arrow-reachable — it carries data-option, since Tab closes the popup', async () => {
+    const onSelect = vi.fn()
+    renderWithAction(onSelect)
+    const list = await screen.findByRole('listbox')
+    const action = screen.getByRole('button', { name: 'List all installed fonts…' })
+    // Enrolled in the roving-focus ring the listbox hook walks.
+    expect(list).toContainElement(action)
+    expect(action).toHaveAttribute('data-option')
+    fireEvent.keyDown(action, { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledTimes(1)
+  })
+
+  it('commits no value, so it is not an option', async () => {
+    renderWithAction(vi.fn())
+    await screen.findByRole('listbox')
+    expect(screen.getAllByRole('option')).toHaveLength(1)
+  })
+
+  it('reports the action outcome INSIDE the popup, which overlays the row below', async () => {
+    renderWithAction(vi.fn(), 'No fonts beyond the ones already listed.')
+    const list = await screen.findByRole('listbox')
+    expect(list).toContainElement(screen.getByText('No fonts beyond the ones already listed.'))
+  })
+
+  it('renders no action row when none is given', async () => {
+    render(
+      <SearchableSelect options={[{ value: 'Menlo', label: 'Menlo' }]} value="" onChange={() => {}} aria-label="Font" />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    expect(screen.queryByRole('button', { name: 'List all installed fonts…' })).not.toBeInTheDocument()
+  })
+})
+
+describe('SearchableSelect — per-option presentation', () => {
+  it('renders a row in its own font, so the choice is visible before it is made', async () => {
+    render(
+      <SearchableSelect
+        options={[{
+          value: 'Hack', label: 'Hack', sublabel: '0O1lI',
+          previewFontFamily: "'Hack', monospace",
+        }]}
+        value=""
+        onChange={() => {}}
+        aria-label="Font"
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    expect(screen.getByText('Hack')).toHaveStyle({ fontFamily: "'Hack', monospace" })
+    expect(screen.getByText('0O1lI')).toHaveStyle({ fontFamily: "'Hack', monospace" })
+  })
+})
+
+describe('SearchableSelect — modal host-dialog scroll', () => {
+  it('threads the modal prop to the Radix Popover root', () => {
+    // Source-level pin: when modal={true}, the Popover must receive that prop
+    // so its own react-remove-scroll instance takes over from the host
+    // dialog's wheel lock. Without this, the host lock cancels wheel events
+    // over the portal and the list cannot scroll from a modal dialog caller
+    // (e.g. the crew-capabilities editor).
+    const src = readFileSync(join(__dirname, '..', 'components', 'SearchableSelect.tsx'), 'utf8')
+    expect(src).toContain('modal={modal}')
+  })
+
+  it('accepts modal={true} and still renders the trigger', () => {
+    render(
+      <SearchableSelect options={OPTS} value="" onChange={() => {}} aria-label="Timezone" modal />,
+    )
+    expect(screen.getByRole('button', { name: 'Timezone' })).toBeInTheDocument()
+  })
+
+  it('applies overscroll-contain to the inner list scroller', async () => {
+    render(<SearchableSelect options={OPTS} value="" onChange={() => {}} aria-label="Timezone" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Timezone' }))
+    const listbox = await screen.findByRole('listbox')
+    expect(listbox.className).toContain('overscroll-contain')
   })
 })

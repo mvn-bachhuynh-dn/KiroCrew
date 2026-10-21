@@ -7,12 +7,14 @@
 #   3. pip-install kiro_crew + deps INTO the bundled interpreter
 #   4. Stage the dashboard into the package's static dir
 #   5. Prune caches/tests/unused stdlib to shrink the bundle
-#   6. Package the desktop app with electron-builder -> DMG (mac) / AppImage (linux)
+#   6. (opt-in, BUNDLE_KIRO_CLI=1) Stage a pinned kiro-cli into backend-dist/kiro-cli/
+#   6b. Stage the pinned KAS engine bundle into backend-dist/kas[-<arch>]/
+#   7. Package the desktop app with electron-builder -> DMG / AppImage / NSIS
 #
 # The result is a double-clickable app that embeds the whole Python backend +
 # dashboard — no system Python, pip, npm, or node required by the end user.
 #
-# This REPLACES the old PyInstaller approach. PBS interpreters are self-contained
+# PBS interpreters are self-contained
 # and use @executable_path-relative dylib references, so the bundle is genuinely
 # portable across machines without needing the exact same system Python version.
 #
@@ -26,11 +28,19 @@
 # (AppImage). UNIVERSAL=0 forces a host-arch-only macOS build (faster local
 # iteration, or the only option on an Intel Mac).
 #
+# TARGET_ARCH=arm64|x86_64 (macOS, UNIVERSAL=0 only) names the ONE arch a
+# single-arch build is for, instead of taking the host's. x86_64 on an
+# Apple-Silicon host builds under Rosetta 2, exactly as the universal build's
+# x86_64 half does. The artifact carries the arch in its name either way.
+#
 # Usage:
 #   bash packaging/build-desktop.sh            # macOS: universal DMG · Linux: host arch
 #   UNIVERSAL=0 bash packaging/...             # macOS: host-arch-only DMG
+#   UNIVERSAL=0 TARGET_ARCH=x86_64 bash ...    # macOS: single-arch DMG for a named arch
 #   SKIP_FRONTEND=1 bash packaging/...         # reuse an already-staged dist
 #   SKIP_ELECTRON=1 bash packaging/...         # stop after the backend binary
+#   BUNDLE_KIRO_CLI=1 bash packaging/...       # also stage a pinned kiro-cli (off by default)
+#   BUNDLE_KAS=0 bash packaging/...            # ship without the bundled KAS engine
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,15 +56,22 @@ HOST_ARCH="$(uname -m)"
 
 # Beacon provenance for the artifact this run produces, derived from the
 # electron-builder target rather than the host: mac.target is dmg, linux.target
-# is AppImage (website/electron/package.json). Reading the host OS instead would
-# be wrong on Linux, where the same machine also builds wheels.
-# Windows ships an NSIS installer, which has no KNOWN_DISTRIBUTIONS value yet;
-# "source" is the honest answer until "nsis" is added on both sides.
+# is AppImage + deb + rpm, win.target is nsis (website/electron/package.json).
+# Reading the host OS instead would be wrong on Linux, where the same machine
+# also builds wheels.
 case "$OS" in
   darwin)  KC_DISTRIBUTION="dmg" ;;
-  windows) KC_DISTRIBUTION="source" ;;
+  windows) KC_DISTRIBUTION="nsis" ;;
   *)       KC_DISTRIBUTION="appimage" ;;
 esac
+
+# Linux packages ONE backend tree into several artifact formats, and the beacon
+# `dist` value is baked INTO that tree — so each format needs its own stamp or
+# one artifact reports itself as the other, which is exactly the mislabel
+# scripts/stamp-distribution.sh exists to prevent. Pair each target with its
+# dist label here; the packaging step re-stamps between invocations. The
+# expensive work (PBS interpreter + pip closure) still happens once.
+LINUX_TARGET_DISTS=( "AppImage:appimage" "deb:deb" "rpm:rpm" )
 
 # Universal is the macOS default; Linux has no universal concept (AppImage is
 # per-arch). UNIVERSAL=0 opts a macOS build out.
@@ -68,6 +85,14 @@ if [ "$UNIVERSAL" = "1" ]; then
   if [ "$OS" != "darwin" ]; then
     echo "ERROR: UNIVERSAL=1 is a macOS-only mode (universal .app = lipo-merged" >&2
     echo "       Mach-O shell + dual macOS backends). Build Linux per-arch instead." >&2
+    exit 1
+  fi
+  if [ -n "${TARGET_ARCH:-}" ]; then
+    # A named arch and a universal build contradict each other; silently
+    # building universal would hand a caller who asked for x86_64 a DMG that
+    # is not what its command line said.
+    echo "ERROR: TARGET_ARCH=${TARGET_ARCH} needs UNIVERSAL=0 (a universal build" >&2
+    echo "       always carries both arches). Run: UNIVERSAL=0 TARGET_ARCH=${TARGET_ARCH} ..." >&2
     exit 1
   fi
   if [ "$HOST_ARCH" != "arm64" ]; then
@@ -85,9 +110,46 @@ if [ "$UNIVERSAL" = "1" ]; then
   fi
   printf '\n\033[1;33m▶ Building UNIVERSAL macOS app: arm64 + x86_64.\033[0m\n'
 else
-  printf '\n\033[1;33m▶ Building for host arch only: %s/%s.\033[0m\n' \
-    "$(uname -s)" "$HOST_ARCH"
+  if [ -n "${TARGET_ARCH:-}" ]; then
+    if [ "$OS" != "darwin" ]; then
+      echo "ERROR: TARGET_ARCH is a macOS-only knob (Linux/Windows build the host arch)." >&2
+      exit 1
+    fi
+    case "$TARGET_ARCH" in
+      arm64|x86_64) ;;
+      *)
+        echo "ERROR: TARGET_ARCH must be arm64 or x86_64 (got '$TARGET_ARCH')." >&2
+        exit 1 ;;
+    esac
+    if [ "$TARGET_ARCH" = "arm64" ] && [ "$HOST_ARCH" != "arm64" ]; then
+      echo "ERROR: TARGET_ARCH=arm64 needs an Apple-Silicon host — an Intel Mac" >&2
+      echo "       cannot execute the arm64 backend it would have to gate." >&2
+      exit 1
+    fi
+    if [ "$TARGET_ARCH" = "x86_64" ] && [ "$HOST_ARCH" = "arm64" ] \
+        && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+      echo "ERROR: Rosetta 2 is required to build the x86_64 backend on this host:" >&2
+      echo "       softwareupdate --install-rosetta --agree-to-license" >&2
+      exit 1
+    fi
+    printf '\n\033[1;33m▶ Building SINGLE-ARCH macOS app: %s.\033[0m\n' "$TARGET_ARCH"
+  else
+    printf '\n\033[1;33m▶ Building for host arch only: %s/%s.\033[0m\n' \
+      "$(uname -s)" "$HOST_ARCH"
+  fi
 fi
+
+# The one arch a non-universal build produces: the named target, else the
+# host. Universal ignores it (it always builds both). uname spelling
+# (arm64 / x86_64), which is also what `file` prints for the Mach-O gate.
+BUILD_ARCH="${TARGET_ARCH:-$HOST_ARCH}"
+# electron-builder's spelling of the same arch (its CLI flag and ${arch}
+# artifact macro).
+case "$BUILD_ARCH" in
+  arm64)          EB_ARCH="arm64" ;;
+  x86_64|amd64)   EB_ARCH="x64" ;;
+  *)              EB_ARCH="$BUILD_ARCH" ;;
+esac
 
 ELECTRON_DIR="$ROOT/website/electron"
 
@@ -112,6 +174,134 @@ case "$KC_VERSION" in
 esac
 
 log() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
+
+is_macos_intel_backend() {
+  local want_arch="$1"
+  [ "$OS" = "darwin" ] && {
+    [ "$want_arch" = "x86_64" ] ||
+      { [ -z "$want_arch" ] && [ "$HOST_ARCH" = "x86_64" ]; }
+  }
+}
+
+# The audio decoder wheel a backend installs, or nothing.
+#
+# The macOS Intel backend installs NONE and resolves a system FFmpeg the way a
+# source install does (kiro_crew.stt.decoder.bundle_carries_decoder). Do not add
+# the wheel back for it: the runtime carries no pin for that platform, so a
+# bundled copy would never be authenticated or used.
+#   $1 = target arch, as build_backend receives it
+desktop_decoder_requirement() {
+  if is_macos_intel_backend "$1"; then
+    return 0
+  fi
+  printf '%s\n' "imageio-ffmpeg==0.6.0"
+}
+
+# NOTE ON THE APPLE-SILICON DECODER -- do NOT re-introduce a compressed payload.
+#
+# The arm64 imageio-ffmpeg executable ships as a PLAIN Mach-O under
+# Contents/Resources, so the app signer signs it with Developer ID + hardened
+# runtime + secure timestamp along with every other nested binary
+# (packaging/signing/generate-manifest.py enumerates it).
+#
+# #6746 instead stored it as inert gzip data, to keep the bytes byte-identical to
+# the pinned upstream wheel across signing. The Apple notary service DECOMPRESSES
+# archive members and scans what is inside them, so that made notarization fail
+# closed on the whole release (submission 3dbd3c7d, three `error` issues on
+# .../binaries/ffmpeg-macos-aarch64-v7.1.gz/ffmpeg-macos-aarch64-v7.1: not signed
+# with a valid Developer ID certificate / no secure timestamp / hardened runtime
+# not enabled). A raw Mach-O in the same submission drew no issue at all -- that
+# is the working shape.
+#
+# The runtime consequence is handled in kiro_crew.transcribe: the packaged decoder
+# is accepted either at the pinned upstream digest (local builds and the build gate
+# below, which run BEFORE signing) or on a valid Developer ID signature from our
+# team (the released app, whose bytes signing necessarily rewrote).
+
+# Prove that the installed native wheel, audio decoder, and their transitive
+# libraries can actually run from the pruned bundle. A successful pip resolution
+# is not enough: an ABI mismatch or missing executable otherwise reaches every
+# user as an unusable Download button. Model weights are deliberately not involved
+# in this gate.
+#
+# THREE outcomes, not two, because the decoder answers two independent questions
+# (see transcribe.PackagedDecoderProbe):
+#
+#   exit 0  everything loaded and ran
+#   exit 1  the recogniser is broken, OR no decoder AUTHENTICATED -- a defect in
+#           what we are about to publish, so the build stops
+#   exit 2  the decoder authenticated but this HOST would not run it
+#
+# Exit 2 is a warning and not a failure, and that is the whole point of splitting
+# them. Authenticity is a property of the artifact and is gated everywhere;
+# executability is a property of the build machine. A build image missing an OS
+# library the pinned executable load-time imports refuses it before its entry
+# point runs -- Windows Server Core, which every CodeBuild Windows image is built
+# on, ships no Video for Windows components and so cannot load an ffmpeg that
+# imports AVICAP32.dll -- while the identical bytes run correctly on a user's
+# machine. Blocking a release on that withholds a correct artifact because the
+# machine that assembled it was not the machine that runs it.
+#   $1 = bundled interpreter
+local_voice_runtime_gate() {
+  local python="$1" report status
+  log "Verifying bundled local voice runtime…"
+  # `if` rather than a bare assignment: under `set -e` a command substitution that
+  # exits non-zero aborts the script, which would make exit 2 a hard failure again.
+  if report="$(env PYTHONNOUSERSITE=1 PYTHONPATH= "$python" -s -c '
+import sys
+
+from kiro_crew.stt.engine import probe
+from kiro_crew.transcribe import _packaged_ffmpeg_version_probe
+
+state = probe()
+if not state.ok:
+    sys.stderr.write(f"{state.code}: {state.detail}\n")
+    raise SystemExit(1)
+
+decoder = _packaged_ffmpeg_version_probe()
+if decoder.ok:
+    raise SystemExit(0)
+sys.stderr.write(f"{decoder.code}: {decoder.detail}\n")
+raise SystemExit(1 if not decoder.authentic else 2)
+' 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ -n "$report" ]; then
+    printf '    %s\n' "$report"
+  fi
+  case "$status" in
+    0) ;;
+    2)
+      echo "  ⚠ the bundled decoder authenticated but does not run on THIS host." >&2
+      echo "    Its bytes are the pinned payload, so the bundle is shipped as-is." >&2
+      ;;
+    *)
+      echo "ERROR: bundled local voice runtime cannot load" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Re-stamp every staged backend tree with <dist>, for the Linux multi-format
+# path (see LINUX_TARGET_DISTS). Rewrites one generated module per tree, so it
+# is cheap enough to run between electron-builder invocations. Finding the trees
+# by their site-packages layout keeps this working for both the single-tree
+# Linux build and macOS's two-arch layout.
+restamp_backends() {
+  local dist="$1" sp found=0
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    bash "$ROOT/scripts/stamp-distribution.sh" "$dist" "$sp" >/dev/null
+    found=$((found + 1))
+  done < <(find "$ELECTRON_DIR/backend-dist" -type d -path "*/site-packages/kiro_crew" 2>/dev/null)
+  if [ "$found" -eq 0 ]; then
+    echo "ERROR: no staged backend tree found to stamp as '$dist'" >&2
+    exit 1
+  fi
+  echo "    stamped $found backend tree(s) as dist=$dist"
+}
 
 # Recursively remove a directory tree, defeating the macOS .DS_Store/ENOTEMPTY
 # race. macOS Desktop Services (Finder/Spotlight) can drop a fresh .DS_Store
@@ -143,6 +333,80 @@ rm_rf_resilient() {
     fi
     attempt=$((attempt + 1))
     sleep 1
+  done
+}
+
+# Invoke electron-builder. Split into its own function purely so a test can
+# shadow it with a stub -- CSC_IDENTITY_AUTO_DISCOVERY=false disables macOS
+# codesign identity auto-discovery for local/CI builds.
+_eb_invoke() {
+  CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@"
+}
+
+# Run electron-builder (EB_ARGS as "$@"), retrying a bounded number of times
+# on two transient failure classes -- and still failing the build on anything
+# else, or once the retry budget is exhausted:
+#
+#   - macOS .DS_Store/ENOTEMPTY temp-dir race (electron-userland/electron-builder#6890):
+#     the universal build's lipo-merge stage removes dist/mac-universal-<arch>-temp
+#     dirs with a recursive fs.rm that has no retries of its own, and Desktop
+#     Services (Finder/Spotlight) can drop a fresh .DS_Store into one mid-removal.
+#   - transient network/TLS failures in electron-builder's OWN mid-build
+#     fetches: the AppImage and NSIS/Squirrel targets pull their own tooling
+#     through `got` AFTER the electron zip has already reported
+#     progress=100%. A dropped connection ("socket hang up"), a
+#     TLS-intercepted response ("self-signed certificate"), or an HTTP-level
+#     answer from the artifact CDN that is retryable rather than final
+#     ("Response code 504") aborts the whole build there. These are
+#     per-execution network events, not build errors -- the same commit
+#     passes on a plain re-run, and one matrix leg can fail while its
+#     siblings go green in the same attempt (#3088, #6795).
+#
+# Split out of the packaging step (rather than left inline) so the
+# retry/classification logic is testable in isolation, mirroring
+# rm_rf_resilient above: a test extracts this function's body, shadows
+# _eb_invoke with a stub that fails N times, and asserts the real retry/
+# classification logic here recovers (or correctly gives up).
+run_electron_builder_with_retry() {
+  local attempt=1 max_attempts=3 eb_log eb_transient eb_backoff
+  while : ; do
+    eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
+    if _eb_invoke "$@" 2>&1 | tee "$eb_log"; then
+      rm -f "$eb_log"; return 0
+    fi
+    # Classify the failure before deciding: each transient class needs its
+    # own cleanup, and anything unrecognised must still abort on the first
+    # failure.
+    eb_transient=""
+    if grep -q "ENOTEMPTY" "$eb_log"; then
+      eb_transient="ds_store"
+    # Socket-level errno strings and HTTP-level statuses share ONE class
+    # because the class boundary here is cleanup, not protocol layer (see the
+    # header comment): both arise in the same `got` fetches, and both recover
+    # by simply re-fetching on the next attempt with nothing to sweep first.
+    # A 5xx is transient by definition and a 429 is a rate limit that clears;
+    # every OTHER 4xx (401/403/404/400) is a configuration or authorisation
+    # fault that would fail identically on all three attempts, so it stays
+    # unrecognised and still aborts on the first one.
+    elif grep -qE "socket hang up|self[- ]signed certificate|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND" "$eb_log" \
+      || grep -qE "Response code (429|5[0-9][0-9])" "$eb_log"; then
+      eb_transient="network"
+    fi
+    if [ -n "$eb_transient" ] && [ "$attempt" -lt "$max_attempts" ]; then
+      if [ "$eb_transient" = "ds_store" ]; then
+        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
+        find dist -name .DS_Store -delete 2>/dev/null || true
+        rm -rf dist/*-temp 2>/dev/null || true
+        eb_backoff=2
+      else
+        echo "  ⚠ transient network/TLS/HTTP failure in an electron-builder fetch (attempt $attempt/$max_attempts); retrying…" >&2
+        eb_backoff=$((attempt * 10))
+      fi
+      rm -f "$eb_log"; attempt=$((attempt + 1)); sleep "$eb_backoff"; continue
+    fi
+    rm -f "$eb_log"
+    echo "❌ electron-builder failed (not a known transient class, or retries exhausted)." >&2
+    return 1
   done
 }
 
@@ -225,6 +489,43 @@ build_backend() {
     "$out/bin/python3.12" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check "$ROOT"
 
+  # The voice extras, in TWO steps.
+  #
+  # They have to be in the bundle at all because `local` is the default
+  # speech-to-text provider and nothing in the app can install it later: the
+  # pip-invoking endpoint was deliberately removed, so a bundle without them
+  # reports the default provider as unavailable with no in-app way to fix it.
+  #
+  # Two steps because pip resolves an extra ATOMICALLY, and this bundle is
+  # UNIVERSAL on macOS where Intel has no published pywhispercpp wheel. A single
+  # `[voice]` install there fails as a whole and omits boto3 and amazon-transcribe
+  # with it, taking the `transcribe` provider down alongside the `local` one it has
+  # nothing to do with. So the cloud half goes in first and unconditionally, then
+  # the recogniser is attempted on its own.
+  #
+  # `--only-binary pywhispercpp` (scoped to that one name, so kirocrew itself still
+  # installs from this checkout) prevents a surprise CMake/C++ source build. Missing
+  # recogniser wheels fail every supported desktop build: local dictation is the
+  # default and must be usable immediately. macOS Intel is the sole legacy exception.
+  local decoder_req
+  decoder_req="$(desktop_decoder_requirement "$want_arch")"
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/bin/python3.12" -m pip install --prefer-binary \
+    --no-warn-script-location --disable-pip-version-check \
+    "$ROOT[voice-aws]" ${decoder_req:+"$decoder_req"}
+  if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+      "$out/bin/python3.12" -m pip install --prefer-binary \
+      --only-binary pywhispercpp \
+      --no-warn-script-location --disable-pip-version-check "$ROOT[voice]"; then
+    if is_macos_intel_backend "$want_arch"; then
+      log "No prebuilt speech recogniser for macOS Intel — leaving that legacy backend unsupported."
+    else
+      echo "ERROR: no prebuilt speech recogniser for supported target ${OS}/${want_arch:-$HOST_ARCH}" >&2
+      echo "       Refusing to ship a desktop app whose default local voice provider is unusable." >&2
+      exit 1
+    fi
+  fi
+
   # Stage the dashboard dist into the package's static dir.
   sp="$out/lib/python3.12/site-packages"
   log "Staging dashboard dist into kiro_crew/static/dist…"
@@ -256,7 +557,27 @@ while [ -h "$SOURCE" ]; do
   [ "${SOURCE:0:1}" != "/" ] && SOURCE="$DIR/$SOURCE"
 done
 DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-exec "$DIR/python3.12" -s -m kiro_crew "$@"
+# -P keeps the caller's working directory OFF sys.path. `-m` otherwise puts the
+# cwd first, ahead of the standard library, so a `~/concurrent/`, `~/json/` or
+# any other stdlib-named directory in the directory kirocrew is run from (the
+# home directory, for a service unit) is imported instead of the real module and
+# fails later with an unrelated-looking TypeError. -s does not cover this: it
+# removes the user site, not the launch entry.
+#
+# An inherited PYTHONPATH/PYTHONHOME is the other way a foreign tree gets in:
+# a development shell exporting PYTHONPATH=<checkout>/src makes this bundled
+# interpreter import checkout code mixed into the shipped backend, and
+# PYTHONHOME points it at another Python's stdlib. The desktop shell scrubs
+# both for the gateway it spawns (website/electron/gateway-env.js), but this
+# launcher is also run directly -- `kirocrew token`, `kirocrew stop`, the
+# ~/.local/bin/kirocrew shim -- so the scrub has to live here, at the entry
+# point every caller shares. Only these two are dropped: PYTHONUTF8,
+# PYTHONIOENCODING and the bytecode knobs the shell hands down stay in force,
+# and -E would discard them too. Children spawned by the backend (operator
+# Python, MCP servers, cron) inherit this scrubbed environment, exactly as they
+# do under the desktop shell.
+unset PYTHONPATH PYTHONHOME
+exec "$DIR/python3.12" -s -P -m kiro_crew "$@"
 LAUNCH
   chmod +x "$out/bin/kirocrew"
 
@@ -274,8 +595,13 @@ LAUNCH
   fi
 
   # Self-containment gate: the full import chain must resolve with no user-site.
+  # Bare `--version` is a pre-dispatch fast-path that skips `kiro_crew.cli`'s
+  # heavy imports, so it cannot prove the chain alone: the import probe below
+  # restores the gate's meaning.
   log "Verifying self-containment ($(basename "$out"))…"
-  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -m kiro_crew --version >/dev/null \
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -s -P -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   # Prune to shrink the bundle.
@@ -285,6 +611,80 @@ LAUNCH
     find lib/python3.12/site-packages -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + 2>/dev/null || true
     rm -rf lib/python3.12/test lib/python3.12/idlelib lib/python3.12/tkinter \
            lib/python3.12/turtledemo lib/python3.12/ensurepip lib/python3.12/lib2to3 2>/dev/null || true )
+
+  if ! is_macos_intel_backend "$want_arch"; then
+    local_voice_runtime_gate "$out/bin/python3.12"
+  fi
+
+  # After pruning, so it validates what actually ships.
+  stdlib_probe_gate "$out"
+
+  # Compile the WHOLE shipped tree as checked-hash pycs, then let the runtime
+  # forbid writing any.
+  #
+  # This is what keeps the signed .app's seal intact. codesign seals every file
+  # under Contents/, so bytecode written there after signing invalidates the
+  # signature and Gatekeeper refuses the app as "damaged" -- which is what
+  # managed Macs report, because their policy re-evaluates instead of reusing a
+  # cached accept verdict.
+  #
+  # Deliberately the whole tree, not the traced startup closure the Windows lane
+  # ships. The pipeline signs a COMPLETE bundle, so nothing on a user's machine
+  # has any business writing into it -- and a module left uncompiled is exactly
+  # what creates the reason to. Windows can afford the narrower closure because
+  # Authenticode seals no resource tree, so a later write there is harmless; on
+  # macOS an uncovered module is a latent signature break, so coverage has to be
+  # total rather than measured.
+  #
+  # The MODE is the other half. The prune above deletes the TIMESTAMP pycs pip
+  # left behind, and deleting them is not squeamishness -- a timestamp pyc
+  # records the mtime of the source it was built from, `ditto` restamps sources
+  # at extraction, so every shipped timestamp pyc is guaranteed to look stale on
+  # the user's machine and be rewritten in place. That rewrite IS the corruption.
+  # CHECKED_HASH validates against contents, so an extraction-restamped source
+  # still matches.
+  #
+  # `-q -f`: quiet, and force so nothing is skipped on a stale timestamp cache.
+  # A failure to compile one module must not fail the build -- compileall exits
+  # non-zero on a syntax error in any file it walks, including vendored samples
+  # that are not importable on this interpreter -- so the exit code is reported
+  # and tolerated while the coverage assertion below is what actually gates.
+  log "Precompiling the shipped tree as checked-hash pycs ($(basename "$out"))…"
+  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+    "$out/bin/python3.12" -s -m compileall -q -f \
+    --invalidation-mode checked-hash "$out/lib" \
+    || echo "    compileall reported errors (unimportable vendored samples are expected)"
+
+  # Coverage gate: the point of the exercise is that the runtime never needs to
+  # write, so a tree that shipped without caches would silently reintroduce the
+  # defect the moment PYTHONDONTWRITEBYTECODE is honoured.
+  "$out/bin/python3.12" -s - "$out/lib" <<'COVERAGE'
+import os, sys
+root = sys.argv[1]
+missing = []
+for dirpath, dirnames, filenames in os.walk(root):
+    if os.path.basename(dirpath) == "__pycache__":
+        continue
+    cache = os.path.join(dirpath, "__pycache__")
+    for name in filenames:
+        if not name.endswith(".py"):
+            continue
+        stem = name[:-3]
+        if not any(
+            f.startswith(stem + ".") and f.endswith(".pyc")
+            for f in (os.listdir(cache) if os.path.isdir(cache) else ())
+        ):
+            missing.append(os.path.join(dirpath, name))
+if missing:
+    print(f"    {len(missing)} module(s) shipped without a bytecode cache", file=sys.stderr)
+    for path in missing[:10]:
+        print(f"      {os.path.relpath(path, root)}", file=sys.stderr)
+    # A handful of unimportable vendored samples is tolerable; a wholesale miss
+    # means compileall did not run and every launch would want to write.
+    if len(missing) > 50:
+        print("ERROR: bytecode coverage is too low to forbid runtime writes", file=sys.stderr)
+        raise SystemExit(1)
+COVERAGE
 
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
@@ -297,7 +697,7 @@ LAUNCH
 # python.exe directly -- see main.js).
 #   $1 = PBS interpreter dir   $2 = output dir
 build_backend_windows() {
-  local pbs_dir="$1" out="$2" sp
+  local pbs_dir="$1" out="$2" sp root_uri
 
   log "Installing kiro_crew into the bundled interpreter ($(basename "$out"))…"
   mkdir -p "$(dirname "$out")"
@@ -307,6 +707,35 @@ build_backend_windows() {
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/python.exe" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check "$ROOT"
+
+  # Git Bash normally rewrites a plain /d/a/... argument for a native Windows
+  # process, which is why the core install above works. Appending `[voice]`
+  # defeats that MSYS path conversion and pip receives the literal POSIX path,
+  # then rejects it as an invalid requirement. Derive a real file URI from the
+  # native interpreter's cwd and use explicit PEP 508 direct references for both
+  # extras, so spaces and the drive-letter boundary are unambiguous too.
+  root_uri="$(cd "$ROOT" && "$out/python.exe" -c \
+    'import sys; from pathlib import Path; sys.stdout.write(Path.cwd().as_uri())')"
+
+  # The voice extras, in two steps so an independent AWS-provider dependency
+  # cannot be omitted by recogniser resolution. Windows is a supported local-
+  # dictation target, so the recogniser is a hard gate. Model weights remain an
+  # explicit one-click download after installation.
+  #
+  # They have to be in the bundle at all because `local` is the default
+  # speech-to-text provider and nothing in the app can install it later: the
+  # pip-invoking endpoint was deliberately removed, so a bundle without them
+  # reports the default provider as unavailable with no in-app way to fix it.
+  #
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/python.exe" -m pip install --prefer-binary \
+    --no-warn-script-location --disable-pip-version-check \
+    "kirocrew[voice-aws] @ $root_uri" "imageio-ffmpeg==0.6.0"
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/python.exe" -m pip install --prefer-binary \
+    --only-binary pywhispercpp \
+    --no-warn-script-location --disable-pip-version-check \
+    "kirocrew[voice] @ $root_uri"
 
   sp="$out/Lib/site-packages"
   log "Staging dashboard dist into kiro_crew/static/dist…"
@@ -324,20 +753,90 @@ build_backend_windows() {
 
   # Relocatable launcher shim: %~dp0 is the .cmd's own directory (bin\),
   # so the interpreter resolves relative to the bundle wherever it lands.
+  # -P for the same reason as the POSIX launcher above: keep the caller's cwd
+  # off sys.path so a stdlib-named directory there cannot shadow the stdlib.
+  # PYTHONPATH/PYTHONHOME are cleared for the same reason as the POSIX launcher
+  # too: a dev shell's checkout must not be imported into the bundled backend.
+  # `set "NAME="` deletes the variable, and cmd's environment is
+  # case-insensitive, so a mixed-case `PythonPath` goes with it. `setlocal`
+  # keeps the deletion inside this shim: a user running kirocrew.cmd from an
+  # interactive cmd window keeps their own PYTHONPATH afterwards.
   mkdir -p "$out/bin"
-  printf '@echo off\r\n"%%~dp0..\\python.exe" -s -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
+  printf '@echo off\r\nsetlocal\r\nset "PYTHONPATH="\r\nset "PYTHONHOME="\r\n"%%~dp0..\\python.exe" -s -P -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
 
   log "Verifying self-containment ($(basename "$out"))…"
-  PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -P -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   log "Pruning bundle ($(basename "$out"))…"
   ( cd "$out"
     find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
     find Lib/site-packages -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + 2>/dev/null || true
-    rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 2>/dev/null || true )
+    rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 \
+           include libs tcl \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_aarch64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_x86_64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_arm64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_x86_64 \
+           2>/dev/null || true
+    rm -f DLLs/_tkinter.pyd DLLs/tcl*.dll DLLs/tk*.dll 2>/dev/null || true )
+
+  local_voice_runtime_gate "$out/python.exe"
+
+  # After pruning, so it validates what actually ships.
+  stdlib_probe_gate "$out"
+
+  # Trace the real gateway import after the final prune and ship hash-based
+  # (UNCHECKED) pycs for exactly that closure. Windows can consume these beside
+  # the source without invalidating an Authenticode signature, avoiding the first
+  # launch's thousand-file cache write while keeping unrelated modules out of the
+  # bundle. Unchecked, not checked, and the difference is load-bearing: a
+  # checked-hash pyc makes the loader read and hash each .py in ADDITION to the
+  # .pyc, which measured 43.55 MB and 1639 extra cold file opens per boot -- a
+  # median 12.5 s on a cold file cache. Both hash modes ignore mtime, which is
+  # the property this needs; only the re-read is dropped. The posix tree above
+  # stays checked-hash: it is a different mechanism (whole tree, codesigned) and
+  # does not show the symptom.
+  log "Precompiling Windows gateway startup modules ($(basename "$out"))…"
+  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+    "$out/python.exe" -s "$ROOT/packaging/precompile_windows.py" \
+    --root "$out" --module kiro_crew.cli_server
 
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
+}
+
+# Stdlib-probe agreement gate: every package bundle-integrity.js probes must be
+# present, as an importable package, in the tree we just built. That module
+# refuses to spawn a backend whose stdlib looks incomplete, so a name it probes
+# that this bundle does not ship (a Python bump turning a package back into a
+# module, a rename, or a new prune above) would refuse EVERY launch of a healthy
+# app — a permanent failure strictly worse than the transient one it prevents.
+# Failing the build here converts that into a build error the developer sees.
+#   $1 = built backend tree
+stdlib_probe_gate() {
+  local out="$1"
+  if ! command -v node >/dev/null 2>&1; then
+    log "node unavailable — SKIPPING stdlib-probe gate for $(basename "$out")"
+    return 0
+  fi
+  log "Verifying bundle-integrity.js stdlib probes resolve ($(basename "$out"))…"
+  node -e '
+    const fs=require("fs"), path=require("path");
+    const { findMissingBundleParts, REQUIRED_STDLIB_PARTS } =
+      require(path.join(process.argv[1], "bundle-integrity"));
+    const out = process.argv[2];
+    const missing = findMissingBundleParts(fs, path, out);
+    if (missing.length) {
+      console.error(`ERROR: bundle-integrity.js probes ${REQUIRED_STDLIB_PARTS.length} stdlib `
+        + `packages; this bundle is missing: ${missing.join(", ")}`);
+      console.error("       The launcher would refuse to start this bundle on every launch.");
+      console.error("       Fix the prune step, or update REQUIRED_STDLIB_PARTS in");
+      console.error("       website/electron/bundle-integrity.js to match the shipped stdlib.");
+      process.exit(1);
+    }
+  ' "$ELECTRON_DIR" "$out" || exit 1
 }
 
 # Resolver-agreement gate: the Electron launcher (find-bin.js) must locate the
@@ -394,7 +893,10 @@ if [ "$UNIVERSAL" = "1" ]; then
 else
   log "Provisioning python-build-standalone interpreter (uv)…"
   # Pin to CPython 3.12 (latest stable, matches CI python-version).
-  ARCH="$HOST_ARCH"
+  # BUILD_ARCH, not HOST_ARCH: a TARGET_ARCH=x86_64 build on an Apple-Silicon
+  # host provisions the x86_64 interpreter and runs it under Rosetta, the same
+  # way the universal build's x86_64 half does.
+  ARCH="$BUILD_ARCH"
   [ "$ARCH" = "arm64" ] && ARCH="aarch64"
   if [ "$OS" = "darwin" ]; then
     PBS_PATTERN="cpython-3.12*-macos-${ARCH}-none"
@@ -403,21 +905,624 @@ else
   else
     PBS_PATTERN="cpython-3.12*-linux-${ARCH}-gnu"
   fi
-  PBS_DIR="$(provision_pbs "cpython-3.12" "$PBS_PATTERN")"
+  # The bare "cpython-3.12" key asks uv for the HOST's build, so a named
+  # TARGET_ARCH must spell the arch out — otherwise an x86_64 build on an
+  # Apple-Silicon runner installs the aarch64 interpreter and then finds no
+  # x86_64 tree to match PBS_PATTERN. Same fully-qualified key shape the
+  # universal branch uses for its two halves.
+  PBS_KEY="cpython-3.12"
+  if [ -n "${TARGET_ARCH:-}" ]; then
+    PBS_KEY="cpython-3.12-macos-${ARCH}-none"
+  fi
+  PBS_DIR="$(provision_pbs "$PBS_KEY" "$PBS_PATTERN")"
   echo "    PBS interpreter: $PBS_DIR"
 
   if [ "$OS" = "windows" ]; then
     build_backend_windows "$PBS_DIR" "$ELECTRON_DIR/backend-dist/kirocrew-backend"
     resolver_gate "$ELECTRON_DIR/backend-dist/kirocrew-backend/bin/kirocrew.cmd" ""
   else
-    build_backend "$PBS_DIR" "$ELECTRON_DIR/backend-dist/kirocrew-backend" ""
+    # Arch-gate the tree only when an arch was NAMED: that is the one case
+    # where the interpreter uv handed back can differ from the host, and the
+    # gate is what turns a wrong wheel into a build failure instead of an app
+    # whose backend crashes at launch. Host-arch builds keep the ungated path.
+    build_backend "$PBS_DIR" "$ELECTRON_DIR/backend-dist/kirocrew-backend" "${TARGET_ARCH:-}"
     resolver_gate "$ELECTRON_DIR/backend-dist/kirocrew-backend/bin/kirocrew" ""
   fi
 fi
 
+# A leftover staged marker from an earlier interrupted build is removed on
+# EVERY run, before any early exit: step 3b re-stages it when asked. This sits
+# ahead of the SKIP_ELECTRON return so a backend-only build cannot leave a
+# stale declaration behind for a hand-run electron-builder to pack. The baked
+# auth allowlist (step 3b2) is cleared the same way.
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST"
+
 if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   log "SKIP_ELECTRON=1 — backend(s) ready under $ELECTRON_DIR/backend-dist/"
   exit 0
+fi
+
+# --- 3b. Baked EXTERNALLY-MANAGED marker (optional) --------------------------
+# An edition whose installs are owned by an external package manager (a Toolbox,
+# a corporate installer) declares that at BUILD time by naming its marker here.
+# The file is copied to $ELECTRON_DIR/EXTERNALLY-MANAGED, which package.json's
+# `files` list packs INTO app.asar next to main.js -- so the running app reads
+# it as its own code, on every platform, with no ownership probe (see
+# readExternallyManaged in website/electron/auto-update.js). A marker dropped
+# beside the app after the build (`<resources>/EXTERNALLY-MANAGED`) is the
+# repackager affordance and stays gated on file provenance; that gate refuses
+# every user-owned install and can never pass on Windows, which is why an
+# edition bakes instead of dropping.
+#
+# The copy is validated as the JSON object the reader accepts -- string fields
+# only, under the reader's 8 KiB read cap -- and the build FAILS on anything
+# else: the reader treats a malformed marker as "managed, nothing to run", so a
+# typo here would silently ship an app that can neither self-update nor be
+# updated from its About panel. Unset, nothing is staged: the unconditional
+# cleanup above (ahead of the SKIP_ELECTRON exit) already removed any leftover
+# from a previous local build, so a stale declaration cannot ride along.
+if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
+  MARKER_SRC="$KIROCREW_MANAGED_INSTALL_MARKER"
+  test -f "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER does not name a file: $MARKER_SRC" >&2; exit 1; }
+  node -e '
+    const fs = require("fs");
+    const [src] = process.argv.slice(1);
+    const buf = fs.readFileSync(src);
+    if (buf.length > 8192) { console.error(`marker is ${buf.length} bytes; the reader caps at 8192`); process.exit(1); }
+    let parsed;
+    try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
+    const allowed = ["managedBy", "updateCommand", "checkCommand"];
+    // The reader TRIMS each field and slices it to a cap (auto-update.js:
+    // MANAGED_BY_MAX_CHARS / UPDATE_COMMAND_MAX_CHARS / CHECK_COMMAND_MAX_CHARS).
+    // Validate the value the reader will actually see: a whitespace-only
+    // command would trim to nothing and turn the marker bare, and an over-cap
+    // one would be truncated into a DIFFERENT command. Both are refused here.
+    const caps = { managedBy: 128, updateCommand: 512, checkCommand: 512 };
+    for (const k of Object.keys(parsed)) {
+      if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
+      if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
+      if (parsed[k].trim() !== parsed[k]) { console.error(`marker field "${k}" has leading/trailing whitespace the reader would trim`); process.exit(1); }
+      if (parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
+    }
+    if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
+    if (!parsed.checkCommand) { console.error("marker has updateCommand but no checkCommand: every managed-lane check will fail; no update will ever be offered"); process.exit(1); }
+  ' "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER rejected: $MARKER_SRC" >&2; exit 1; }
+  # Staged for THIS build only: electron-builder packs it below, and the copy
+  # must not outlive the run -- a later build of a different edition from the
+  # same tree (or a hand-run electron-builder) would otherwise pack the previous
+  # edition's commands. The unconditional rm above covers the next
+  # build-desktop.sh run; this covers every other exit path. The trap is armed
+  # BEFORE the copy so there is no instant at which the file exists without
+  # its cleanup -- an interrupt between the two would leave a stale marker for
+  # a hand-run `npm run dist` to pack.
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"' EXIT
+  cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+  log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
+fi
+
+# --- 3b2. Baked integrated-auth allowlist (optional) -------------------------
+# An edition that ships to a Kerberos-gated intranet names the hosts whose
+# Negotiate challenge the app's web contents may answer, as a comma-separated
+# list (`*.example.com,intranet.example.org`). It is validated by the same
+# parser the app runs (website/electron/auth-allowlist.js) and the build FAILS
+# on anything else: the reader ignores a malformed list, so a typo would
+# silently ship an app whose embedded pages get 401s. It is staged as
+# $ELECTRON_DIR/AUTH-SERVER-ALLOWLIST, packed into app.asar by package.json's
+# `files` list, and removed again on exit. Bash keeps one EXIT trap, so this
+# one names the marker too: arming it after step 3b replaces that trap. Unset,
+# nothing is staged and the app appends no switch.
+if [ -n "${KIROCREW_AUTH_SERVER_ALLOWLIST:-}" ]; then
+  AUTH_ALLOWLIST="$(node -e '
+    const { parseAuthServerAllowlist } = require(process.argv[1]);
+    const v = parseAuthServerAllowlist(process.argv[2]);
+    if (v === null) { console.error("not a comma-separated list of host or *.suffix patterns"); process.exit(1); }
+    process.stdout.write(v);
+  ' "$ELECTRON_DIR/auth-allowlist.js" "$KIROCREW_AUTH_SERVER_ALLOWLIST")" \
+    || { echo "❌ KIROCREW_AUTH_SERVER_ALLOWLIST rejected: $KIROCREW_AUTH_SERVER_ALLOWLIST" >&2; exit 1; }
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED" "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST"' EXIT
+  printf '%s\n' "$AUTH_ALLOWLIST" > "$ELECTRON_DIR/AUTH-SERVER-ALLOWLIST"
+  log "Baking AUTH-SERVER-ALLOWLIST into the app: $AUTH_ALLOWLIST"
+fi
+
+# --- 3c. Bundle kiro-cli into the app resources (opt-in) ----------------------
+# OFF by default. The shipped app detects the kiro-cli the user installed, and
+# the first-run gate tells them to install one when there is none; the KAS
+# bundle route (3d) needs no kiro-cli at all. A bundled copy ranks above every
+# system install (kiro_cli.known_kiro_cli_dirs), so a release that carries one
+# reads as "installed" to the gate -- the user never installs kiro-cli -- and
+# runs a copy frozen at this pin instead of following upstream. It is also the
+# largest single payload, ~250 MB of the macOS universal update zip.
+# BUNDLE_KIRO_CLI=1 stages a pinned, sha256-verified kiro-cli entry under
+# backend-dist/kiro-cli/ for a build that wants the runtime it was tested
+# against sealed in. Mirrors docker/Dockerfile's fail-closed manifest resolution.
+# On macOS/Linux that is ONE binary, the chat one, not the upstream layout.
+# The `kiro-cli` launcher
+# resolves `kiro-cli-chat` through $HOME/.local/bin and PATH and never through
+# its own directory, so a bundle entered through the launcher would run whatever
+# copy the user has installed (or fail on a clean machine) while answering
+# `--version` and `whoami` itself. `kiro-cli-chat` is the process every session
+# is anyway and carries every subcommand the app uses; the backend's
+# kiro_cli.bundled_kiro_cli_entry names it. Windows ships one self-contained
+# `kiro-cli.exe` inside its MSI, so that platform stages the executable directly.
+# Landing inside backend-dist/ means the electron-builder extraResources entry
+# and the macOS x64ArchFiles glob both cover it with zero config changes; the
+# Electron shell exports the directory as KIROCREW_BUNDLED_KIRO_DIR at gateway
+# spawn (main.js), and the backend ranks it above system installs but below the
+# KIROCREW_KIRO_BIN operator override (kiro_cli.known_kiro_cli_dirs). Without
+# the payload the shell exports nothing and the app is detect-only.
+#
+# Payload budget: the macOS universal DMG download is ~360 MB and each Linux zip
+# ~160 MB. The Windows MSI is ~190 MB and expands to one executable. What is
+# staged is one binary. On macOS that lands the signing zip near 1 GB;
+# packaging/signing/sign.sh's poll window and sign-and-notarize.yml's job timeout
+# are sized for that. A kiro-cli release that grows past it shows up as a signing
+# timeout, not a build error.
+KIRO_CLI_RELEASE_BASE="https://desktop-release.q.us-east-1.amazonaws.com"
+KIRO_CLI_WINDOWS_RELEASE_BASE="https://prod.download.cli.kiro.dev/stable"
+KIRO_CLI_MANIFEST_URL="$KIRO_CLI_RELEASE_BASE/latest/manifest.json"
+# The kiro-cli release this tree is built and tested against is pinned in TWO
+# files that travel together: packaging/kiro-cli-version names the version and
+# packaging/kiro-cli-sha256 holds the sha256 of each artifact the build stages
+# (the universal macOS DMG, the two Linux gnu zips, the Windows x64 MSI) in
+# sha256sum format, keyed
+# by the artifact's release path, <version>/<file> -- the manifest's own
+# download field. Upstream hosts every release under that prefix
+# (<base>/<version>/<file>) but publishes a manifest -- the only
+# document naming sha256s -- for "latest" alone, so a pinned build fetches the
+# pinned version's own artifact URL and verifies it against the committed sha:
+# it never reads the mutable manifest, and a hotfix rebuild of an older tag
+# keeps working after upstream releases. A version bump without the matching
+# sha lines fails the sha check, closed. KIRO_CLI_VERSION overrides the file
+# (the lane passes it explicitly, read from that file); the value "latest"
+# resolves the manifest instead and takes the version and sha256 it names, for
+# a local build that wants the newest release -- the bytes are sha256-verified
+# either way, so "latest" trades reproducibility, never integrity. Bumping both
+# files, after testing the app against the release, is the whole procedure for
+# shipping a newer kiro-cli (docs/build/release.md).
+KIRO_CLI_PIN_FILE="$ROOT/packaging/kiro-cli-version"
+KIRO_CLI_SHA_FILE="$ROOT/packaging/kiro-cli-sha256"
+KIRO_CLI_VERSION="${KIRO_CLI_VERSION:-$(tr -d '[:space:]' < "$KIRO_CLI_PIN_FILE")}"
+
+# Layout gate for the staged copy. packaging/signing/generate-manifest.py signs
+# every loose Mach-O under Contents/Resources per file, but FAILS the sign on a
+# nested bundle there (the suffixes below mirror its _BUNDLE_SUFFIXES): bundles
+# need bundle-level signing that per-file entries cannot express. Catching that
+# here turns a nightly signing failure into a build error the developer sees.
+#   $1 = staged kiro-cli dir
+kiro_cli_layout_gate() {
+  local dest="$1" nested
+  nested="$(find "$dest" -type d \( -name '*.app' -o -name '*.framework' -o -name '*.appex' \
+    -o -name '*.xpc' -o -name '*.bundle' -o -name '*.plugin' \) -print -quit 2>/dev/null)"
+  if [ -n "$nested" ]; then
+    echo "ERROR: bundled kiro-cli carries a nested bundle the signer cannot seal per-file:" >&2
+    echo "       $nested" >&2
+    exit 1
+  fi
+}
+
+# sha256 of one pinned artifact, read from KIRO_CLI_SHA_FILE (sha256sum
+# format, "<sha>  <version>/<file>"; the name may carry a space). Prints
+# nothing when the file has no line for it, which the caller fails closed on.
+pinned_kiro_cli_sha() {
+  awk -v want="$1" '{ name = $0; sub(/^[0-9a-f]+[ \t]+/, "", name)
+    if (name == want) { print $1; exit } }' "$KIRO_CLI_SHA_FILE"
+}
+
+# sha256 check that runs on both build hosts (macOS ships shasum, Linux
+# sha256sum); true when the file hashes to the expected digest.
+kiro_cli_sha_ok() {
+  local want="$1" path="$2" got
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$path" | cut -d' ' -f1)"
+  else
+    got="$(shasum -a 256 "$path" | cut -d' ' -f1)"
+  fi
+  [ "$got" = "$want" ]
+}
+
+fetch_kiro_cli() {
+  local dest="$ELECTRON_DIR/backend-dist/kiro-cli"
+  # Per-user download cache for the archive (and the manifest, when "latest"
+  # resolves it), so a rebuild against the same pin fetches nothing.
+  local cache="$HOME/.cache/kirocrew-build/kiro-cli"
+  local entry="kiro-cli-chat" release_base="$KIRO_CLI_RELEASE_BASE"
+  mkdir -p "$cache"
+
+  # The one artifact this host stages: the universal DMG on macOS (upstream
+  # publishes no per-arch zips there), the per-arch gnu zip on Linux, selected
+  # exactly as docker/Dockerfile does (matching architecture, musl excluded),
+  # or the x64 MSI on Windows.
+  local karch file
+  karch="$HOST_ARCH"
+  [ "$karch" = "arm64" ] && karch="aarch64"
+  if [ "$OS" = "darwin" ]; then
+    file="Kiro CLI.dmg"
+  elif [ "$OS" = "windows" ]; then
+    if [ "$karch" != "x86_64" ]; then
+      echo "ERROR: upstream publishes no Windows kiro-cli MSI for $karch" >&2
+      exit 1
+    fi
+    file="kiro-cli-x86_64-pc-windows-msvc.msi"
+    entry="kiro-cli.exe"
+    release_base="$KIRO_CLI_WINDOWS_RELEASE_BASE"
+  else
+    file="kirocli-$karch-linux.zip"
+  fi
+
+  local version sha
+  if [ "$KIRO_CLI_VERSION" = "latest" ]; then
+    log "Resolving kiro-cli from the release manifest (KIRO_CLI_VERSION=latest)…"
+    # Same shape as the archive fetch below: a fresh cache-local temp file,
+    # renamed over the entry, so a pre-planted symlink at the cache path is
+    # replaced rather than written through.
+    local fresh_manifest
+    fresh_manifest="$(mktemp "$cache/.manifest.XXXXXX")"
+    curl --proto '=https' --tlsv1.2 -fsSL "$KIRO_CLI_MANIFEST_URL" \
+      -o "$fresh_manifest"
+    rm -f "$cache/manifest.json"
+    mv -f "$fresh_manifest" "$cache/manifest.json"
+    # The manifest's download field is "<version>/<file>", the key the sha
+    # file uses too, so both modes converge on one URL below. Paths reach
+    # Python via argv, never string splicing.
+    local resolved
+    resolved="$(python3 -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+want = sys.argv[2]
+p = next(x for x in m["packages"] if x["download"].split("/", 1)[1] == want)
+print(m["version"])
+print(p["sha256"])' "$cache/manifest.json" "$file")"
+    version="$(printf '%s\n' "$resolved" | sed -n 1p)"
+    sha="$(printf '%s\n' "$resolved" | sed -n 2p)"
+  else
+    version="$KIRO_CLI_VERSION"
+    sha="$(pinned_kiro_cli_sha "$version/$file")"
+    if [ -z "$sha" ]; then
+      echo "ERROR: $KIRO_CLI_SHA_FILE names no sha256 for '$version/$file'" >&2
+      echo "       Pin the release in both files: the version in $KIRO_CLI_PIN_FILE," >&2
+      echo "       each artifact's sha256 from its manifest in $KIRO_CLI_SHA_FILE" >&2
+      echo "       (docs/build/release.md), or build with KIRO_CLI_VERSION=latest." >&2
+      exit 1
+    fi
+  fi
+  echo "    kiro-cli version: $version ($file)"
+
+  # The file name contains a space ("Kiro CLI.dmg"), so the URL path is
+  # percent-encoded. The archive is verified against the sha fail-closed
+  # before anything is extracted; a cached copy that no longer matches is
+  # fetched again. The download lands in a fresh temp file in the cache dir
+  # and is renamed into place only once verified: `curl -o` onto the cache
+  # path would write THROUGH a pre-existing symlink there, and a rename
+  # replaces the link itself instead of following it.
+  local dl archive fresh
+  dl="$version/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$file")"
+  archive="$cache/$version-$file"
+  if [ ! -f "$archive" ] || ! kiro_cli_sha_ok "$sha" "$archive"; then
+    fresh="$(mktemp "$cache/.download.XXXXXX")"
+    curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$dl" -o "$fresh"
+    kiro_cli_sha_ok "$sha" "$fresh" \
+      || { rm -f "$fresh"; echo "ERROR: kiro-cli sha256 mismatch for $file: refusing to bundle" >&2; exit 1; }
+    rm -f "$archive"
+    mv -f "$fresh" "$archive"
+  fi
+
+  if [ "$OS" = "darwin" ]; then
+    # Extract the chat binary from the mounted app. One copy serves both
+    # backend trees: the Mach-O is already lipo'd universal.
+    local mnt
+    mnt="$(mktemp -d)"
+    hdiutil attach "$archive" -nobrowse -readonly -mountpoint "$mnt" >/dev/null
+    mkdir -p "$dest"
+    # Only the chat binary (see the section comment): the launcher, kiro-cli-term,
+    # q and qchat are never executed by the app and the launcher would resolve to
+    # a user install.
+    cp -a "$mnt/Kiro CLI.app/Contents/MacOS/$entry" "$dest/$entry"
+    hdiutil detach "$mnt" >/dev/null
+    rmdir "$mnt" 2>/dev/null || true
+  elif [ "$OS" = "windows" ]; then
+    # Administrative extraction lays out the MSI payload without installing it:
+    # no PATH or registry writes, and no dependency on a pre-existing kiro-cli.
+    # The verified 2.27.1 MSI has no custom actions and carries one executable.
+    local tmp archive_win tmp_win extracted
+    tmp="$(mktemp -d)"
+    archive_win="$(cygpath -w "$archive")"
+    tmp_win="$(cygpath -w "$tmp")"
+    MSYS2_ARG_CONV_EXCL='*' msiexec.exe /a "$archive_win" /qn "TARGETDIR=$tmp_win"
+    extracted="$(find "$tmp" -type f -iname "$entry" -print -quit)"
+    if [ -z "$extracted" ]; then
+      rm -rf "$tmp"
+      echo "ERROR: Windows kiro-cli MSI contains no $entry" >&2
+      exit 1
+    fi
+    if [ "$(find "$tmp" -type f -iname "$entry" | wc -l | tr -d '[:space:]')" != "1" ]; then
+      rm -rf "$tmp"
+      echo "ERROR: Windows kiro-cli MSI contains more than one $entry" >&2
+      exit 1
+    fi
+    mkdir -p "$dest"
+    cp -a "$extracted" "$dest/$entry"
+    rm -rf "$tmp"
+    # kiro-cli.exe imports VCRUNTIME140.dll, VCRUNTIME140_1.dll, MSVCP140.dll
+    # and MSVCP140_1.dll. Those ship with the Visual C++ redistributable and
+    # are not part of any Windows edition, so on a machine without it the exe
+    # cannot start: it exits 0xC0000135 (STATUS_DLL_NOT_FOUND) before running a
+    # line, which the probe below sees and the app would see at spawn time.
+    # Administrative extraction lays out the payload without running the
+    # installer, and the MSI carries exactly one file, so nothing supplies the
+    # runtime on the way in either.
+    #
+    # Stage the four beside the executable, where the loader looks first. This
+    # is the deployment the bundle already relies on elsewhere: the Python
+    # runtime it ships carries vcruntime140.dll next to its own interpreter,
+    # for the same reason.
+    #
+    # The runtime is one of two things the executable needs and the MSI does not
+    # bring. The other is DirectML: it imports DMLCreateDevice1 from
+    # directml.dll as a static import, so the loader resolves it before main.
+    # That one is left to the host because it is an OS component on desktop
+    # Windows, which is where the app runs and what an unbundled kiro-cli
+    # install already relies on -- but a build host without it (a Windows Server
+    # Core image carries none) needs it supplied, and the probe below is where
+    # that shows up.
+    local crt_dir crt
+    local -a crt_missing=()
+    crt_dir="$(cygpath -u "${SYSTEMROOT:-${WINDIR:-C:\\Windows}}")/System32"
+    for crt in vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll; do
+      if [ -f "$crt_dir/$crt" ]; then
+        cp -a "$crt_dir/$crt" "$dest/$crt"
+      else
+        crt_missing+=("$crt")
+      fi
+    done
+    if [ "${#crt_missing[@]}" -ne 0 ]; then
+      echo "ERROR: this build host has no Visual C++ runtime to stage beside kiro-cli" >&2
+      echo "       $crt_dir lacks: ${crt_missing[*]}" >&2
+      echo "       kiro-cli.exe imports them and cannot start without them." >&2
+      echo "       Install the Visual C++ 2015-2022 x64 redistributable." >&2
+      exit 1
+    fi
+  else
+    local tmp
+    tmp="$(mktemp -d)"
+    unzip -q "$archive" -d "$tmp"
+    mkdir -p "$dest"
+    # Only the chat binary, for the reason the section comment gives.
+    cp -a "$tmp/kirocli/bin/$entry" "$dest/$entry"
+    rm -rf "$tmp"
+  fi
+
+  kiro_cli_layout_gate "$dest"
+
+  # Record provenance beside the payload, mirroring the Docker image's
+  # /usr/local/share/kirocrew/kiro-cli-version audit file.
+  printf '%s\n' "$version" > "$dest/BUNDLED-VERSION"
+  # Build-time gate: the staged copy must actually run on this host class, in a
+  # clean room -- empty HOME, minimal PATH -- so no user install on the build
+  # machine can answer for it (the launcher used to pass this gate that way).
+  # Three probes: `--version`, `login --help`, then one ACP `initialize` round trip,
+  # the call every Kiro Crew session opens with. A binary that answers it here,
+  # alone in its directory, is self-contained on THIS platform, which is the
+  # premise the resolver rests on when it hands sessions exactly this file.
+  # Enforced on EVERY platform: the Linux zip is selected by the build host's
+  # own architecture (karch=HOST_ARCH), so the binary is always executable here
+  # and a failure means a broken artifact, not a cross-arch limitation.
+  #
+  # Every probe runs under an EXPLICIT environment (`env -i` + the list below),
+  # never the job's: the release lanes hold the signing role's AWS_* session in
+  # the step env, and the probed file is a freshly downloaded executable. POSIX
+  # gets an empty HOME and a system-only PATH, so a signed-in system copy's
+  # state cannot answer. Windows keeps the runner's own profile and PATH: with
+  # HOME/USERPROFILE redirected to an empty directory the exe exits 1 at startup
+  # with "home directory not found" (observed on two consecutive runs), and ACP
+  # startup may invoke Windows helpers outside System32. The explicit staged
+  # executable is what pins which binary answers on both.
+  local clean_home probe_binary name
+  local -a probe_environ=()
+  clean_home="$(mktemp -d)"
+  probe_binary="$dest/$entry"
+  if [ "$OS" = "windows" ]; then
+    # Native Python does not perform Git Bash's MSYS path conversion.
+    probe_binary="$(cygpath -w "$probe_binary")"
+    for name in SYSTEMROOT SystemRoot SYSTEMDRIVE SystemDrive WINDIR windir COMSPEC ComSpec \
+      PATHEXT TEMP TMP USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA \
+      PROGRAMDATA ProgramData USERNAME; do
+      [ -n "${!name:-}" ] && probe_environ+=("$name=${!name}")
+    done
+    probe_environ+=("PATH=$PATH")
+  else
+    probe_environ+=("HOME=$clean_home" "PATH=/usr/bin:/bin")
+  fi
+  probe_environ+=("KIRO_NO_AUTO_UPDATE=1")
+  # Keep what the probe saw. A binary that cannot start says so only through its
+  # exit status -- Windows reports a missing dependency as STATUS_DLL_NOT_FOUND
+  # with no output at all -- so discarding both leaves "does not execute" as the
+  # entire diagnosis and the reader with nothing to act on. The status a shell
+  # sees is the low 8 bits of the process's, so it is reported as-is rather than
+  # reconstructed into a code it cannot represent; silence beside a failure is
+  # itself the signal, and gets named.
+  local probe_out probe_status=0
+  probe_out="$(env -i "${probe_environ[@]}" "$dest/$entry" --version 2>&1)" || probe_status=$?
+  if [ "$probe_status" -ne 0 ]; then
+    rm -rf "$clean_home"
+    echo "ERROR: staged kiro-cli does not execute (exit $probe_status)" >&2
+    if [ -n "$probe_out" ]; then
+      printf '       %s\n' "$probe_out" >&2
+    else
+      echo "       It produced no output, so it failed before running: check that" >&2
+      echo "       every library it links against is present on this host." >&2
+    fi
+    exit 1
+  fi
+  # `login` is the command the setup gate gives a fresh machine. Prove the
+  # staged entry accepts the device-flow flag without starting a network login.
+  if ! env -i "${probe_environ[@]}" "$dest/$entry" login --help 2>/dev/null \
+    | grep -q -- '--use-device-flow'; then
+    rm -rf "$clean_home"
+    echo "ERROR: staged kiro-cli does not accept login --use-device-flow" >&2; exit 1
+  fi
+  # The interpreter runs in the build's own env; the CHILD gets exactly the
+  # list above, handed over as argv so one allowlist covers all three probes.
+  if ! python3 - "$probe_binary" "$OS" "${probe_environ[@]}" <<'PY'
+import json, os, queue, subprocess, sys, threading, time
+binary, build_os = sys.argv[1], sys.argv[2]
+child_env = dict(entry.split("=", 1) for entry in sys.argv[3:])
+started = time.monotonic()
+request = json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": 1, "clientCapabilities": {}},
+}).encode() + b"\n"
+# stdin stays open until the reply lands: the agent exits on EOF before
+# answering, so a write-then-close would read as a broken binary.
+proc = subprocess.Popen(
+    [binary, "acp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    env=child_env,
+)
+proc.stdin.write(request)
+proc.stdin.flush()
+# Windows select() accepts sockets only, not subprocess pipes. A reader thread
+# gives every host the same bounded wait without closing stdin before the reply.
+lines = queue.Queue()
+def read_stdout():
+    while True:
+        line = proc.stdout.readline()
+        lines.put(line)
+        if not line:
+            return
+threading.Thread(target=read_stdout, daemon=True).start()
+deadline = time.monotonic() + 120
+answered = None
+while answered is None and time.monotonic() < deadline:
+    try:
+        remaining = max(0.0, deadline - time.monotonic())
+        line = lines.get(timeout=min(1.0, remaining))
+    except queue.Empty:
+        if proc.poll() is not None:
+            break
+        continue
+    if not line:
+        break
+    sys.stderr.write(line.decode(errors="replace"))
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(msg, dict) and msg.get("id") == 1 and "result" in msg:
+        answered = msg
+proc.stdin.close()
+try:
+    proc.wait(timeout=10)
+except subprocess.TimeoutExpired:
+    proc.kill()
+if answered is None:
+    elapsed = time.monotonic() - started
+    sys.exit("ERROR: staged kiro-cli did not answer ACP initialize "
+             f"(exit={proc.returncode}, elapsed={elapsed:.1f}s, "
+             f"python={sys.executable}, os.name={os.name}, build_os={build_os})")
+print("    acp initialize: answered (protocolVersion "
+      f"{answered['result'].get('protocolVersion')})")
+PY
+  then
+    rm -rf "$clean_home"
+    exit 1
+  fi
+  rm -rf "$clean_home"
+  echo "    staged kiro-cli $version -> backend-dist/kiro-cli/ ($(du -sh "$dest" 2>/dev/null | cut -f1))"
+}
+
+if [ "${BUNDLE_KIRO_CLI:-0}" = "1" ]; then
+  fetch_kiro_cli
+else
+  log "app ships without a bundled kiro-cli (BUNDLE_KIRO_CLI=1 stages one)"
+fi
+
+# --- 3d. Bundled KAS engine --------------------------------------------------
+# Stages the KAS engine bundle this release PINS (src/kiro_crew/acp/kas_pin.py:
+# KAS_PIN_VERSION + KAS_PIN_MANIFEST_SHA256) into the app's resources, so the
+# `agent.kas_bundle` route runs with no download and no kiro-cli at all. The
+# staging IS the backend's own installer (acp.kas_bundle.install_bundle, run
+# from the just-built backend tree): manifest bytes checked against the pin
+# before parsing, every artifact sha256+size-pinned by that manifest, tar
+# filter="data", a `node --version` probe on THIS host, one atomic publish --
+# the same code `kirocrew kas install` runs, so the staged tree is byte-for-byte
+# what an install would lay down and the backend reads it with the same reader.
+#
+# Layout mirrors the backend trees: one root per architecture on a universal
+# macOS build (backend-dist/kas-arm64/, backend-dist/kas-x64/: Node ships no
+# universal binary, the engine's own JS is shared), backend-dist/kas/ otherwise.
+# Each root holds <version>/{bundle,node,install.json} plus a BUNDLED-VERSION
+# provenance file beside it, which the Electron shell reads to know which
+# version directory's record to check (gateway-env.js, bundledKasEnvironment)
+# before it exports KIROCREW_BUNDLED_KAS_DIR. The backend ranks the data home's own
+# install ahead of this root, so `kirocrew kas install` keeps working in the app.
+#
+# BUNDLE_KAS=0 opts a build out; the switch then needs `kirocrew kas install`
+# first, exactly as a pip install does. Fetches from KAS_BUNDLE_URL (default:
+# the project's CDN); no per-user cache -- the artifacts are ~55 MB per arch and
+# the manifest digest is the pin, so nothing stale can be reused by mistake.
+#   $1 = backend tree (its python runs the installer)   $2 = dest root
+#   $3 = platform.system() name   $4 = platform.machine() name
+stage_kas_bundle() {
+  local tree="$1" dest="$2" system="$3" machine="$4" py
+  if [ -x "$tree/bin/python3.12" ]; then
+    py="$tree/bin/python3.12"
+  elif [ -x "$tree/python.exe" ]; then
+    py="$tree/python.exe"
+  else
+    echo "ERROR: no interpreter under $tree to run the KAS bundle installer" >&2
+    exit 1
+  fi
+  rm_rf_resilient "$dest"
+  mkdir -p "$dest"
+  # Paths and names reach Python via argv, never string splicing. -I (isolated):
+  # no user site, no PYTHONPATH, no PYTHON* env, so `kiro_crew` resolves to the
+  # backend this build just installed and nothing else on the build host.
+  "$py" -I - "$dest" "$system" "$machine" "${KAS_BUNDLE_URL:-}" <<'PY'
+import sys
+from pathlib import Path
+
+from kiro_crew.acp import kas_bundle
+from kiro_crew.acp.kas_pin import KAS_PIN_MANIFEST_SHA256, KAS_PIN_VERSION
+from kiro_crew.config.sections import KAS_BUNDLE_DEFAULT_URL
+
+dest, system, machine, base = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+base = base or KAS_BUNDLE_DEFAULT_URL
+print(f"    KAS {KAS_PIN_VERSION} for {system}/{machine} from {base}")
+manifest, url = kas_bundle.fetch_manifest(
+    base, version=KAS_PIN_VERSION, sha256=KAS_PIN_MANIFEST_SHA256
+)
+installed = kas_bundle.install_bundle(
+    manifest, source=url, root=dest, system=system, machine=machine
+)
+# Re-read through the same reader the gateway will use: a tree the reader
+# rejects is a build error here, not a refusal on the user's first prompt.
+again = kas_bundle.installed_bundle(root=dest, version=KAS_PIN_VERSION)
+assert again is not None and again.acp_server == installed.acp_server, "staged tree does not read back"
+(dest / "BUNDLED-VERSION").write_text(KAS_PIN_VERSION + "\n", encoding="utf-8")
+print(f"    engine: {installed.acp_server.relative_to(dest)}")
+print(f"    node:   {installed.node_bin.relative_to(dest)} (v{installed.node_version})")
+PY
+  kiro_cli_layout_gate "$dest"
+  echo "    staged KAS bundle -> backend-dist/$(basename "$dest")/ ($(du -sh "$dest" 2>/dev/null | cut -f1))"
+}
+
+if [ "${BUNDLE_KAS:-1}" = "1" ]; then
+  log "Staging the pinned KAS engine bundle…"
+  if [ "$UNIVERSAL" = "1" ]; then
+    stage_kas_bundle "$ELECTRON_DIR/backend-dist/kirocrew-backend-arm64" "$ELECTRON_DIR/backend-dist/kas-arm64" Darwin arm64
+    stage_kas_bundle "$ELECTRON_DIR/backend-dist/kirocrew-backend-x64" "$ELECTRON_DIR/backend-dist/kas-x64" Darwin x86_64
+  else
+    case "$OS" in
+      darwin)  KAS_SYSTEM=Darwin ;;
+      windows) KAS_SYSTEM=Windows ;;
+      *)       KAS_SYSTEM=Linux ;;
+    esac
+    KAS_MACHINE="$BUILD_ARCH"
+    [ "$KAS_MACHINE" = "aarch64" ] && KAS_MACHINE="arm64"
+    stage_kas_bundle "$ELECTRON_DIR/backend-dist/kirocrew-backend" "$ELECTRON_DIR/backend-dist/kas" "$KAS_SYSTEM" "$KAS_MACHINE"
+  fi
+else
+  log "BUNDLE_KAS=0: app ships without a bundled KAS engine"
 fi
 
 # --- 4. Package the desktop app with electron-builder -----------------------
@@ -438,7 +1543,7 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
     # scheme could not disambiguate the two apps (none is registered today).
     EB_ARGS+=(
       "-c.productName=KiroCrew Nightly"
-      "-c.mac.icon=icon-nightly.png"
+      "-c.mac.icon=icon-nightly.icns"
       "-c.linux.icon=icon-nightly.png"
       "-c.win.icon=icon-nightly.png"
       # Finder/Dock title (CFBundleDisplayName) mirrors the spaced display
@@ -447,6 +1552,35 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       # space-free makes the packaged app abort with "Unable to find helper
       # app". Nightly re-overrides the static display name to keep its suffix.
       "-c.mac.extendInfo.CFBundleDisplayName=Kiro Crew Nightly"
+      # Linux packages key their INSTALL identity off the package name, so
+      # nightly needs its own or dpkg/rpm treat a nightly install as an UPGRADE
+      # of stable and remove it -- the same hazard as the nsis.guid below, from
+      # the Linux side. Three names move together because all three are
+      # per-install-unique paths a second channel must not claim:
+      #
+      #   packageName    -> the dpkg/rpm package identity
+      #   executableName -> /usr/bin/<name> and /opt/<Product>/<name>
+      #   desktopName    -> /usr/share/applications/<name>, and (via
+      #                     linux.syncDesktopName) Electron's app_id and the
+      #                     entry's StartupWMClass, which must keep matching
+      #
+      # productName already differs, so the /opt directory does not collide.
+      "-c.deb.packageName=kirocrew-nightly"
+      "-c.rpm.packageName=kirocrew-nightly"
+      "-c.linux.executableName=kirocrew-desktop-nightly"
+      "-c.extraMetadata.desktopName=kirocrew-desktop-nightly.desktop"
+      # The npm package `name` is per-channel for the same reason the Linux
+      # package name is. It is not build metadata: appInfo derives
+      # updaterCacheDirName from it (`sanitizedName.toLowerCase() +
+      # "-updater"`), Electron derives the userData directory from it, and NSIS
+      # receives it as ${APP_PACKAGE_NAME}. Shared, that makes nightly and
+      # stable write ONE %LOCALAPPDATA%\<name>-updater and ONE
+      # %APPDATA%\<name> -- so uninstalling either channel would delete the
+      # other's pending update download, its differential baseline, and its
+      # window state. productName and nsis.guid already separate the install
+      # directory and the registry key; this separates the per-user state they
+      # do not cover.
+      "-c.extraMetadata.name=kirocrew-desktop-nightly"
       # Squirrel.Windows keyed the INSTALL identity off squirrelWindows.name;
       # NSIS keys it off two separate things, and nightly needs both:
       #
@@ -468,54 +1602,101 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       # changing it later orphans installed updaters, so it is pinned from the
       # first shipped build.
       "-c.nsis.guid=0f417bf9-2759-51d6-acfb-f864805d1f41"
+      # WINDOWS-ONLY appId split. The shared appId above is required on macOS
+      # (Squirrel.Mac validates against the host's designated requirement, which
+      # pins the bundle id), but on Windows it reaches ${APP_ID}, which the NSIS
+      # template uses for two registrations that are global per-id rather than
+      # per-install: WinShell::SetLnkAUMI stamps the AppUserModelID onto the
+      # desktop and Start Menu shortcuts, and WinShell::UninstAppUserModelId
+      # removes that registration outright.
+      #
+      # The update path is safe on its own: nsis.allowToChangeInstallationDirectory
+      # is false, so that define is never emitted, setIsTryToKeepShortcuts always
+      # yields "true", and the old uninstaller runs with --keep-shortcuts, which
+      # skips the deregistration. A real UNINSTALL does not. Uninstall one
+      # channel and WinShell::UninstAppUserModelId runs against the id BOTH
+      # channels share, deregistering the AppUserModelID the surviving channel's
+      # shortcuts still carry -- its desktop shortcut then resolves to a dead
+      # registration and the shell reports that app as relocated or missing even
+      # though its .exe is untouched.
+      #
+      # Scoped to `win` deliberately: appInfo.id prefers the platform-specific
+      # value, so a top-level -c.appId would also move the macOS bundle id and
+      # strand every installed mac app's updates. This is the same identity
+      # main.js already claims at runtime via app.setAppUserModelId, so the
+      # packaged shortcuts and the running process finally agree.
+      "-c.win.appId=com.amazon.kiro.crew.nightly"
     )
   fi
-  if [ "$OS" = "darwin" ]; then
-    EB_ARGS+=( --mac )
-    [ "$UNIVERSAL" = "1" ] && EB_ARGS+=( --universal )
-  elif [ "$OS" = "windows" ]; then
-    EB_ARGS+=( --win )
-  else
-    EB_ARGS+=( --linux )
-  fi
-
   # Start from a pristine output dir. A prior interrupted universal build can
   # leave dist/mac-universal-<arch>-temp dirs behind (with a .DS_Store inside);
   # those linger and re-trip the ENOTEMPTY cleanup below on every later run.
   # This pre-clean is itself exposed to the .DS_Store race (Finder re-drops one
   # mid-removal), so it MUST go through the resilient helper — a plain rm here
   # aborts the build before the retry loop below is ever reached.
+  # Runs ONCE, before any invocation: the Linux path invokes electron-builder
+  # per target, and clearing between them would delete the previous artifact.
   rm_rf_resilient dist
 
-  # macOS universal .DS_Store/ENOTEMPTY race:
-  # electron-builder's universal step stages each arch into
-  # dist/mac-universal-<arch>-temp, lipo-merges them, then removes the temp
-  # dirs with a recursive fs.rm. If macOS Desktop Services (Finder/Spotlight)
-  # drops a .DS_Store into a temp dir *during* that removal, Node's fs.rm --
-  # which performs no retries -- fails the final rmdir with ENOTEMPTY and the
-  # whole build aborts (electron-userland/electron-builder#6890). It is a
-  # transient race, so retry from a swept, clean dir a bounded number of times.
-  attempt=1; max_attempts=3
-  while : ; do
-    eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
-    if CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "${EB_ARGS[@]}" 2>&1 | tee "$eb_log"; then
-      rm -f "$eb_log"; break
+  # Each electron-builder invocation below goes through
+  # run_electron_builder_with_retry (defined above, alongside rm_rf_resilient)
+  # so the macOS .DS_Store/ENOTEMPTY race AND transient network/TLS failures
+  # in electron-builder's own mid-build fetches are both retried, not just
+  # the former.
+  if [ "$OS" = "darwin" ]; then
+    EB_ARGS+=( --mac )
+    if [ "$UNIVERSAL" = "1" ]; then
+      EB_ARGS+=( --universal )
+    elif [ -n "${TARGET_ARCH:-}" ]; then
+      # Named single arch. The explicit artifactName patterns exist for x64:
+      # electron-builder's DEFAULT pattern drops "-${arch}" for x64 (an Intel
+      # build would land as "KiroCrew-1.2.3.dmg", indistinguishable from nothing
+      # in particular), and these two builds ship NEXT TO the universal DMG,
+      # so every mac artifact must spell its arch. arm64 already does by
+      # default; spelling the pattern out keeps both legs on one rule.
+      # dmg.artifactName (target-specific) outranks mac.artifactName
+      # (platform-wide), so the DMG drops the "-mac" that the zip keeps --
+      # the zip suffix is what sign-and-notarize.yml's "*-mac.zip" match and
+      # electron-updater's per-arch feed lookup both key on.
+      #
+      # extraMetadata.desktopDistArch stamps the arch INTO the app's own
+      # package.json, which is how the running app learns which build it is:
+      # process.arch cannot tell a single-arch app from the universal one
+      # (both answer "arm64" on Apple Silicon), and the feed the app must
+      # follow differs -- website/electron/auto-update.js reads this field
+      # and, when set, resolves feed/<channel>/<arch>/latest-mac.yml instead
+      # of the universal channel file. Universal builds leave it unset.
+      EB_ARGS+=(
+        "--${EB_ARCH}"
+        '-c.mac.artifactName=${productName}-${version}-${arch}-mac.${ext}'
+        '-c.dmg.artifactName=${productName}-${version}-${arch}.${ext}'
+        "-c.extraMetadata.desktopDistArch=${EB_ARCH}"
+      )
     fi
-    if grep -q "ENOTEMPTY" "$eb_log" && [ "$attempt" -lt "$max_attempts" ]; then
-      echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
-      find dist -name .DS_Store -delete 2>/dev/null || true
-      rm -rf dist/*-temp 2>/dev/null || true
-      rm -f "$eb_log"; attempt=$((attempt + 1)); sleep 2; continue
-    fi
-    rm -f "$eb_log"
-    echo "❌ electron-builder failed (not the .DS_Store race, or retries exhausted)." >&2
-    exit 1
-  done
+    run_electron_builder_with_retry "${EB_ARGS[@]}"
+  elif [ "$OS" = "windows" ]; then
+    EB_ARGS+=( --win )
+    run_electron_builder_with_retry "${EB_ARGS[@]}"
+  else
+    # One invocation PER FORMAT, each preceded by its own beacon stamp, so the
+    # AppImage and the deb do not both claim the label of whichever was built
+    # last. Targets are named explicitly rather than letting package.json's
+    # target array drive a single invocation, because a single invocation shares
+    # one stamped backend tree between both artifacts.
+    for pair in "${LINUX_TARGET_DISTS[@]}"; do
+      target="${pair%%:*}"; dist="${pair##*:}"
+      log "Packaging Linux ${target} (dist=${dist})…"
+      restamp_backends "$dist"
+      run_electron_builder_with_retry "${EB_ARGS[@]}" --linux "$target"
+    done
+  fi
 )
 
-# Universal post-gate: the staged shell binary must carry BOTH arch slices.
-if [ "$UNIVERSAL" = "1" ]; then
-  log "Verifying the shell binary is universal (lipo)…"
+# macOS shell-arch post-gate. Universal: the staged shell binary must carry
+# BOTH arch slices. Named single arch: it must carry exactly THAT one (a
+# host-arch shell in an x86_64-labelled DMG is the mislabel this catches).
+if [ "$OS" = "darwin" ] && { [ "$UNIVERSAL" = "1" ] || [ -n "${TARGET_ARCH:-}" ]; }; then
+  log "Verifying the shell binary's arch slices (lipo)…"
   APP_BIN="$(find "$ELECTRON_DIR/dist" -maxdepth 5 \
     -path "*/${PRODUCT_NAME}.app/Contents/MacOS/${PRODUCT_NAME}" -print -quit 2>/dev/null)"
   if [ -z "$APP_BIN" ]; then
@@ -523,16 +1704,23 @@ if [ "$UNIVERSAL" = "1" ]; then
     exit 1
   fi
   LIPO_ARCHS="$(lipo -archs "$APP_BIN")"
-  case "$LIPO_ARCHS" in
-    *x86_64*arm64*|*arm64*x86_64*)
-      echo "    $APP_BIN: $LIPO_ARCHS" ;;
-    *)
-      echo "ERROR: shell binary is not universal (lipo -archs: $LIPO_ARCHS)" >&2
-      exit 1 ;;
-  esac
+  if [ "$UNIVERSAL" = "1" ]; then
+    case "$LIPO_ARCHS" in
+      *x86_64*arm64*|*arm64*x86_64*)
+        echo "    $APP_BIN: $LIPO_ARCHS" ;;
+      *)
+        echo "ERROR: shell binary is not universal (lipo -archs: $LIPO_ARCHS)" >&2
+        exit 1 ;;
+    esac
+  elif [ "$LIPO_ARCHS" = "$TARGET_ARCH" ]; then
+    echo "    $APP_BIN: $LIPO_ARCHS"
+  else
+    echo "ERROR: shell binary is not ${TARGET_ARCH}-only (lipo -archs: $LIPO_ARCHS)" >&2
+    exit 1
+  fi
 fi
 
 log "Done. Installer(s) are in $ELECTRON_DIR/dist/"
-ls -1 "$ELECTRON_DIR/dist/"*.{dmg,AppImage,zip,exe} 2>/dev/null | sed 's/^/   /' || true
+ls -1 "$ELECTRON_DIR/dist/"*.{dmg,AppImage,deb,rpm,zip,exe} 2>/dev/null | sed 's/^/   /' || true
 echo ""
 echo "    The .app embeds the backend, so it runs with no PATH kirocrew needed."

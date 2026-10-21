@@ -20,6 +20,11 @@
 //
 // The decision logic lives in a plain async tick() so tests can drive it with a
 // stubbed probe and no timers; start()/stop() only wrap the interval.
+//
+// A suspend is not a failure. A probe that settles more than two intervals after
+// it started was held up by the host, not the backend (a probe in flight when the
+// host sleeps fails on wake); it is logged and not counted. The run it interrupts
+// is kept, so a backend that was already failing still trips on its next failure.
 
 /**
  * @param {object} o
@@ -32,6 +37,8 @@
  * @param {() => boolean} [o.isWindowAlive]       false => stop (window closed)
  * @param {number} [o.failureThreshold=3]         consecutive failures before firing
  * @param {number} [o.intervalMs=10000]           poll cadence
+ * @param {() => number} [o.now=Date.now]         wall clock (counts a host
+ *                                                suspend), injectable for tests
  * @param {(fn: Function, ms: number) => any} [o.setIntervalFn]
  * @param {(h: any) => void} [o.clearIntervalFn]
  * @param {(msg: string) => void} [o.log]
@@ -45,6 +52,7 @@ function createLivenessMonitor({
   isWindowAlive = () => true,
   failureThreshold = 3,
   intervalMs = 10_000,
+  now = Date.now,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
   log = () => {},
@@ -64,6 +72,7 @@ function createLivenessMonitor({
     }
     if (inFlight) return; // previous probe slower than the interval; skip
     inFlight = true;
+    const startedAt = now();
     try {
       await probe();
       if (consecutiveFailures > 0) {
@@ -72,6 +81,15 @@ function createLivenessMonitor({
       }
       consecutiveFailures = 0;
     } catch {
+      // The probe is bounded below one interval, so one that settles more
+      // than two intervals after it started was held up by the host, not the
+      // backend: the host slept (or this process stalled) while it was in
+      // flight, so its failure says nothing about the backend.
+      const heldMs = now() - startedAt;
+      if (heldMs > 2 * intervalMs) {
+        log(`backend probe failed after ${Math.round(heldMs / 1000)}s across a suspend; not counted`);
+        return;
+      }
       consecutiveFailures += 1;
       log(`backend probe failed (${consecutiveFailures}/${failureThreshold})`);
       if (consecutiveFailures >= failureThreshold && !fired) {
@@ -108,4 +126,45 @@ function createLivenessMonitor({
   return { start, stop, tick, getState };
 }
 
-module.exports = { createLivenessMonitor };
+// How long ONE post-handoff probe waits for /api/status before it counts as a
+// miss. This is deliberately NOT the 2s the boot poll uses. The boot poll runs
+// every 500ms and a slow answer just means "poll again"; here three misses in a
+// row force-kill the gateway, so the budget has to tell a loop that is merely
+// SLOW from one that is WEDGED. Observed on a Windows desktop under a full test
+// run plus several subagents: the event loop logged 1-9s of lag from synchronous
+// disk I/O, still answered every request, and was killed anyway because three
+// 2s probes in a row timed out — 6 subagents orphaned for a loop that was never
+// stuck. A wedged loop answers nothing at all, so 8s costs it only ~6s of extra
+// detection (3 probes × 10s interval ≈ 28s vs 22s), still inside the in-process
+// loop-stall watchdog's own 25s budget, which reports a true wedge through the
+// spawn 'exit' watcher rather than through this monitor.
+const LIVENESS_PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * Build the probe the post-handoff monitor polls with: one GET against the
+ * loop-turning status endpoint, resolving on any non-5xx answer and rejecting
+ * on a connection error, a 5xx, or `timeoutMs` of silence.
+ *
+ * Pure and injectable like the monitor itself: `httpMod` is whatever exposes
+ * `get(url, options, callback)`, so tests can assert the option the request is
+ * made with instead of racing a real socket.
+ *
+ * @param {object} o
+ * @param {{get: Function}} o.httpMod
+ * @param {string} o.url
+ * @param {number} [o.timeoutMs=LIVENESS_PROBE_TIMEOUT_MS]
+ * @returns {() => Promise<void>}
+ */
+function createBackendProbe({ httpMod, url, timeoutMs = LIVENESS_PROBE_TIMEOUT_MS }) {
+  return () => new Promise((resolve, reject) => {
+    const req = httpMod.get(url, { timeout: timeoutMs }, (res) => {
+      res.resume();
+      if (res.statusCode < 500) resolve();
+      else reject(new Error(`status ${res.statusCode}`));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error(`no answer in ${timeoutMs}ms`)); });
+  });
+}
+
+module.exports = { createLivenessMonitor, createBackendProbe, LIVENESS_PROBE_TIMEOUT_MS };

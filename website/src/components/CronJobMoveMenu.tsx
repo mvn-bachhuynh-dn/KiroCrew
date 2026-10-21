@@ -5,6 +5,7 @@ import {
 } from './ui/dropdown-menu'
 import { Btn } from './ui'
 import type { CronFolder } from '../utils/cronFolders'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { i18nT } from '../i18n/t'
 
 interface Props {
@@ -24,11 +25,18 @@ export default function CronJobMoveMenu({ folders, currentFolderId, onMove, onNe
         <Btn
           aria-label={i18nT('pages.schedulePage.cronFolders.move_to_folder')}
           title={i18nT('pages.schedulePage.cronFolders.move_to_folder')}
+          {...uiLocation('schedule.move-to-folder')}
         >
           <Folder size={13} />
         </Btn>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-[160px] max-h-[240px] overflow-y-auto">
+      {/* Intentional tighter cap: the folder list can grow long, so a fixed
+          240px keeps this picker compact. Composed via min() with the
+          primitive's available-height var so the viewport never-clip floor is
+          preserved on a short viewport (a bare max-h-[240px] would override the
+          primitive's cap, since cn()'s tailwind-merge dedupes max-h-*). overflow
+          is left to the primitive. */}
+      <DropdownMenuContent align="end" className="min-w-[160px] max-h-[min(240px,var(--radix-dropdown-menu-content-available-height))]">
         <DropdownMenuItem onSelect={() => { onMove(''); setOpen(false) }}>
           <Folder size={13} className="text-muted shrink-0" />
           <span>{i18nT('pages.schedulePage.cronFolders.ungrouped')}</span>

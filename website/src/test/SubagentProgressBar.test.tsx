@@ -1,20 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, sseSubagentDone, sseSubagentTool, sseSubagentStalled } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, reconcileSubagentQueuedFromSlots, sseSubagentDone, sseSubagentTool, sseSubagentStalled } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
 vi.mock('../api/client', () => ({
   api: {
     spawnDelete: vi.fn().mockResolvedValue({}),
+    spawnStopAll: vi.fn().mockResolvedValue({}),
     spawnList: vi.fn().mockResolvedValue({ agents: [] }),
   },
 }))
 
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import { api } from '../api/client'
+import { OVERLAY_Z_MAX } from '../lib/themeDecorLayer'
 
 const SLOT = 'test-slot'
 
@@ -30,10 +33,13 @@ function makeStore(running: string[], pending?: string) {
 }
 
 function renderBar(store: ReturnType<typeof makeStore>) {
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
   return render(
-    <Provider store={store}>
-      <SubagentProgressBar slot={SLOT} />
-    </Provider>,
+    <QueryClientProvider client={queryClient}>
+      <Provider store={store}>
+        <SubagentProgressBar slot={SLOT} />
+      </Provider>
+    </QueryClientProvider>,
   )
 }
 
@@ -52,13 +58,12 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     expect(api.spawnDelete).toHaveBeenCalledWith('a1')
   })
 
-  it('"Stop all" cancels every running agent but never a pending one', () => {
+  it('"Stop all" sends one session-scoped bulk stop for running work', async () => {
     renderBar(makeStore(['a1', 'a2'], 'p1'))
-    fireEvent.click(screen.getByLabelText('Stop all running subagents'))
-    expect(api.spawnDelete).toHaveBeenCalledTimes(2)
-    expect(api.spawnDelete).toHaveBeenCalledWith('a1')
-    expect(api.spawnDelete).toHaveBeenCalledWith('a2')
-    expect(api.spawnDelete).not.toHaveBeenCalledWith('p1')
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+    expect(api.spawnDelete).not.toHaveBeenCalled()
   })
 
   it('labels the header stop control "Stop" (not "Stop all") when exactly one agent is stoppable', () => {
@@ -67,7 +72,7 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     expect(screen.queryByLabelText('Stop all running subagents')).not.toBeInTheDocument()
   })
 
-  it('excludes native (nested) kiro-cli subagents from the count and rows so it matches "spawned N"', () => {
+  it('excludes native (nested) kiro-cli subagents from the count and rows so it matches "spawned N"', async () => {
     // 2 top-level managed agents + 2 native:* nested agents surfaced from the
     // kiro-cli list_update. The chip must show only the 2 managed ones.
     renderBar(makeStore(['a1', 'a2', 'native:sess-x', 'native:sess-y']))
@@ -76,12 +81,12 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     // Exactly two rows, both managed; no native task rows.
     const rows = screen.getAllByTestId('subagent-row')
     expect(rows).toHaveLength(2)
-    // "Stop all" acts on the 2 managed agents, never the native ones.
-    fireEvent.click(screen.getByLabelText('Stop all running subagents'))
-    expect(api.spawnDelete).toHaveBeenCalledTimes(2)
-    expect(api.spawnDelete).toHaveBeenCalledWith('a1')
-    expect(api.spawnDelete).toHaveBeenCalledWith('a2')
-    expect(api.spawnDelete).not.toHaveBeenCalledWith('native:sess-x')
+    // "Stop all" delegates the managed running/queue scope to the backend;
+    // native nested cards are not part of SubagentManager.
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+    expect(api.spawnDelete).not.toHaveBeenCalled()
   })
 
   it('renders no stop controls when every active agent is pending (stoppableCount === 0)', () => {
@@ -119,6 +124,15 @@ describe('SubagentProgressBar — queued / waiting count', () => {
     expect(screen.getByTestId('subagent-queued-count').textContent).toContain('3')
   })
 
+  it('offers Stop all for a queued-only wave and stops the queue by slot', async () => {
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 3 }))
+    renderBar(store)
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+  })
+
   it('hides the waiting segment once the queue drains to zero', () => {
     const store = makeStore(['a1'])
     store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
@@ -134,17 +148,80 @@ describe('SubagentProgressBar — queued / waiting count', () => {
   })
 })
 
+// Ported from kyleseaman's #13921 (the REST-poll reconcile), re-pointed at the
+// `slots` push that now carries the gateway's published depth.
+describe('SubagentProgressBar — a slots push reconciles a stale queued count', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('clears a stale queued count and unmounts the chip when the push says 0', () => {
+    // The symptom: "running 0, queued 1" with Stop all, while the gateway holds
+    // nothing for this parent. The count comes from subagent_queued frames, so
+    // one left non-zero stays until something corrects it.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1 }))
+    const { container } = renderBar(store)
+    expect(screen.getByTestId('subagent-queued-count').textContent).toContain('1')
+
+    act(() => { store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 0 }])) })
+
+    expect(store.getState().chat.subagentQueued[SLOT]).toBeUndefined()
+    expect(container).toBeEmptyDOMElement()
+  })
+
+  it('leaves the queued count alone when the row does not report one', () => {
+    // A `slot_patch` row, or an older gateway: no field is not a 0.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
+    renderBar(store)
+    act(() => { store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT }])) })
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+  })
+
+  it('keeps a cron-born tab\'s real queued count across a push', () => {
+    // A cron-born tab is named `cron-<id>` while its runs publish under
+    // `cron:<id>[:<run>]`. The gateway routes each published depth to the tab its
+    // frames reach (test_published_queue_depth.py pins that half), so the row
+    // carries the real depth under the TAB key and the chip keeps it.
+    const CRON_SLOT = 'cron-job-7'
+    const store = configureStore({
+      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
+    })
+    store.dispatch(setActiveSlot(CRON_SLOT))
+    store.dispatch(sseSubagentQueued({ slot: CRON_SLOT, queued: 2 }))
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Provider store={store}>
+          <SubagentProgressBar slot={CRON_SLOT} />
+        </Provider>
+      </QueryClientProvider>,
+    )
+    act(() => {
+      store.dispatch(reconcileSubagentQueuedFromSlots([
+        { key: CRON_SLOT, subagents_queued: 2 },
+        { key: 'dashboard-other', subagents_queued: 0 },
+      ]))
+    })
+    expect(store.getState().chat.subagentQueued[CRON_SLOT]).toBe(2)
+    expect(screen.getByTestId('subagent-queued-count').textContent).toContain('2')
+  })
+})
+
 describe('SubagentProgressBar — overlay stacking', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  // Theme-experience overlays are clamped to OVERLAY_Z_MAX=45 (ThemeExperienceLayer).
-  // The chip wrapper must sit strictly above that band so no theme can paint over
-  // an active wave; z-[46] is the minimal clearance (below mute z=50 / consent z=120).
+  // Theme-experience overlays portal into the shell's decor slot, pinned at
+  // OVERLAY_Z_MAX (lib/themeDecorLayer.ts) — the chip shares that stacking
+  // context, so its z must sit strictly above the ceiling for no theme to paint
+  // over an active wave. Read the constant rather than restating it: a restated
+  // number is exactly the drift #7377 was about.
   it('elevates the wave chip above the theme-overlay ceiling (relative + z-[46])', () => {
     const { container } = renderBar(makeStore(['a1']))
     const wrapper = container.firstChild as HTMLElement
     expect(wrapper).toHaveClass('relative')
-    expect(wrapper).toHaveClass('z-[46]')
+    const z = Number(/\bz-\[(\d+)\]/.exec(wrapper.className)?.[1])
+    expect(z).toBe(46)
+    expect(z).toBeGreaterThan(OVERLAY_Z_MAX)
   })
 })
 
@@ -168,6 +245,29 @@ describe('sseSubagentQueued reducer', () => {
     store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 4 }))
     store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 0 }))
     expect(store.getState().chat.subagentQueued[SLOT]).toBeUndefined()
+  })
+
+  it('a slots push keeps the wait label while rows still wait, and clears it at 0', () => {
+    const store = freshStore()
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 3, reason: 'low_memory' }))
+    store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 2 }]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+    expect(store.getState().chat.subagentQueuedReason[SLOT]?.reason).toBe('low_memory')
+    store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 0 }]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBeUndefined()
+    expect(store.getState().chat.subagentQueuedReason[SLOT]).toBeUndefined()
+  })
+
+  it('a slots push restores a count the client never heard, and ignores garbage', () => {
+    const store = freshStore()
+    store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 2.9 }]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+    store.dispatch(reconcileSubagentQueuedFromSlots([
+      { key: SLOT, subagents_queued: 'x' as unknown as number },
+      { key: '__proto__', subagents_queued: 5 },
+    ]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+    expect(Object.prototype.hasOwnProperty.call(store.getState().chat.subagentQueued, '__proto__')).toBe(false)
   })
 
   it('clamps negative / garbage payloads to a non-negative integer', () => {
@@ -229,8 +329,12 @@ describe('SubagentProgressBar — chrome follows the Font Family setting', () =>
     store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true }))
     const { container } = renderBar(store)
 
+    // The tool name is now its OWN span, interpolated into a single translated
+    // sentence rather than glued together with a hardcoded English " at " --
+    // so the fragment holds the bare value, not the value plus its preposition.
+    // The requirement being guarded is unchanged: this value renders mono.
     const toolFragment = [...container.querySelectorAll('span')]
-      .find(s => s.textContent === ' at npx vitest run')
+      .find(s => s.textContent === 'npx vitest run')
     expect(toolFragment).toBeTruthy()
     expect(toolFragment!.className).toContain('font-mono')
 
@@ -239,6 +343,69 @@ describe('SubagentProgressBar — chrome follows the Font Family setting', () =>
     // And the sanitised value is still what gets rendered — the whole line reads
     // as one sentence with exactly one space before `at`.
     expect(toolFragment!.parentElement!.textContent).toContain('at npx vitest run')
+  })
+
+  it('hedges the stalled copy and shows the IDLE span, not total elapsed', () => {
+    // The watchdog observes an ABSENCE of stream events, which a slow silent
+    // tool also produces — so the row must not assert a stall, and the number
+    // beside the warning must be the idle span that justifies it (the row's
+    // other figure, `elapsed`, is total runtime and is a different number).
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentTool({ slot: SLOT, id: 'a1', tool: 'Reading retrieval.py:1', tool_count: 7 }))
+    store.dispatch(sseSubagentStalled({
+      slot: SLOT, id: 'a1', stalled: true, idle_secs: 196,
+    }))
+    const { container } = renderBar(store)
+
+    const warn = [...container.querySelectorAll('span.text-warn')]
+      .find(s => s.textContent?.includes('possibly stalled'))
+    expect(warn).toBeTruthy()
+    expect(warn!.textContent).toContain('no activity for 196s')
+    // Hedged, not asserted: the bare "stalled ... — no activity" wording is gone.
+    expect(warn!.textContent).not.toMatch(/(^|[^y] )stalled at/)
+  })
+
+  it('advances the idle figure while stalled instead of freezing it', async () => {
+    // The backend emits `idle_secs` ONCE on the stalled transition. Rendering it
+    // verbatim would freeze at that value beside the live elapsed counter, so a
+    // subagent wedged for 20 minutes would still read "no activity for 196s" —
+    // a milder form of the contradiction this row exists to remove.
+    vi.useFakeTimers()
+    try {
+      const store = makeStore(['a1'])
+      store.dispatch(sseSubagentTool({ slot: SLOT, id: 'a1', tool: 'sleep 600', tool_count: 1 }))
+      store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true, idle_secs: 196 }))
+      const { container } = renderBar(store)
+
+      const idleText = () => [...container.querySelectorAll('span.text-warn')]
+        .find(s => s.textContent?.includes('possibly stalled'))?.textContent ?? ''
+      expect(idleText()).toContain('no activity for 196s')
+
+      // Two 1Hz ticks later the figure has moved with the clock.
+      // Advance ONE tick per act() flush. The component's 1Hz tick is a toggle
+      // (`setTick(n => 1 - n)`), so jumping two intervals inside a single flush
+      // lands back on the original value and React bails out of the re-render —
+      // an artifact of batching, not a product bug (real ticks arrive singly).
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(idleText()).toContain('no activity for 197s')
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(idleText()).toContain('no activity for 198s')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to the plain no-activity wording when no idle span was sent', () => {
+    // Reconnect replays from a pre-upgrade gateway carry no idle_secs; the row
+    // must still render hedged copy rather than a bare "196s"-shaped gap.
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true }))
+    const { container } = renderBar(store)
+    const warn = [...container.querySelectorAll('span.text-warn')]
+      .find(s => s.textContent?.includes('possibly stalled'))
+    expect(warn).toBeTruthy()
+    expect(warn!.textContent).toContain('no activity')
+    expect(warn!.textContent).not.toContain('no activity for')
   })
 })
 
@@ -264,13 +431,93 @@ describe('SubagentProgressBar — collapse toggle', () => {
     expect(listContainer.className).toContain('hidden')
     // Header still carries the running count and the stop-all control.
     expect(screen.getByTestId('subagent-running-count')).toHaveTextContent('2')
-    expect(screen.getByLabelText('Stop all running subagents')).toBeInTheDocument()
+    expect(screen.getByLabelText('Stop all')).toBeInTheDocument()
   })
 
-  it('lets "Stop all" work while collapsed', () => {
+  it('lets "Stop all" work while collapsed', async () => {
     renderBar(makeStore(['a1', 'a2']))
     fireEvent.click(screen.getByLabelText('Collapse subagent list'))
-    fireEvent.click(screen.getByLabelText('Stop all running subagents'))
-    expect(api.spawnDelete).toHaveBeenCalledTimes(2)
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+  })
+})
+
+describe('SubagentProgressBar — why the queued agents wait', () => {
+  it('renders the deferral sentence as visible text, not only in the tooltip', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1, reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }))
+    renderBar(store)
+    const line = screen.getByTestId('subagent-wait-reason')
+    expect(line.textContent).toContain('free up memory to continue')
+    expect(line.className).toContain('text-warn')
+    expect(screen.getByTestId('subagent-queued-count').getAttribute('title')).toBe(line.textContent)
+  })
+
+  it('says free memory is unknown, not "0 free", when the cgroup usage is unreadable', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({
+      slot: SLOT, queued: 1, reason: 'low_memory', required_gb: 4.5, cause: 'cgroup_usage_unreadable',
+    }))
+    renderBar(store)
+    const line = screen.getByTestId('subagent-wait-reason')
+    expect(line.textContent).toContain('free memory is unknown')
+    expect(line.textContent).not.toMatch(/free now|not enough free memory/)
+  })
+
+  it('renders no extra line for a bare count (older gateway) or the capacity wait', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
+    renderBar(store)
+    expect(screen.queryByTestId('subagent-wait-reason')).toBeNull()
+    expect(screen.getByTestId('subagent-queued-count').getAttribute('title'))
+      .toBe('Waiting to start — queued behind the concurrency limit')
+  })
+})
+
+describe('SubagentProgressBar — expand renders no empty body', () => {
+  beforeEach(() => { vi.clearAllMocks(); try { localStorage.clear() } catch { /* not available in this env */ } })
+
+  it('renders no rows body when the chip is mounted only on a queued count', () => {
+    // The second bug in the report: expanding the chip while running===0 (only a
+    // queued tally) added vertical whitespace with nothing in it, because the
+    // rows body carried its px-3 pb-2 padding around an empty list. There must be
+    // no such body — the header (count + Stop all) stands alone.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1 }))
+    renderBar(store)
+    // Header is present…
+    expect(screen.getByTestId('subagent-queued-count')).toBeInTheDocument()
+    // …but no row exists and no empty padded body is rendered.
+    expect(screen.queryAllByTestId('subagent-row')).toHaveLength(0)
+    expect(screen.queryByTestId('subagent-overflow-row')).toBeNull()
+  })
+
+  it('still renders the rows body when there is a running agent to show', () => {
+    renderBar(makeStore(['a1']))
+    expect(screen.getAllByTestId('subagent-row')).toHaveLength(1)
+  })
+})
+
+describe('SubagentProgressBar — elapsed figure (#19930)', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it.each([
+    [4_000, '4s'],
+    [909_000, '15m 9s'],
+    [4_031_000, '1h 7m 11s'],
+  ])('renders %i ms of runtime as %s, not raw seconds', (runMs, shown) => {
+    const t0 = 1_700_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      const store = makeStore(['a1'])
+      now.mockReturnValue(t0 + runMs)
+      renderBar(store)
+      const row = screen.getByTestId('subagent-row')
+      expect(row.textContent).toContain(shown)
+      if (runMs >= 60_000) expect(row.textContent).not.toContain(`${Math.round(runMs / 1000)}s`)
+    } finally {
+      now.mockRestore()
+    }
   })
 })

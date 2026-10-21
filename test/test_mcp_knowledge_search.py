@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -128,7 +128,9 @@ class TestKnowledgeSearchResults:
         from kiro_crew.mcp_core import _call_tool_inner
 
         _call_tool_inner("local_knowledge_search", {"query": "test"})
-        mock_retriever_cls.return_value.search.assert_called_once_with("test", limit=3)
+        mock_retriever_cls.return_value.search.assert_called_once_with(
+            "test", limit=3, source_id=None, namespace=None
+        )
 
     @patch("kiro_crew.mcp_core.config_dir")
     @patch("kiro_crew.mcp_core.HybridRetriever")
@@ -249,3 +251,285 @@ class TestKnowledgeSearchToolDefinition:
         tools = _list_tools()
         tool = next(t for t in tools if t["name"] == "local_knowledge_search")
         assert "query" in tool["inputSchema"]["required"]
+
+    def test_source_id_is_optional(self):
+        from kiro_crew.mcp_core import _list_tools
+
+        tools = _list_tools()
+        tool = next(t for t in tools if t["name"] == "local_knowledge_search")
+        assert "source_id" in tool["inputSchema"]["properties"]
+        assert "source_id" not in tool["inputSchema"]["required"]
+
+    def test_namespace_is_optional(self):
+        from kiro_crew.mcp_core import _list_tools
+
+        tools = _list_tools()
+        tool = next(t for t in tools if t["name"] == "local_knowledge_search")
+        assert "namespace" in tool["inputSchema"]["properties"]
+        assert "namespace" not in tool["inputSchema"]["required"]
+
+    def test_list_sources_tool_listed(self):
+        from kiro_crew.mcp_core import _list_tools
+
+        tools = _list_tools()
+        names = [t["name"] for t in tools]
+        assert "knowledge_list_sources" in names
+
+
+class TestKnowledgeSearchSourceFilter:
+    def test_source_id_rejects_non_string(self):
+        from kiro_crew.mcp_core import _validate_args
+
+        # At the MCP entry point: a genuinely wrong type (list) on a string
+        # field is still rejected, while a number is defensively converted to
+        # its string form (the re-typed-numeric-string repair).
+        with pytest.raises(ValidationError):
+            _validate_args("local_knowledge_search", {"query": "q", "source_id": [7]})
+        coerced = _validate_args("local_knowledge_search", {"query": "q", "source_id": 7})
+        assert coerced["source_id"] == "7"
+
+    def test_source_id_rejects_overlong_value(self):
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        with pytest.raises(ValidationError):
+            _call_tool_inner("local_knowledge_search", {"query": "q", "source_id": "x" * 65})
+
+    @patch("kiro_crew.mcp_core.config_dir")
+    @patch("kiro_crew.mcp_core.HybridRetriever")
+    @patch("kiro_crew.mcp_core._get_knowledge_search")
+    def test_source_id_passed_through_to_retriever(
+        self, mock_get_search, mock_retriever_cls, mock_config_dir, mock_db_exists
+    ):
+        mock_config_dir.return_value = mock_db_exists
+        mock_store = MagicMock()
+        mock_store.db.execute.return_value.fetchone.return_value = (1,)  # source exists
+        mock_get_search.return_value = (mock_store, None)
+        mock_retriever_cls.return_value.search.return_value = []
+
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        _call_tool_inner("local_knowledge_search", {"query": "auth", "source_id": "src-1"})
+        mock_retriever_cls.return_value.search.assert_called_once_with(
+            "auth", limit=3, source_id="src-1", namespace=None
+        )
+
+    def test_namespace_rejects_non_string(self):
+        from kiro_crew.mcp_core import _validate_args
+
+        # At the MCP entry point: a genuinely wrong type (list) on a string
+        # field is still rejected, while a number is defensively converted to
+        # its string form (the re-typed-numeric-string repair).
+        with pytest.raises(ValidationError):
+            _validate_args("local_knowledge_search", {"query": "q", "namespace": [7]})
+        coerced = _validate_args("local_knowledge_search", {"query": "q", "namespace": 7})
+        assert coerced["namespace"] == "7"
+
+    def test_namespace_rejects_overlong_value(self):
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        with pytest.raises(ValidationError):
+            _call_tool_inner("local_knowledge_search", {"query": "q", "namespace": "x" * 65})
+
+    @patch("kiro_crew.mcp_core.config_dir")
+    @patch("kiro_crew.mcp_core.HybridRetriever")
+    @patch("kiro_crew.mcp_core._get_knowledge_search")
+    def test_namespace_passed_through_to_retriever(
+        self, mock_get_search, mock_retriever_cls, mock_config_dir, mock_db_exists
+    ):
+        # A namespace does not need to exist as a source, so no sources probe
+        # is required (unlike source_id): it flows straight to the retriever.
+        mock_config_dir.return_value = mock_db_exists
+        mock_store = MagicMock()
+        mock_get_search.return_value = (mock_store, None)
+        mock_retriever_cls.return_value.search.return_value = []
+
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        _call_tool_inner("local_knowledge_search", {"query": "auth", "namespace": "client-a"})
+        mock_retriever_cls.return_value.search.assert_called_once_with(
+            "auth", limit=3, source_id=None, namespace="client-a"
+        )
+
+    @patch("kiro_crew.mcp_core.config_dir")
+    @patch("kiro_crew.mcp_core._get_knowledge_search")
+    def test_unknown_source_id_names_discovery_tool(
+        self, mock_get_search, mock_config_dir, mock_db_exists
+    ):
+        # A nonexistent source id gets guidance, not an exception and not a
+        # silent empty search.
+        mock_config_dir.return_value = mock_db_exists
+        mock_store = MagicMock()
+        mock_store.db.execute.return_value.fetchone.return_value = None
+        mock_get_search.return_value = (mock_store, None)
+
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        result = _call_tool_inner(
+            "local_knowledge_search", {"query": "auth", "source_id": "no-such-id"}
+        )
+        assert "knowledge_list_sources" in result
+        assert "no-such-id" in result
+
+    @patch("kiro_crew.mcp_core.sel")
+    @patch("kiro_crew.mcp_core.config_dir")
+    @patch("kiro_crew.mcp_core._get_knowledge_search")
+    def test_unknown_source_audit_redacts_query(
+        self, mock_get_search, mock_config_dir, mock_sel, mock_db_exists
+    ):
+        # SEL is persisted and dashboard-readable: a credential-bearing query
+        # must be redacted before the unknown_source audit write.
+        mock_config_dir.return_value = mock_db_exists
+        mock_store = MagicMock()
+        mock_store.db.execute.return_value.fetchone.return_value = None
+        mock_get_search.return_value = (mock_store, None)
+
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        _call_tool_inner(
+            "local_knowledge_search",
+            {"query": "key AKIAIOSFODNN7EXAMPLE leak", "source_id": "no-such-id"},
+        )
+        logged = mock_sel.return_value.log_tool_invocation.call_args.kwargs
+        assert logged["outcome"] == "unknown_source"
+        assert "AKIAIOSFODNN7EXAMPLE" not in logged["metadata"]["query"]
+
+
+class TestKnowledgeListSources:
+    @patch("kiro_crew.mcp_core.config_dir")
+    def test_returns_not_configured_when_db_missing(self, mock_config_dir, tmp_path):
+        mock_config_dir.return_value = tmp_path  # no knowledge.db here
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        result = _call_tool_inner("knowledge_list_sources", {})
+        assert "not configured" in result
+
+    @patch("kiro_crew.mcp_core.config_dir")
+    def test_lists_sources_with_active_item_counts(self, mock_config_dir, tmp_path):
+        from kiro_crew.knowledge.store import KnowledgeStore
+
+        db_dir = tmp_path / "workspace" / "knowledge"
+        db_dir.mkdir(parents=True)
+        store = KnowledgeStore(str(db_dir / "knowledge.db"))
+        src_a = store.add_source("Design Docs", "local_folder", "/tmp/a")
+        src_b = store.add_source("Runbooks", "local_folder", "/tmp/b")
+        doc1 = store.add_item("Doc 1", "content", "note", source_id=src_a)
+        store.add_item("Doc 2", "content two", "note", source_id=src_a)
+        gone = store.add_item("Doc 3", "content three", "note", source_id=src_b)
+        # Non-active items are outside what search can return, so they must not
+        # inflate the advertised count.
+        store.db.execute("UPDATE items SET status = 'deleted' WHERE id = ?", (gone,))
+        store.db.commit()
+        # A dedup survivor owned by A but located in B counts for B too —
+        # membership matches the retriever's scoped seed queries.
+        store.add_source_location(doc1, src_b)
+        store.close()
+        mock_config_dir.return_value = tmp_path
+
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        result = _call_tool_inner("knowledge_list_sources", {})
+        assert f"Design Docs — id: {src_a} (2 item(s))" in result
+        assert f"Runbooks — id: {src_b} (1 item(s))" in result
+
+    @patch("kiro_crew.mcp_core.config_dir")
+    def test_empty_library_reports_no_sources(self, mock_config_dir, tmp_path):
+        from kiro_crew.knowledge.store import KnowledgeStore
+
+        db_dir = tmp_path / "workspace" / "knowledge"
+        db_dir.mkdir(parents=True)
+        KnowledgeStore(str(db_dir / "knowledge.db")).close()
+        mock_config_dir.return_value = tmp_path
+
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        result = _call_tool_inner("knowledge_list_sources", {})
+        assert "no sources yet" in result
+
+    def test_rejects_unknown_fields(self):
+        from kiro_crew.mcp_core import _call_tool_inner
+
+        with pytest.raises(ValidationError):
+            _call_tool_inner("knowledge_list_sources", {"filter": "x"})
+
+
+# The correlated reference shape: IN (SELECT ...) inside the JOIN. It is the
+# answer the linear query must agree with, and the shape the plan guard must
+# recognise.
+_CORRELATED_COUNTS_SQL = (
+    "SELECT s.id, s.name, COUNT(DISTINCT i.id) AS item_count "
+    "FROM sources s LEFT JOIN items i ON i.status = 'active' AND ("
+    "  i.source_id = s.id"
+    "  OR i.id IN (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = s.id)"
+    ") GROUP BY s.id, s.name ORDER BY s.name"
+)
+
+
+class TestKnowledgeListSourcesCountQuery:
+    """The per-source count is linear and matches the correlated answer."""
+
+    @staticmethod
+    def _seed(path, seed: int):
+        import random
+
+        from kiro_crew.knowledge.store import KnowledgeStore
+
+        rng = random.Random(seed)
+        store = KnowledgeStore(str(path))
+        sources = [
+            store.add_source(f"S{n}", "local_folder", f"/tmp/s{seed}-{n}")
+            for n in range(rng.randint(1, 5))
+        ]
+        items = []
+        for n in range(rng.randint(0, 25)):
+            owner = rng.choice(sources + [None])
+            items.append(store.add_item(f"I{n}", f"body {seed} {n}", "note", source_id=owner))
+        for item in items:
+            if rng.random() < 0.3:
+                store.db.execute("UPDATE items SET status = 'deleted' WHERE id = ?", (item,))
+            for src in sources:
+                if rng.random() < 0.3:
+                    store.add_source_location(item, src)
+        store.db.commit()
+        return store
+
+    def test_item_owned_and_located_in_same_source_counts_once(self, tmp_path):
+        from kiro_crew.knowledge.store import KnowledgeStore
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = KnowledgeStore(str(tmp_path / "k.db"))
+        try:
+            src = store.add_source("Only", "local_folder", "/tmp/only")
+            item = store.add_item("Doc", "content", "note", source_id=src)
+            store.add_source_location(item, src)
+            rows = [tuple(r) for r in store.db.execute(_SOURCE_COUNTS_SQL)]
+        finally:
+            store.close()
+        assert rows == [(src, "Only", 1)]
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_matches_correlated_query_on_random_libraries(self, tmp_path, seed):
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = self._seed(tmp_path / "k.db", seed)
+        try:
+            new = [tuple(r) for r in store.db.execute(_SOURCE_COUNTS_SQL)]
+            old = [tuple(r) for r in store.db.execute(_CORRELATED_COUNTS_SQL)]
+        finally:
+            store.close()
+        assert new == old
+
+    def test_query_plan_has_no_correlated_subquery(self, tmp_path):
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = self._seed(tmp_path / "k.db", 0)
+        try:
+
+            def plan(sql: str) -> str:
+                return " | ".join(str(r[-1]) for r in store.db.execute(f"EXPLAIN QUERY PLAN {sql}"))
+
+            # Probe: this SQLite reports the old shape as correlated, so the
+            # guard below can see the regression it is meant to catch.
+            assert "CORRELATED" in plan(_CORRELATED_COUNTS_SQL)
+            assert "CORRELATED" not in plan(_SOURCE_COUNTS_SQL)
+        finally:
+            store.close()

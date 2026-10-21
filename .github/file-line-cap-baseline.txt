@@ -1,0 +1,37 @@
+# Code files already over the 2,000-line cap, as `<lines> <path>`, sorted by
+# path. scripts/check_file_line_cap.py fails on any OTHER file over the cap, so
+# this list can only shrink: a file that drops to 2,000 lines or fewer must
+# leave it, and from then on it is capped like any other file.
+#
+# Do NOT add a line or raise a count to make a red check green: split the file
+# instead, moving whole definitions into a new sibling module. A listed file
+# must not grow; the check reports one that did.
+#
+# Delete only your own rows, never someone else's. The refresh below edits only
+# the rows of files your change touches, and only deletes lines and lowers counts;
+# where it cannot tell which files those are, it refuses unless --whole-tree asks
+# it to rewrite every row:
+#   python3 scripts/check_file_line_cap.py --update-baseline
+5522 conftest.py
+2666 scripts/docs_lint.py
+9026 src/kiro_crew/acp/runtime.py
+6697 src/kiro_crew/agent.py
+2683 src/kiro_crew/apps/builtins/code_review_sage/backend/routes.py
+5184 src/kiro_crew/apps/routes.py
+2579 src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py
+2232 src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/push_guard.py
+2058 src/kiro_crew/change_card_catalog.py
+3161 src/kiro_crew/cron_script.py
+18473 src/kiro_crew/dashboard/chat_runner.py
+2492 src/kiro_crew/dashboard/handlers/members.py
+2158 src/kiro_crew/dashboard/handlers/work_ledger.py
+2818 src/kiro_crew/dashboard/server.py
+2284 src/kiro_crew/sandbox_launcher_program.py
+3181 src/kiro_crew/security_posture.py
+2641 test/conftest.py
+3125 test/test_cron_script.py
+3102 test/test_handlers_memory_coverage.py
+2096 test/test_monitor_directive_apply.py
+12647 test/test_security.py
+3082 test/test_skills.py
+3093 test/test_subagent.py

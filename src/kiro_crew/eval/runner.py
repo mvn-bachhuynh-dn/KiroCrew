@@ -7,6 +7,7 @@ optional profile seeding.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -17,8 +18,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.constants import DENY_CAUSE_POLICY, DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.eval.scenario import Assertion, AssertionType, Scenario, SeedProfile, Session, Turn
+from kiro_crew.llm_helpers import _steer_host_deny
 from kiro_crew.memory import MemoryStore
+from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+    refusal_for,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -27,8 +36,31 @@ from kiro_crew.providers.base import (
     LLMProvider,
 )
 from kiro_crew.sel import sel
+from kiro_crew.skills import SkillsLoader
 
 logger = logging.getLogger(__name__)
+
+#: What the model is told when the eval harness refuses a tool it does not know
+#: to be read-only. The eval SURFACE refuses the call -- nothing about the call
+#: itself was judged -- so the reason says what this surface permits, which is
+#: what the surface-policy notice tells the model to read.
+_EVAL_UNSAFE_TOOL_REASON = (
+    "the eval harness runs tools read-only: only known read-only APIs and "
+    "filesystem reads of non-sensitive paths are approved here, so every other "
+    "tool call is refused"
+)
+#: The harness's own path check judged the call itself (a policy verdict).
+#: "sensitive credential path" is the fixed wording ``deny_guidance`` keys the
+#: secret-file remediation off, the same class the hook gate's own refusal
+#: lands in, so the model gets the same guidance either way.
+_EVAL_SENSITIVE_PATH_REASON = (
+    "the eval harness refused this filesystem call: it accesses a sensitive credential path"
+)
+_EVAL_NO_PATH_REASON = (
+    "the eval harness refused this filesystem call: no target path could be read "
+    "from its input, and a filesystem call is only approved on a path the harness "
+    "can check"
+)
 
 
 # ── Result types ──
@@ -113,16 +145,17 @@ def score_by_dimension(results: list[ScenarioResult]) -> dict[str, dict[str, Any
     dim_stats: dict[str, dict[str, int]] = {}
     for r in results:
         for dim in r.dimensions:
-            if dim not in dim_stats:
-                dim_stats[dim] = {"total": 0, "passed": 0}
-            dim_stats[dim]["total"] += 1
-            dim_stats[dim]["passed"] += 1 if r.passed else 0
+            stats = dim_stats.setdefault(dim, {"total": 0, "passed": 0})
+            stats["total"] += 1
+            stats["passed"] += int(r.passed)
 
+    # Every entry is created by the loop above and immediately counted, so `total`
+    # is at least 1 for each key and the division needs no zero guard.
     return {
         dim: {
             "total": s["total"],
             "passed": s["passed"],
-            "rate": round(s["passed"] / s["total"], 3) if s["total"] > 0 else 1.0,
+            "rate": round(s["passed"] / s["total"], 3),
         }
         for dim, s in dim_stats.items()
     }
@@ -227,10 +260,10 @@ class EvalRunner:
 
         config = KiroCrewConfig.load()
         memory = MemoryStore(workspace=ws)
-        memory.init()
+        await asyncio.to_thread(memory.init)
 
         if scenario.seed:
-            _seed_profile(ws, scenario.seed)
+            await asyncio.to_thread(_seed_profile, ws, scenario.seed)
 
         # Set env so providers share the same memory directory
         # NOTE: os.environ mutation is process-global — not safe for concurrent runs.
@@ -239,13 +272,19 @@ class EvalRunner:
 
         session_mgr = None
         vector_store = None
+        skills = None
         try:
             # Memory-loop components
             conv_log = ConversationLog(base_dir=ws)
             conv_log.init()
             lesson_store = LessonStore(base_dir=ws)
             vector_store = VectorMemoryStore(db_path=ws / "vector_memory.db")
-            vector_store.init()
+            # Off the loop: init() tightens the DB and its sidecars to
+            # owner-only — blocking file IO alongside the sqlite connect and
+            # migrations (the Windows lockdown itself is now in-process).
+            # This runs once per scenario, so a synchronous call would stall
+            # the loop on every one.
+            await asyncio.to_thread(vector_store.init)
 
             # Wrap provider factory so all sessions share the same workspace root
             # (default factory creates per-session subdirs, which isolates memory)
@@ -282,9 +321,26 @@ class EvalRunner:
                 vector_store=vector_store,
             )
 
+            # Constructed on a running loop, where construction-time sync
+            # skips itself; eval runs standalone with no gateway to own the
+            # sync, so run the explicit seam in a worker thread (mirrors
+            # gateway startup). The loader targets a scenario-local skills
+            # dir: eval must never write quarantines into the user's real
+            # skills home, and a self-contained dir keeps scenarios
+            # reproducible across machines. A failed sync must not fail the
+            # scenario before it runs.
+            skills = SkillsLoader(skills_path=ws / "skills", install_builtins=False)
+            try:
+                await asyncio.to_thread(skills.sync_builtins)
+            except Exception:
+                logger.warning(
+                    "builtin-skill sync failed; continuing without synced "
+                    "builtins", exc_info=True,
+                )
             ctx_builder = ContextBuilder(
                 memory=memory,
                 lessons=lesson_store,
+                skills=skills,
                 conversation_log=conv_log,
             )
 
@@ -324,7 +380,9 @@ class EvalRunner:
             if session_mgr:
                 await session_mgr.close_all()
             if vector_store:
-                vector_store.close()
+                await asyncio.to_thread(vector_store.close)
+            if skills:
+                await asyncio.to_thread(skills.close)
             if old_ws is None:
                 os.environ.pop("KIROCREW_WORKSPACE", None)
             else:
@@ -366,7 +424,11 @@ class EvalRunner:
         # Build memory context once for the first turn of non-first sessions
         memory_context = ""
         if ctx_builder is not None:
-            memory_context = ctx_builder.build_session_context(session_key=session_key)
+            memory_context = await asyncio.to_thread(
+                ctx_builder.build_session_context,
+                session_key=session_key,
+                memory_store=DEFAULT_MEMORY_STORE,
+            )
 
         session_result = SessionResult(name=session_def.name)
         try:
@@ -447,29 +509,78 @@ class EvalRunner:
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 from kiro_crew.security import is_sensitive_path
 
-                safety = self._classify_safe_tool(event)
-                if safety in ("exact", "prefix_api"):
-                    # Known read-only API — approve without path check
+                reason = await asyncio.to_thread(
+                    refusal_for,
+                    event,
+                    session_key=session_key,
+                    agent="",
+                    security_only=False,
+                )
+                if reason is not None:
+                    logger.warning("Rejected tool by permission gate: %s", event.title)
                     sel().log_tool_invocation(
                         session_key=session_key,
                         tool_name=event.title,
-                        outcome="approved",
+                        outcome="rejected_hook_deny",
                         source="eval_runner",
                     )
-                    await provider.approve_tool(event.request_id)
+                    # Audit FIRST, then tell the model in-band that the HOST
+                    # refused this (a rejected permission reaches it as
+                    # kiro-cli's "User denied tool execution"), then answer the
+                    # wire. The gate judged the call itself: a policy verdict,
+                    # with the gate's own reason so the class remediation can
+                    # key off it.
+                    await _steer_host_deny(provider, event, reason, cause=DENY_CAUSE_POLICY)
+                    await provider.reject_tool(event.request_id)
+                    continue
+
+                safety = self._classify_safe_tool(event)
+                if safety in ("exact", "prefix_api"):
+                    # Known read-only API — approve without path check.
+                    # Audit BEFORE the wire call (approve_tool can raise); the
+                    # definitive row follows.
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=event.title,
+                        outcome=OUTCOME_PENDING_APPROVAL,
+                        source="eval_runner",
+                    )
+                    approval_sent = await provider.approve_tool(event.request_id)
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=event.title,
+                        outcome=(
+                            "approved"
+                            if approval_sent is not False
+                            else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        ),
+                        source="eval_runner",
+                    )
                 elif safety == "prefix_fs":
                     # Filesystem operation — deny-by-default path check
                     target = self._extract_path_from_input(event.tool_input or "")
                     if target:
                         target = str(Path(target).expanduser().resolve())
                     if target and not is_sensitive_path(target):
+                        # Audit BEFORE the wire call (approve_tool can raise);
+                        # the definitive row follows.
                         sel().log_tool_invocation(
                             session_key=session_key,
                             tool_name=event.title,
-                            outcome="approved",
+                            outcome=OUTCOME_PENDING_APPROVAL,
                             source="eval_runner",
                         )
-                        await provider.approve_tool(event.request_id)
+                        approval_sent = await provider.approve_tool(event.request_id)
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            tool_name=event.title,
+                            outcome=(
+                                "approved"
+                                if approval_sent is not False
+                                else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                            ),
+                            source="eval_runner",
+                        )
                     else:
                         outcome = "rejected_sensitive" if target else "rejected_no_path"
                         logger.warning("Rejected tool (path check failed): %s", event.title)
@@ -479,6 +590,14 @@ class EvalRunner:
                             outcome=outcome,
                             source="eval_runner",
                         )
+                        # The path check judged the call itself: a policy
+                        # verdict, so the notice may name a sanctioned path.
+                        await _steer_host_deny(
+                            provider,
+                            event,
+                            _EVAL_SENSITIVE_PATH_REASON if target else _EVAL_NO_PATH_REASON,
+                            cause=DENY_CAUSE_POLICY,
+                        )
                         await provider.reject_tool(event.request_id)
                 else:
                     logger.warning("Rejected unsafe tool in eval: %s", event.title)
@@ -487,6 +606,13 @@ class EvalRunner:
                         tool_name=event.title,
                         outcome="rejected",
                         source="eval_runner",
+                    )
+                    # The SURFACE refuses a tool it does not know to be
+                    # read-only; nothing about the call was judged, so the
+                    # notice says what this harness permits instead of a
+                    # sanctioned alternative the model should run.
+                    await _steer_host_deny(
+                        provider, event, _EVAL_UNSAFE_TOOL_REASON, cause=DENY_CAUSE_SURFACE_POLICY
                     )
                     await provider.reject_tool(event.request_id)
             elif event.kind == EVENT_COMPLETE:

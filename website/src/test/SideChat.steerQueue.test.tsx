@@ -1,12 +1,13 @@
 import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import reducer, {
   sseSideResult, sseSideQueue, sideReleaseConsumed, sideOptimisticAppend, sideOptimisticRollback,
   sideClose as sideCloseAction,
 } from '../store/chatSlice'
 import { renderWithProviders, createTestStore } from './helpers'
+import dashboardReducer from '../store/dashboardSlice'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -21,6 +22,11 @@ vi.mock('../api/client', () => ({
 
 import SideChat from '../pages/chat/SideChat'
 import { api } from '../api/client'
+import { readSideChatDraft } from '../chat-core/composer/sideChatDrafts'
+
+// The composer blocks sends while the gateway reads as offline, so every
+// scene runs against a connected dashboard unless it tests the offline path.
+const dashInitial = { ...dashboardReducer(undefined, { type: '@@INIT' }), connected: true }
 
 const SLOT = 'test-slot-1'
 const initial = reducer(undefined, { type: '@@INIT' })
@@ -29,6 +35,7 @@ const initial = reducer(undefined, { type: '@@INIT' })
  *  steer or queue. */
 function busyState(extra: Record<string, unknown> = {}) {
   return createTestStore({
+    dashboard: dashInitial,
     chat: {
       ...initial,
       activeSlot: SLOT,
@@ -70,9 +77,9 @@ describe('SideChat busy-send: steer vs queue', () => {
     const user = userEvent.setup()
     renderWithProviders(<SideChat slot={SLOT} />, { store: busyState() })
 
+    await user.type(screen.getByLabelText('Ask a side question'), 'later please')
     await user.click(screen.getByTestId('busy-send-caret'))
     await user.click(screen.getByTestId('busy-send-mode-queue'))
-    await user.type(screen.getByLabelText('Ask a side question'), 'later please')
     await user.click(screen.getByTestId('busy-send-button'))
 
     await waitFor(() => expect(api.sideTurn).toHaveBeenCalledWith(SLOT, 'later please', undefined))
@@ -80,7 +87,7 @@ describe('SideChat busy-send: steer vs queue', () => {
 
   it('an idle side keeps the plain send button and never sends a steer flag', async () => {
     const user = userEvent.setup()
-    const store = createTestStore({ chat: { ...initial, activeSlot: SLOT } })
+    const store = createTestStore({ dashboard: dashInitial, chat: { ...initial, activeSlot: SLOT } })
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
     await user.type(screen.getByLabelText('Ask a side question'), 'fresh question')
@@ -282,6 +289,79 @@ describe('SideChat queue cards', () => {
     await waitFor(() => expect(screen.getByText('Could not update that queued question')).toBeInTheDocument())
     expect(store.getState().chat.slotSide[SLOT].queue?.[0].content).toBe('old')
   })
+
+  it('an edit that fails after the panel was re-bound restores to the slot it was FOR, not the one shown', async () => {
+    // Same failure as above, but the host re-binds the panel (split view's Ask,
+    // a member switch) while the edit is in flight. A's wording must come back
+    // to A's draft — never be appended into B's.
+    const user = userEvent.setup()
+    let rejectEdit: (e: Error) => void = () => {}
+    vi.mocked(api.sideQueueEdit).mockImplementationOnce(() => new Promise((_, rej) => { rejectEdit = rej }))
+    const store = busyState({
+      queue: [{ id: 'q-1', content: 'old', ts: '2026-05-20T00:00:02Z', raw: true }],
+    })
+    const view = renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    await user.click(screen.getByLabelText('Edit queued message'))
+    await user.clear(screen.getByLabelText('Edit queued message'))
+    await user.type(screen.getByLabelText('Edit queued message'), 'new wording{Enter}')
+    await waitFor(() => expect(api.sideQueueEdit).toHaveBeenCalledWith(SLOT, 'q-1', 'new wording'))
+
+    view.rerender(<SideChat slot="other-slot" />)
+    const composer = () => screen.getByLabelText('Ask a side question') as HTMLTextAreaElement
+    await user.type(composer(), 'typing in B')
+
+    await act(async () => { rejectEdit(new Error('queue entry not found')); await Promise.resolve() })
+    await waitFor(() => expect(readSideChatDraft(SLOT)).toContain('new wording'))
+    expect(composer().value).toBe('typing in B')
+    expect(readSideChatDraft('other-slot')).toBe('typing in B')
+  })
+
+  it('two edits failing in the same tick both come back — the second restore does not erase the first', async () => {
+    // Both rejections land before React re-renders, so a restore that merged
+    // from the composer's render-time draft would build both on the same stale
+    // base and keep only the last one. The store is the single source of truth
+    // precisely so successive restores compose.
+    const user = userEvent.setup()
+    const rejecters: Array<(e: Error) => void> = []
+    vi.mocked(api.sideQueueEdit).mockImplementation(() => new Promise((_, rej) => { rejecters.push(rej) }))
+    const store = busyState({
+      queue: [
+        { id: 'q-1', content: 'first old', ts: '2026-05-20T00:00:02Z', raw: true },
+        { id: 'q-2', content: 'second old', ts: '2026-05-20T00:00:03Z', raw: true },
+      ],
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    // Two cards collapse into a stack; per-card actions show once it is expanded.
+    // The stack is the aria-expanded ancestor of the visible card text (other
+    // controls on the page also carry aria-expanded).
+    const stack = screen.getByText('first old').closest('[role="button"][aria-expanded]') as HTMLElement
+    expect(stack).not.toBeNull()
+    await user.click(stack)
+    const editBox = () => screen.getByRole('textbox', { name: 'Edit queued message' })
+    const editButtons = () => screen.getAllByRole('button', { name: 'Edit queued message' })
+    await waitFor(() => expect(editButtons()).toHaveLength(2))
+
+    await user.click(editButtons()[0])
+    await user.clear(editBox())
+    await user.type(editBox(), 'first fix{Enter}')
+    await waitFor(() => expect(api.sideQueueEdit).toHaveBeenCalledWith(SLOT, 'q-1', 'first fix'))
+    // q-1 is pending (its button is disabled); the remaining enabled one is q-2's.
+    await user.click(editButtons().find(b => !(b as HTMLButtonElement).disabled)!)
+    await user.clear(editBox())
+    await user.type(editBox(), 'second fix{Enter}')
+    await waitFor(() => expect(api.sideQueueEdit).toHaveBeenCalledWith(SLOT, 'q-2', 'second fix'))
+    expect(rejecters).toHaveLength(2)
+
+    await act(async () => {
+      rejecters[0](new Error('queue entry not found'))
+      rejecters[1](new Error('queue entry not found'))
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(readSideChatDraft(SLOT)).toContain('second fix'))
+    expect(readSideChatDraft(SLOT)).toContain('first fix')
+  })
 })
 
 describe('chatSlice side queue reducer', () => {
@@ -370,9 +450,12 @@ describe('chatSlice steer frame placement', () => {
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
     const user = userEvent.setup()
+    // Type first: the mid-turn split button (with its mode caret) renders only
+    // once the composer has a draft — an empty busy composer now shows the Stop
+    // control instead.
+    await user.type(screen.getByLabelText('Ask a side question'), raw)
     await user.click(screen.getByTestId('busy-send-caret'))
     await user.click(screen.getByTestId('busy-send-mode-steer'))
-    await user.type(screen.getByLabelText('Ask a side question'), raw)
     await user.click(screen.getByTestId('busy-send-button'))
     await waitFor(() => expect(api.sideTurn).toHaveBeenCalled())
 
@@ -409,9 +492,12 @@ describe('chatSlice steer frame placement', () => {
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
     const user = userEvent.setup()
+    // Type first: the mid-turn split button (with its mode caret) renders only
+    // once the composer has a draft — an empty busy composer now shows the Stop
+    // control instead.
+    await user.type(screen.getByLabelText('Ask a side question'), raw)
     await user.click(screen.getByTestId('busy-send-caret'))
     await user.click(screen.getByTestId('busy-send-mode-steer'))
-    await user.type(screen.getByLabelText('Ask a side question'), raw)
     await user.click(screen.getByTestId('busy-send-button'))
     await waitFor(() => expect(api.sideTurn).toHaveBeenCalled())
 
@@ -1008,9 +1094,12 @@ describe('chatSlice steer frame placement', () => {
     expect(screen.getByRole('button', { name: /refresh/i })).toBeEnabled()
   })
 
-  it('refresh is blocked during a running turn, which can hold an unconsumed steer', async () => {
-    // An accepted steer is not in `queue` and has no card, so the empty-queue check cannot see
-    // it. Closing clears the ledger before the cleanup can requeue it, losing the question.
+  it('refresh is disabled during a running turn; Stop is the in-flight escape', async () => {
+    // The hung-turn escape (#15069) is the Stop control, not a mid-turn Refresh.
+    // A running turn can hold an accepted-but-unconsumed steer that has no queue
+    // card, so the empty-queue guard cannot see it and a mid-turn Refresh would
+    // silently drop it. Refresh becomes reachable the ordinary way once the turn
+    // settles (Stop → is_complete → busy clears).
     const store = busyState()
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
@@ -1018,6 +1107,386 @@ describe('chatSlice steer frame placement', () => {
     expect(refresh).toBeDisabled()
     await userEvent.setup().click(refresh)
     expect(api.sideClose).not.toHaveBeenCalled()
+  })
+
+  it('an answer offering choices renders them as buttons, not as the raw marker', async () => {
+    // `parseOptions` strips the marker out of the answer text, and the bar that turns the
+    // choices into buttons lives in the composer — so stripping without the bar would DELETE
+    // the choices, which is worse than the raw marker the user could at least read and type.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick one\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    expect(screen.queryByText(/\[OPTIONS:/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Rebase first' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Skip the rebase' })).toBeInTheDocument()
+  })
+
+  it('picking a choice fills the composer instead of sending it', async () => {
+    // The draft is the source of truth for what gets submitted, so a pick stays amendable.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick one\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    // `api.sideTurn` is shared across this file, so the baseline is what makes "did not send"
+    // meaningful — an absolute count would carry earlier tests' calls.
+    const turnsBefore = vi.mocked(api.sideTurn).mock.calls.length
+    // A single click on the chip body is debounced (the chip reserves double-click for its
+    // own send gesture), so the fill lands after the timer rather than on the click.
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Rebase first' }))
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/ask/i)).toHaveValue('Rebase first')
+    })
+    expect(vi.mocked(api.sideTurn).mock.calls.length).toBe(turnsBefore)
+  })
+
+  it("a choice's send arrow submits that choice, not the unrelated draft", async () => {
+    // The chip hands the option to `onSend` precisely because it has not been folded into the
+    // draft yet. A callback that ignored the argument would submit the draft alone and drop the
+    // answer the user just clicked.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick one\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    await user.type(screen.getByPlaceholderText(/ask/i), 'some unrelated note')
+    await user.click(screen.getByRole('button', { name: /send now.*Rebase first/i }))
+
+    await waitFor(() => expect(api.sideTurn).toHaveBeenCalled())
+    const sent = vi.mocked(api.sideTurn).mock.calls.at(-1)
+    expect(JSON.stringify(sent)).toContain('Rebase first')
+    // The draft belongs to the composer, not to this send: wiping it would destroy text the
+    // user typed and never sent. The main chat guards the same way (`if (!optionText)`).
+    expect(screen.getByPlaceholderText(/ask/i)).toHaveValue('some unrelated note')
+  })
+
+  it('un-picking keeps the identical word the user typed themselves', async () => {
+    // The tail is `bar, bar`: only the second one is the pick. Peeling both would delete the
+    // user's own word along with it.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick\n\n[OPTIONS: bar]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+    const chip = screen.getByRole('button', { name: 'bar' })
+
+    await user.type(composer, 'bar, bar')
+    // Only the LAST one is treated as the pick, so the chip offers to take one back.
+    // The tooltip leads with the chip's own label (it may be visually clamped), so
+    // assert the hint is present rather than that it is the whole content.
+    fireEvent.focus(chip)
+    expect(screen.getByRole('tooltip').textContent).toContain('Click to remove from input (double-click to send)')
+    fireEvent.blur(chip)
+
+    await user.click(chip)
+    await waitFor(() => expect(composer).toHaveValue('bar'))
+  })
+
+  it('a pick made after editing still reaches the draft and gets sent', async () => {
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+    const before = (api.sideTurn as unknown as Mock).mock.calls.length
+
+    await user.click(screen.getByRole('button', { name: 'Rebase first' }))
+    await waitFor(() => expect(composer).toHaveValue('Rebase first'))
+
+    await user.type(composer, ' if you can')
+    await user.click(screen.getByRole('button', { name: 'Skip the rebase' }))
+    // A highlighted chip whose text never landed in the composer would be dropped silently here.
+    await waitFor(() => {
+      expect(composer).toHaveValue('Rebase first if you can, Skip the rebase')
+    })
+
+    // Exactly 'Send': the chips carry their own 'Send now: <option>' segments.
+    await user.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      const calls = (api.sideTurn as unknown as Mock).mock.calls.slice(before)
+      expect(calls.length).toBe(1)
+      expect(calls[0][1]).toContain('Skip the rebase')
+    })
+  })
+
+  it('editing elsewhere in the draft is not undone by a later un-pick', async () => {
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+    const chip = screen.getByRole('button', { name: 'Rebase first' })
+
+    await user.type(composer, 'hi')
+    await user.click(chip)
+    await waitFor(() => expect(composer).toHaveValue('hi, Rebase first'))
+
+    // Typed at the front, so the option is still the tail and the block is still found — but what
+    // precedes it is no longer what was recorded.
+    await user.type(composer, 'X ', { initialSelectionStart: 0, initialSelectionEnd: 0 })
+    expect(composer).toHaveValue('X hi, Rebase first')
+
+    await user.click(chip)
+    await waitFor(() => expect(composer).toHaveValue('X hi'))
+  })
+
+  it('a draft already ending in a comma does not get a second one', async () => {
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+    const chip = screen.getByRole('button', { name: 'Rebase first' })
+
+    await user.type(composer, 'hello,')
+    await user.click(chip)
+    await waitFor(() => expect(composer).toHaveValue('hello, Rebase first'))
+
+    // And un-picking puts the user's comma back exactly, even though `hello,` + ` ` and
+    // `hello` + `, ` are the same string.
+    await user.click(chip)
+    await waitFor(() => expect(composer).toHaveValue('hello,'))
+  })
+
+  it('editing past the option de-selects it, and clicking again appends', async () => {
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+    const chip = screen.getByRole('button', { name: 'Rebase first' })
+
+    await user.click(chip)
+    await waitFor(() => expect(composer).toHaveValue('Rebase first'))
+    fireEvent.focus(chip)
+    await waitFor(() => expect(screen.getByRole('tooltip').textContent).toContain('Click to remove from input (double-click to send)'))
+    fireEvent.blur(chip)
+
+    // Typing past the option makes it part of the user's own sentence, so it stops being a block
+    // this can take back out — and the chip must stop claiming otherwise.
+    await user.type(composer, ' but only if CI is green')
+    expect(composer).toHaveValue('Rebase first but only if CI is green')
+    fireEvent.focus(chip)
+    expect(screen.getByRole('tooltip').textContent).toContain('Click to add to input (double-click to select and send)')
+    fireEvent.blur(chip)
+
+    // So the next click is a fresh pick: it appends rather than being swallowed.
+    await user.click(chip)
+    await waitFor(() => {
+      expect(composer).toHaveValue('Rebase first but only if CI is green, Rebase first')
+    })
+    fireEvent.focus(chip)
+    expect(screen.getByRole('tooltip').textContent).toContain('Click to remove from input (double-click to send)')
+    fireEvent.blur(chip)
+  })
+
+  it('un-picking one option leaves another whose text contains it intact', async () => {
+    // `foo, bar` contains `bar` plus the separator, so any substring search for `, bar` cuts into
+    // the second option instead of removing the first. The block is rebuilt from the picked list.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick\n\n[OPTIONS: bar | foo, bar]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+
+    await user.click(screen.getByRole('button', { name: 'bar' }))
+    await waitFor(() => expect(composer).toHaveValue('bar'))
+
+    await user.click(screen.getByRole('button', { name: 'foo, bar' }))
+    await waitFor(() => expect(composer).toHaveValue('bar, foo, bar'))
+
+    // Removing the FIRST option must leave the second one whole.
+    await user.click(screen.getByRole('button', { name: 'bar' }))
+    await waitFor(() => expect(composer).toHaveValue('foo, bar'))
+  })
+
+  it('un-picking removes the appended copy, not the same words the user typed', async () => {
+    // A draft may legitimately already contain the option's words. Searching from the left
+    // splices the user's own text and leaves the appended copy behind.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'pick one\n\n[OPTIONS: Rebase first | Skip the rebase]',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    const user = userEvent.setup()
+    const composer = screen.getByPlaceholderText(/ask/i)
+    await user.type(composer, 'a, Rebase first and b')
+
+    const chip = screen.getByRole('button', { name: 'Rebase first' })
+    await user.click(chip)
+    await waitFor(() => {
+      expect(composer).toHaveValue('a, Rebase first and b, Rebase first')
+    })
+
+    await user.click(chip)
+    await waitFor(() => {
+      expect(composer).toHaveValue('a, Rebase first and b')
+    })
+  })
+
+  it('a steer acknowledgement renders as a chip, not as the raw marker', async () => {
+    // kiro-cli emits the acknowledgement inline as `[STEERING steer-<id>: <summary>]` and the
+    // backend deliberately does NOT strip it — it only holds back a half-streamed fragment,
+    // because a frontend consumer is expected to extract it. Rendering the side transcript
+    // through the shared list is what runs that extraction.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'partial [STEERING steer-abc123: switched to the new question] rest',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    expect(screen.queryByText(/\[STEERING/)).toBeNull()
+    expect(screen.getByText('Steered')).toBeInTheDocument()
+    // The summary is folded behind the chip and shown once the reader opens it.
+    fireEvent.click(screen.getByTestId('steer-ack-toggle'))
+    expect(screen.getByText('switched to the new question')).toBeInTheDocument()
+  })
+
+  it('an error answer renders through the shared error treatment', async () => {
+    // The side buffer flags an error on an `assistant` row rather than carrying an `error`
+    // role, so the mapping is what gets it the same treatment as the main transcript.
+    const store = busyState({
+      messages: [
+        { role: 'user' as const, content: 'q1', ts: '2026-05-20T00:00:00Z', run_id: 'r1' },
+        {
+          role: 'assistant' as const,
+          content: 'the backend refused',
+          ts: '2026-05-20T00:00:01Z',
+          run_id: 'r1',
+          is_error: true,
+        },
+      ],
+      streaming: false,
+      pending: false,
+    })
+    renderWithProviders(<SideChat slot={SLOT} />, { store })
+
+    // The danger treatment is the point: the same text in an assistant row proves nothing.
+    expect(screen.getByText('the backend refused')).toHaveClass('text-danger-text')
   })
 
   it('a card whose text this client never had can be neither edited nor cancelled', async () => {

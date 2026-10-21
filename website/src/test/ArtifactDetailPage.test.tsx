@@ -1,10 +1,20 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import type { MockedFunction } from 'vitest'
 import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
+import { chooseMore, commentsShown, findMoreItem, hasMoreItem } from './artifactMoreMenu'
 import ArtifactDetailPage from '../pages/ArtifactDetailPage'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import type { Artifact } from '../types'
+
+// The sandboxed frames mint their document URL through the api client. The
+// automock resolves every method to `undefined`, which the component cannot
+// await — without this stub the frame throws instead of rendering.
+beforeEach(() => {
+  vi.mocked(api.sandboxDocUrl).mockResolvedValue({ url: '/sandbox-doc/test/tok' })
+})
+
 
 vi.mock('../api/client')
 // Stub the embedded chat page (companion chat) — its rendering is covered by its
@@ -64,13 +74,13 @@ async function versionRowLabels() {
 describe('ArtifactDetailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    // jsdom needs URL.createObjectURL for blob iframes
-    if (!URL.createObjectURL) {
-      // @ts-expect-error stub
-      URL.createObjectURL = vi.fn().mockReturnValue('blob:test')
-      // @ts-expect-error stub
-      URL.revokeObjectURL = vi.fn()
-    }
+    // Spy rather than assign: only a spy lands in the registry that
+    // vi.restoreAllMocks() can undo. The env provides both natively.
+    // Well-formed blob: URI, not a bare 'blob:test' literal — see the note in
+    // WidgetFrame.test.tsx's beforeEach for why a malformed mock value here
+    // risks a deferred ECONNREFUSED crashing an unrelated shard.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:http://localhost:6776/test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     // Default events response so the events query never throws "undefined".
     // Individual tests can override this with .mockResolvedValueOnce when
     // they need a specific event log.
@@ -92,6 +102,10 @@ describe('ArtifactDetailPage', () => {
     vi.mocked(api).chatSlots = vi.fn().mockResolvedValue([])
   })
 
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('renders artifact metadata and iframe', async () => {
     vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact())
     vi.mocked(api).artifactVersions = vi
@@ -108,6 +122,76 @@ describe('ArtifactDetailPage', () => {
     expect(await screen.findByTitle(/Artifact: cr-queue/)).toBeInTheDocument()
   })
 
+  it('renders an image artifact as an <img> from the asset URL with a download control and no editor/iframe', async () => {
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(
+      mkArtifact({
+        kind: 'image',
+        content: undefined,
+        image: { mime: 'image/png', ext: 'png', original_filename: 'chart.png', alt: 'A bar chart' },
+      }),
+    )
+    vi.mocked(api).artifactVersions = vi
+      .fn()
+      .mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
+    renderRoute()
+    await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
+    // The image renders straight from the asset endpoint (no base64 in JSON).
+    const img = screen.getByAltText('A bar chart') as HTMLImageElement
+    expect(img.getAttribute('src')).toBe('/api/artifacts/cr-queue/asset')
+    // Download control points at the same URL and names the file.
+    const anchor = document.querySelector('a[download]') as HTMLAnchorElement | null
+    expect(anchor?.getAttribute('href')).toBe('/api/artifacts/cr-queue/asset')
+    expect(anchor?.getAttribute('download')).toBe('chart.png')
+    // Image is not editable: no Monaco textarea, no widget iframe body.
+    expect(document.querySelector('.monaco-editor')).toBeNull()
+    expect(document.querySelector('iframe')).toBeNull()
+    // The kind badge reads "image".
+    expect(screen.getByText('image')).toBeInTheDocument()
+  })
+
+  it('header Download for an image artifact targets the asset URL, not an empty .html blob', async () => {
+    // The header Download is the habituated spot; for images it must deliver the
+    // real bytes. `artifact.content` is empty by design for kind: 'image', so
+    // blobbing it would silently hand the user a junk `Name-v1.html`.
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(
+      mkArtifact({
+        kind: 'image',
+        content: undefined,
+        image: { mime: 'image/png', ext: 'png', original_filename: 'chart.png' },
+      }),
+    )
+    vi.mocked(api).artifactVersions = vi
+      .fn()
+      .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
+    renderRoute()
+    await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
+
+    const clicked: { href?: string; download?: string } = {}
+    const realCreate = document.createElement.bind(document)
+    const createSpy = vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = realCreate(tag) as HTMLElement
+      if (tag === 'a') {
+        // Capture what the synthetic anchor was pointed at instead of navigating.
+        Object.defineProperty(el, 'click', {
+          value: () => {
+            clicked.href = (el as HTMLAnchorElement).getAttribute('href') ?? undefined
+            clicked.download = (el as HTMLAnchorElement).getAttribute('download') ?? undefined
+          },
+        })
+      }
+      return el
+    })
+    try {
+      fireEvent.click(await findMoreItem('Download'))
+    } finally {
+      createSpy.mockRestore()
+    }
+
+    expect(clicked.href).toBe('/api/artifacts/cr-queue/asset')
+    expect(clicked.download).toBe('chart.png')
+    expect(clicked.href).not.toMatch(/^blob:/)
+  })
+
   it('keeps the comment sidebar collapsed when the artifact has no comments', async () => {
     vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact())
     vi.mocked(api).artifactVersions = vi
@@ -118,8 +202,7 @@ describe('ArtifactDetailPage', () => {
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     // Empty comment panel = wasted space on a dashboard/infographic, so the
     // sidebar stays collapsed by default.
-    const toggle = screen.getByLabelText('Toggle comments')
-    await waitFor(() => expect(toggle).toHaveAttribute('aria-pressed', 'false'))
+    expect(await commentsShown()).toBe(false)
   })
 
   it('auto-opens the comment sidebar when the artifact has comments', async () => {
@@ -140,7 +223,7 @@ describe('ArtifactDetailPage', () => {
     renderRoute()
     // The comment body appears because the sidebar auto-reveals on comments.
     await waitFor(() => expect(screen.getByText('first review note')).toBeInTheDocument())
-    expect(screen.getByLabelText('Toggle comments')).toHaveAttribute('aria-pressed', 'true')
+    expect(await commentsShown()).toBe(true)
   })
 
   it('clears the manual sidebar override when navigating to another artifact', async () => {
@@ -159,11 +242,11 @@ describe('ArtifactDetailPage', () => {
     })
     vi.mocked(api).artifact = vi.fn((s: string) =>
       Promise.resolve(mkArtifact({ slug: s, name: s === 'art-a' ? 'Artifact A' : 'Artifact B' })),
-    ) as any
+    ) as MockedFunction<typeof api.artifact>
     vi.mocked(api).artifactVersions = vi.fn((s: string) =>
       Promise.resolve({ slug: s, versions: [1] }),
-    ) as any
-    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as any
+    ) as MockedFunction<typeof api.artifactVersions>
+    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as MockedFunction<typeof api.artifactComments>
 
     function Nav() {
       const navigate = useNavigate()
@@ -180,15 +263,14 @@ describe('ArtifactDetailPage', () => {
     )
     // Artifact A auto-opens on its comment; the user then closes it.
     await waitFor(() => expect(screen.getByText('art-a note')).toBeInTheDocument())
-    const toggleA = screen.getByLabelText('Toggle comments')
-    expect(toggleA).toHaveAttribute('aria-pressed', 'true')
-    fireEvent.click(toggleA)
-    expect(screen.getByLabelText('Toggle comments')).toHaveAttribute('aria-pressed', 'false')
+    expect(await commentsShown()).toBe(true)
+    await chooseMore(/Hide comments/)
+    expect(await commentsShown()).toBe(false)
     // Navigate to B (same route, different param). The override must reset so B
     // — which also has a comment — auto-reveals its sidebar again.
     fireEvent.click(screen.getByText('go-b'))
     await waitFor(() => expect(screen.getByText('art-b note')).toBeInTheDocument())
-    expect(screen.getByLabelText('Toggle comments')).toHaveAttribute('aria-pressed', 'true')
+    expect(await commentsShown()).toBe(true)
   })
 
   it('shows version dropdown with Live default and changes selected version', async () => {
@@ -312,7 +394,7 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    expect(screen.queryByTitle('Edit content')).toBeNull()
+    expect(screen.queryByRole('button', { description: 'Edit content' })).toBeNull()
   })
 
   it('edit toggle shown for markdown artifacts and reveals Save/Cancel', async () => {
@@ -324,11 +406,11 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    const editBtn = screen.getByTitle('Edit content')
+    const editBtn = screen.getByRole('button', { description: 'Edit content' })
     expect(editBtn).toBeInTheDocument()
     editBtn.click()
-    await waitFor(() => expect(screen.getByTitle(/Save/)).toBeInTheDocument())
-    expect(screen.getByTitle(/Cancel/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { description: /Save/ })).toBeInTheDocument())
+    expect(screen.getByRole('button', { description: /Cancel/ })).toBeInTheDocument()
   })
 
   it('cron-source warning banner shows when editing a cron-generated artifact', async () => {
@@ -342,7 +424,7 @@ describe('ArtifactDetailPage', () => {
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     // Banner is hidden in read-only mode.
     expect(screen.queryByText(/regenerated by a cron job/i)).toBeNull()
-    screen.getByTitle('Edit content').click()
+    screen.getByRole('button', { description: 'Edit content' }).click()
     await waitFor(() =>
       expect(screen.getByText(/regenerated by a cron job/i)).toBeInTheDocument(),
     )
@@ -361,10 +443,10 @@ describe('ArtifactDetailPage', () => {
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     // Current view: no Revert button.
-    expect(screen.queryByTitle(/Revert to v/)).toBeNull()
+    expect(screen.queryByRole('button', { description: /Revert to v/ })).toBeNull()
     // Switch to v1.
     await pickVersion('v1')
-    await waitFor(() => expect(screen.getByTitle(/Revert to v1/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('button', { description: /Revert to v1/ })).toBeInTheDocument())
   })
 
   // ── comments → companion chat ───────────────────────────────
@@ -523,7 +605,7 @@ describe('ArtifactDetailPage', () => {
     expect(screen.queryByText(/→ v2/)).toBeNull()
   })
 
-  it('Save and Snapshot buttons both render in edit mode with distinct titles', async () => {
+  it('edit mode keeps Save and Cancel in the row and offers Snapshot from More', async () => {
     // Save = silent live update, Snapshot = bumps version. Both buttons
     // appear together in edit mode under the explicit-snapshot model. We can't
     // drive the Monaco editor in jsdom so
@@ -538,15 +620,15 @@ describe('ArtifactDetailPage', () => {
 
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    fireEvent.click(screen.getByTitle('Edit content'))
+    fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
     await waitFor(() =>
       expect(
-        screen.getByTitle(/Save to Live \(Cmd\+S\) — updates the live state/i),
+        screen.getByRole('button', { description: /Save to Live \(Cmd\+S\) — updates the live state/i }),
       ).toBeInTheDocument(),
     )
-    expect(
-      screen.getByTitle(/Snapshot \(Cmd\+Shift\+S\) — save and create a new version/i),
-    ).toBeInTheDocument()
+    // Snapshot moved into the "More" menu; Save and Cancel stay in the row.
+    expect(screen.getByRole('button', { name: /Cancel/ })).toBeInTheDocument()
+    expect(await findMoreItem(/^Snapshot/)).toBeInTheDocument()
   })
 
   it('version dropdown shows Live + numbered snapshots newest-first', async () => {
@@ -602,7 +684,7 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    expect(screen.getByText('Snapshot')).toBeInTheDocument()
+    expect(await hasMoreItem('Snapshot')).toBe(true)
   })
 
   it('Snapshot hidden when artifact is in sync with latest version', async () => {
@@ -614,7 +696,7 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    expect(screen.queryByText('Snapshot')).toBeNull()
+    expect(await hasMoreItem('Snapshot')).toBe(false)
   })
 
   it('Snapshot click calls updateArtifact with snapshot:true (no content)', async () => {
@@ -628,7 +710,7 @@ describe('ArtifactDetailPage', () => {
     vi.mocked(api).updateArtifact = updateSpy
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    fireEvent.click(screen.getByText('Snapshot'))
+    await chooseMore('Snapshot')
     await waitFor(() =>
       expect(updateSpy).toHaveBeenCalledWith('cr-queue', { snapshot: true }),
     )
@@ -645,7 +727,7 @@ describe('ArtifactDetailPage', () => {
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     // Enter edit mode (no Monaco interaction needed — dirty stays false).
-    fireEvent.click(screen.getByTitle('Edit content'))
+    fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
     // Back without dirty: no confirm.
     fireEvent.click(screen.getByRole('button', { name: /Back/ }))
     expect(confirmSpy).not.toHaveBeenCalled()
@@ -668,7 +750,7 @@ describe('ArtifactDetailPage', () => {
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     const trigger = versionTrigger()
     expect(trigger).not.toBeDisabled()
-    fireEvent.click(screen.getByText('Snapshot'))
+    await chooseMore('Snapshot')
     // Wait for the saving state to render (in-flight update).
     await waitFor(() => expect(trigger).toBeDisabled())
     // Resolve to clean up.
@@ -684,7 +766,7 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    fireEvent.click(screen.getByTitle('Edit content'))
+    fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
     // Dispatch Cmd+S — without dirty state the handler is a no-op,
     // but the keydown listener path executes for coverage.
     fireEvent.keyDown(document, { key: 's', metaKey: true })
@@ -709,7 +791,7 @@ describe('ArtifactDetailPage', () => {
     fireEvent.click(screen.getByLabelText('Toggle agent chat'))
     await waitFor(() => expect(createSlotSpy).toHaveBeenCalledTimes(1))
     // The 8th positional argument is the artifact binding the backend persists.
-    expect(createSlotSpy.mock.calls[0][7]).toBe('cr-queue')
+    expect(createSlotSpy.mock.calls[0][6]).toBe('cr-queue')
   })
 
   it('description renders when artifact has one', async () => {
@@ -761,9 +843,9 @@ describe('ArtifactDetailPage', () => {
     await waitFor(() => expect(versionFetch).toHaveBeenCalledWith('cr-queue', 2))
     await waitFor(() => expect(screen.getByText(/historical v2/)).toBeInTheDocument())
     // Edit/Snapshot buttons hidden on historical view.
-    expect(screen.queryByTitle('Edit content')).toBeNull()
+    expect(screen.queryByRole('button', { description: 'Edit content' })).toBeNull()
     // Revert button visible.
-    expect(screen.getByTitle(/Revert to v2/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { description: /Revert to v2/ })).toBeInTheDocument()
   })
 
   it('revert click calls updateArtifact with reverted event_type and from_version', async () => {
@@ -782,8 +864,8 @@ describe('ArtifactDetailPage', () => {
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     await pickVersion('v2')
-    await waitFor(() => expect(screen.getByTitle(/Revert to v2/)).toBeInTheDocument())
-    fireEvent.click(screen.getByTitle(/Revert to v2/))
+    await waitFor(() => expect(screen.getByRole('button', { description: /Revert to v2/ })).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { description: /Revert to v2/ }))
     await waitFor(() =>
       expect(updateSpy).toHaveBeenCalledWith('cr-queue', expect.objectContaining({
         content: 'v2 content',
@@ -803,13 +885,13 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    fireEvent.click(screen.getByTitle('Edit content'))
+    fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
     // Click Cancel — without dirty there's no confirm.
     const confirmSpy = vi.spyOn(window, 'confirm')
-    fireEvent.click(screen.getByTitle(/Cancel/))
+    fireEvent.click(screen.getByRole('button', { description: /Cancel/ }))
     expect(confirmSpy).not.toHaveBeenCalled()
     // Edit toggle should reappear.
-    await waitFor(() => expect(screen.getByTitle('Edit content')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('button', { description: 'Edit content' })).toBeInTheDocument())
     confirmSpy.mockRestore()
   })
 
@@ -877,7 +959,7 @@ describe('ArtifactDetailPage', () => {
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
     // Enter edit mode but stay clean — no dirty, no confirm needed.
-    fireEvent.click(screen.getByTitle('Edit content'))
+    fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
     const confirmSpy = vi.spyOn(window, 'confirm')
     await pickVersion('v1')
     expect(confirmSpy).not.toHaveBeenCalled()
@@ -1020,7 +1102,7 @@ describe('ArtifactDetailPage', () => {
       renderRoute()
       await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
 
-      fireEvent.click(screen.getByTitle('Edit content'))
+      fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
       const callsWhileEditing = vi.mocked(api).artifact.mock.calls.length
 
       fireEvent.click(screen.getByLabelText('Star artifact'))

@@ -14,14 +14,14 @@
  */
 import { ChevronDown, MoreHorizontal, Plus, X } from 'lucide-react'
 import React, { useCallback, useEffect, useState } from 'react'
-import type { PackMeta } from './appearanceTypes'
-import { REQUIRED_STATES, STATUS_STATES, RANDOM_STATES, LEGACY_STATES, ALL_MOODS } from './appearanceTypes'
+import type { PackMeta } from '../../lib/appearancePacks/types'
+import { REQUIRED_STATES, STATUS_STATES, RANDOM_STATES, LEGACY_STATES, ALL_MOODS } from '../../lib/appearancePacks/types'
 import { toDataUri } from './animationResolver'
 import { applySvgColorMap, type ColorMap } from './colorCustomizer'
 import { ghostPoseForKey } from './ghostEyes'
 import { GhostEyeOverlay } from './GhostEyeOverlay'
-import { LottieRenderer } from './LottieRenderer'
-import { SpriteRenderer } from './SpriteRenderer'
+import { LottieRenderer } from '../../components/appearancePacks/LottieRenderer'
+import { SpriteRenderer } from '../../components/appearancePacks/SpriteRenderer'
 import { PackEditor } from './PackEditor'
 import { SpriteImporter } from './SpriteImporter'
 import { buildSpritePackData, firstFramePreview } from './petdexImport'
@@ -87,7 +87,8 @@ import { slotLabel } from './slotLabel'
 import { errorText } from './errorText'
 import type { SpriteImportResult } from './spriteImportTypes'
 import './gallery.css'
-import { splitOnPlaceholder } from './splitOnPlaceholder'
+import { splitOnPlaceholder } from '../../lib/splitOnPlaceholder'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 
 // ── Styles ─────────────────────────────────────────────────────────────────
@@ -597,6 +598,7 @@ function ImportPetDialog({ input, onInput, resolving, resolved, importing, error
   onClose: () => void
   onBrowse: () => void
 }) {
+  const ime = useImeGuard()
   // Esc closes, like any dialog
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -606,6 +608,7 @@ function ImportPetDialog({ input, onInput, resolving, resolved, importing, error
 
   return (
     <div role="presentation" style={S.detailOverlay} onClick={onClose}>
+      {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions -- stopPropagation prevents backdrop dismiss when clicking inside modal */}
       <div role="dialog" aria-modal="true" style={S.modal} onClick={(e) => e.stopPropagation()}>
         <div style={S.modalHeader}>
           <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>{i18nT('apps.crewCompanion.gallery.importPet')}</span>
@@ -651,8 +654,9 @@ function ImportPetDialog({ input, onInput, resolving, resolved, importing, error
           <input
             value={input}
             onChange={(e) => onInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && resolved) onConfirm() }}
+            {...ime.bindEnter({ onEnter: () => { if (resolved) onConfirm() } })}
             placeholder={i18nT('apps.crewCompanion.gallery.petdexPlaceholder')}
+            aria-label={i18nT('apps.crewCompanion.gallery.petdexPlaceholder')}
             autoFocus
             disabled={importing}
             style={{
@@ -766,6 +770,7 @@ function DetailPanel({ detail, isActive, onClose, onApply, onExport, onEdit, onD
 
   return (
     <div role="presentation" style={S.detailOverlay} onClick={onClose}>
+      {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions -- stopPropagation prevents backdrop dismiss when clicking inside modal */}
       <div role="dialog" aria-modal="true" style={S.detailPanel} onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div style={S.detailHeader}>
@@ -1029,7 +1034,7 @@ export const GalleryPanel: React.FC = () => {
       offColor?.()
       offConfig?.()
     }
-  }, [fetchActiveId, fetchPacks])
+  }, [fetchActiveId, fetchPacks, lang])
 
   // ── Card click → fetch detail ──────────────────────────────────────────
 

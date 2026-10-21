@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ from unittest import mock
 
 import pytest
 
+from kiro_crew import env as env_mod
 from kiro_crew.apps.builtins.pptx_maker.backend import provision
 
 
@@ -230,8 +232,8 @@ class TestResolveUv:
         packaged.write_text("#!/bin/sh", encoding="utf-8")
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(return_value=str(packaged)))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which") as which,
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which") as which,
         ):
             assert provision.resolve_uv() == str(packaged)
         assert not which.called, "PATH must not be consulted when the package resolves"
@@ -243,16 +245,16 @@ class TestResolveUv:
             find_uv_bin=mock.Mock(side_effect=FileNotFoundError("no uv in any location"))
         )
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value="/usr/local/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="/usr/local/bin/uv"),
         ):
             assert provision.resolve_uv() == "/usr/local/bin/uv"
 
     def test_falls_back_to_path_when_the_package_is_absent(self):
         """An install without the uv wheel at all must not raise ImportError."""
         with (
-            mock.patch.dict(sys.modules, {"uv": None}),
-            mock.patch.object(provision.shutil, "which", return_value="/usr/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", None),
+            mock.patch.object(env_mod.shutil, "which", return_value="/usr/bin/uv"),
         ):
             assert provision.resolve_uv() == "/usr/bin/uv"
 
@@ -261,81 +263,59 @@ class TestResolveUv:
         than hand an absolute nonexistent path to `subprocess.run`."""
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(return_value=str(tmp_path / "gone")))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value="/usr/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="/usr/bin/uv"),
         ):
             assert provision.resolve_uv() == "/usr/bin/uv"
 
-    def test_finds_the_binary_staged_next_to_a_frozen_executable(self, tmp_path: Path):
-        """The DMG path. PyInstaller's bundle has no scripts dir, so
-        `find_uv_bin()` raises there; the spec stages uv at the bundle root."""
-        bundled = tmp_path / ("uv" + (provision.sysconfig.get_config_var("EXE") or ""))
-        bundled.write_text("#!/bin/sh", encoding="utf-8")
-        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("frozen")))
+    def test_falls_through_to_path_when_find_uv_bin_raises(self, tmp_path: Path):
+        """`find_uv_bin()` raises `UvNotFound` on an install repackaged without the
+        binary — a system uv must still be used rather than reporting none."""
+        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("no binary")))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(sys, "frozen", True, create=True),
-            mock.patch.object(sys, "_MEIPASS", str(tmp_path), create=True),
-            mock.patch.object(provision.shutil, "which") as which,
-        ):
-            assert provision.resolve_uv() == str(bundled)
-        assert not which.called, "the bundled binary must win over PATH"
-
-    def test_finds_the_binary_beside_sys_executable_in_a_one_folder_build(self, tmp_path: Path):
-        """`_MEIPASS` and `dirname(sys.executable)` differ for a one-FILE build,
-        so both are probed."""
-        bundled = tmp_path / ("uv" + (provision.sysconfig.get_config_var("EXE") or ""))
-        bundled.write_text("#!/bin/sh", encoding="utf-8")
-        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("frozen")))
-        with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(sys, "frozen", True, create=True),
-            mock.patch.object(sys, "executable", str(tmp_path / "kirocrew-backend")),
-            mock.patch.object(provision.shutil, "which"),
-        ):
-            assert provision.resolve_uv() == str(bundled)
-
-    def test_falls_through_to_path_when_the_frozen_location_is_empty(self, tmp_path: Path):
-        """A frozen build whose bundle did NOT stage uv still uses a system one."""
-        empty = tmp_path / "bundle"
-        empty.mkdir()
-        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("frozen")))
-        with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(sys, "frozen", True, create=True),
-            mock.patch.object(sys, "_MEIPASS", str(empty), create=True),
-            mock.patch.object(
-                # Both frozen candidates must be empty, or the interpreter's own
-                # scripts dir (which really does hold a uv here) satisfies the probe.
-                sys,
-                "executable",
-                str(empty / "kirocrew-backend"),
-            ),
-            mock.patch.object(provision.shutil, "which", return_value="/opt/homebrew/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="/opt/homebrew/bin/uv"),
         ):
             assert provision.resolve_uv() == "/opt/homebrew/bin/uv"
-
-    def test_the_frozen_location_is_ignored_when_not_frozen(self, tmp_path: Path):
-        """A stray `uv` next to a normal interpreter must not be picked up as if
-        it were a bundled one — only `sys.frozen` opens that door."""
-        assert provision._frozen_bundle_dirs() == []
 
     def test_returns_none_when_uv_is_absent_everywhere_and_never_raises(self):
         """The contract `provision()` depends on: an absent uv is a reportable
         condition, not a traceback inside a detached background job."""
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("nope")))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value=None),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value=None),
         ):
             assert provision.resolve_uv() is None
+
+    def test_a_relative_which_result_is_skipped(self, tmp_path: Path, monkeypatch):
+        """A relative `PATH` entry makes `shutil.which` return a relative path.
+        Pod provisioning runs uv with `cwd=<checkout>`, where that path does not
+        resolve and `Popen` would raise before the pip fallback. A binary found
+        through a relative PATH entry is also whatever sits in the cwd, so the
+        ladder reports no uv and lets the caller fall back."""
+        monkeypatch.chdir(tmp_path)
+        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("nope")))
+        with (
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="bin/uv"),
+        ):
+            assert provision.resolve_uv() is None
+
+    def test_a_relative_locator_result_is_made_absolute(self, tmp_path: Path, monkeypatch):
+        """Same contract for the wheel locator branch."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "uv").write_text("#!/bin/sh", encoding="utf-8")
+        fake_uv = mock.Mock(find_uv_bin=mock.Mock(return_value="uv"))
+        with mock.patch.object(env_mod, "_uv_package", fake_uv):
+            assert provision.resolve_uv() == str(tmp_path / "uv")
 
     def test_the_resolved_path_is_cached(self, tmp_path: Path):
         """Called on every provision, and the answer cannot change in-process."""
         packaged = tmp_path / "uv"
         packaged.write_text("#!/bin/sh", encoding="utf-8")
         locator = mock.Mock(return_value=str(packaged))
-        with mock.patch.dict(sys.modules, {"uv": mock.Mock(find_uv_bin=locator)}):
+        with mock.patch.object(env_mod, "_uv_package", mock.Mock(find_uv_bin=locator)):
             assert provision.resolve_uv() == str(packaged)
             assert provision.resolve_uv() == str(packaged)
         assert locator.call_count == 1
@@ -360,7 +340,7 @@ class TestRunSandboxing:
             mock.patch.object(
                 provision, "sandboxed_spawn_argv", return_value=(["/opt/uv", "x"], scrubbed, None)
             ) as chokepoint,
-            mock.patch.object(provision.subprocess, "run") as run,
+            mock.patch.object(provision, "run_limited") as run,
         ):
             run.return_value = mock.Mock(returncode=0, stdout="out", stderr="")
             provision._run(["/opt/uv", "x"], cwd=str(tmp_path), timeout=5)
@@ -419,8 +399,8 @@ class TestRunSandboxing:
         with (
             mock.patch.object(provision, "sandboxed_spawn_argv", return_value=(["uv"], {}, None)),
             mock.patch.object(
-                provision.subprocess,
-                "run",
+                provision,
+                "run_limited",
                 side_effect=subprocess.TimeoutExpired(cmd="uv", timeout=7),
             ),
         ):
@@ -431,7 +411,7 @@ class TestRunSandboxing:
     def test_a_missing_binary_is_reported_not_raised(self, tmp_path: Path):
         with (
             mock.patch.object(provision, "sandboxed_spawn_argv", return_value=(["uv"], {}, None)),
-            mock.patch.object(provision.subprocess, "run", side_effect=OSError("No such file")),
+            mock.patch.object(provision, "run_limited", side_effect=OSError("No such file")),
         ):
             code, out = provision._run(["uv", "sync"], cwd=str(tmp_path), timeout=7)
         assert code == 1
@@ -446,7 +426,7 @@ class TestRunSandboxing:
             mock.patch.object(
                 provision, "sandboxed_spawn_argv", return_value=(["/opt/uv"], {}, str(profile))
             ),
-            mock.patch.object(provision.subprocess, "run", side_effect=OSError("boom")),
+            mock.patch.object(provision, "run_limited", side_effect=OSError("boom")),
         ):
             provision._run(["/opt/uv"], cwd=str(tmp_path), timeout=5)
         assert not profile.exists()
@@ -458,7 +438,7 @@ class TestRunSandboxing:
             mock.patch.object(
                 provision, "sandboxed_spawn_argv", return_value=(["/opt/uv"], {}, None)
             ),
-            mock.patch.object(provision.subprocess, "run") as run,
+            mock.patch.object(provision, "run_limited") as run,
         ):
             run.return_value = mock.Mock(returncode=2, stdout="on-out\n", stderr="on-err")
             code, out = provision._run(["/opt/uv"], cwd=str(tmp_path), timeout=5)
@@ -719,6 +699,52 @@ class TestRenderAgents:
             assert provision._render_agents(tmp_path / "install", log=[]) == 0
 
 
+_MODE_ENFORCED = pytest.mark.skipif(
+    os.name != "nt" and os.geteuid() == 0,
+    reason="root ignores POSIX mode bits, so a read-only fixture cannot refuse removal",
+)
+
+
+def _harden(root: Path) -> None:
+    """Make *root* look like this package on a read-only install.
+
+    Deepest entry first, so every `is_dir()` still runs under a searchable
+    parent. On Windows `os.chmod` only sets the read-only attribute, which is
+    enough: it is what `rmdir`/`unlink` consult there.
+    """
+    for entry in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        os.chmod(entry, 0o555 if entry.is_dir() else 0o444)
+    os.chmod(root, 0o555)
+
+
+def _soften(root: Path) -> None:
+    """Undo :func:`_harden`, root downwards so the walk can descend.
+
+    Directories go back to owner-only `S_IRWXU` rather than `0o755`: all this
+    has to restore is THIS process's ability to list, write and descend so
+    pytest can clean `tmp_path` up, and group/other bits buy none of that.
+    Spelled symbolically because it is the exact permission being asked for --
+    and because the numeric spelling of owner-rwx trips
+    `insecure-file-permissions`, which reads any `7` triad as widely permissive
+    even when it is owner-only. On Windows `os.chmod` honours only the
+    read-only flag, which the owner write bit clears either way.
+    """
+    os.chmod(root, stat.S_IRWXU)
+    for entry in root.rglob("*"):
+        os.chmod(entry, stat.S_IRWXU if entry.is_dir() else 0o644)
+
+
+@pytest.fixture
+def restore_modes(tmp_path: Path):
+    """Hand the read-only fixtures back writable.
+
+    Without this they defeat pytest's own `tmp_path` cleanup, which is the same
+    refusal these tests are about.
+    """
+    yield
+    _soften(tmp_path)
+
+
 class TestStageStatic:
     def test_prompts_are_copied_so_a_read_only_wheel_install_works(self, tmp_path: Path):
         """Copied, not symlinked: the package dir is read-only on a wheel
@@ -739,6 +765,96 @@ class TestStageStatic:
         stale.write_text("from an older version", encoding="utf-8")
         provision._stage_static(install_dir, log=[])
         assert not stale.exists()
+
+    @_MODE_ENFORCED
+    def test_restaging_replaces_a_copy_made_from_a_read_only_source(
+        self, tmp_path: Path, restore_modes: None
+    ):
+        """The staged copy inherits the package dir's modes, so on a read-only
+        install (a Nix store path, a read-only mount) it is read-only too — and
+        the NEXT provision must still be able to replace it.
+
+        The stale copy in the test above is one this test wrote itself, so it is
+        writable and a plain `rmtree` clears it; that is why the idempotence
+        contract held there and still broke here. `provision` reports ok even
+        when staging fails, so an upgrade kept the previous version's prompts
+        and said it had succeeded.
+        """
+        pkg = tmp_path / "pkg"
+        prompts = pkg / "prompts"
+        prompts.mkdir(parents=True)
+        (prompts / "deck.md").write_text("v1", encoding="utf-8")
+        install_dir = tmp_path / "install"
+        log: list[str] = []
+        with mock.patch.object(provision, "_PACKAGE_ROOT", pkg):
+            _harden(prompts)
+            provision._stage_static(install_dir, log)
+            assert (install_dir / "prompts" / "deck.md").read_text(encoding="utf-8") == "v1"
+            # The app is upgraded: the packaged prompt changes underneath.
+            _soften(prompts)
+            (prompts / "deck.md").write_text("v2", encoding="utf-8")
+            _harden(prompts)
+            provision._stage_static(install_dir, log)
+        # The staged prompt FIRST: a failed restage is what the app actually
+        # serves, and the log line below is only how it is reported.
+        assert (install_dir / "prompts" / "deck.md").read_text(encoding="utf-8") == "v2"
+        assert log == []
+
+    @_MODE_ENFORCED
+    def test_restaging_repairs_a_read_only_copy_from_an_older_version(
+        self, tmp_path: Path, restore_modes: None
+    ):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "deck.md").write_text("current", encoding="utf-8")
+        staged = tmp_path / "install" / "prompts"
+        (staged / "nested").mkdir(parents=True)
+        (staged / "nested" / "stale.md").write_text("stale", encoding="utf-8")
+        _harden(staged)
+
+        provision._copy_tree(source, staged)
+
+        assert not (staged / "nested").exists()
+        assert (staged / "deck.md").read_text(encoding="utf-8") == "current"
+
+    @_MODE_ENFORCED
+    def test_the_read_only_fixture_really_refuses_a_plain_rmtree(
+        self, tmp_path: Path, restore_modes: None
+    ):
+        """Guard the guard: a fixture that could be removed anyway would let the
+        restaging test above pass without the repair."""
+        tree = tmp_path / "tree"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "sub" / "a.md").write_text("x", encoding="utf-8")
+        _harden(tree)
+        with pytest.raises(OSError):
+            shutil.rmtree(tree)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="asserts real POSIX mode bits")
+    def test_the_staged_copy_is_left_owner_writable(self, tmp_path: Path, restore_modes: None):
+        """Normalizing the fresh copy is what keeps every LATER provision cheap:
+        the repair walk has nothing left to fix. Checked by mode rather than by
+        behaviour so it holds even where the process ignores mode bits."""
+        pkg = tmp_path / "pkg"
+        prompts = pkg / "prompts"
+        prompts.mkdir(parents=True)
+        (prompts / "deck.md").write_text("v1", encoding="utf-8")
+        _harden(prompts)
+        install_dir = tmp_path / "install"
+        with mock.patch.object(provision, "_PACKAGE_ROOT", pkg):
+            provision._stage_static(install_dir, log=[])
+        staged = install_dir / "prompts"
+        assert stat.S_IMODE(staged.stat().st_mode) & stat.S_IRWXU == stat.S_IRWXU
+
+    def test_a_removal_that_cannot_be_repaired_is_reported(self, tmp_path: Path):
+        """A tree that survives the forced removal must not be copied over
+        silently — the raise is what `_stage_static` turns into a log line."""
+        install_dir = tmp_path / "install"
+        (install_dir / "prompts").mkdir(parents=True)
+        log: list[str] = []
+        with mock.patch.object(provision, "rmtree_force", return_value=False):
+            provision._stage_static(install_dir, log)
+        assert any("could not be staged" in line for line in log)
 
     def test_the_skill_is_deliberately_not_staged(self, tmp_path: Path):
         """The skill ships via `builtin_skills/` (copied on every gateway start)
@@ -1046,3 +1162,123 @@ class TestShippedAgentsDoNotPreAuthorizeTools:
                 raw = raw.replace(placeholder, "/rendered")
             data = json.loads(raw)
             assert data.get("tools"), f"{path} lost its tools entirely"
+
+    def test_every_at_server_grant_resolves_to_a_declared_server(self) -> None:
+        """Every ``@server``/``@server/tool`` grant names a server something declares.
+
+        kiro-cli drops an unresolvable ``@`` reference SILENTLY at mount time:
+        the agent registers, mounts without the tool, and no exception or
+        warning appears anywhere — so a typo in a spec edit degrades an agent
+        with zero signal. This gate makes that failure loud in CI.
+
+        A shipped spec's ``@`` grant is resolvable when its server part names
+        one of the three sources registration actually merges (see
+        ``bridges._register_agents``):
+
+        - the spec's OWN ``mcpServers`` block (e.g. pptx-maker's ``sdpm``);
+        - a HOST-MANAGED server — read from ``agent._MANAGED_MCP_SERVERS``
+          itself, the registry ``bridges._materialize_managed_refs`` consults,
+          so a renamed managed server fails here instead of un-mounting. The
+          materializer resolves the server portion of both ``@server`` and
+          ``@server/tool``, preserving the original tool grants;
+        - the owning app's NAMESPACED servers, ``<app>:<server>`` for every
+          key in the manifest's ``mcpServers`` (``bridges._own_mcp_servers``
+          injects these by prefix after ``_register_mcp_servers`` writes them).
+
+        Deliberately NOT validated: bare builtin names (kiro-cli checks those
+        at registration — re-listing its vocabulary here would rot) and the
+        ``/tool`` half of a reference (only the live server can enumerate its
+        tools; the server lookup is the part that fails silently).
+        """
+        import io
+
+        from kiro_crew.agent import _MANAGED_MCP_SERVERS
+
+        builtins_dir = provision._PACKAGE_ROOT.parent
+        templates = sorted(builtins_dir.glob("*/agents/*.json"))
+        assert templates, "no shipped agent templates found — did the path change?"
+        offenders: list[str] = []
+        grants_seen = 0
+        for path in templates:
+            raw = io.open(path, encoding="utf-8").read()
+            for placeholder in _declared_placeholders():
+                raw = raw.replace(placeholder, "/rendered")
+            data = json.loads(raw)
+            resolvable = set(data.get("mcpServers") or {})
+            manifest = json.loads((path.parent.parent / "app.json").read_text(encoding="utf-8"))
+            app_name = manifest.get("name")
+            if isinstance(app_name, str) and app_name:
+                resolvable.update(
+                    f"{app_name}:{server}" for server in (manifest.get("mcpServers") or {})
+                )
+            for entry in data.get("tools") or []:
+                if not isinstance(entry, str) or not entry.startswith("@"):
+                    continue
+                grants_seen += 1
+                remainder = entry[1:]
+                server = remainder.split("/", 1)[0]
+                # Match the materializer's server lookup without widening the
+                # original per-tool grant.
+                if server in _MANAGED_MCP_SERVERS:
+                    continue
+                if server not in resolvable:
+                    offenders.append(f"{path}: {entry!r} (server {server!r})")
+        # The gate must not pass vacuously: shipped specs DO carry @ grants
+        # today, so finding none means the traversal or the spec format moved.
+        assert grants_seen, "no @server grants found in any shipped spec — did the format change?"
+        assert offenders == [], (
+            "these shipped agent specs grant tools on a server that nothing "
+            "declares — kiro-cli will silently drop them at mount time:\n  "
+            + "\n  ".join(offenders)
+        )
+
+
+class TestTheProvisionLogIsDecodedAsUtf8:
+    """`_run`'s captured output is the provisioning log the operator reads.
+
+    ``ProvisionState`` serves it straight to the dashboard
+    (``{"ok": ..., "log": self.log[-LOG_TAIL_CHARS:], ...}``), so whatever this
+    decode gets wrong is what a human sees while trying to work out why an
+    install failed — the one moment the log has to be right.
+
+    The child is ``uv``, which this module's own docstring calls "a static Rust
+    binary": it writes UTF-8, not the console code page. But
+    ``run_limited(..., text=True)`` with no ``encoding=`` decodes with
+    ``locale.getpreferredencoding()``, which on Windows is the legacy ANSI code
+    page. uv's output carries package names and absolute paths under the user's
+    data home, so a non-ASCII account name is enough to reach this.
+
+    Measured, not argued: the child exits **0** and the whole log arrives as
+    ``""``. On Windows ``capture_output`` decodes on a helper thread, so the
+    error kills that thread rather than the call and ``proc.stdout`` is ``None``;
+    the operator gets a blank log for a run that printed plenty. On POSIX the
+    same decode raises `UnicodeDecodeError` — a `ValueError`, so neither
+    ``except subprocess.TimeoutExpired`` nor
+    ``except (OSError, subprocess.SubprocessError)`` catches it and it escapes
+    ``_run`` entirely.
+    """
+
+    #: Not valid UTF-8 (``0xff`` never begins a sequence), so this is red on
+    #: every host — it turns on the decode being strict, not on the host codec.
+    PAYLOAD = b"Resolved 41 packages\nerror: failed at " + bytes([0xFF, 0xFE]) + b"/pkg\n"
+
+    def _argv(self) -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            f"import sys;sys.stdout.buffer.write({self.PAYLOAD!r});sys.stdout.buffer.flush()",
+        ]
+
+    def test_undecodable_uv_output_still_reaches_the_log(self, tmp_path):
+        """A malformed byte must cost one character, not the entire log."""
+        with pytest.raises(UnicodeDecodeError):
+            self.PAYLOAD.decode("utf-8")  # guard the guard
+
+        with mock.patch.object(
+            provision, "sandboxed_spawn_argv", return_value=(self._argv(), None, None)
+        ):
+            code, out = provision._run(self._argv(), cwd=str(tmp_path), timeout=30)
+
+        assert code == 0
+        assert "Resolved 41 packages" in out, "the log must survive one bad byte"
+        assert "error: failed at" in out

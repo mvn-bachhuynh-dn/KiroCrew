@@ -25,12 +25,16 @@ state model only. Ranking/relevance and budget come from the caller (Stage 5/6).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
 
+from kiro_crew.atomic_write import read_json_or
+
 QUEUE_FILENAME = "subquestion_queue.json"
 _WS_RE = re.compile(r"\s+")
+logger = logging.getLogger(__name__)
 
 
 def new_queue() -> dict:
@@ -142,15 +146,6 @@ def pending_count(queue: dict) -> int:
     return len(queue.get("pending", []))
 
 
-def analyzed_count(queue: dict) -> int:
-    return len(queue.get("analyzed", []))
-
-
-def is_known(queue: dict, text: str) -> bool:
-    """True if ``text`` (normalized) is already pending or analyzed."""
-    return _norm(text) in _known_keys(queue)
-
-
 def normalize(text: str) -> str:
     """Public dedup-key normalizer (lowercased, whitespace-collapsed, stripped).
 
@@ -182,10 +177,10 @@ def load_queue(campaign_dir: Path) -> dict:
     p = Path(campaign_dir) / QUEUE_FILENAME
     if not p.exists():
         return new_queue()
-    try:
-        data = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return new_queue()
+    # The queue file lives in the agent-writable campaign dir, so a worker
+    # can rewrite it as UTF-8 (json.dumps below is ASCII-only, but that is
+    # not a guarantee about who wrote the file last).
+    data = read_json_or(p, None, logger=logger, what="subquestion queue")
     if not isinstance(data, dict):
         return new_queue()
     data.setdefault("pending", [])
@@ -198,5 +193,5 @@ def save_queue(campaign_dir: Path, queue: dict) -> None:
     p = Path(campaign_dir) / QUEUE_FILENAME
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(queue, indent=2))
+    tmp.write_text(json.dumps(queue, indent=2), encoding="utf-8")
     tmp.replace(p)

@@ -17,6 +17,28 @@
  *   import { registerTheme }             from '@/hooks/useTheme'
  *   import { registerCapsuleSegment }    from '@/apps/capsuleSegments'
  *   import { registerOverviewStatCards } from '@/pages/overviewStatCards'
+ *   import { registerOverviewPanel }     from '@/pages/overviewPanel'
+ *   import { registerAutolinkRules }     from '@/utils/autolinkRules'
+ *   import { registerSourceProvider }    from '@/utils/pullRequestLinks'
+ *   import { registerMobileConnectRenderer } from '@/components/mobileConnectRenderers'
+ *   import { registerRemoteProvisionerRenderer } from '@/components/remoteProvisionerRenderers'
+ *
+ * plus one SUPPRESSOR, for a built-in surface an edition's environment makes
+ * permanently inapplicable (the registrars above can only add):
+ *
+ *   import { suppressOverviewBuiltin }   from '@/pages/overviewBuiltins'
+ *
+ * and two SETTERS for a value the core consumes itself (nothing to enumerate,
+ * so no registry): the rendered product name, and the feedback tracker the
+ * Request-a-Feature, About and redaction-report surfaces send a user to:
+ *
+ *   import { setProductName }            from '@/i18n'
+ *   import { setFeedbackTracker }        from '@/feedbackTracker'
+ *
+ * Syntax-highlighting languages are the one contribution that is NOT a
+ * registrar here: the highlight.js worker must load them too, and it never
+ * imports this module. The edition ships them as a data module,
+ * `$KIROCREW_EDITION_DIR/languages.ts` (see `@/utils/highlightLanguages`).
  *
  * For edition-owned API methods there is no registrar — the edition imports the
  * blessed `apiTransport` (`@/api/apiTransport`) and builds its own typed API

@@ -17,6 +17,7 @@ import RunStatusPill from './RunStatusPill'
 import ShimmerLine from './ShimmerLine'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 /** The report area's loading state: placeholder rows in the report's own shape. */
 function ReportSkeleton() {
   return (
@@ -39,7 +40,7 @@ function DetailHeader({ run }: { run: Run }) {
   const { startReview } = useSage()
   const { label, more } = runIdentity(run.repo, run.changes)
   return (
-    <header className="px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
+    <header className="px-4 md:px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
           <h1 className="text-[22px] font-bold leading-tight text-text-strong break-words">
@@ -97,7 +98,7 @@ export default function RunDetail({ run }: { run: Run }) {
   const {
     pool, cancelRun, cancelling, report, reportLoading, reportError,
     archiveRun, archiving, archiveError, runs, postComments,
-    postCommentGroups, posting, postError,
+    postCommentGroups, posting, postError, dismissFinding,
     postingSelection,
   } = useSage()
   const running = run.status === 'running'
@@ -116,7 +117,7 @@ export default function RunDetail({ run }: { run: Run }) {
   return (
     <article className="h-full flex flex-col min-h-0">
       <DetailHeader run={run} />
-      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-6 py-5 flex flex-col gap-5">
+      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-4 md:px-6 py-5 flex flex-col gap-5">
         <RunProgress
           run={run}
           pool={pool}
@@ -126,7 +127,7 @@ export default function RunDetail({ run }: { run: Run }) {
         />
 
         {reportError ? (
-          <div className="text-[12.5px] text-danger">{reportError.message}</div>
+          <ErrorNotice message={reportError.message} askAgent />
         ) : reportLoading ? (
           <ReportSkeleton />
         ) : report?.ready ? (
@@ -152,6 +153,9 @@ export default function RunDetail({ run }: { run: Run }) {
           // the groups go out SEQUENTIALLY, because the backend refuses a second
           // post while one is in flight.
           onPostSelection={(groups) => postCommentGroups(run.run_id, groups)}
+          dismissed={run.dismissed}
+          onDismissFinding={(changeId, key, reason) => dismissFinding(
+            run.run_id, changeId, key, reason)}
           onArchive={() => archiveRun(run.run_id)}
             archiving={archiving}
             archiveError={archiveError?.message ?? null}

@@ -22,6 +22,7 @@ import ReportView from './ReportView'
 import DraftReviewActions from './DraftReviewActions'
 import FailureNotice from './FailureNotice'
 import PrStatusChips from './PrStatusChips'
+import ReviewChat from './ReviewChat'
 import RunProgress from './RunProgress'
 import PostCommentsButton from './PostCommentsButton'
 import RunStatusPill from './RunStatusPill'
@@ -29,6 +30,7 @@ import ShimmerLine from './ShimmerLine'
 import PullRequestPanel from '../../../components/PullRequestPanel'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 type Tab = 'review' | 'source'
 
 /** http(s) only: the URL is provider-derived and lands in an href. */
@@ -106,7 +108,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
   const {
     prRun, report, reportLoading, reportError,
     startReview, cancelRun, cancelling, pool,
-    archiveRun, archiving, archiveError, runs, postComments, postCommentGroups,
+    archiveRun, archiving, archiveError, runs, postComments, postCommentGroups, dismissFinding,
     posting, postError, postingSelection,
   } = useSage()
   const [tab, setTab] = useState<Tab>('review')
@@ -188,7 +190,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
           hint={i18nT('apps.codeReviewSage.components.prReviewDetail.start_a_review_and_its_findings_appear_here_you')}
         />
       ) : reportError ? (
-        <div className="text-[12.5px] text-danger">{reportError.message}</div>
+        <ErrorNotice message={reportError.message} askAgent />
       ) : reportLoading ? (
         <ReportSkeleton />
       ) : scoped && scoped.rows.length > 0 ? (
@@ -222,6 +224,9 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
           // One request per change: a request posts one pending review against
           // one pull request, so a selection spanning changes is grouped.
           onPostSelection={(groups) => postCommentGroups(prRun.run_id, groups)}
+          dismissed={prRun.dismissed}
+          onDismissFinding={(changeId, key, reason) => dismissFinding(
+            prRun.run_id, changeId, key, reason)}
           onArchive={() => archiveRun(prRun.run_id)}
           archiving={archiving}
           archiveError={archiveError?.message ?? null}
@@ -252,6 +257,13 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
               ? i18nT('apps.codeReviewSage.components.prReviewDetail.see_the_reason_above')
               : i18nT('apps.codeReviewSage.components.prReviewDetail.did_not_complete_for_this_change')}
         />
+      )}
+      {/* Questions about the findings sit between reading them and sending
+          them: "why is this a problem?" is what you ask before deciding whether
+          to post it. The panel is collapsed by default and only offers a composer
+          while the reviewer that produced these findings is still loaded. */}
+      {prRun && (
+        <ReviewChat runId={prRun.run_id} changeId={pr.change_id} />
       )}
       {/* Posting the findings above leaves a PENDING review -- a draft only its
           author can see. This releases it with a verdict, so the whole loop
@@ -318,7 +330,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
 
   return (
     <article className="h-full flex flex-col min-h-0">
-      <header className="px-6 pt-5 pb-3 border-b border-border flex-shrink-0">
+      <header className="px-4 md:px-6 pt-5 pb-3 border-b border-border flex-shrink-0">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
             <h1 className="text-[21px] font-bold leading-tight text-text-strong break-words">
@@ -381,9 +393,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
           </button>
         </div>
         {startReview.error && (
-          <div className="mt-2 text-[12.5px] text-danger">
-            {(startReview.error as Error).message}
-          </div>
+          <ErrorNotice message={(startReview.error as Error).message} variant="inline" askAgent className="mt-2" />
         )}
 
         <div
@@ -421,7 +431,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
         </div>
       </header>
 
-      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-6 py-5 flex flex-col gap-5">
+      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-4 md:px-6 py-5 flex flex-col gap-5">
         {tab === 'review' && reviewBody}
         {tab === 'source' && sourceBody()}
       </div>

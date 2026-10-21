@@ -5,7 +5,7 @@ reaches through ``ctx``. They are pure ``asyncio`` combinators over caller-suppl
 thunks / stage callables — they hold no agent, session, or gateway logic, so this
 module sits at the BOTTOM of the layering (``dsl`` → ``context`` → ``runner``;
 GATE F1) and imports nothing heavy. The runner injects the concurrency ``limit``
-(from ``resolve_max_subagents()``); tests pass a small limit or ``None``.
+(the host's fixed workflow cap); tests pass a small limit or ``None``.
 
 Semantics (frozen — see ``docs/system-specs/modules/workflows.md``):
 
@@ -40,7 +40,7 @@ Stage = Callable[..., Awaitable[Any]]
 def _positional_arity(func: Callable[..., Any]) -> Optional[int]:
     """Number of positional params a callable accepts, or None if it takes *args.
 
-    Used to call a stage with only as many of (prev, item, index) as it declares,
+    Lets a stage be called with only as many of (prev, item, index) as it declares,
     mirroring the JS pipeline's "extra args ignored" behavior so 1-arg and 3-arg
     stages both work.
     """
@@ -71,7 +71,9 @@ async def _maybe_await(value: Any) -> Any:
 async def _call_stage(stage: Stage, prev: Any, item: Any, index: int) -> Any:
     arity = _positional_arity(stage)
     all_args = (prev, item, index)
-    args = all_args if arity is None else all_args[: max(0, min(arity, 3))]
+    # ``arity`` is None (accepts everything) or a non-negative count, and slicing
+    # past the end of the tuple already yields all three, so the count needs no clamp.
+    args = all_args if arity is None else all_args[:arity]
     return await _maybe_await(stage(*args))
 
 
@@ -98,17 +100,16 @@ async def parallel(thunks: Sequence[Thunk], *, limit: Optional[int] = None) -> l
     """Run thunks concurrently (barrier), results in input order.
 
     A failing thunk → ``None``; this never raises (GATE A5). ``limit`` bounds
-    concurrency via a semaphore (the runner passes the subagent cap).
+    concurrency via a semaphore (the runner passes its run-global cap).
     """
     if not thunks:
         return []
 
-    if limit is None or limit <= 0:
-        return list(await asyncio.gather(*[_run_thunk(t) for t in thunks]))
-
-    sem = asyncio.Semaphore(limit)
+    sem = asyncio.Semaphore(limit) if (limit and limit > 0) else None
 
     async def _guarded(t: Thunk) -> Any:
+        if sem is None:
+            return await _run_thunk(t)
         async with sem:
             return await _run_thunk(t)
 

@@ -6,46 +6,67 @@ persona injection, and other helpers used across chat_*.py modules.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
+import importlib as _importlib
 import json
 import logging
+import sys as _sys
 import time
 import uuid
 from datetime import datetime, timezone
-from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from aiohttp import web
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
-    from kiro_crew.slack.outbound import PostedOptions
 
+from kiro_crew import _facade_mirror
+from kiro_crew.context_blocks import attributable_user_chars
+from kiro_crew.dashboard.chat_utils_display import redact_display_content
 from kiro_crew.dashboard.state import (
-    BUSY_RECOVERY_PREFIX,
-    CONN_RECOVERY_PREFIX,
-    CRON_NOTIFY_PREFIX,
-    EMPTY_RESPONSE_RECOVERY_PREFIX,
-    MANUAL_RESUME_RECOVERY_PREFIX,
-    POSTTOKEN_RECOVERY_PREFIX,
-    SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
-    _normalize_slot_key,
+    append_and_surface,
     parse_cls_meta,
 )
-from kiro_crew.hooks import safe_read_file
-from kiro_crew.messaging.link import canonical_key, is_channel_session_key
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.external_text import redact_external_text
+from kiro_crew.quick_prompts import QUICK_PROMPTS
+from kiro_crew.security import (  # noqa: F401 - pinned by test_chat_utils.py
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import SecurityEvent, sel
-from kiro_crew.session_surface import has_dashboard_surface, set_dashboard_surfaced
-from kiro_crew.slack.outbound import expire_options, mark_options_terminal, options_edit_lock
 from kiro_crew.validation import (
     MAX_TOOL_NAME_LEN,
-    THEME_CONSENT_SHA_RE,
     sanitize_string,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("kiro_crew.dashboard.chat_utils")
+
+
+#: ``meta["notice"]`` on the three `error` rows the transient-5xx ladder appends
+#: (chat_runner ``acp_error_is_transient`` branches). The row's CONTENT is the
+#: English fallback below, read verbatim by non-dashboard consumers (channel
+#: mirrors, SSE, an older frontend); the dashboard ignores it and renders
+#: localized copy keyed on this token instead
+#: (``website/src/pages/chat/transientNotice.ts``). A structured token rather
+#: than prose-matching so the wording can change on either side without the
+#: other silently falling back to raw English -- the drift class
+#: ``test_recovery_marker_parity.py`` exists for. Both sides are still
+#: hand-synced (no shared schema), so ``test_transient_notice_parity.py`` pins
+#: these values against the frontend table.
+TRANSIENT_NOTICE_META_KEY = "notice"
+TRANSIENT_NOTICE_RETRYING = "transient_retrying"
+TRANSIENT_NOTICE_RESUMING = "transient_resuming"
+TRANSIENT_NOTICE_GIVE_UP = "transient_give_up"
+
+#: English fallback text for the rows above. Plain language on purpose: the
+#: failure is an upstream model-backend 5xx the gateway is already retrying
+#: against, and neither "backend" nor "hiccup" tells a reader that.
+TRANSIENT_RETRYING_TEXT = "⟳ Connection unstable — retrying…"
+TRANSIENT_RESUMING_TEXT = "⟳ Connection unstable — resuming…"
+TRANSIENT_GIVE_UP_TEXT = "⟳ Connection unstable — please try again."
+
 
 # Per-turn compaction-failure backoff. See
 # _broadcast_compaction_result for the full rationale. Kept small: this is a
@@ -56,11 +77,39 @@ _COMPACTION_NOTICE_SHOW_FIRST_N = 2
 _COMPACTION_FAIL_COOLDOWN_SECS = 60.0
 
 
+def history_corpus_unreadable(code: str = "history_corpus_unreadable") -> Any:
+    """The one response for "this session's history corpus could not be read".
+
+    Three handlers independently wrapped a corpus read in `try/except` and, on
+    failure, substituted their own local encoding of "there is nothing there" --
+    `rotated = []`, `_rotated_head = []`, `all_msgs = []`. Each substitution turns
+    a read failure into a SUCCESSFUL response that reports a shorter transcript,
+    and this corpus is an index space, so the shortening also shifts every index
+    above the missing rows. A reader cannot see it and has nothing to retry, and a
+    fork taken at a rendered row lands on a different message.
+
+    Three separate hand-written recoveries is why the same defect was found three
+    times in three places. This exists so the recovery is one decision rather than
+    a choice each call site re-makes: on a corpus read failure, call this.
+
+    `code` names the surface (the fork path answers `fork_corpus_unreadable`) so a
+    client can tell which affordance to retry.
+    """
+    return web.json_response(
+        {
+            "error": "this session's history could not be read; please retry",
+            "code": code,
+        },
+        status=503,
+    )
+
+
 def _redact_deep(obj):
     """Recursively redact all string values in a nested structure."""
     if isinstance(obj, str):
-        obj, _ = redact_exfiltration_urls(obj)
-        obj, _ = redact_credentials(obj)
+        from kiro_crew.security import redact
+
+        obj = redact(obj)
         return obj
     if isinstance(obj, dict):
         return {k: _redact_deep(v) for k, v in obj.items()}
@@ -89,10 +138,23 @@ def _redact_tool_field(text: str | None, *, limit: int = _MAX_TOOL_FIELD) -> str
         if len(encoded) > limit:
             # errors="ignore" cleanly drops a partial trailing multi-byte
             # sequence at the cut point.
-            text = encoded[:limit].decode("utf-8", errors="ignore") + f"\n… [truncated at {limit:,} bytes]"
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
+            text = (
+                encoded[:limit].decode("utf-8", errors="ignore")
+                + f"\n… [truncated at {limit:,} bytes]"
+            )
+    from kiro_crew.security import redact
+
+    text = redact(text)
     return text
+
+
+#: Wire frame pushed onto ``slot._pending`` at a turn's end, before the queue
+#: drain or the cycle's end writes anything (``chat_runner._mark_turn_end``); a
+#: recovery the ending turn queued for itself is the same turn and gets none.
+#: ``done`` marks the end of the whole queue cycle; this marks the end of one
+#: turn, which is where an app's stream on a user's session stops
+#: (``chat_handlers.api_chat``). Never a row: other readers skip it.
+TURN_END_WIRE_CLS = "turn_end"
 
 
 def _build_stream_chunk(msg: dict) -> str:
@@ -104,34 +166,27 @@ def _build_stream_chunk(msg: dict) -> str:
         meta = None
     if meta:
         meta = _redact_deep(meta)
-    content = msg.get("content", "")
-    if isinstance(content, str):
-        content, _ = redact_exfiltration_urls(content)
-        content, _ = redact_credentials(content)
-    else:
-        content = _redact_deep(content)
+    # One shared guard for content: redact recursively and hold the
+    # wire-string shape (see redact_display_content). This stream has no
+    # user-content carve-out — it redacts every role, same as its previous
+    # inline redactor pair.
+    content = redact_display_content(msg.get("content", ""))
     cls_val = msg.get("cls", "")
     if isinstance(cls_val, str):
-        cls_val, _ = redact_exfiltration_urls(cls_val)
-        cls_val, _ = redact_credentials(cls_val)
+        from kiro_crew.security import redact
+
+        cls_val = redact(cls_val)
     else:
         cls_val = _redact_deep(cls_val)
     return json.dumps(
-        {"type": msg.get("role", ""), "content": content, "ts": msg.get("ts", ""),
-         "cls": cls_val,
-         **({"meta": meta} if meta else {})}
+        {
+            "type": msg.get("role", ""),
+            "content": content,
+            "ts": msg.get("ts", ""),
+            "cls": cls_val,
+            **({"meta": meta} if meta else {}),
+        }
     )
-
-
-def _extract_bash_command(tool_input: str) -> str:
-    """Extract the command string from execute_bash tool_input (JSON or raw)."""
-    try:
-        data = json.loads(tool_input)
-        if isinstance(data, dict):
-            return data.get("command", "")
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return tool_input
 
 
 # Deprecated -1m model aliases → base model (Anthropic 1M GA, April 2026)
@@ -181,16 +236,33 @@ _SLASH_COMMANDS = frozenset(
         "/todos",
         "/tools",
         "/usage",
+        "/workflow",
     }
 )
 
-_BLOCKED_SLASH_COMMANDS = frozenset(
-    {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor"}
+# Blocked on the kiro path ONLY: the KiroACP harness does not implement /todos
+# and rejects it with an "unknown variant" error, while Claude Code has its own.
+_KIRO_ONLY_BLOCKED_SLASH_COMMANDS = frozenset({"/todos"})
+
+# Commands that exist in kiro-cli's interactive TUI but cannot work in the
+# dashboard (they drive a local terminal: quitting it, pasting from its
+# clipboard, opening an editor, or toggling checkpoint modes the dashboard's
+# own session model already covers via tabs and /side). Blocked commands are
+# rejected before session acquisition AND excluded from the
+# GET /api/slash-commands suggestion payload, so every surface hides them at
+# once — advertising a command that only yields a warning teaches a gesture
+# that does not work.
+_BLOCKED_SLASH_COMMANDS = (
+    frozenset({"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent"})
+    | _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
 )
 
-# Single source of truth for slash-command descriptions surfaced by the
-# dashboard API (GET /api/slash-commands) and mirrored by the frontend
-# autocomplete fallback. Keys are slash-prefixed command names. Covers every
+# Slash-command descriptions surfaced by the dashboard API
+# (GET /api/slash-commands): the English text for API clients and the fallback
+# the frontend shows for a command it has no catalog key for. A command with a
+# ``slashCommandMenu.desc_*`` key in the frontend's i18n catalog renders that
+# catalog text instead (SlashCommandMenu.tsx ``commandDescription``), so the two
+# can differ. Keys are slash-prefixed command names. Covers every
 # command in _SLASH_COMMANDS plus the claude_code-only /init, /review, and
 # /security-review so no command renders a blank description in either path.
 SLASH_COMMAND_DESCRIPTIONS: dict[str, str] = {
@@ -225,31 +297,118 @@ SLASH_COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/tools": "Show available tools",
     "/usage": "Show billing and usage information",
     "/workflows": "List and manage dynamic workflow runs",
+    "/workflow": "List or run a saved workflow by name",
 }
+
+
+def parse_workflow_command(message: str) -> tuple[str, str] | None:
+    """Parse ``/workflow <slug> [input]`` without interpreting the input."""
+    parts = message.strip().split(None, 2)
+    if not parts or parts[0] != "/workflow":
+        return None
+    workflow_ref = parts[1] if len(parts) > 1 else ""
+    input_text = parts[2] if len(parts) > 2 else ""
+    return workflow_ref, input_text
+
+
+def user_text_span(
+    offset: int,
+    typed_len: int,
+    *,
+    quick_prompt: bool,
+    prompt_expanded: bool,
+) -> tuple[int, int]:
+    """WHERE the user's typed text sits in the message handed to ``build_message``.
+
+    Deliberately NOT the same question as how much of the turn is ATTRIBUTABLE to
+    the user, which is :func:`attributable_user_chars`. Conflating the two is a live
+    trap: a quick-prompt turn credits the user zero characters, so deriving the
+    span from the attributable count hands ``build_message`` an EMPTY slice — and
+    since that slice is what the quick-prompt matcher reads, the token silently
+    stops expanding altogether.
+
+    So a quick prompt reports its REAL typed span (the matcher has to see the
+    token; ``build_message`` zeroes the attribution itself once it has expanded),
+    while an ``@prompt`` turn — already replaced before this point, so its typed
+    text is gone from the message — reports the empty span the attribution rule
+    asks for.
+    """
+    length = (
+        typed_len
+        if quick_prompt
+        else attributable_user_chars(typed_len, prompt_expanded=prompt_expanded)
+    )
+    return offset, offset + length
+
+
+def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
+    """Whether *first_word* should be forwarded to the harness as a command.
+
+    Two rules, and the second exists because of a trap. A member of
+    :data:`_SLASH_COMMANDS` is a command on every provider. Under ``claude_code``
+    the harness owns its own command set, so ANY leading slash is forwarded —
+    except a quick-prompt token, which is not a command at all but a macro
+    :meth:`ContextBuilder.build_message` expands into an instruction. Forwarding one
+    would hand the harness a command it has no definition for, and the token would
+    silently do nothing on that provider while working everywhere else.
+    """
+    if first_word in _SLASH_COMMANDS:
+        return True
+    if not (cc_provider and first_word.startswith("/")):
+        return False
+    return first_word.lower() not in QUICK_PROMPTS
+
+
+def _tool_identity_fields(event: "LLMEvent") -> dict[str, str]:
+    """``tool_name`` / ``mcp_server`` for a tool_call frame, present only when known.
+
+    Read from the trusted ``_meta.kiro`` identity the dispatcher extracted, never
+    from the title. Omitted rather than sent empty so a consumer merging a
+    refinement field-by-field keeps what the initial frame supplied, and so a
+    frame from a backend that sends no ``_meta`` carries nothing to misread. The
+    dashboard's title derivation treats both as optional and falls back to
+    parsing the title, so an absent pair never breaks a row.
+    """
+    out: dict[str, str] = {}
+    name = getattr(event, "tool_name", "")
+    server = getattr(event, "mcp_server_name", "")
+    # Only a real string is an identity; any other value (an event shape that
+    # lacks the attribute, a stand-in object) is treated as unknown.
+    if isinstance(name, str) and name:
+        out["tool_name"] = _redact_tool_field(name, limit=200)
+    if isinstance(server, str) and server:
+        out["mcp_server"] = _redact_tool_field(server, limit=200)
+    return out
 
 
 def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEvent") -> str:
     """Broadcast an auto-approved tool call via WS with redacted title. Returns redacted title."""
-    title, _ = redact_exfiltration_urls(event.title)
-    title, _ = redact_credentials(title)
-    kind, _ = redact_exfiltration_urls(event.tool_kind)
-    kind, _ = redact_credentials(kind)
-    tcid, _ = redact_exfiltration_urls(event.tool_call_id or "")
-    tcid, _ = redact_credentials(tcid)
+    from kiro_crew.security import redact
+
+    title = redact(event.title)
+    from kiro_crew.security import redact
+
+    kind = redact(event.tool_kind)
+    from kiro_crew.security import redact
+
+    tcid = redact(event.tool_call_id or "")
     state.broadcast_ws(
         "tool_call",
         {
-            "slot": slot.key, "tool": title, "kind": kind, "auto": True, "tool_call_id": tcid,
+            "slot": slot.key,
+            "tool": title,
+            "kind": kind,
+            "auto": True,
+            "tool_call_id": tcid,
             "purpose": _redact_tool_field(event.tool_purpose, limit=_MAX_TOOL_PURPOSE),
             "input_preview": _redact_tool_field(event.tool_input),
+            **_tool_identity_fields(event),
         },
     )
     return title
 
 
-def _append_compaction_notice(
-    state: DashboardState, slot: _ChatSlot, msg_text: str
-) -> None:
+def _append_compaction_notice(state: DashboardState, slot: _ChatSlot, msg_text: str) -> None:
     """Append a compaction status notice as an assistant message and broadcast it.
 
     The notice is tagged ``kind="compaction"`` so the dashboard can tell it apart
@@ -261,7 +420,7 @@ def _append_compaction_notice(
 
     This is the single chokepoint for emitting a compaction notice — every
     compaction path (auto-compaction status events and the ``/compact`` slash
-    command, the kiro backend and the dormant claude seam alike) must route
+    command, the kiro and claude backends alike) must route
     through here so the tag is never accidentally dropped.
 
     Defense-in-depth: callers already redact, but since this chokepoint posts to
@@ -269,20 +428,11 @@ def _append_compaction_notice(
     so a future caller passing unredacted LLM-derived text (e.g. a compaction
     summary) can never leak a credential/exfil URL. Both passes are idempotent.
     """
-    msg_text, _ = redact_credentials(msg_text)
-    msg_text, _ = redact_exfiltration_urls(msg_text)
+    from kiro_crew.security import redact
+
+    msg_text = redact(msg_text)
     meta = {"kind": "compaction"}
-    slot.append("assistant", msg_text, "msg msg-a", meta=meta)
-    state.broadcast_ws(
-        "chat_message",
-        {
-            "slot": slot.key,
-            "role": "assistant",
-            "content": msg_text,
-            "kind": "compaction",
-            "meta": meta,
-        },
-    )
+    append_and_surface(state, slot, "assistant", msg_text, "msg msg-a", meta=meta)
 
 
 def _broadcast_compaction_result(
@@ -307,8 +457,9 @@ def _broadcast_compaction_result(
     if status_type == "completed":
         slot._compaction_fail_streak = 0
         slot._compaction_fail_cooldown_until = 0.0
-        summary, _ = redact_credentials(event.title)
-        summary, _ = redact_exfiltration_urls(summary)
+        from kiro_crew.security import redact
+
+        summary = redact(event.title)
         msg_text = (
             f"✅ Conversation compacted: {summary}" if summary else "✅ Conversation compacted."
         )
@@ -329,8 +480,9 @@ def _broadcast_compaction_result(
             # once/twice. Nothing new to say — don't spam identical notices.
             return None
 
-        error, _ = redact_credentials(event.title or "unknown error")
-        error, _ = redact_exfiltration_urls(error)
+        from kiro_crew.security import redact
+
+        error = redact(event.title or "unknown error")
         if streak <= _COMPACTION_NOTICE_SHOW_FIRST_N:
             msg_text = f"❌ Compaction failed: {error}"
         else:
@@ -351,13 +503,14 @@ def _broadcast_compaction_result(
 
 def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") -> None:
     """Emit a SEL audit event when an agent is set, changed, or rejected on a slot."""
+    safe_agent = redact_external_text(agent)
     sel().log(
         SecurityEvent(
             event_id=uuid.uuid4().hex,
             timestamp=datetime.now(tz=timezone.utc).isoformat(),
             event_type="agent_assignment",
             caller_identity=f"dashboard:{slot_key}",
-            agent=agent,
+            agent=safe_agent,
             source="dashboard",
             operation="slot_agent_set",
             outcome=outcome,
@@ -366,7 +519,7 @@ def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") 
     )
 
 
-def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
+def _validate_tool_name(tool_name: str, *, is_shell: bool = False, canonical_name: str = "") -> str:
     """Validate and sanitize tool display names for hook matching.
 
     ``is_shell`` is the provider-agnostic signal (set at the provider boundary)
@@ -375,1121 +528,368 @@ def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
     on this flag rather than a hardcoded set of provider tool_kind literals
     (e.g. "execute"/"Bash") stops the cap from silently re-breaking long shell
     commands on every engine migration or tool rename.
+
+    ``canonical_name`` is the adapter-authored tool identity that travelled
+    beside the title (``AcpEvent.tool_name``, read from the harness's own
+    ``_meta`` channel, never from the title or the model's ``description``).
+    The length cap protects the case where the title IS the only identity a
+    hook can match on; when a canonical identity is present the title is
+    content (a ``read`` title embeds the paths it reads, exactly as a shell
+    title embeds its command line), so the cap is skipped for it as it is for
+    ``is_shell``. Sanitisation and the empty check apply regardless: only the
+    length predicate is relaxed. A backend that publishes no identity leaves
+    ``canonical_name`` empty and keeps the loud refusal.
     """
     sanitized = sanitize_string(tool_name)
     if not sanitized:
         raise ValueError("Tool name cannot be empty")
-    if not is_shell and len(sanitized) > MAX_TOOL_NAME_LEN:
+    if not is_shell and not canonical_name and len(sanitized) > MAX_TOOL_NAME_LEN:
         raise ValueError(f"Tool name exceeds max length {MAX_TOOL_NAME_LEN}")
     return sanitized
 
 
-def _history_key_for(slot_key: str) -> str:
-    """Canonical history key for a dashboard chat slot.
-
-    Takes a SLOT KEY, never a session key: the ``dashboard:`` prefix it adds is
-    unconditional, so feeding it a channel session key yields the nonexistent
-    ``dashboard:slack:<ts>``. Slots whose conversation lives on a channel must
-    go through :func:`effective_session_key` instead.
-    """
-    if slot_key.startswith("dashboard:"):
-        return slot_key
-    while slot_key.startswith("dashboard_"):
-        slot_key = slot_key[len("dashboard_"):]
-    return f"dashboard:{slot_key}"
-
-
-def dashboard_slot_key(session_key: str) -> str:
-    """The dashboard slot name displaying *session_key*, or ``""`` if none.
-
-    Answers "which tab shows this conversation?" — the question that
-    ``session_key.startswith("dashboard:")`` plus a prefix strip approximates,
-    and gets wrong for a channel-born conversation, whose session key is the
-    channel's own even while its tab is open.
-
-    Use it wherever dashboard behaviour is gated on the user having a tab to
-    receive it: routing a notice, addressing a card, honouring a dashboard-only
-    directive.
-    """
-    if session_key.startswith("cron:"):
-        # A cron-born tab is named ``cron-<job_id>`` (see cron_inject.py), which
-        # is NOT the session key folded: ``_normalize_slot_key`` turns
-        # ``cron:<id>`` into ``cron_<id>`` (underscore), a slot that has never
-        # existed. Consumers that trusted the fold — sub-agent completion
-        # injection, compaction/recycle notices — silently missed the open cron
-        # tab ("parent slot cron_<id> gone, notification only"), so agent
-        # results reached the bell icon but never the conversation.
-        #
-        # Per-run execution keys carry extra segments — ``cron:<job_id>:<run_id>``
-        # for stateless jobs, ``cron:<job_id>:<agent>`` for agent sequences —
-        # while the surface registry only ever holds the slot's linked key
-        # (``cron:<job_id>``), so the surface gate is checked against both
-        # spellings. Whichever matched, the displaying tab is the job's own.
-        job_id = session_key.removeprefix("cron:").split(":", 1)[0]
-        if not (
-            has_dashboard_surface(session_key) or has_dashboard_surface(f"cron:{job_id}")
-        ):
-            return ""
-        return _normalize_slot_key(f"cron-{job_id}")
-    if not has_dashboard_surface(session_key):
-        return ""
-    return _normalize_slot_key(session_key)
-
-
-def subagent_event_slot(parent_session_key: str) -> str:
-    """The ``slot`` value a per-slot WS event must carry for *parent_session_key*.
-
-    The frontend routes ``subagent_*`` / ``batch_finished`` frames by EXACT
-    match between the frame's ``slot`` and the tab's slot key, so a bare
-    ``removeprefix("dashboard:")`` breaks every non-dashboard parent: a
-    cron-born tab is named ``cron-<id>`` while its session key is
-    ``cron:<id>``, and a channel-born tab is named by its transcript stem
-    (``slack_<ts>``) while its session key stays ``slack:<ts>``. Frames tagged
-    with those raw keys route to a slot no tab reads — the Subagents panel
-    showed "No subagents running" for the entire life of every agent spawned
-    from such a session.
-
-    :func:`dashboard_slot_key` owns the real mapping; fall back to the old
-    prefix-strip when it answers ``""`` (no open tab — nothing routes anywhere
-    either way, but keeping the raw key preserves the historical payload for
-    external WS consumers and log lines).
-    """
-    return dashboard_slot_key(parent_session_key) or parent_session_key.removeprefix("dashboard:")
-
-
-def slot_transcript_key(slot_key: str) -> str:
-    """Transcript key for a slot known only by NAME, with no slot object yet.
-
-    Used by the restore paths, which build slots *from* disk and so cannot ask a
-    slot for its own key. A channel-born slot's name is its transcript's
-    filename stem (``slack_1785370133.085469``), and ``history._safe_key`` folds
-    both that stem and the live ``slack:1785370133.085469`` onto the same
-    ``.jsonl`` — so the stem already addresses the channel transcript and needs
-    no translation.
-
-    This resolves the FILE only. The session key cannot be recovered this way
-    (``_safe_key`` folds every ``:`` to ``_``, so ``discord_a_b_c`` is ambiguous)
-    and is read back from the persisted ``linked_session_key`` instead.
-    """
-    if is_channel_session_key(slot_key):
-        return slot_key
-    return _history_key_for(slot_key)
-
-
-def slot_history_key(slot: _ChatSlot) -> str:
-    """The TRANSCRIPT key for *slot* — the file its conversation is stored in.
-
-    Differs from :func:`effective_session_key` in exactly one case, and that
-    case is a real one: a channel-born slot the dashboard could not bind.
-    ``surface_channel_session`` deliberately surfaces such a slot **unbound**
-    when ``channel_key_for_stem`` cannot resolve its key (the session map was
-    pruned, or the thread predates it), because guessing would route replies to
-    a session the channel never reads. For that slot ``linked_session_key`` is
-    empty, so ``effective_session_key`` falls back to ``_history_key_for``,
-    which prefixes ``dashboard:`` and names a file NO restore path reads —
-    while every read path resolves the same slot through
-    :func:`slot_transcript_key` and gets the channel transcript. Reads and
-    writes then address different files: a close flag, a fork, or a backfill
-    lands on (or is looked for in) a phantom transcript.
-
-    Resolving the fallback through :func:`slot_transcript_key` puts both back on
-    one file. Deliberately does NOT change the slot's SESSION identity — an
-    unbound channel slot keeps running under ``dashboard:<name>``, so approval
-    policy and restricted-key bookkeeping keyed on that prefix stay intact.
-
-    Gated on the slot's ``channel_origin`` provenance, NOT on its name's shape.
-    A name is not provenance: ``POST /api/chat/slots`` accepts a client-supplied
-    slot name, so keying off the ``slack_<ts>`` shape alone would let a fresh
-    dashboard conversation write itself into an existing thread's transcript and
-    merge two unrelated histories. Only the paths that adopt an EXISTING channel
-    conversation (``surface_channel_session``, the restore, a History resume)
-    set the flag.
-
-    Use this wherever a slot is turned into a transcript path; use
-    :func:`effective_session_key` where a slot is turned into a session.
-    """
-    linked = getattr(slot, "linked_session_key", "")
-    if linked:
-        return linked
-    if getattr(slot, "channel_origin", False):
-        return slot_transcript_key(slot.key)
-    return _history_key_for(slot.key)
-
-
-def effective_session_key(slot: _ChatSlot) -> str:
-    """The session key for *slot* — the session its turns run on.
-
-    A channel-born slot carries the real channel key (``slack:<ts>``) in
-    ``linked_session_key``, so its turns run on the channel's own session and
-    its transcript IS the channel transcript: ``history._safe_key`` folds
-    ``slack:<ts>`` and the ``slack_<ts>`` filename stem onto the same
-    ``.jsonl``, so one key addresses both the live session and the file the
-    channel side appends to. Everything else derives from the slot key.
-
-    Use this anywhere a slot's SESSION is addressed — resolving the session its
-    turns run on, mirroring its links. For the slot's TRANSCRIPT use
-    :func:`slot_history_key`, which resolves the unbound-channel-slot case onto
-    the file the read paths actually use. Reserve :func:`_history_key_for` for
-    the cases that genuinely start from a slot key with no slot in hand.
-    """
-    return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
-
-
-def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:
-    """The slot holding *session_key*'s Slack OPTIONS state, if one exists.
-
-    Deliberately not routed through :func:`dashboard_slot_key`, which answers
-    "is a tab open?". A slot can hold OPTIONS state with no tab currently open,
-    and one lookup reaches both flavours of slot: a channel-born slot
-    (``slack_<ts>``) and a dashboard slot mirroring out to Slack
-    (``chat-<n>-<epoch>``) both live in the same registry.
-
-    Returns None rather than raising for any state object that cannot answer the
-    question. OPTIONS bookkeeping is best-effort cleanup and must never be able
-    to abort the turn that triggered it.
-
-    The key is required to be a real ``str``: ``_normalize_slot_key`` strips a
-    repeated ``dashboard_`` prefix with an unbounded ``while``, which only
-    terminates for a genuine string. Handing it anything whose ``startswith``
-    is always truthy spins forever, allocating as it goes -- so a non-string
-    key is refused here rather than normalized.
-    """
-    if not isinstance(session_key, str):
-        return None
-    getter = getattr(state, "get_slot", None)
-    if not callable(getter):
-        return None
-    try:
-        slot = getter(_normalize_slot_key(session_key))
-        if slot is not None:
-            return slot
-        # The fold is FILENAME-shaped, so any slot whose name is not its session
-        # key folded is unreachable through it. A cron slot is named
-        # ``cron-<id>`` while its session key is ``cron:<id>``, which folds to
-        # ``cron_<id>`` and matches nothing — so a persistent cron's OPTIONS
-        # control was never tracked at all, and the follow-up turn had nothing
-        # to expire, leaving it clickable into a superseded question.
-        #
-        # Such a slot still knows its own identity (``linked_session_key``), so
-        # ask the slots rather than guessing at more spellings. Only on a miss,
-        # so the common path stays a single dict lookup.
-        for candidate in (getattr(state, "_slots", None) or {}).values():
-            if effective_session_key(candidate) == session_key:
-                return candidate
-        return None
-    except Exception:
-        logger.debug("Slack OPTIONS slot lookup failed", exc_info=True)
-        return None
-
-
-def slack_options_turn_counter(state: DashboardState | None, session_key: str) -> int | None:
-    """*session_key*'s monotonic turn counter, or None if it cannot be read.
-
-    Tells "a turn happened" from "a turn is running", which
-    ``SessionManager.is_busy`` cannot: a turn that starts and finishes inside a
-    single await window reports idle at both ends. ``_ChatSlot.total_messages``
-    is a lifetime count that survives the slot's trim cap, so it moves for a turn
-    that came and went.
-
-    Lives here, beside the resolver it depends on, because more than one Slack
-    posting path needs it and a second copy would drift from this one.
-
-    Returns None on any failure. This feeds best-effort OPTIONS cleanup and must
-    never abort the turn that triggered it; a None on either side of a comparison
-    simply reads as "no observed change".
-
-    Only comparable against itself: two counters read from DIFFERENT sessions say
-    nothing about each other, so a caller whose owner may have changed has to
-    treat that change as supersession instead of comparing.
-    """
-    try:
-        if state is None:
-            return None
-        slot = slack_options_slot(state, session_key)
-        return None if slot is None else int(slot.total_messages)
-    except Exception:
-        logger.debug("Could not read the turn counter for OPTIONS bookkeeping", exc_info=True)
-        return None
-
-
-def slack_options_linked_slot(state: DashboardState | None, thread_ts: str) -> _ChatSlot | None:
-    """The dashboard slot that owns *thread_ts*, if a session mirrors into it.
-
-    Prefers the thread -> slot reverse index, then falls back to scanning slots
-    for a matching ``_slack_thread_ts``. The fallback exists because the index is
-    written by one helper that a caller can forget: relying on it alone made this
-    resolver silently return nothing for a freshly-linked thread.
-    """
-    if not thread_ts or state is None:
-        return None
-    linked = getattr(state, "get_linked_slot", None)
-    if callable(linked):
-        try:
-            slot = linked(thread_ts)
-        except Exception:
-            slot = None
-        if slot is not None:
-            return slot
-    slots = getattr(state, "_slots", None)
-    if not isinstance(slots, dict):
-        return None
-    for slot in slots.values():
-        if getattr(slot, "_slack_linked", False) and (
-            getattr(slot, "_slack_thread_ts", "") == thread_ts
-        ):
-            return slot
-    return None
-
-
-def _persisted_thread_owner(state: DashboardState | None, thread_ts: str) -> str:
-    """The session key the PERSISTED thread index maps *thread_ts* to.
-
-    Distinct from :func:`slack_options_linked_slot`, which only knows the
-    dashboard SLOT index. A cron thread is linked with ``cron:<id>`` and has no
-    slot at all, so the slot index cannot see it — yet that is the key a control
-    on such a thread is recorded under, because the record sites resolve the owner
-    through this same index. Leaving it out of the ownership helpers made the
-    record and the forget disagree: the control was filed under ``cron:<id>`` and
-    then never cleared, so a later expiry found it and overwrote the selection.
-
-    Returns "" when unknown. The ``isinstance`` check is deliberate: the index is
-    typed ``str | None``, and anything else means the caller handed us a stub.
-    """
-    if state is None or not thread_ts:
-        return ""
-    sessions = getattr(state, "sessions", None)
-    if sessions is None:
-        return ""
-    try:
-        owner = sessions.get_session_for_thread(thread_ts)
-    except Exception:
-        logger.debug("Could not resolve the persisted owner of %s", thread_ts, exc_info=True)
-        return ""
-    return owner if isinstance(owner, str) and owner else ""
-
-
-def slack_options_owner_key(state: DashboardState | None, thread_ts: str) -> str:
-    """The single session key that owns the conversation living in *thread_ts*.
-
-    Use this when RECORDING a control — it has to land on the one session whose
-    next turn should spend it. Use :func:`slack_options_session_keys` when
-    CLEARING, where covering every candidate is correct.
-
-    The slot index is consulted first and the persisted thread index second. Where
-    both know the thread they agree (``link_slack`` writes both), so the order only
-    matters for a thread ONE of them can see — and a cron-linked thread is visible
-    only to the persisted one.
-    """
-    slot = slack_options_linked_slot(state, thread_ts)
-    if slot is not None:
-        mirrored = effective_session_key(slot)
-        if mirrored:
-            return mirrored
-    persisted = _persisted_thread_owner(state, thread_ts)
-    if persisted:
-        return persisted
-    return canonical_key(thread_ts) if thread_ts else ""
-
-
-def slack_options_session_keys(state: DashboardState | None, thread_ts: str) -> list[str]:
-    """Every session key under which *thread_ts*'s OPTIONS control may be recorded.
-
-    One Slack thread belongs to one conversation, but that conversation is
-    addressed by several different keys depending on which side owns it: a
-    Slack-born session is ``slack:<ts>``, a dashboard session mirroring out to the
-    thread is ``dashboard:<slot>``, and a persistent cron is ``cron:<id>``. A
-    caller holding only the thread timestamp cannot tell which, so return every
-    candidate — they name the same conversation, so acting on all of them is
-    correct rather than merely safe.
-
-    Missing the cron spelling here is what let a selection leave its record
-    behind: the forget cleared the keys it could guess, the ``cron:<id>`` record
-    survived, and the next expiry edited over the user's answer.
-    """
-    if not thread_ts:
-        return []
-    keys = [canonical_key(thread_ts)]
-    slot = slack_options_linked_slot(state, thread_ts)
-    if slot is not None:
-        mirrored = effective_session_key(slot)
-        if mirrored and mirrored not in keys:
-            keys.append(mirrored)
-    persisted = _persisted_thread_owner(state, thread_ts)
-    if persisted and persisted not in keys:
-        keys.append(persisted)
-    return keys
-
-
-def options_records(state: DashboardState | None, session_key: str) -> tuple[PostedOptions, ...]:
-    """Every OPTIONS control still outstanding for *session_key*.
-
-    The store is keyed by SESSION KEY, on ``DashboardState``, not held on the
-    slot. A plain Slack thread frequently has no dashboard slot, and a slot-held
-    record was simply dropped for those sessions — so nothing tracked the control,
-    no later turn could expire it, and the stale click this whole lifecycle exists
-    to prevent stayed possible (#1694). Keying by session key makes the slotless
-    case ordinary instead of special, and it cannot go stale when a slot appears
-    or disappears mid-conversation.
-    """
-    if state is None or not session_key:
-        return ()
-    store = getattr(state, "_slack_options_by_key", None)
-    if not isinstance(store, dict):
-        return ()
-    return store.get(canonical_key(session_key), ())
-
-
-def set_options_records(
-    state: DashboardState | None, session_key: str, records: tuple[PostedOptions, ...]
-) -> None:
-    """Replace *session_key*'s outstanding controls, dropping the key when empty.
-
-    Pruning on empty is the ONLY bound, and it is the right one: an entry exists
-    exactly as long as a question is still unanswered, and it leaves the moment the
-    lifecycle completes — the expiry settles it, a click forgets it, or an unlink
-    clears it.
-
-    Deliberately NOT capped with eviction. A cap sounds prudent and is actively
-    harmful here: evicting a record for a control that is still clickable means no
-    later turn can retire it, which is precisely the untracked control this whole
-    lifecycle exists to eliminate — so a bound would reintroduce the defect at
-    scale, silently, on the busiest instances. The footprint is also no worse than
-    what it replaced: records used to hang off ``_ChatSlot``, and slots are
-    themselves unbounded in number, so this holds strictly fewer entries (only
-    conversations with a live unanswered question) than the store it came from.
-    """
-    if state is None or not session_key:
-        return
-    store = getattr(state, "_slack_options_by_key", None)
-    if not isinstance(store, dict):
-        return
-    key = canonical_key(session_key)
-    if records:
-        store[key] = records
-    else:
-        store.pop(key, None)
-
-
-def remember_slack_options(
-    state: DashboardState | None,
-    session_key: str,
-    posted: PostedOptions | None,
-) -> None:
-    """Record the live OPTIONS control just posted for *session_key*.
-
-    APPENDS rather than replaces. A turn can post more than one OPTIONS message,
-    and the same slot is reachable from several posting paths, so overwriting
-    would leave the earlier control on screen with nothing tracking it — a click
-    on it would then answer a question the conversation has already passed.
-    Every outstanding record is kept so expiry can drain all of them.
-
-    A no-op when there is no control or no dashboard state. Note there is NO
-    slot requirement: the store is keyed by session key precisely so a plain
-    Slack thread without a slot still gets its control tracked (#1694).
-    """
-    if posted is None or state is None or not session_key:
-        return
-    current = options_records(state, session_key)
-    # Same message posted twice (a retry, or two paths recording one post)
-    # must not queue two edits for one control.
-    if posted not in current:
-        set_options_records(state, session_key, (*current, posted))
-
-
-def forget_slack_options(
-    state: DashboardState | None, session_key: str, ts: str | None = None
-) -> None:
-    """Drop the recorded control for *session_key* without editing Slack.
-
-    For when something else has already spent the control — a Send click
-    re-renders the message with the user's selection, and striking every choice
-    through afterwards would erase the choice they made.
-
-    Pass *ts* to drop ONLY the control posted as that message. A click spends one
-    control, not every control outstanding in the conversation: dropping them all
-    would leave any other one on screen with nothing tracking it, so a later click
-    on it would answer a superseded question. Omitting *ts* clears all of them,
-    which is right when the whole conversation is going away (an unlink).
-    """
-    if state is None or not session_key:
-        return
-    if ts is None:
-        set_options_records(state, session_key, ())
-        return
-    set_options_records(
-        state,
-        session_key,
-        tuple(p for p in options_records(state, session_key) if p.ts != ts),
+# This module is the facade of the dashboard chat helpers: every name is reached through it
+# as ``kiro_crew.dashboard.chat_utils.<name>``. A read is served by the owner that binds the
+# name, and a write -- ``monkeypatch.setattr``, ``mock.patch`` -- reaches every owner holding
+# it (:mod:`kiro_crew._facade_mirror`). Owners never import this module. The code above stays
+# here: the stream chunks, tool and compaction events and slash commands a turn emits, the
+# deprecated model aliases, and the transient-notice tokens the frontend table is pinned to.
+# New work goes to the owner of its responsibility:
+#
+#   ``chat_utils_slots`` -- a slot's session, history and transcript keys, and its memory mode
+#   ``chat_utils_display`` -- display redaction and preparing stored rows for the wire
+#   ``chat_utils_turn_text`` -- what a turn's final text claims: promise-only, leaked tool calls
+#   ``chat_utils_injected_rows`` -- the rows the runner injects, their kinds, the next message
+#   ``chat_utils_turn_recovery`` -- how a turn ended and whether the runner continues it
+#   ``chat_utils_awaits`` -- cancellation-safe awaits for handlers that must finish a write
+#   ``chat_utils_completion`` -- the end of a turn: sub-agent probes, the done payload
+#   ``chat_utils_slack_options`` -- Slack option controls and paused mirrors
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.dashboard.chat_utils_awaits",
+    "kiro_crew.dashboard.chat_utils_slots",
+    "kiro_crew.dashboard.chat_utils_display",
+    "kiro_crew.dashboard.chat_utils_turn_text",
+    "kiro_crew.dashboard.chat_utils_injected_rows",
+    "kiro_crew.dashboard.chat_utils_turn_recovery",
+    "kiro_crew.dashboard.chat_utils_completion",
+    "kiro_crew.dashboard.chat_utils_slack_options",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.dashboard.chat_utils_awaits import (  # noqa: F401
+        drained_to_thread,
+        run_config_write,
+        run_to_completion,
+    )
+    from kiro_crew.dashboard.chat_utils_completion import (  # noqa: F401
+        _CHUNK_GENERATION,
+        SYNTHESIS_CLEAR,
+        SYNTHESIS_HELD,
+        SYNTHESIS_UNKNOWN,
+        _attached_verdict,
+        _queued_depth_off_loop,
+        chat_done_payload,
+        chunk_generation,
+        subagents_attached,
+        subagents_attached_async,
+        synthesis_fire_verdict,
+        wire_session_subagent_probe,
+    )
+    from kiro_crew.dashboard.chat_utils_display import (  # noqa: F401
+        _DISPLAY_CLEAN_GENERATION,
+        _DISPLAY_PREVIEW_CACHE_MAX_BYTES,
+        _DISPLAY_PREVIEW_CACHE_MAX_ENTRIES,
+        _DISPLAY_REDACTION_CACHE_MAX_BYTES,
+        _DISPLAY_REDACTION_CACHE_MAX_ENTRIES,
+        _DISPLAY_REDACTION_SALT,
+        _DISPLAY_REDACTION_STRINGS_PER_ROW,
+        _NO_BASE,
+        REDACTION_RECORD_FIELDS,
+        SLOT_DETAIL_MAX_LIMIT,
+        UNKNOWN_ROW_FIELDS_KEY,
+        _broadcast_expired_oauth_banners,
+        _clean_verdict_key,
+        _clear_display_redaction_cache,
+        _collapse_wire_rows,
+        _cut_preview,
+        _display_clean_add,
+        _display_clean_old,
+        _display_clean_seen,
+        _display_clean_young,
+        _display_preview_cache,
+        _display_preview_cache_bytes,
+        _display_preview_cache_info,
+        _display_redaction_cache,
+        _display_redaction_cache_bytes,
+        _display_redaction_cache_info,
+        _display_redaction_cache_key,
+        _display_redaction_cache_lock,
+        _display_scope_changes_battery,
+        _DisplayPreviewKey,
+        _DisplayRedactionKey,
+        _expire_dead_child_oauth_meta,
+        _live_child_instance,
+        _prepare_messages,
+        _prepare_messages_scoped,
+        _redact_for_display,
+        _redact_meta,
+        _redact_meta_for_role,
+        _redact_value,
+        _redacted_preview,
+        _remember_preview,
+        _remember_redacted,
+        _variant_for_emit,
+        adopt_variant_text,
+        drop_records_without_placeholders,
+        serialize_wire_content,
+        variant_from_row,
+        with_allowed_links_restored,
+        with_bounded_redaction_records,
+        without_unknown_row_fields,
+    )
+    from kiro_crew.dashboard.chat_utils_injected_rows import (  # noqa: F401
+        _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+        _BUSY_RECOVER_MSG,
+        _COMPACTION_CONTINUE_MSG,
+        _CONN_RECOVER_MSG,
+        _EMPTY_AUTO_CONTINUE_MSG,
+        _POSTTOKEN_RECOVER_MSG,
+        _PROMISE_ONLY_CONTINUE_MSG,
+        _SYNTHETIC_RECOVERY_MSGS,
+        _SYSTEM_INJECTION_KINDS,
+        APP_AGENT_REFUSED_KIND,
+        APP_MESSAGE_END,
+        APP_MESSAGE_PREFIX,
+        AUTH_REQUIRED_KIND,
+        AUTOMATION_NOTICE_KIND,
+        CONTEXT_OVERFLOW_KIND,
+        CRON_NOTIFICATION_KIND,
+        EMPTY_TURN_NOTICE_KIND,
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+        KIRO_CLI_MISSING_KIND,
+        MCP_APP_MESSAGE_KIND,
+        MODEL_UNENTITLED_KIND,
+        SESSION_START_FAILED_KIND,
+        SPEC_HOOKS_NOTICE_KIND,
+        STEER_INTENT_META,
+        STEER_POSSIBLY_DELIVERED_META,
+        STEER_POSSIBLY_DELIVERED_NOTE,
+        SUBAGENT_COMPLETION_KIND,
+        SUBAGENT_DELIVERY_KINDS,
+        SYNTHETIC_RECOVERY_KIND,
+        TRANSIENT_RETRY_KIND,
+        USAGE_LIMIT_KIND,
+        RecoveryPayload,
+        _dequeue_next_message,
+        _dequeue_next_system_message,
+        _edit_queued_by_id,
+        _remove_queued_by_id,
+        _stamped_turn_actor,
+        app_inject_row,
+        carries_attachments,
+        is_synthetic_payload_item,
+        is_synthetic_recovery_item,
+        is_system_injection,
+        is_system_injection_item,
+        payload_for_replay,
+        releases_past_subagent_hold,
+    )
+    from kiro_crew.dashboard.chat_utils_slack_options import (  # noqa: F401
+        _persisted_thread_owner,
+        expire_slack_options,
+        forget_slack_options,
+        forget_slack_options_for_thread,
+        mint_options_token,
+        mirror_is_paused,
+        options_control_is_stale,
+        options_records,
+        remember_slack_options,
+        set_options_records,
+        slack_mirror_is_paused,
+        slack_options_linked_slot,
+        slack_options_owner_key,
+        slack_options_owner_keys_snapshot,
+        slack_options_session_keys,
+        slack_options_slot,
+    )
+    from kiro_crew.dashboard.chat_utils_slots import (  # noqa: F401
+        _INCOGNITO_PREFIX,
+        _TEMPORARY_PREFIX,
+        ReplacementTightening,
+        _apply_incognito_prefix,
+        _history_key_for,
+        _installed_theme_persona,
+        _maybe_consolidate,
+        _maybe_inject_persona,
+        _resettle_restricted_key,
+        _sync_dashboard_slots,
+        apply_pending_slot_memory_mode,
+        dashboard_slot_key,
+        effective_session_key,
+        reject_if_slot_under_construction,
+        replacement_shares_transcript,
+        restore_replacement_if_handover_did_not_land,
+        session_key_for,
+        slot_history_key,
+        slot_transcript_key,
+        subagent_event_slot,
+        tighten_live_slot_memory_mode,
+        tighten_replacement_to_restricted_original,
+    )
+    from kiro_crew.dashboard.chat_utils_turn_recovery import (  # noqa: F401
+        _CONTINUATION_BY_CAUSE,
+        _FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE,
+        _FALSE_CURRENT_TOOL_BLOCKER_RE,
+        _MANUAL_CONTINUE_MSG,
+        _MANUAL_RESUME_MSG,
+        _READ_ONLY_PREPARATION_TOOLS,
+        _REFUSAL_FALLBACK_RESUME_MSG,
+        _STOP_CANCELLED_REASON,
+        _STOP_END_TURN,
+        _STOP_REFUSAL,
+        EMPTY_CAUSE_NO_TERMINAL,
+        EMPTY_CAUSE_OTHER,
+        EMPTY_CAUSE_PROVIDER_EMPTY,
+        EMPTY_CAUSE_SYNTHETIC,
+        EMPTY_CAUSE_THINKING_ONLY,
+        EMPTY_CAUSE_TOOL_ONLY,
+        EMPTY_CAUSE_VISIBLE_PARTIAL,
+        EMPTY_RUNG_CONTINUE,
+        EMPTY_RUNG_GIVE_UP,
+        EMPTY_RUNG_REPLAY,
+        STOP_REASON_ABSENT,
+        STOP_REASON_OTHER,
+        EmptyTurnActivity,
+        ResetCause,
+        build_recovery_requeue,
+        classify_empty_turn,
+        is_false_current_tool_blocker,
+        is_false_current_tool_blocker_near_miss,
+        normalize_stop_reason,
+        should_continue_after_compaction,
+        should_recover_promise_only,
+        tool_calls_are_read_only_preparation,
+    )
+    from kiro_crew.dashboard.chat_utils_turn_text import (  # noqa: F401
+        _APPROVAL_GATED_RE,
+        _CODE_DELIM_RE,
+        _LEAKED_INVOKE_BODY_RE,
+        _LEAKED_INVOKE_OPEN_RE,
+        _NEGATED_PROMISE_RE,
+        _NO_ACTION_CLOSER_RE,
+        _PROMISE_HAS_FOLLOWING_CONTENT_RE,
+        _PROMISE_NOW_RE,
+        _SENTENCE_BOUNDARY_RE,
+        _UNFINISHED_PROGRESS_RE,
+        _strip_quoted_code,
+        _terminal_sentence,
+        has_leaked_tool_call,
+        has_unfinished_progress_claim,
+        is_promise_only_terminal,
+        open_construct_at_end,
+        should_notice_compaction_dropped_leak,
+        should_notice_leaked_tool_call,
+        should_notice_mixed_turn_leak,
     )
 
-
-def slack_options_owner_keys_snapshot(
-    state: DashboardState | None, thread_ts: str
-) -> tuple[str, ...]:
-    """The keys *thread_ts*'s control could be recorded under, captured NOW.
-
-    A caller that is about to await Slack has to take this BEFORE the await and
-    forget against it afterwards. Recomputing after the fact reads the keys of
-    whoever owns the thread THEN: a relink landing during a submit's edit moves the
-    thread to another session, so the recomputed list names the new owner, the
-    previous owner's record survives the click, and that session's next turn edits
-    straight over the selection the user just made.
-    """
-    return tuple(slack_options_session_keys(state, thread_ts))
-
-
-def forget_slack_options_for_thread(
-    state: DashboardState | None,
-    thread_ts: str,
-    ts: str | None = None,
-    keys: tuple[str, ...] | None = None,
-) -> None:
-    """Drop the recorded control for the conversation living in *thread_ts*.
-
-    For callers that hold a Slack thread timestamp rather than a session key —
-    the interaction handlers, which see a click on a message and not the session
-    behind it. Clears every key the thread's conversation can be recorded under,
-    so a control posted by the dashboard mirror is forgotten too.
-
-    *ts* scopes it to the ONE control posted as that message, which is what a
-    click spends. Without it every outstanding control in the conversation is
-    dropped, leaving any other one clickable with nothing tracking it.
-
-    Pass *keys* from :func:`slack_options_owner_keys_snapshot` when an await sits
-    between reading ownership and clearing it — a relink during that window would
-    otherwise leave the previous owner's record behind. Omitting *keys* resolves
-    now, which is right only for a caller that has not awaited.
-    """
-    for key in keys if keys is not None else slack_options_session_keys(state, thread_ts):
-        forget_slack_options(state, key, ts)
-
-
-async def expire_slack_options(
-    state: DashboardState | None, session_key: str, ts: str | None = None
-) -> None:
-    """Spend the OPTIONS control left from *session_key*'s previous turn.
-
-    Called as a new turn begins, whichever surface it arrives on, so a control
-    the conversation has moved past stops inviting a click that would answer a
-    superseded question.
-
-    Records stay TRACKED across the Slack edit and are only ever REMOVED
-    afterwards, never re-added. A write-back that re-adds cannot tell "still
-    outstanding" from "deliberately removed while I was awaiting": a click landing
-    mid-await calls :func:`forget_slack_options`, and re-adding would resurrect
-    the control it just answered, so every later turn would re-edit the message
-    and overwrite the user's selected summary. Removing only what settled leaves
-    a concurrent forget authoritative. A record whose edit failed *transiently* is
-    simply never removed, so it is still retried later — dropping it would leave a
-    live control on screen with nothing tracking it, the exact stale click this
-    whole lifecycle exists to prevent. A failure that will never succeed (deleted
-    message, a channel we are not in) counts as settled, so it cannot be retried
-    on every later turn forever.
-
-    Two concurrent expiries can therefore both edit the same control. That is
-    deliberate: both write byte-identical spent blocks, so the cost is a wasted
-    API call, whereas resurrecting an answered control corrupts what the user
-    sees.
-
-    Drains EVERY outstanding control, not just the newest: a turn can leave more
-    than one on screen, and any one left untracked stays clickable into a
-    superseded question.
-
-    Pass *ts* to spend ONLY the control posted as that message. A caller that is
-    cleaning up after ITSELF has to narrow this way: a concurrent turn can record
-    its own fresh control in the same slot while this caller is still awaiting
-    Slack, and a session-wide drain would strike that newer question through too
-    — leaving the question the conversation is actually waiting on unanswerable.
-    Omitting *ts* drains all of them, which is what a NEW turn wants (it
-    supersedes everything before it) and what an unlink wants (the whole
-    conversation is going away).
-    """
-    if state is None or not session_key:
-        return
-    outstanding = options_records(state, session_key)
-    if not outstanding:
-        return
-    if ts is not None:
-        outstanding = tuple(posted for posted in outstanding if posted.ts == ts)
-        if not outstanding:
-            # Already spent by whoever else tracked it; nothing of ours to edit.
-            return
-    slack = getattr(state, "slack_client", None)
-    if slack is None:
-        # Nothing was spent, so nothing may be dropped: with no client the
-        # controls are still live on screen and must stay tracked.
-        return
-    settled: list[PostedOptions] = []
-    for posted in outstanding:
-        # Serialize against the Send handler's edit to this SAME message, and
-        # re-read the record INSIDE the lock. A click that won the race has
-        # already rewritten the message with the user's selection and dropped the
-        # record, so finding it gone means "do not edit" -- without the re-read,
-        # a late expiry would erase the answer the user just gave. The lock makes
-        # that check trustworthy; the check is what makes the lock useful.
-        async with options_edit_lock(posted.channel, posted.ts):
-            if posted not in options_records(state, session_key):
-                continue
-            if await expire_options(slack, posted):
-                # Retire the control for clicks too, not just for our records. A
-                # Send click queued behind this expiry would otherwise find the
-                # answer claim unheld, take it, and dispatch an answer to the
-                # question we just struck through. Marked while we still hold the
-                # lock, so the queued click cannot slip between the edit and this.
-                mark_options_terminal(posted.channel, posted.ts)
-                settled.append(posted)
-    if settled:
-        # Remove by identity against the CURRENT records, not by reassigning a
-        # remembered tuple: a turn that finished while we awaited Slack may have
-        # recorded its own control here, and it must survive.
-        set_options_records(
-            state,
-            session_key,
-            tuple(p for p in options_records(state, session_key) if p not in settled),
-        )
-
-
-_INCOGNITO_PREFIX = (
-    "[INCOGNITO SESSION] This is an ephemeral session. "
-    "Do NOT call learn_add or any memory-writing tool. "
-    "learn_remove and cron tools are allowed (active user actions). "
-    "If the user asks to save a lesson, respond: "
-    "'⚠️ Incognito mode — lessons are not saved in this session.'\n\n"
-)
-
-_TEMPORARY_PREFIX = (
-    "[TEMPORARY SESSION] This is a blank-slate ephemeral session. "
-    "The user has explicitly chosen ephemeral mode. "
-    "There are NO memory reads or writes — no preferences, no history, "
-    "no lessons, no episodic memory, no projects. "
-    "Do NOT reference prior conversations or stored preferences. "
-    "Do NOT call learn_add, learn_list, or any memory tool. "
-    "Treat this as a completely fresh conversation with no prior context.\n\n"
-)
-
-
-def _apply_incognito_prefix(slot, message: str) -> str:
-    """Prepend incognito/temporary instruction for non-persistent sessions."""
-    if slot.memory_mode == "temporary":
-        return _TEMPORARY_PREFIX + message
-    if slot.memory_mode == "incognito":
-        return _INCOGNITO_PREFIX + message
-    return message
-
-
-def _maybe_inject_persona(
-    message: str,
-    color_theme: str,
-    is_new: bool,
-    theme_consent_sha: str | None = None,
-) -> str:
-    """Append a theme persona to *message* on the first turn, when an installed
-    theme (value ``custom-<slug>``) ships a validated ``persona.md``.
-
-    ALL personas come from installed packs and are gated on **content-bound**
-    consent: the caller threads ``theme_consent_sha`` (the sha256 hex the user
-    granted in the consent modal, from the frontend), and the pack's persona is
-    injected only when it equals sha256 of the persona text actually read from
-    disk *now*. A stale hash (e.g. a reinstall rewrote ``persona.md``) or a
-    missing hash fails closed, so a never-consented persona can never be
-    injected. The legacy boolean ``theme_consent`` request field does not grant
-    injection on its own -- consent is content-bound. There is
-    no built-in / unconditional persona path."""
-    if not is_new:
-        return message
-    # Installed themes may carry a persona.md (validated at install, §6.5).
-    # Persona activation for INSTALLED packs is content-bound: the sha256 the
-    # user consented to must equal the hash of the persona text we read now
-    # (fail closed on None/mismatch/non-str). This closes the reinstall-swap
-    # gap where a client-asserted boolean would inject a never-consented
-    # persona after persona.md changed. The THEME_CONSENT_SHA_RE full-match is
-    # also a hard guard that only pure 64-hex ASCII ever reaches
-    # hmac.compare_digest below (which raises TypeError on non-ASCII).
-    if (
-        color_theme.startswith("custom-")
-        and isinstance(theme_consent_sha, str)
-        and THEME_CONSENT_SHA_RE.fullmatch(theme_consent_sha)
-    ):
-        text = _installed_theme_persona(color_theme[len("custom-"):])
-        if text:
-            actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            if hmac.compare_digest(actual, theme_consent_sha):
-                return message + f"\n[THEME PERSONA]\n{text}\n[END THEME PERSONA]\n\n"
-    return message
-
-
-def _installed_theme_persona(slug: str) -> str:
-    """Read an installed theme's ``persona.md`` (bounded), or '' if none.
-
-    Defense-in-depth: re-validate the slug (no traversal) even though install
-    already did, and cap the length at the install-time bound. A lazy import of
-    ``config_dir`` avoids a circular import with the handlers package.
-    """
-    if not slug or not all(("a" <= c <= "z") or ("0" <= c <= "9") or c == "-" for c in slug):
-        return ""
-    try:
-        from kiro_crew.config.loader import config_dir
-
-        p = config_dir() / "themes" / slug / "persona.md"
-        if not p.is_file() or p.is_symlink():
-            return ""
-        text = safe_read_file(str(p))
-        return text[:2000] if text else ""
-    except Exception:
-        logger.warning("Installed theme persona load failed", exc_info=True)
-        return ""
-
-
-def _maybe_consolidate(state, slot) -> None:
-    """Run memory consolidation unless session is restricted."""
-    if state.consolidator and not slot.is_restricted:
-        state.consolidator.maybe_consolidate(effective_session_key(slot))
-    elif state.consolidator and slot.is_restricted:
-        sel().log_api_access(
-            caller=f"dashboard:{slot.key}", operation="consolidate",
-            outcome="denied", source="dashboard",
-            resources="restricted_session_block",
-        )
-
-
-def _sync_dashboard_slots(state: "DashboardState") -> None:
-    """Publish the open slots' session keys to SessionManager and the surface registry.
-
-    SessionManager uses the set to reap orphaned sessions; the surface registry
-    lets layers with no dashboard import ask whether a session has an open tab
-    (see :mod:`kiro_crew.session_surface`). A channel-born slot contributes its
-    channel key, which is what both consumers must match against.
-    """
-    keys = {effective_session_key(s) for s in state._slots.values()}
-    state.sessions.set_active_dashboard_slots(keys)
-    set_dashboard_surfaced(keys)
-
-
-def _redact_value(v):  # type: ignore[no-untyped-def]
-    """Recursively redact any value (str, dict, list, or passthrough)."""
-    if isinstance(v, str):
-        v, _ = redact_exfiltration_urls(v)
-        v, _ = redact_credentials(v)
-        return v
-    if isinstance(v, dict):
-        return _redact_meta(v)
-    if isinstance(v, list):
-        # Snapshot for the same reason as _redact_meta — the flush thread reads
-        # containers the event loop is still appending to.
-        return [_redact_value(i) for i in list(v)]
-    return v
-
-
-def _redact_meta(meta: dict) -> dict:
-    """Recursively redact string values in meta dict.
-
-    Iterates a SNAPSHOT of the dict, never the live object. ``_redact_meta`` is
-    reached from ``_save_slot_to_history``, which runs in the flush executor
-    thread while the event loop is still mutating that same message's meta
-    (streaming tool calls, growing file-change lists). Iterating ``meta.items()``
-    directly therefore raised ``RuntimeError: dictionary changed size during
-    iteration``, which propagated out of ``_save_slot_to_history`` and aborted
-    the whole slot's save — the transcript for that flush was lost.
-
-    A shallow copy per level suffices: the copy's key set is stable, and nested
-    containers get their own snapshot from the recursive call.
-    """
-    return {k: _redact_value(v) for k, v in list(meta.items())}
-
-
-def _redact_meta_for_role(role: str, meta: dict) -> dict:
-    """Redact meta, but preserve role-specific user-actionable external URLs (e.g. mcp_oauth).
-
-    Lives here (the display-redaction module) rather than in chat_persistence
-    because it is called on the EMIT path — see _prepare_messages. The
-    dependency runs chat_persistence -> chat_utils, so keeping it here lets both
-    the save path and the emit path share one implementation without a cycle.
-    """
-    if role == "mcp_oauth":
-        out: dict = {}
-        for k, v in list(meta.items()):
-            if k == "oauth_url" and isinstance(v, str):
-                # Two gates, and deliberately NOT a third:
-                #   1. http(s)-only — a tampered history line can't smuggle a
-                #      javascript:/data: URL into <a href>.
-                #   2. URL must not embed an actual credential — a legit OAuth
-                #      consent URL never carries credential patterns; presence of
-                #      one means it's tampered/bogus.
-                #
-                # The generic EXFIL heuristic is deliberately NOT applied, matching
-                # `_oauth_url_contains_credential` (chat_runner.py), whose docstring
-                # says it omits the long-query heuristic because that heuristic
-                # "would reject every real OAuth URL". test/oauth_url_corpus.py is
-                # the contract: real provider URLs routinely exceed 200 query chars
-                # and carry a 43-char base64url `code_challenge`, so the exfil
-                # heuristic fires on all of them.
-                #
-                # This function runs on the EMIT path (_prepare_messages), which
-                # serves the slot-detail endpoint that the frontend refetches on
-                # `chat_done`, on WS reconnect, and on switchSlot. Blanking the URL
-                # here therefore hits a PRE-TERMINAL banner: renderMcpOAuthMessage
-                # returns null when `oauth_url` is empty and neither completed nor
-                # failed is set, so the Authorize banner would silently vanish and
-                # the user could never authorize the server. Keeping the two gates
-                # aligned is what prevents that.
-                lower = v.lower()
-                safe_scheme = lower.startswith("https://") or lower.startswith("http://")
-                _, hit_cred = redact_credentials(v)
-                out[k] = v if (safe_scheme and not hit_cred) else ""
-            else:
-                out[k] = _redact_value(v)
-        return out
-    return _redact_meta(meta)
-
-
-def _redact_for_display(text: str) -> str:
-    """Apply all redaction passes for dashboard/WS display."""
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
-    return text
-
-
-def _remove_queued_by_id(messages: list[dict], queue_id: str) -> bool:
-    """Remove a 'queued' placeholder by queue_id stored in cls JSON."""
-    for i, m in enumerate(messages):
-        if m.get("role") != "queued":
-            continue
-        try:
-            cls = json.loads(m.get("cls", "{}"))
-            if cls.get("queue_id") == queue_id:
-                del messages[i]
-                return True
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return False
-
-
-def _edit_queued_by_id(messages: list[dict], queue_id: str, content: str) -> bool:
-    """Update the content of a 'queued' placeholder by queue_id stored in cls JSON."""
-    for m in messages:
-        if m.get("role") != "queued":
-            continue
-        try:
-            cls = json.loads(m.get("cls", "{}"))
-            if cls.get("queue_id") == queue_id:
-                m["content"] = content
-                return True
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return False
-
-
-# Runner-injected synthetic recovery instructions (defined here — the shared
-# utils layer — so BOTH the runner's turn logic and the queue/merge predicates
-# below classify them from one source of truth; chat_runner re-exports them).
-# The connection-loss and post-transient continuations resume interrupted turns;
-# the empty-response nudge breaks the repeated-empty-generation pattern. All are
-# orchestration, not user speech.
-#
-# Each carries a bracketed marker line, matching the recovery prefixes in
-# state.py. The marker is what the dashboard matches to fold the row into a
-# one-line RecoveryCard instead of printing the machine-facing prose as a
-# full-width bubble; it also labels the injection for the model, which reads
-# these the same way it reads the refusal/stall continuations.
-_CONN_RECOVER_MSG = (
-    f"{CONN_RECOVERY_PREFIX}\n"
-    "Your previous turn was interrupted by a lost backend connection and has "
-    "been automatically recovered. This was NOT a user action — do not treat "
-    "it as a cancellation or interruption by the user. The work already done "
-    "above is preserved in the conversation. Continue from where it stopped "
-    "and finish the request — do not restart it or repeat steps or tools that "
-    "already completed successfully."
-)
-_BUSY_RECOVER_MSG = (
-    f"{BUSY_RECOVERY_PREFIX}\n"
-    "Your previous turn was interrupted because the backend session was still "
-    "busy, so the session was reset and the turn automatically recovered. This "
-    "was NOT a user action — do not treat it as a cancellation or interruption "
-    "by the user. The work already done above is preserved in the "
-    "conversation. Continue from where it stopped and finish the request — do "
-    "not restart it or repeat steps or tools that already completed "
-    "successfully."
-)
-_POSTTOKEN_RECOVER_MSG = (
-    f"{POSTTOKEN_RECOVERY_PREFIX}\n"
-    "The previous response was interrupted partway through by a transient "
-    "backend error. The work already done above (including any completed tool "
-    "results) is preserved in the conversation. Continue from where it stopped "
-    "to finish the original request — do NOT restart from scratch and do NOT "
-    "re-run steps or tools that already completed successfully."
-)
-_EMPTY_AUTO_CONTINUE_MSG = (
-    f"{EMPTY_RESPONSE_RECOVERY_PREFIX}\n"
-    "Your previous turn produced no output (the model returned an empty "
-    "response twice). Continue working on the pending request from the "
-    "conversation above and respond now — do NOT restart from scratch and do "
-    "NOT re-run steps or tools that already completed successfully."
-)
-_SYNTHETIC_RECOVERY_MSGS = (
-    _CONN_RECOVER_MSG,
-    _BUSY_RECOVER_MSG,
-    _POSTTOKEN_RECOVER_MSG,
-    _EMPTY_AUTO_CONTINUE_MSG,
-)
-# Injected when the USER presses Continue on an interrupted turn. Worded to be
-# TRUE in both interruption shapes, which is why the endpoint needs no branch:
-# a turn that streamed partway and one that produced nothing at all read this
-# same text correctly. It must not assert that completed work exists above —
-# _POSTTOKEN_RECOVER_MSG does ("The work already done above ... is preserved"),
-# and after a gateway restart mid-first-turn that is simply false, which would
-# point the model at progress it cannot find.
-_MANUAL_RESUME_MSG = (
-    f"{MANUAL_RESUME_RECOVERY_PREFIX}\n"
-    "The previous turn was interrupted before it finished (a dropped "
-    "connection, a restart, or a backend error) and the user has asked you to "
-    "carry on. Look at the conversation above, work out what was already "
-    "completed, and finish the user's most recent request from there. Do NOT "
-    "re-run steps or tools that already completed successfully, and do NOT "
-    "assume any particular progress was made — if nothing was done yet, simply "
-    "start the request now."
-)
-# Injected when the user presses Continue on a slot whose last turn ended
-# NORMALLY. Continue is offered on any idle slot with a transcript (a killed
-# gateway writes no error row, so an interrupted turn can be shape-identical to
-# a clean one — see ``_is_interrupted``), which means the button must also have
-# something true to say when nothing was actually cut short. Sharing
-# ``MANUAL_RESUME_RECOVERY_PREFIX`` is deliberate: to the user the two are one
-# button, so they must fold into the same RecoveryCard.
-#
-# The closing sentence is load-bearing. Without an explicit licence to say "this
-# is done", a model handed a bare "keep going" on a finished thread invents
-# follow-up work to justify the turn.
-_MANUAL_CONTINUE_MSG = (
-    f"{MANUAL_RESUME_RECOVERY_PREFIX}\n"
-    "The user pressed Continue without typing a new instruction. Look at the "
-    "conversation above and carry on with their most recent request: take the "
-    "next step that was still outstanding, or finish anything left half-done. "
-    "Do NOT re-run steps or tools that already completed successfully. If the "
-    "request is genuinely complete, say so in one line instead of inventing "
-    "further work."
-)
-
-
-class ResetCause(str, Enum):
-    """Why a turn's session had to be reset, which selects the continuation the
-    requeue carries — and so the row the transcript renders.
-
-    A closed set rather than a boolean or a caller-supplied string: every reset
-    site must state its cause, and a site added later cannot silently inherit
-    another cause's user-facing label.
-
-    ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``KindSupport``.
-    """
-
-    CONNECTION_LOST = "connection_lost"
-    SESSION_BUSY = "session_busy"
-
-
-#: The continuation each cause resumes with once the turn has emitted output.
-_CONTINUATION_BY_CAUSE = {
-    ResetCause.CONNECTION_LOST: _CONN_RECOVER_MSG,
-    ResetCause.SESSION_BUSY: _BUSY_RECOVER_MSG,
-}
-
-
-def build_recovery_requeue(
-    message: str, turn_emitted: bool, cause: ResetCause, *, message_is_synthetic: bool
-) -> tuple[str, RecoveryPayload]:
-    """Choose the prompt for a reset-and-requeue recovery, and label its provenance.
-
-    Once output or a tool call has been emitted, replaying the original request
-    can repeat side effects. A continuation instead resumes from restored
-    conversation state. Before any output, the original request is safe and is
-    still required for the model to begin the work.
-
-    That decision is the same for every cause, but the continuation is not:
-    ``cause`` is required because the marker it carries is what the transcript
-    renders, and a session that was merely busy must not be reported as a lost
-    connection.
-
-    The text and its label are returned together because choosing them apart is how
-    they drifted. Replaying ``message`` unchanged only means "the user's own words"
-    when this turn was not itself a recovery: a second consecutive failure before any
-    output re-queues the runner's previous continuation, so ``turn_emitted`` alone
-    cannot say whose words these are. ``message_is_synthetic`` carries that from the
-    queue entry that produced the turn, and is required for the same reason ``cause``
-    is — a requeue site added later must not silently inherit "the user said this".
-    """
-    if turn_emitted:
-        return _CONTINUATION_BY_CAUSE[cause], RecoveryPayload.CONTINUATION
-    return message, payload_for_replay(message_is_synthetic)
-
-
-def is_system_injection(content: str) -> bool:
-    """True when a queued message is a system injection (sub-agent completion
-    or cron notification) rather than a plain user message.
-
-    Single source of truth for the predicate that decides which queued
-    messages keep draining during a sub-agent run (`_dequeue_next_system_message`),
-    which break a user-message merge (`_dequeue_next_message`), and which must
-    not consume the session-reset notice (chat_runner drain loop).
-
-    Both sub-agent shapes count: the per-agent event and the wave digest, whose
-    prefix is a sibling of the per-agent one rather than an extension of it.
-    """
-    return content.startswith(SUBAGENT_COMPLETION_PREFIXES) or content.startswith(
-        CRON_NOTIFY_PREFIX
+if TYPE_CHECKING:  # names it serves from outside the family, from their homes
+    from kiro_crew.dashboard import display_verdicts as _display_verdicts  # noqa: F401
+    from kiro_crew.dashboard.display_battery import (  # noqa: F401
+        display_battery,
     )
-
-
-#: Structural queue-entry kind for runner-injected recovery instructions.
-SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
-
-
-def is_synthetic_recovery_item(item: dict) -> bool:
-    """True when a queue ENTRY is a runner-injected synthetic recovery
-    instruction (post-transient CONTINUE / empty-response nudge).
-
-    Classification is structural — the ``kind`` tag set at ``queue_insert``
-    time — never content equality: metadata survives any queue transformation
-    (merge, prefixing, truncation) and cannot collide with a user pasting the
-    transcript-visible recovery text verbatim (which must classify as a plain
-    user message)."""
-    return item.get("kind") == SYNTHETIC_RECOVERY_KIND
-
-
-class RecoveryPayload(str, Enum):
-    """Whether a recovery entry's TEXT is runner-authored or the user's own words.
-
-    ``build_recovery_requeue`` already draws this line — a continuation once the
-    turn emitted output, the original request before that — but both re-queue
-    under ``SYNTHETIC_RECOVERY_KIND``, because both must render as an inject row
-    rather than a second user bubble. The kind therefore cannot also answer
-    whether the text may be mirrored to a linked thread as user speech.
-
-    ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``ResetCause``.
-    """
-
-    CONTINUATION = "continuation"
-    ORIGINAL = "original"
-
-
-def payload_for_replay(message_is_synthetic: bool) -> RecoveryPayload:
-    """The payload tag for a requeue that replays the incoming ``message`` verbatim.
-
-    Asks the only question such a site has: were these the user's words, or the
-    runner's? Branching on ``turn_emitted`` instead was wrong — a recovery turn that
-    dies before emitting replays the runner's own continuation, and labelling that
-    ORIGINAL mirrors internal orchestration to a linked thread as user speech.
-    """
-    return RecoveryPayload.CONTINUATION if message_is_synthetic else RecoveryPayload.ORIGINAL
-
-
-def is_synthetic_payload_item(item: dict) -> bool:
-    """True when a queue ENTRY's text was written by the runner, not the user.
-
-    Separate question from :func:`is_synthetic_recovery_item`, which answers where
-    the entry came from. An untagged entry falls back to the kind because the two
-    errors are not symmetric: mirroring runner text as if the user typed it
-    misattributes machine orchestration, while suppressing a mirror only loses an
-    echo of something the user can already see.
-    """
-    payload = item.get("payload")
-    if payload:
-        return payload == RecoveryPayload.CONTINUATION
-    return is_synthetic_recovery_item(item)
-
-
-def is_system_injection_item(item: dict) -> bool:
-    """Item-aware system-injection predicate for queue-entry consumers.
-
-    Synthetic recovery instructions are orchestration, not user speech: they
-    must BREAK a user-message merge (folding one into a "[N queued messages
-    merged]" turn would flip it back into user-authored, persisted,
-    channel-mirrored history), keep draining during sub-agent runs, and never
-    consume the session-reset notice — same treatment as sub-agent completion
-    and cron injections."""
-    return is_synthetic_recovery_item(item) or is_system_injection(item["content"])
-
-
-def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
-    """Drain the queue: merge non-cron messages or pop the first one."""
-    if merge_enabled and len(slot._queue) > 1:
-        to_merge: list[dict] = []
-        for item in list(slot._queue):
-            if is_system_injection_item(item):
-                break
-            to_merge.append(item)
-        if len(to_merge) > 1:
-            del slot._queue[:len(to_merge)]
-            merged = "\n\n".join(item["content"] for item in to_merge)
-            return f"[{len(to_merge)} queued messages merged]\n\n{merged}", to_merge
-    item = slot.queue_pop(0)
-    return item["content"], [item]
-
-
-def _dequeue_next_system_message(slot) -> tuple:
-    """Pop the first queued sub-agent-completion or cron injection, leaving
-    plain user messages queued.
-
-    Implements the (always-on) queue-during-subagents behavior: while background
-    sub-agents run for a slot, a tangential user message is held (not drained)
-    so it does not start a main turn mid-run, while system injections that must
-    keep flowing (sub-agent completions, cron notifications) are still drained.
-    Returns ``(content, [item])`` for the drained item, or ``(None, [])`` when
-    only held (user) messages remain queued.
-    """
-    for i, item in enumerate(slot._queue):
-        if is_system_injection_item(item):
-            popped = slot.queue_pop(i)
-            return popped["content"], [popped]
-    return None, []
-
-
-def _prepare_messages(messages: list[dict], running: bool) -> list[dict]:
-    """Prepare messages for API response."""
-    out: list[dict] = []
-    chunk_text = ""
-    for m in messages:
-        role = m.get("role", "")
-        if role == "chunk":
-            chunk_text += m.get("content", "")
-        elif role == "done":
-            continue
-        else:
-            if chunk_text:
-                redacted_chunk, _ = redact_exfiltration_urls(chunk_text)
-                redacted_chunk, _ = redact_credentials(redacted_chunk)
-                out.append({"role": "streaming", "content": redacted_chunk, "cls": "msg msg-a"})
-                chunk_text = ""
-            text = m.get("content", "")
-            # Gate is `!= "user"`, NOT `not in ("user", "system")`. This is the
-            # display-time redaction boundary for everything the slot detail
-            # endpoint returns — including the frozen-prefix lines read straight
-            # off disk — so it must cover every non-user role. The load path does
-            # not redact on load, and `system` content is written to disk
-            # unredacted (see _build_message_entry's gate), so excluding it here
-            # would emit raw stored bytes.
-            # User-authored content stays raw: the user typed it and is the only
-            # one who sees it back.
-            if role != "user" and text:
-                text, _ = redact_exfiltration_urls(text)
-                text, _ = redact_credentials(text)
-                m = {**m, "content": text}
-            msg_out = dict(m)
-            if msg_out.get("variants"):
-                msg_out["variants"] = [
-                    {**v, "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0]}
-                    for v in msg_out["variants"] if isinstance(v, dict)
-                ]
-            meta = parse_cls_meta(m.get("cls", ""))
-            if meta is not None:
-                msg_out["meta"] = _redact_meta_for_role(role, meta)
-            elif isinstance(msg_out.get("meta"), dict):
-                # Redact the STORED meta too. Without this branch the stored dict
-                # passes through by reference (dict(m) is shallow), so it would
-                # reach the client exactly as loaded. This is the only guard on
-                # meta for the slot-detail response (the load path does not
-                # redact meta).
-                msg_out["meta"] = _redact_meta_for_role(role, msg_out["meta"])
-            out.append(msg_out)
-    if chunk_text:
-        redacted_chunk, _ = redact_exfiltration_urls(chunk_text)
-        redacted_chunk, _ = redact_credentials(redacted_chunk)
-        out.append({"role": "streaming", "content": redacted_chunk, "cls": "msg msg-a"})
-    return out
+    from kiro_crew.dashboard.slot_queue_repository import (  # noqa: F401
+        ATTACHMENT_META_KEYS,
+    )
+    from kiro_crew.dashboard.state import (  # noqa: F401
+        BUSY_RECOVERY_PREFIX,
+        COMPACTION_RECOVERY_PREFIX,
+        CONN_RECOVERY_PREFIX,
+        CRON_NOTIFY_PREFIX,
+        EMPTY_RESPONSE_RECOVERY_PREFIX,
+        MANUAL_RESUME_RECOVERY_PREFIX,
+        POSTTOKEN_RECOVERY_PREFIX,
+        PROMISE_ONLY_RECOVERY_PREFIX,
+        REFUSAL_FALLBACK_RECOVERY_PREFIX,
+        SUBAGENT_COMPLETION_PREFIXES,
+        _normalize_slot_key,
+    )
+    from kiro_crew.execution_context import (  # noqa: F401
+        ExecutionContext,
+        canonical_memory_mode,
+        read_live_session_execution,
+        rollback_live_session_tightening,
+        stricter_memory_mode,
+        tighten_live_session_execution,
+    )
+    from kiro_crew.history import (  # noqa: F401
+        is_incognito_transcript,
+        transcript_lock_stems,
+        transcript_sort_key,
+        transcript_stems,
+    )
+    from kiro_crew.hooks import (  # noqa: F401
+        _HOST_READ_ONLY_BUILTIN_TOOLS,
+        safe_read_file,
+    )
+    from kiro_crew.memory_stores import (  # noqa: F401
+        UnknownMemoryStore,
+    )
+    from kiro_crew.messaging.link import (  # noqa: F401
+        canonical_key,
+        is_channel_session_key,
+    )
+    from kiro_crew.messaging.renderer import (  # noqa: F401
+        split_options_trailer,
+    )
+    from kiro_crew.messaging.split import (  # noqa: F401
+        FENCE_CLOSE,
+        FENCE_OPEN,
+        iter_fence_lines,
+    )
+    from kiro_crew.security import (  # noqa: F401
+        CREDENTIAL_REDACTION_TAGS,
+        EXFILTRATION_REDACTION_TAG_PREFIX,
+        _exempt_exact_hosts,
+        bounded_blocked_links,
+        oauth_url_contains_credential,
+    )
+    from kiro_crew.security.credential_sources import (  # noqa: F401
+        bounded_credential_records,
+    )
+    from kiro_crew.security.exfil import (  # noqa: F401
+        current_scoped_exempt_hosts,
+        restore_allowed_links,
+        scoped_exempt_hosts,
+    )
+    from kiro_crew.security.redaction import (  # noqa: F401
+        _token_param_exempt_prefixes,
+    )
+    from kiro_crew.security.redaction_allow import (  # noqa: F401
+        allowed_hosts_for,
+    )
+    from kiro_crew.session_surface import (  # noqa: F401
+        has_dashboard_surface,
+        set_dashboard_surfaced,
+    )
+    from kiro_crew.slack.outbound import (  # noqa: F401
+        decode_options_token,
+        encode_options_token,
+        expire_options,
+        mark_options_terminal,
+        options_edit_lock,
+    )
+    from kiro_crew.validation import (  # noqa: F401
+        THEME_CONSENT_SHA_RE,
+    )
+    from kiro_crew.widget_parse import (  # noqa: F401
+        parse_widgets,
+    )

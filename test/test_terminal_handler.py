@@ -1,4 +1,11 @@
-"""Tests for the built-in CLI terminal panel handlers."""
+"""Tests for the built-in CLI terminal panel handlers.
+
+This file holds owner authorization, the shell, config and cwd resolvers,
+session teardown (``_kill_session``), and the create and redact routes. The
+sibling ``test_terminal_handler_*.py`` files hold the rest of the handler's
+tests, and ``terminal_handler_helpers.py`` holds the builders and the
+autouse fixture the whole family shares.
+"""
 
 from __future__ import annotations
 
@@ -6,73 +13,259 @@ import asyncio
 import contextlib
 import json
 import os
+import sys
 import threading
-import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
+from terminal_handler_helpers import (  # noqa: F401 -- the autouse fixture registers by import
+    _clear_enabled_cache,
+    _make_request,
+    _make_session,
+)
 
 from kiro_crew import platform_compat
-from kiro_crew.dashboard import terminal_commands
 from kiro_crew.dashboard.handlers import terminal
+from kiro_crew.testing.ids import UNALLOCATABLE_PID
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
-@pytest.fixture(autouse=True)
-def _clear_enabled_cache(monkeypatch):
-    """Enable terminal and reset cache between tests."""
-    terminal._enabled_cache[0] = True
-    terminal._enabled_cache[1] = time.monotonic()
-    yield
-    terminal._enabled_cache[0] = False
-    terminal._enabled_cache[1] = 0.0
-
-
-# ── Helpers ──
-
-
-def _make_request(
-    user="testuser",
-    session_id="abc123",
-    registry=None,
-    cfg=None,
-    origin=None,
-    remote="127.0.0.1",
-):
-    """Build a mock aiohttp request with state and match_info.
-
-    ``origin`` is the Origin header the handshake carries. Left unset it is
-    absent, which ``check_origin`` trusts from loopback — a browser always
-    sends one, so its absence means a local process rather than a page.
-    """
-    state = MagicMock()
-    state._terminal_sessions = registry if registry is not None else {}
-    app = {"state": state, "allowed_origins": {"http://localhost:5476"}}
-    request = MagicMock()
-    request.app = app
-    request.get = lambda k, default=None: user if k == "user" else default
-    request.match_info = MagicMock()
-    request.match_info.get = lambda k, default="": session_id if k == "session_id" else default
-    request.remote = remote
-    request.headers = {} if origin is None else {"Origin": origin}
-    return request
-
-
-def _make_session(session_id="s1", alive=True, ws=None, disconnect=None):
-    """Build a mock _TerminalSession."""
-    proc = MagicMock()
-    proc.returncode = None if alive else 0
-    proc.pid = 12345
-    proc.wait = AsyncMock()
-    sess = terminal._TerminalSession(
-        session_id=session_id,
-        master_fd=99,
-        proc=proc,
-        ws=ws,
+class TestTerminalOwnerAuthorization:
+    @pytest.mark.parametrize(
+        "handler",
+        [
+            terminal.api_terminal_ws,
+            terminal.api_terminal_create,
+            terminal.api_terminal_redact,
+            terminal.api_terminal_complete,
+            terminal.api_terminal_delete,
+            terminal.api_terminal_list,
+        ],
     )
-    sess.last_ws_disconnect = disconnect
-    sess.reader_task = None
-    return sess
+    @pytest.mark.asyncio
+    async def test_non_owner_is_denied_before_terminal_capability(self, handler):
+        req = _make_request(user="intruder", owner_id="owner")
+
+        response = await handler(req)
+
+        assert response.status == 403
+        assert json.loads(response.body)["code"] == "owner_only"
+
+
+# ── _resolve_shell ──
+
+
+class TestAgentCanRewrite:
+    """Ownership, not current mode bits, decides whether a path is rewritable: the
+    owner of a 0555 directory can chmod it writable in one syscall."""
+
+    def test_a_directory_the_caller_owns_is_rewritable_even_at_mode_0555(self, tmp_path, request):
+        d = tmp_path / "bin"
+        d.mkdir()
+        d.chmod(0o555)
+        request.addfinalizer(lambda: d.chmod(0o755))
+        assert terminal._agent_can_rewrite(str(d), os.geteuid()) is True
+
+    def test_a_directory_owned_by_someone_else_is_not(self, tmp_path, request):
+        d = tmp_path / "bin"
+        d.mkdir()
+        d.chmod(0o555)
+        request.addfinalizer(lambda: d.chmod(0o755))
+        assert terminal._agent_can_rewrite(str(d), os.geteuid() + 1) is False
+
+    def test_a_rewritable_ancestor_taints_the_path(self, tmp_path, request):
+        outer = tmp_path / "outer"
+        inner = outer / "bin"
+        inner.mkdir(parents=True)
+        inner.chmod(0o555)
+        request.addfinalizer(lambda: inner.chmod(0o755))
+        # The caller owns `outer`, so it can rename it and substitute everything
+        # underneath, whatever `inner`'s own bits say.
+        assert terminal._agent_can_rewrite(str(inner), os.geteuid()) is True
+
+    def test_a_missing_path_fails_closed(self, tmp_path):
+        assert terminal._agent_can_rewrite(str(tmp_path / "nope"), os.geteuid()) is True
+
+
+class TestResolveFenceShells:
+    """Fence-shell discovery adds no trusted location and consults no PATH: each
+    name is probed inside the directory the session's own shell came from, and
+    nothing the gateway's user could rewrite is offered -- a reported path is
+    invoked later, when the user confirms, so anything it owns is swappable then."""
+
+    def _foreign_uid(self, monkeypatch):
+        """Run as a uid that owns nothing under tmp_path, so a real directory can
+        stand in for a system one without needing root to create it."""
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+
+    def _sysdir(self, tmp_path, names, request=None):
+        """A read-only directory of read-only executables, like /usr/bin.
+
+        Restores the directory to a writable mode on teardown via a finalizer:
+        left at 0o555, pytest's own tmp_path cleanup cannot unlink entries
+        inside it, so it renames the tree to a `garbage-<uuid>` directory under
+        the shared pytest temp root and leaves it there forever. `request` is
+        optional so a caller with no fixture request (there are none left, but
+        this keeps the helper safe to call standalone) still gets a directory,
+        just without the guaranteed restore.
+        """
+        d = tmp_path / "bin"
+        d.mkdir(parents=True)
+        for name in names:
+            p = d / name
+            p.write_text("#!/bin/sh\n")
+            p.chmod(0o555)
+        d.chmod(0o555)
+        if request is not None:
+            request.addfinalizer(lambda: d.chmod(0o755))
+        return d
+
+    def test_reports_shells_beside_the_launched_one(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash", "zsh", "fish"), request)
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert found == {
+            "bash": str(d / "bash"), "zsh": str(d / "zsh"), "fish": str(d / "fish"),
+        }
+
+    def test_ignores_a_shell_in_another_directory(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash",), request)
+        elsewhere = self._sysdir(tmp_path / "other", ("fish",), request)
+        assert (elsewhere / "fish").exists()
+        self._foreign_uid(monkeypatch)
+        assert terminal._resolve_fence_shells(str(d / "bash")) == {"bash": str(d / "bash")}
+
+    def test_probes_the_directory_rather_than_the_search_path(self, tmp_path, monkeypatch, request):
+        shims = self._sysdir(tmp_path / "s", ("fish",), request)
+        d = self._sysdir(tmp_path / "r", ("bash", "fish"), request)
+        monkeypatch.setenv("PATH", str(shims))
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert found["fish"] == str(d / "fish")
+
+    def test_offers_nothing_from_a_directory_the_gateway_user_owns(self, tmp_path, request):
+        # The swap window, and the Homebrew/workspace prefix case: the caller owns
+        # this directory, so read-only mode bits are one chmod from irrelevant.
+        d = self._sysdir(tmp_path, ("bash", "fish"), request)
+        assert terminal._resolve_fence_shells(str(d / "bash")) == {}
+
+    def test_skips_a_world_writable_candidate(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash",), request)
+        d.chmod(0o755)
+        (d / "fish").write_text("#!/bin/sh\n")
+        (d / "fish").chmod(0o757)  # anyone may overwrite it before invocation
+        d.chmod(0o555)
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert "fish" not in found
+        assert found == {"bash": str(d / "bash")}
+
+    def test_skips_a_symlinked_candidate(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash",), request)
+        target = self._sysdir(tmp_path / "elsewhere", ("fish",), request)
+        d.chmod(0o755)
+        (d / "fish").symlink_to(target / "fish")
+        d.chmod(0o555)
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert "fish" not in found
+
+    def test_reports_nothing_without_a_launched_shell(self):
+        assert terminal._resolve_fence_shells("") == {}
+
+
+class TestResolveShell:
+    """Shell resolution: configured → $SHELL (POSIX) → platform default, each
+    candidate validated as an executable, and the value returned is the path
+    `which` RESOLVED — never the bare candidate, which the spawn's project cwd
+    could re-resolve differently. `which` is pinned in every test so outcomes
+    never depend on what the CI host has installed."""
+
+    @pytest.fixture(autouse=True)
+    def _posix(self, monkeypatch):
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", False)
+
+    def _pin_which(self, monkeypatch, mapping):
+        monkeypatch.setattr(terminal.shutil, "which", lambda c: mapping.get(c))
+
+    def test_configured_executable_wins(self, monkeypatch):
+        self._pin_which(monkeypatch, {"/opt/fish": "/opt/fish", "/bin/bash": "/bin/bash"})
+        assert terminal._resolve_shell({"shell": "/opt/fish"}) == ("/opt/fish", None)
+
+    def test_bare_name_pinned_to_resolved_path(self, monkeypatch):
+        # The RESOLVED path is returned, not the bare name: the spawn runs in
+        # the session's project cwd, where a relative PATH entry could resolve
+        # the same bare name to a project-planted executable.
+        self._pin_which(monkeypatch, {"fish": "/usr/local/bin/fish"})
+        assert terminal._resolve_shell({"shell": "fish"}) == ("/usr/local/bin/fish", None)
+
+    def test_relative_which_result_anchored_to_absolute(self, monkeypatch):
+        # A RELATIVE PATH entry (PATH=bin:…) makes `which` itself return a
+        # relative path, which the spawn cwd would re-resolve — the return
+        # must be anchored to the gateway cwd the validation ran in, on both
+        # the configured and the fallback branch.
+        monkeypatch.setenv("SHELL", "zsh")
+        self._pin_which(monkeypatch, {"fish": "bin/fish", "zsh": "bin/zsh"})
+        shell, rejected = terminal._resolve_shell({"shell": "fish"})
+        assert os.path.isabs(shell) and shell.endswith("/bin/fish")
+        assert rejected is None
+        shell, rejected = terminal._resolve_shell({})
+        assert os.path.isabs(shell) and shell.endswith("/bin/zsh")
+        assert rejected is None
+
+    def test_invalid_configured_falls_back_to_env_shell(self, monkeypatch):
+        monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+        self._pin_which(monkeypatch, {"/usr/bin/zsh": "/usr/bin/zsh", "/bin/bash": "/bin/bash"})
+        assert terminal._resolve_shell({"shell": "/opt/typo"}) == (
+            "/usr/bin/zsh",
+            "/opt/typo",
+        )
+
+    def test_unset_uses_env_shell_without_rejection(self, monkeypatch):
+        monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+        self._pin_which(monkeypatch, {"/usr/bin/zsh": "/usr/bin/zsh"})
+        assert terminal._resolve_shell({}) == ("/usr/bin/zsh", None)
+
+    def test_whitespace_configured_treated_as_unset(self, monkeypatch):
+        monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+        self._pin_which(monkeypatch, {"/usr/bin/zsh": "/usr/bin/zsh"})
+        assert terminal._resolve_shell({"shell": "   "}) == ("/usr/bin/zsh", None)
+
+    def test_invalid_env_shell_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("SHELL", "/opt/gone")
+        self._pin_which(monkeypatch, {"/bin/bash": "/bin/bash"})
+        assert terminal._resolve_shell({}) == ("/bin/bash", None)
+
+    def test_no_env_shell_uses_default(self, monkeypatch):
+        monkeypatch.delenv("SHELL", raising=False)
+        self._pin_which(monkeypatch, {"/bin/bash": "/bin/bash"})
+        assert terminal._resolve_shell({}) == ("/bin/bash", None)
+
+    def test_nothing_resolves_returns_default_unvalidated(self, monkeypatch):
+        # A host where no candidate validates keeps the historical behavior:
+        # return the default so the spawn's own error surfaces, never a
+        # silent no-terminal state.
+        monkeypatch.delenv("SHELL", raising=False)
+        self._pin_which(monkeypatch, {})  # nothing resolves
+        assert terminal._resolve_shell({"shell": "/opt/typo"}) == (
+            "/bin/bash",
+            "/opt/typo",
+        )
+
+    def test_windows_rejects_to_powershell(self, monkeypatch):
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", True)
+        self._pin_which(
+            monkeypatch, {"powershell.exe": "C:\\WINDOWS\\System32\\powershell.exe"}
+        )
+        shell, rejected = terminal._resolve_shell({"shell": "C:\\typo.exe"})
+        # abspath is host-dependent for a Windows-style fake on a POSIX test
+        # host, so assert the wiring (absolute + right program) rather than an
+        # exact string.
+        assert os.path.isabs(shell)
+        assert shell.endswith("powershell.exe")
+        assert rejected == "C:\\typo.exe"
 
 
 # ── _get_config ──
@@ -105,6 +298,56 @@ class TestGetConfig:
         result = terminal._get_config(req)
         assert result == {}
 
+    @pytest.mark.parametrize(
+        "document",
+        [
+            '{"dashboard": false}',
+            '{"dashboard": true}',
+            '{"dashboard": 7}',
+            '{"dashboard": "x"}',
+            '{"dashboard": []}',
+            '{"dashboard": null}',
+            "[]",
+            '"x"',
+            "7",
+            "null",
+        ],
+    )
+    def test_a_malformed_parent_never_raises(self, document, tmp_path, monkeypatch):
+        # A chained `.get` on a non-dict raises AttributeError, which is NOT in
+        # this function's caught set — so before the type checks a single
+        # hand-edited typo was an HTTP 500 on every terminal route, including the
+        # per-keystroke completion one. The read fails closed to the default.
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(document)
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        assert terminal._get_config(_make_request()) == {}
+
+    @pytest.mark.parametrize("value", ["false", "true", "7", '"x"', "[]", "null"])
+    def test_a_non_object_terminal_value_is_the_default(
+        self, value, tmp_path, monkeypatch,
+    ):
+        # `"terminal": false` reads like "off" but is not the documented shape
+        # (`terminal.enabled`), and returning it verbatim made `_is_enabled` do
+        # `False.get("enabled")` — a 500 rather than a disabled panel. A malformed
+        # value degrades to the default, as an absent key does.
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text('{"dashboard": {"terminal": ' + value + "}}")
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        assert terminal._get_config(_make_request()) == {}
+
+    def test_is_enabled_survives_a_non_object_terminal_value(
+        self, tmp_path, monkeypatch,
+    ):
+        # The panel flag is the first `_get_config` consumer on every terminal
+        # route, so a raise here took the whole panel down, not just completion.
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text('{"dashboard": {"terminal": false}}')
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        terminal._enabled_cache[0] = True
+        terminal._enabled_cache[1] = 0.0
+        assert terminal._is_enabled(_make_request()) is True
+
     def test_returns_empty_when_no_terminal_key(self, tmp_path, monkeypatch):
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"dashboard": {}}))
@@ -118,6 +361,32 @@ class TestGetConfig:
 
 
 class TestResolveCwd:
+    @pytest.fixture
+    def invalid_workspace(self, tmp_path, monkeypatch):
+        registry = {}
+        request = _make_request(registry=registry)
+        request.query = {"cwd": str(tmp_path / "missing")}
+        ws = MagicMock(spec=web.WebSocketResponse)
+        ws.closed = False
+        ws.prepare = AsyncMock()
+        ws.send_str = AsyncMock()
+        ws.close = AsyncMock()
+        monkeypatch.setattr(terminal, "_get_config", lambda _: {"cwd": str(tmp_path)})
+        monkeypatch.setattr(
+            terminal, "_resolve_shell_with_fence_shells",
+            lambda _: ("/bin/sh", None, {}),
+        )
+        monkeypatch.setattr(terminal.web, "WebSocketResponse", lambda **_: ws)
+        # Fail before allocating a POSIX PTY or preparing either spawn's env.
+        pty = MagicMock()
+        pty.openpty.side_effect = AssertionError("unexpected PTY allocation")
+        monkeypatch.setattr(terminal, "_pty", pty)
+        monkeypatch.setattr(
+            terminal, "_pty_child_env",
+            MagicMock(side_effect=AssertionError("unexpected shell spawn")),
+        )
+        return request, registry, ws
+
     def test_valid_requested_dir_wins(self, tmp_path):
         assert terminal._resolve_cwd({"cwd": "/etc"}, str(tmp_path)) == str(tmp_path)
 
@@ -128,15 +397,244 @@ class TestResolveCwd:
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
         assert terminal._resolve_cwd({}, "~") == str(tmp_path)
 
-    def test_invalid_requested_falls_back_to_config_cwd(self, tmp_path):
-        assert terminal._resolve_cwd({"cwd": str(tmp_path)}, "/no/such/dir/xyz") == str(tmp_path)
+    def test_invalid_requested_refuses_another_directory(self, tmp_path):
+        with pytest.raises(ValueError, match="working directory"):
+            terminal._resolve_cwd({"cwd": str(tmp_path)}, str(tmp_path / "missing"))
+
+    @pytest.mark.parametrize("windows", [False, True])
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_reports_error_without_spawning(
+        self, invalid_workspace, monkeypatch, windows,
+    ):
+        request, registry, ws = invalid_workspace
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", windows)
+
+        async def check_released(*_args):
+            assert registry == {}
+
+        ws.prepare.side_effect = check_released
+        ws.close.side_effect = check_released
+        response = await terminal.api_terminal_ws(request)
+        assert response is ws
+        ws.prepare.assert_awaited_once_with(request)
+        ws.send_str.assert_awaited_once()
+        assert json.loads(ws.send_str.call_args.args[0]) == {
+            "type": "error",
+            "code": "terminal_invalid_cwd",
+            "message": "Terminal working directory is unavailable",
+        }
+        ws.close.assert_awaited_once()
+        assert registry == {}
+        terminal._pty.openpty.assert_not_called()
+        terminal._pty_child_env.assert_not_called()
+
+    @pytest.mark.parametrize("stage", ["prepare", "send_str", "close"])
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_cancellation_releases_reservation(
+        self, invalid_workspace, stage,
+    ):
+        request, registry, ws = invalid_workspace
+        getattr(ws, stage).side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await terminal.api_terminal_ws(request)
+        assert registry == {}
+
+    @pytest.mark.asyncio
+    async def test_probe_capacity_refusal_is_audited_and_releases_slot(
+        self,
+        invalid_workspace,
+        monkeypatch,
+    ):
+        request, registry, ws = invalid_workspace
+        monkeypatch.setattr(
+            terminal,
+            "_run_path_probe",
+            AsyncMock(side_effect=terminal._PathProbeBusy),
+        )
+        audit = MagicMock()
+        monkeypatch.setattr(terminal, "_sel", lambda: audit)
+
+        assert await terminal.api_terminal_ws(request) is ws
+        assert registry == {}
+        assert json.loads(ws.send_str.call_args.args[0])["code"] == "terminal_invalid_cwd"
+        record = audit.log_api_access.call_args.kwargs
+        assert record["outcome"] == "denied"
+        assert repr(request.query["cwd"]) in record["resources"]
+        terminal._pty.openpty.assert_not_called()
+        terminal._pty_child_env.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_cwd_under_two_stuck_probes_is_refused_by_its_key(
+        self, invalid_workspace, monkeypatch, tmp_path,
+    ):
+        """The cwd is the probe's SECOND argument, so it is keyed by ``stall_path``:
+        with two probes stuck under it the open is refused before ``_resolve_cwd``
+        runs, while a third worker is still free."""
+        from kiro_crew import executors
+        from kiro_crew.dashboard.handlers import files
+
+        request, registry, ws = invalid_workspace
+        request.query = {"cwd": str(tmp_path)}
+        resolve = MagicMock(side_effect=AssertionError("_resolve_cwd ran on a stuck mount"))
+        monkeypatch.setattr(terminal, "_resolve_cwd", resolve)
+        monkeypatch.setattr(files, "_PATH_PROBE_ADMIT_TIMEOUT_SECS", 0.2)
+        monkeypatch.setattr(files, "_PATH_PROBE_STALL_SECS", 0.0)
+        release = threading.Event()
+
+        def park(_path: str, entered: threading.Event) -> None:
+            entered.set()
+            release.wait()
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            monkeypatch.setattr(executors, "path_probe_executor", lambda: pool)
+            entered_a, entered_b = threading.Event(), threading.Event()
+            wedged = [
+                asyncio.ensure_future(files._run_path_probe(park, str(tmp_path / n), e))
+                for e, n in ((entered_a, "a"), (entered_b, "b"))
+            ]
+            try:
+                await async_wait_until(
+                    lambda: entered_a.is_set() and entered_b.is_set(),
+                    describe=lambda: "the two stuck probes starting",
+                )
+                assert await terminal.api_terminal_ws(request) is ws
+                assert registry == {}
+                assert json.loads(ws.send_str.call_args.args[0])["code"] == (
+                    "terminal_invalid_cwd"
+                )
+                resolve.assert_not_called()
+                assert await files._run_path_probe(lambda: "free") == "free"
+            finally:
+                release.set()
+                await await_until(asyncio.gather(*wedged), what="the parked probes settling")
+
+    @pytest.mark.parametrize("stage", ["send_str", "close"])
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_response_is_bounded(
+        self, invalid_workspace, monkeypatch, stage,
+    ):
+        request, registry, ws = invalid_workspace
+
+        async def blocked(*_args):
+            await asyncio.Event().wait()
+
+        getattr(ws, stage).side_effect = blocked
+        monkeypatch.setattr(terminal, "_TERMINAL_WS_CLEANUP_TIMEOUT_S", 0.01)
+        response = await await_until(
+            asyncio.ensure_future(terminal.api_terminal_ws(request)),
+            what="the invalid-workspace response",
+        )
+        assert response is ws
+        ws.close.assert_awaited_once()
+        assert registry == {}
+
+    @pytest.mark.asyncio
+    async def test_wedged_cwd_releases_slot_without_holding_discovery(
+        self,
+        invalid_workspace,
+        monkeypatch,
+        tmp_path,
+    ):
+        from kiro_crew import executors
+
+        request, registry, ws = invalid_workspace
+        entered = asyncio.Event()
+        expire = asyncio.Event()
+        finished = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        probe_threads = []
+        wait_for = asyncio.wait_for
+
+        async def expire_after_probe_starts(awaitable, timeout):
+            if timeout != terminal._TERMINAL_CWD_TIMEOUT_S:
+                return await wait_for(awaitable, timeout=timeout)
+            probe = asyncio.create_task(awaitable)
+            # Expire the real await only after a worker has claimed the probe.
+            # A short wall-clock budget would race thread startup on CI.
+            await await_until(entered, what="the probe worker starting")
+            await await_until(expire, what="the test expiring the probe")
+            return await wait_for(probe, timeout=0)
+
+        def blocked_probe(*_args):
+            probe_threads.append(threading.current_thread().name)
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                assert release.wait(timeout=5), "test did not release the path probe"
+                return str(tmp_path)
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="terminal-cwd-probe",
+        ) as pool:
+            monkeypatch.setattr(executors, "path_probe_executor", lambda: pool)
+            monkeypatch.setattr(terminal, "_resolve_cwd", blocked_probe)
+            monkeypatch.setattr(
+                terminal.asyncio,
+                "wait_for",
+                expire_after_probe_starts,
+            )
+            opening = asyncio.create_task(terminal.api_terminal_ws(request))
+            try:
+                await await_until(entered, what="the probe worker starting")
+                assert registry == {"abc123": None}
+                expire.set()
+                assert await await_until(opening, what="the opening handler returning") is ws
+                assert not release.is_set()
+                assert registry == {}
+                assert probe_threads[0].startswith("terminal-cwd-probe")
+                assert await await_until(
+                    loop.run_in_executor(terminal.discovery_executor(), lambda: True),
+                    what="the discovery executor taking a job",
+                )
+                assert json.loads(ws.send_str.call_args.args[0])["code"] == ("terminal_invalid_cwd")
+                terminal._pty.openpty.assert_not_called()
+                terminal._pty_child_env.assert_not_called()
+            finally:
+                expire.set()
+                release.set()
+                await await_until(finished, what="the blocked probe finishing")
+                if not opening.done():
+                    opening.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await opening
+        assert registry == {}
 
     def test_no_request_uses_config_cwd(self, tmp_path):
         assert terminal._resolve_cwd({"cwd": str(tmp_path)}, None) == str(tmp_path)
 
     def test_no_request_no_config_uses_home(self, tmp_path, monkeypatch):
+        # POSIX expanduser reads HOME; Windows reads USERPROFILE — set both so
+        # the test is platform agnostic.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         assert terminal._resolve_cwd({}, None) == str(tmp_path)
+
+    def test_windows_home_unset_falls_back_to_userprofile(self, tmp_path, monkeypatch):
+        # On Windows cmd/PowerShell HOME is unset and only USERPROFILE is set.
+        # expanduser("~") resolves the profile, so the default is the user's home
+        # rather than "/" (which Windows reads as the drive root).
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            terminal.os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p
+        )
+        assert terminal._resolve_cwd({}, None) == str(tmp_path)
+
+    def test_posix_home_set_still_opens_at_home(self, tmp_path, monkeypatch):
+        # With HOME set and no requested/configured cwd, the default is the home
+        # directory (resolved via expanduser).
+        monkeypatch.setattr(
+            terminal.os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p
+        )
+        assert terminal._resolve_cwd({}, None) == str(tmp_path)
+
+    def test_unresolvable_home_keeps_root_last_resort(self, monkeypatch):
+        # When no home can be resolved at all, expanduser returns the literal "~";
+        # the "/" last resort applies rather than returning "~".
+        monkeypatch.setattr(terminal.os.path, "expanduser", lambda p: p)
+        assert terminal._resolve_cwd({}, None) == "/"
 
 
 # ── _kill_session ──
@@ -179,7 +677,37 @@ class TestKillSession:
         with patch("os.close"), \
                 patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree") as mock_kill:
             await terminal._kill_session(sess)
-        mock_kill.assert_any_call(12345, platform_compat.SIGTERM)
+        mock_kill.assert_any_call(UNALLOCATABLE_PID, platform_compat.SIGTERM)
+
+    @pytest.mark.asyncio
+    async def test_the_process_tree_is_hung_up_and_ended_before_the_pty_is_closed(self):
+        """Signals first, close second, HUP among the signals: and the order is the fix.
+
+        Closing the PTY's controller end while the reader is blocked in ``os.read()``
+        on it only unblocks that read on Linux; on macOS/BSD ``close()`` WAITS for the
+        read, so with an interactive bash still holding the terminal end the close never
+        returned and four PTY tests timed out at 120 s on every macOS run. Ending the
+        process tree first releases the terminal end on both. SIGHUP is included because an interactive
+        shell ignores SIGTERM, which alone would cost the 5 s SIGKILL escalation on
+        every terminal close.
+        """
+        order: list[str] = []
+        sess = _make_session(alive=True)
+        sess.master_fd = 42  # wokeignore:rule=master
+
+        def _kill(pid, sig):
+            order.append(f"kill:{sig}")
+            return True
+
+        with patch("os.close", side_effect=lambda fd: order.append("close")), patch(
+            "kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree",
+            side_effect=_kill,
+        ):
+            await terminal._kill_session(sess)
+
+        assert "close" in order and f"kill:{platform_compat.SIGHUP}" in order
+        assert order.index(f"kill:{platform_compat.SIGHUP}") < order.index("close")
+        assert order.index(f"kill:{platform_compat.SIGTERM}") < order.index("close")
 
     @pytest.mark.asyncio
     async def test_skips_kill_when_process_already_exited(self):
@@ -206,8 +734,172 @@ class TestKillSession:
                 patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree") as mock_kill:
             await terminal._kill_session(sess)
         calls = [c.args for c in mock_kill.call_args_list]
-        assert (12345, platform_compat.SIGTERM) in calls
-        assert (12345, platform_compat.SIGKILL) in calls
+        assert (UNALLOCATABLE_PID, platform_compat.SIGTERM) in calls
+        assert (UNALLOCATABLE_PID, platform_compat.SIGKILL) in calls
+
+    @pytest.mark.asyncio
+    async def test_ends_child_before_closing_controller_fd(self):
+        """Teardown ends the child, THEN closes the PTY controller fd.
+
+        The read loop parks a pool thread in a blocking ``os.read()`` on that
+        fd. Only the child's exit frees it portably: the worker side hangs up
+        and the read returns EOF on macOS or EIO on Linux. Closing the fd does
+        not wake a blocking PTY read on macOS, where the read returns only on
+        that hangup, so a close-first order parks the thread for the process's
+        lifetime and stalls teardown before it signals anything. The assertion
+        is on the ORDER, so it holds on every platform.
+        """
+        order: list[tuple[str, object]] = []
+        sess = _make_session(alive=True)
+        sess.master_fd = 42  # wokeignore:rule=master
+
+        async def _kill(pid, sig):
+            order.append(("kill", sig))
+
+        with patch("os.close", side_effect=lambda fd: order.append(("close", fd))), patch(
+            "kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree_async",
+            AsyncMock(side_effect=_kill),
+        ):
+            await terminal._kill_session(sess)
+
+        assert ("kill", platform_compat.SIGTERM) in order, order
+        assert ("close", 42) in order, order
+        assert order.index(("kill", platform_compat.SIGTERM)) < order.index(("close", 42)), (
+            f"controller fd closed before the child was ended: {order}"
+        )
+        assert sess.master_fd == -1  # wokeignore:rule=master
+
+    @pytest.mark.asyncio
+    async def test_reader_task_cancelled_after_child_ends(self):
+        """The reader task is cancelled after the child's exit, so the parked
+        read has already returned EOF and the cancel is a formality."""
+        order: list[str] = []
+        task = AsyncMock()
+        task.cancel = MagicMock(side_effect=lambda: order.append("cancel"))
+        sess = _make_session(alive=True)
+        sess.reader_task = task
+
+        async def _kill(pid, sig):
+            order.append("kill")
+
+        with patch("os.close"), patch(
+            "kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree_async",
+            AsyncMock(side_effect=_kill),
+        ):
+            await terminal._kill_session(sess)
+
+        # Every signal (SIGHUP, then SIGTERM) lands before the reader is touched;
+        # the exact signal sequence is the previous test's business.
+        assert order and order[-1] == "cancel", order
+        assert order.count("cancel") == 1, order
+        assert all(step == "kill" for step in order[:-1]), order
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS,
+        reason="POSIX pty teardown; Windows sessions use the ConPTY backend",
+    )
+    @pytest.mark.asyncio
+    async def test_close_completes_with_a_reader_parked_on_a_real_pty(self):
+        """End to end on a real PTY: a thread parked in a blocking read on the
+        controller fd must not outlive teardown, and teardown must finish.
+
+        This is the shape a user hits by closing a terminal whose shell is
+        alive. It passes on Linux with either order and fails on macOS with a
+        close-first order, so the macOS leg is what proves the fix.
+        """
+        controller_fd, worker_fd = os.openpty()
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import sys; sys.stdin.read()",
+            stdin=worker_fd, stdout=worker_fd, stderr=worker_fd,
+            start_new_session=True,
+        )
+        os.close(worker_fd)
+        sess = terminal._TerminalSession(
+            session_id="real-pty", master_fd=controller_fd, proc=proc,  # wokeignore:rule=master
+        )
+        parked = threading.Event()
+
+        def _blocking_read():
+            parked.set()
+            try:
+                return os.read(controller_fd, 4096)
+            except OSError:
+                return b""
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            read_future = pool.submit(_blocking_read)
+            assert parked.wait(10), "reader thread never started"
+            await asyncio.sleep(0.2)  # let the read enter the kernel
+
+            await await_until(
+                asyncio.ensure_future(terminal._kill_session(sess)),
+                what="_kill_session with a reader parked on the PTY",
+            )
+
+            assert sess.master_fd == -1  # wokeignore:rule=master
+            assert proc.returncode is not None, "child survived teardown"
+            # The parked read has returned, so the pool worker is free again.
+            await async_wait_until(
+                read_future.done,
+                describe=lambda: (
+                    "the parked os.read() never returned: closing the controller fd "
+                    "does not wake it, so the child must be ended first"
+                ),
+            )
+        finally:
+            # A failure above (a _kill_session timeout, a wrong assertion) must
+            # not leave the child holding the PTY and the worker parked in
+            # os.read(): end the child, then close the controller so the read
+            # returns, then let the pool go. Otherwise the non-daemon worker
+            # blocks the interpreter's exit and the run hangs instead of failing.
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await await_until(
+                    asyncio.ensure_future(proc.wait()), what="the killed child being reaped"
+                )
+            if sess.master_fd != -1:  # wokeignore:rule=master
+                with contextlib.suppress(OSError):
+                    os.close(controller_fd)
+            pool.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_reap_after_sigkill_is_bounded(self, monkeypatch):
+        """A child that does not exit after SIGKILL must not hang teardown.
+
+        A shell blocked writing into an undrained PTY controller buffer stays in
+        a tty write until the fd is read or closed, so a pending SIGKILL does
+        not tear it down and an unbounded wait() loses the request handler for
+        the life of the process. Teardown gives up on the reap and continues,
+        which is what lets the controller fd close and release the write.
+        """
+        sess = _make_session(alive=True)
+        sess.master_fd = 42  # wokeignore:rule=master
+        calls = {"n": 0}
+
+        async def _wait(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise asyncio.TimeoutError  # the 5s SIGTERM wait expires
+            await asyncio.Event().wait()  # SIGKILL never lands: wait forever
+
+        sess.proc.wait = _wait
+        monkeypatch.setattr(terminal.platform_compat, "REAP_TIMEOUT_SECS", 0.05)
+
+        with patch("os.close") as mock_close, patch(
+            "kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree_async",
+            AsyncMock(),
+        ):
+            await await_until(
+                asyncio.ensure_future(terminal._kill_session(sess)),
+                what="_kill_session giving up on the reap",
+            )
+
+        # Teardown ran to completion: the controller fd is closed and cleared.
+        mock_close.assert_called_with(42)
+        assert sess.master_fd == -1  # wokeignore:rule=master
+        assert calls["n"] == 2
 
     @pytest.mark.asyncio
     async def test_handles_os_error_on_close(self):
@@ -245,23 +937,43 @@ class TestKillSession:
     @pytest.mark.asyncio
     async def test_master_fd_cleared_before_await_survives_cancellation(self):
         """If the coroutine is cancelled while suspended on the executor close,
-        master_fd must already be -1 so the fd is not left referenced."""
+        the controller fd field must already be -1 so the fd is not left
+        referenced.
 
-        async def _hang(*_a, **_k):
-            await asyncio.sleep(3600)  # never completes; we cancel mid-await
+        The tree-kill is stubbed like in every sibling: this test is about the
+        descriptor handoff, and the mock session's pid is never signalled for
+        real.
+        """
+        loop = asyncio.get_running_loop()
+        closing = loop.create_future()
+        entered = asyncio.Event()
+
+        def submit(*_args):
+            entered.set()
+            return closing
 
         sess = _make_session()
         sess.master_fd = 42
-        with patch.object(
-            asyncio.get_event_loop(), "run_in_executor", side_effect=_hang
-        ), patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree"):
-            task = asyncio.ensure_future(terminal._kill_session(sess))
-            await asyncio.sleep(0)  # let it reach the await
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        # Cleared BEFORE the await, so cancellation cannot leave a stale fd.
-        assert sess.master_fd == -1
+        with patch.object(loop, "run_in_executor", side_effect=submit), patch(
+            "kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree_async",
+            AsyncMock(),
+        ):
+            task = asyncio.create_task(terminal._kill_session(sess))
+            try:
+                await await_until(entered, what="the paused step being entered")
+                assert sess.master_fd == -1  # wokeignore:rule=master
+                task.cancel()
+                cancelled = asyncio.Event()
+                loop.call_soon(cancelled.set)
+                await await_until(cancelled, what="the cancellation's loop turn")
+                assert not closing.cancelled()
+            finally:
+                if not closing.done():
+                    closing.set_result(None)
+                (result,) = await await_until(
+                    asyncio.gather(task, return_exceptions=True), what="the task settling"
+                )
+            assert isinstance(result, asyncio.CancelledError)
 
     @pytest.mark.skipif(
         terminal.platform_compat.IS_WINDOWS,
@@ -283,7 +995,7 @@ class TestKillSession:
             await terminal._kill_session(sess)
         # The close error was swallowed and teardown continued to the tree-kill.
         assert sess.master_fd == -1
-        mock_kill.assert_any_call(12345, platform_compat.SIGTERM)
+        mock_kill.assert_any_call(UNALLOCATABLE_PID, platform_compat.SIGTERM)
 
 
 # ── api_terminal_create ──
@@ -294,7 +1006,7 @@ class TestApiTerminalCreate:
     Windows build host too — the Windows-specific 501 gate has its own suite in
     ``TestApiTerminalCreateWindowsFailFast``. Mirrors the umbrella-wide
     monkeypatch pattern used by ``TestRestrictToOwnerArgvOnLinux`` in
-    ``test_platform_compat.py``."""
+    ``test_platform_compat_owner_only.py``."""
 
     @pytest.fixture(autouse=True)
     def _force_posix(self, monkeypatch):
@@ -343,7 +1055,12 @@ class TestApiTerminalCreate:
         assert resp.status == 429
 
     @pytest.mark.asyncio
-    async def test_uses_configured_shell(self):
+    async def test_uses_configured_shell(self, monkeypatch):
+        # The configured shell must actually resolve to an executable to be
+        # used — pin `which` so the test does not depend on the host's zsh.
+        monkeypatch.setattr(
+            terminal.shutil, "which", lambda c: c if c == "/bin/zsh" else None
+        )
         req = _make_request()
         with patch.object(
             terminal, "_get_config", return_value={"enabled": True, "shell": "/bin/zsh"}
@@ -352,13 +1069,38 @@ class TestApiTerminalCreate:
             resp = await terminal.api_terminal_create(req)
         body = json.loads(resp.body)
         assert body["shell"] == "/bin/zsh"
+        assert "shell_fallback" not in body
+
+    @pytest.mark.asyncio
+    async def test_surfaces_fallback_when_configured_shell_missing(self, monkeypatch):
+        # A configured shell that does not resolve must not fail the create —
+        # the response falls back AND says so, so a typo is visible instead of
+        # a silently different shell.
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.setattr(
+            terminal.shutil, "which", lambda c: c if c == "/bin/bash" else None
+        )
+        req = _make_request()
+        with patch.object(
+            terminal, "_get_config",
+            return_value={"enabled": True, "shell": "/opt/no-such-shell"},
+        ), patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            resp = await terminal.api_terminal_create(req)
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert body["shell"] == "/bin/bash"
+        assert body["shell_fallback"] is True
+        assert body["configured_shell"] == "/opt/no-such-shell"
 
 
 class TestApiTerminalCreateWindowsFailFast:
     """POST /api/terminal/sessions must fail fast on Windows with a 501.
 
     Mirrors the ``TestTaskkillErrorMapping`` / ``TestRestrictToOwnerArgvOnLinux``
-    monkeypatch pattern from ``test_platform_compat.py``: patch
+    monkeypatch pattern from ``test_platform_compat_kill_reap.py`` /
+    ``test_platform_compat_owner_only.py``: patch
     ``platform_compat.IS_WINDOWS`` so the branch is exercised on the Linux build
     fleet. PTY/fork are POSIX-only and the ConPTY port is deferred — until then
     the create endpoint MUST refuse on Windows with the same wording the WS
@@ -458,16 +1200,34 @@ class TestApiTerminalRedact:
     @pytest.mark.asyncio
     async def test_rejects_non_string_text(self):
         req = self._req({"text": 42})
-        with patch.object(terminal, "_is_enabled", return_value=True):
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 400
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="denied",
+            source="dashboard",
+            resources="invalid_body",
+        )
 
     @pytest.mark.asyncio
     async def test_rejects_oversized_selection(self):
         req = self._req({"text": "x" * (terminal._REDACT_MAX_BYTES + 1)})
-        with patch.object(terminal, "_is_enabled", return_value=True):
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 413
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="denied",
+            source="dashboard",
+            resources="selection_too_large",
+        )
 
     @pytest.mark.asyncio
     async def test_redacts_credentials_in_contiguous_text(self):
@@ -475,2321 +1235,37 @@ class TestApiTerminalRedact:
         # scanning would have split. The contiguous scan must catch it.
         secret = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
         req = self._req({"text": f"config dump:\n{secret}\ndone"})
-        with patch.object(terminal, "_is_enabled", return_value=True):
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 200
         out = json.loads(resp.text)["text"]
         assert "wJalrXUtnFEMI" not in out
+        # The success path is the one that hands terminal output to a model,
+        # so it must leave an audit row too -- with no selection content.
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="ok",
+            source="dashboard",
+            resources="ok",
+        )
 
     @pytest.mark.asyncio
     async def test_fails_closed_on_redactor_error(self):
         req = self._req({"text": "hello"})
         with patch.object(terminal, "_is_enabled", return_value=True), \
-             patch.object(terminal, "redact_exfiltration_urls", side_effect=RuntimeError):
+             patch.object(terminal, "redact_exfiltration_urls", side_effect=RuntimeError), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 500
         assert "hello" not in resp.text
-
-
-class TestSplitPathToken:
-    def test_no_slash_is_all_prefix(self):
-        assert terminal._split_path_token("Kiro") == ("", "Kiro")
-
-    def test_trailing_slash_has_empty_prefix(self):
-        assert terminal._split_path_token("src/") == ("src/", "")
-
-    def test_relative_parent(self):
-        assert terminal._split_path_token("../Kiro") == ("../", "Kiro")
-
-    def test_absolute(self):
-        assert terminal._split_path_token("/usr/lo") == ("/usr/", "lo")
-
-    def test_empty(self):
-        assert terminal._split_path_token("") == ("", "")
-
-
-class TestResolveCompletionDir:
-    def test_empty_dir_part_is_cwd(self):
-        assert terminal._resolve_completion_dir("/tmp/work", "") == "/tmp/work"
-
-    def test_relative_resolves_against_cwd(self):
-        assert terminal._resolve_completion_dir("/tmp/work", "sub/") == "/tmp/work/sub"
-
-    def test_parent_traversal(self):
-        assert terminal._resolve_completion_dir("/tmp/work", "../") == "/tmp"
-
-    def test_absolute_ignores_cwd(self):
-        assert terminal._resolve_completion_dir("/tmp/work", "/usr/") == "/usr"
-
-    def test_expands_home(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
-        assert terminal._resolve_completion_dir("/tmp/work", "~/") == str(tmp_path)
-
-
-class TestListCompletions:
-    """Directory listing rules: case-insensitive substring match ranked by match
-    offset, dirs first among equals, hidden entries only once the user has typed
-    a dot, folders_only narrowing."""
-
-    @pytest.fixture
-    def tree(self, tmp_path):
-        (tmp_path / "alpha").mkdir()
-        (tmp_path / "Beta").mkdir()
-        (tmp_path / "aardvark.txt").write_text("x")
-        (tmp_path / "zeta.md").write_text("x")
-        (tmp_path / ".hidden").mkdir()
-        return tmp_path
-
-    def test_lists_dirs_before_files(self, tree):
-        entries, truncated = terminal._list_completions(str(tree), "", False, 100)
-        assert [e["name"] for e in entries] == ["alpha", "Beta", "aardvark.txt", "zeta.md"]
-        assert truncated is False
-
-    def test_folders_only_drops_files(self, tree):
-        entries, _ = terminal._list_completions(str(tree), "", True, 100)
-        assert [e["name"] for e in entries] == ["alpha", "Beta"]
-        assert all(e["dir"] for e in entries)
-
-    def test_prefix_match_is_case_insensitive(self, tree):
-        entries, _ = terminal._list_completions(str(tree), "b", False, 100)
-        assert [e["name"] for e in entries] == ["Beta"]
-
-    def test_matches_a_fragment_in_the_middle_of_a_name(self, tree):
-        # The whole point: a long name is reachable by its distinctive middle.
-        entries, _ = terminal._list_completions(str(tree), "dvark", False, 100)
-        assert [e["name"] for e in entries] == ["aardvark.txt"]
-        assert entries[0]["at"] == 3
-
-    def test_ranks_an_earlier_match_first(self, tree):
-        # "a" is a prefix of alpha/aardvark and sits mid-name in Beta/zeta — the
-        # prefix hits must lead, and dirs still win among equal offsets.
-        entries, _ = terminal._list_completions(str(tree), "a", False, 100)
-        assert [(e["name"], e["at"]) for e in entries] == [
-            ("alpha", 0), ("aardvark.txt", 0), ("Beta", 3), ("zeta.md", 3),
-        ]
-
-    def test_a_dot_fragment_matches_as_a_prefix(self, tree):
-        # A leading dot unhides entries; matching it as a substring would drag
-        # in every foo.bar and defeat that filter.
-        entries, _ = terminal._list_completions(str(tree), ".h", False, 100)
-        assert [e["name"] for e in entries] == [".hidden"]
-
-    def test_hides_dotfiles_until_dot_typed(self, tree):
-        assert all(not e["name"].startswith(".")
-                   for e in terminal._list_completions(str(tree), "", False, 100)[0])
-        entries, _ = terminal._list_completions(str(tree), ".", False, 100)
-        assert [e["name"] for e in entries] == [".hidden"]
-
-    def test_truncates_at_limit(self, tree):
-        entries, truncated = terminal._list_completions(str(tree), "", False, 2)
-        assert len(entries) == 2
-        assert truncated is True
-
-    def test_ranking_survives_the_retention_cap(self, tree):
-        # The size-bounded heap must keep the SAME top-N the full sort would:
-        # dirs before files at equal match offset.
-        entries, truncated = terminal._list_completions(str(tree), "a", False, 2)
-        assert [e["name"] for e in entries] == ["alpha", "aardvark.txt"]
-        assert truncated is True
-
-    def test_scan_cap_marks_truncated(self, tmp_path, monkeypatch):
-        # A pathological directory must not be walked to the end; `truncated`
-        # stays truthful for the SCAN cap too, not just the retention cap.
-        for i in range(6):
-            (tmp_path / f"f{i}").write_text("x")
-        monkeypatch.setattr(terminal, "_COMPLETE_MAX_SCAN", 3)
-        entries, truncated = terminal._list_completions(str(tmp_path), "", False, 100)
-        assert len(entries) == 3
-        assert truncated is True
-
-    def test_scan_cap_not_reported_when_directory_fits(self, tmp_path, monkeypatch):
-        (tmp_path / "only").write_text("x")
-        monkeypatch.setattr(terminal, "_COMPLETE_MAX_SCAN", 3)
-        assert terminal._list_completions(str(tmp_path), "", False, 100) == (
-            [{"name": "only", "dir": False, "at": 0}], False,
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="error",
+            source="dashboard",
+            resources="redaction_failed",
         )
-
-    def test_excludes_names_with_control_characters(self, tmp_path):
-        # The client TYPES the accepted name into the PTY, so a newline would
-        # submit a command line. Such names must never reach the client.
-        (tmp_path / "safe.txt").write_text("x")
-        try:
-            (tmp_path / "ev\nil.txt").write_text("x")
-            (tmp_path / "esc\x1bape.txt").write_text("x")
-        except OSError:  # pragma: no cover — filesystem refuses the name
-            pytest.skip("filesystem rejects control characters in names")
-        entries, _ = terminal._list_completions(str(tmp_path), "", False, 100)
-        assert [e["name"] for e in entries] == ["safe.txt"]
-
-    def test_excludes_names_with_lone_surrogates(self, tmp_path):
-        # An undecodable byte in a filename survives as a lone surrogate through
-        # Python's surrogateescape decoding and through JSON, but the browser's
-        # TextEncoder turns it into U+FFFD — the client would then type a path
-        # that does not exist.
-        (tmp_path / "safe.txt").write_text("x")
-        try:
-            (tmp_path / b"bad\xffname.txt".decode("utf-8", "surrogateescape")).write_text("x")
-        except (OSError, UnicodeEncodeError):  # pragma: no cover — fs refuses the name
-            pytest.skip("filesystem rejects undecodable bytes in names")
-        entries, _ = terminal._list_completions(str(tmp_path), "", False, 100)
-        assert [e["name"] for e in entries] == ["safe.txt"]
-
-    def test_filters_lone_surrogates_without_touching_the_filesystem(self, tmp_path):
-        # Runs everywhere: macOS refuses to CREATE a name with undecodable bytes,
-        # but a network/foreign volume can serve one, so the filter itself is
-        # asserted against a synthetic directory read.
-        names = ["safe.txt", "bad\udcffname.txt", "bell\x07name.txt"]
-
-        class _Entry:
-            def __init__(self, name):
-                self.name = name
-
-            def is_dir(self):
-                return False
-
-        class _Scandir:
-            def __enter__(self):
-                return iter([_Entry(n) for n in names])
-
-            def __exit__(self, *exc):
-                return False
-
-        with patch.object(terminal.os, "scandir", return_value=_Scandir()):
-            entries, _ = terminal._list_completions(str(tmp_path), "", False, 100)
-        assert [e["name"] for e in entries] == ["safe.txt"]
-
-    def test_missing_directory_yields_nothing(self, tmp_path):
-        assert terminal._list_completions(str(tmp_path / "nope"), "", False, 100) == ([], False)
-
-    def test_sensitive_directory_yields_nothing(self, tmp_path):
-        # ~/.kiro/crew/profiles is trust-root metadata: enumerating it would
-        # disclose profile/policy filenames.
-        (tmp_path / "leak").mkdir()
-        with _sensitive(always=True):
-            assert terminal._list_completions(str(tmp_path), "", False, 100) == ([], False)
-
-    def test_symlink_into_sensitive_directory_yields_nothing(self, tmp_path):
-        # The name-based check alone would pass: only the realpath of the link
-        # lands in the protected tree.
-        secret = tmp_path / "protected"
-        secret.mkdir()
-        (secret / "profile.json").write_text("x")
-        link = tmp_path / "benign"
-        link.symlink_to(secret, target_is_directory=True)
-        real_check = terminal.is_sensitive_path
-
-        def _fake(path, base_dir=None):
-            # Matches ONLY the canonical target, never the link's own name.
-            return os.path.realpath(path) == os.path.realpath(str(secret)) or real_check(path)
-
-        with _sensitive(predicate=_fake):
-            assert terminal._list_completions(str(link), "", False, 100) == ([], False)
-
-
-class TestSensitiveEntryGate:
-    """Vetting the DIRECTORY is not enough: an allowed directory can hold
-    protected children (``~/.kiro/crew`` holds ``security_policy.json``,
-    ``profiles/``), so every entry is classified before it is returned.
-
-    These call ``_list_vetted_completions`` so the patched predicate is exercised
-    on ENTRIES only — the directory is already vetted by construction."""
-
-    def test_withholds_a_sensitive_child_by_name(self, tmp_path):
-        (tmp_path / "safe.txt").write_text("x")
-        (tmp_path / "security_policy.json").write_text("x")
-
-        def _fake(path, base_dir=None):
-            return os.path.basename(path) == "security_policy.json"
-
-        with _sensitive(predicate=_fake):
-            entries, _ = terminal._list_vetted_completions(str(tmp_path), "", False, 100)
-        assert [e["name"] for e in entries] == ["safe.txt"]
-
-    def test_withholds_a_child_symlinked_into_a_protected_tree(self, tmp_path):
-        # Name-based classification alone would pass this: only the link's
-        # canonical target lands in the protected tree.
-        protected = tmp_path / "protected"
-        protected.mkdir()
-        listed = tmp_path / "listed"
-        listed.mkdir()
-        (listed / "safe.txt").write_text("x")
-        (listed / "shortcut").symlink_to(protected, target_is_directory=True)
-
-        def _fake(path, base_dir=None):
-            return os.path.realpath(path) == os.path.realpath(str(protected))
-
-        with _sensitive(predicate=_fake):
-            entries, _ = terminal._list_vetted_completions(str(listed), "", False, 100)
-        assert [e["name"] for e in entries] == ["safe.txt"]
-
-    def test_withholds_an_entry_that_cannot_be_classified(self, tmp_path):
-        # Over-refusing what we cannot classify is the safe direction.
-        (tmp_path / "safe.txt").write_text("x")
-        with _sensitive(raises=True):
-            assert terminal._list_vetted_completions(str(tmp_path), "", False, 100) == ([], False)
-
-    def test_classifies_only_entries_that_matched_the_fragment(self, tmp_path):
-        # The gate runs at keystroke rate, so it must not be paid for every name
-        # in a large directory — only for names the user could receive.
-        for name in ("alpha", "beta", "gamma"):
-            (tmp_path / name).write_text("x")
-        with _sensitive(always=False) as (gate, _):
-            terminal._list_vetted_completions(str(tmp_path), "alph", False, 100)
-        assert gate.call_count == 1
-
-
-@contextlib.contextmanager
-def _sensitive(*, predicate=None, always=False, raises=False):
-    """Force the sensitive-path verdict at BOTH layers that can decide it.
-
-    The DIRECTORY gate runs inside `hooks.validate_file_path` (the required
-    chokepoint), while the per-ENTRY gate calls `is_sensitive_path` directly from
-    the terminal module. A test that patched only one of them would silently
-    exercise half the guard."""
-    import kiro_crew.hooks as hooks_mod
-    kw = {}
-    if raises:
-        kw["side_effect"] = OSError
-    elif predicate is not None:
-        kw["side_effect"] = predicate
-    else:
-        kw["return_value"] = bool(always)
-    with patch.object(terminal, "is_sensitive_path", **kw) as a, \
-            patch.object(hooks_mod, "is_sensitive_path", **kw) as b:
-        yield a, b
-
-
-class TestOpenVettedDir:
-    """The scan is pinned to a descriptor so a name swap after vetting cannot
-    redirect it, and the open itself is verified against the vetted name."""
-
-    def test_returns_a_descriptor_for_the_vetted_directory(self, tmp_path):
-        fd = terminal._open_vetted_dir(str(tmp_path))
-        assert fd is not None
-        try:
-            opened = os.fstat(fd)
-            named = os.stat(tmp_path)
-            assert (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
-        finally:
-            os.close(fd)
-
-    def test_refuses_a_missing_directory(self, tmp_path):
-        assert terminal._open_vetted_dir(str(tmp_path / "gone")) is None
-
-    def test_refuses_a_file(self, tmp_path):
-        target = tmp_path / "f.txt"
-        target.write_text("x")
-        assert terminal._open_vetted_dir(str(target)) is None
-
-    def test_refuses_a_symlinked_final_component(self, tmp_path):
-        # realpath guaranteed at vet time that the last component was not a link;
-        # if it is one now, the name was swapped underneath us.
-        real = tmp_path / "real"
-        real.mkdir()
-        link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
-        assert terminal._open_vetted_dir(str(link)) is None
-
-    def test_refuses_when_the_name_no_longer_matches_the_descriptor(self, tmp_path):
-        """The swap window between open() and the check must fail closed."""
-        real = tmp_path / "real"
-        real.mkdir()
-        other = tmp_path / "other"
-        other.mkdir()
-        real_st = os.stat(real)
-        other_st = os.stat(other)
-        assert (real_st.st_dev, real_st.st_ino) != (other_st.st_dev, other_st.st_ino)
-        # Simulate the name resolving elsewhere after the descriptor was opened.
-        with patch.object(terminal.os, "stat", return_value=other_st):
-            assert terminal._open_vetted_dir(str(real)) is None
-
-    def test_listing_scans_the_descriptor_not_the_path(self, tmp_path):
-        """Regression: a swap after vetting must not redirect the enumeration.
-
-        `scandir` is asserted to receive the pinned fd (an int), never the path
-        string — passing the string is what reopened the name and reintroduced
-        the race."""
-        (tmp_path / "visible").mkdir()
-        seen: list[object] = []
-        real_scandir = terminal.os.scandir
-
-        def spy(arg):
-            seen.append(arg)
-            return real_scandir(arg)
-
-        with patch.object(terminal.os, "scandir", spy):
-            entries, _ = terminal._list_vetted_completions(str(tmp_path), "", False, 10)
-        assert [e["name"] for e in entries] == ["visible"]
-        assert seen and all(isinstance(a, int) for a in seen)
-
-    def test_listing_yields_nothing_when_the_directory_cannot_be_pinned(self, tmp_path):
-        with patch.object(terminal, "_open_vetted_dir", return_value=None):
-            assert terminal._list_vetted_completions(str(tmp_path), "", False, 10) == ([], False)
-
-    def test_listing_closes_the_descriptor(self, tmp_path):
-        (tmp_path / "a").mkdir()
-        closed: list[int] = []
-        real_close = terminal.os.close
-
-        def spy(fd):
-            closed.append(fd)
-            return real_close(fd)
-
-        with patch.object(terminal.os, "close", spy):
-            terminal._list_vetted_completions(str(tmp_path), "", False, 10)
-        assert closed, "the pinned descriptor must be closed"
-
-
-class TestVettedCompletionDir:
-    def test_routes_through_the_hooks_chokepoint(self, tmp_path):
-        """The backend security rules require file reads to pass through
-        hooks.py rather than re-deriving its realpath + is_sensitive_path pair."""
-        with patch.object(terminal, "validate_file_path", return_value=None) as gate:
-            assert terminal._vetted_completion_dir(str(tmp_path)) is None
-        gate.assert_called_once_with(str(tmp_path))
-
-    def test_returns_canonical_path(self, tmp_path):
-        assert terminal._vetted_completion_dir(str(tmp_path)) == os.path.realpath(str(tmp_path))
-
-    def test_rejects_sensitive_path(self, tmp_path):
-        with _sensitive(always=True):
-            assert terminal._vetted_completion_dir(str(tmp_path)) is None
-
-    def test_rejects_when_canonicalization_fails(self, tmp_path):
-        # Over-refusing a path we cannot canonicalize is the safe direction.
-        with patch.object(terminal.os.path, "realpath", side_effect=OSError):
-            assert terminal._vetted_completion_dir(str(tmp_path)) is None
-
-
-class TestSessionCwdCached:
-    @pytest.mark.asyncio
-    async def test_probes_once_within_ttl(self):
-        sess = _make_session()
-        with patch.object(terminal, "_session_cwd", return_value="/tmp/a") as probe:
-            assert await terminal._session_cwd_cached(sess) == "/tmp/a"
-            assert await terminal._session_cwd_cached(sess) == "/tmp/a"
-        assert probe.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_reprobes_after_ttl_expires(self):
-        # A `cd` must be visible to the next completion — a stale memo would
-        # list the previous directory.
-        sess = _make_session()
-        sess.cwd_probe = (time.monotonic() - terminal._CWD_PROBE_TTL_S - 1, "/tmp/old")
-        with patch.object(terminal, "_session_cwd", return_value="/tmp/new"):
-            assert await terminal._session_cwd_cached(sess) == "/tmp/new"
-
-
-class TestApiTerminalComplete:
-    """POST /api/terminal/complete — path completions for a live PTY session."""
-
-    @pytest.fixture(autouse=True)
-    def sel_log(self):
-        """Every outcome of this route audits, so the sink is patched for the
-        whole class rather than per test."""
-        with patch.object(terminal, "_sel") as mock_sel:
-            log = MagicMock()
-            mock_sel.return_value.log_api_access = log
-            yield log
-
-    def _req(self, body, user="testuser", registry=None):
-        req = _make_request(user=user, registry=registry)
-        req.json = AsyncMock(return_value=body)
-        return req
-
-    @pytest.mark.asyncio
-    async def test_rejects_unauthenticated(self):
-        req = self._req({"session_id": "s1"}, user=None)
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 401
-
-    @pytest.mark.asyncio
-    async def test_rejects_when_disabled(self):
-        req = self._req({"session_id": "s1"})
-        with patch.object(terminal, "_is_enabled", return_value=False), \
-             patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 403
-
-    @pytest.mark.asyncio
-    async def test_rejects_malformed_body(self):
-        req = self._req({"session_id": 42})
-        resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rejects_oversized_token(self):
-        req = self._req({"session_id": "s1", "token": "x" * (terminal._COMPLETE_TOKEN_MAX + 1)})
-        resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 413
-
-    @pytest.mark.asyncio
-    async def test_unknown_session_is_404(self):
-        # Requiring a live PTY is what keeps this from being a general
-        # filesystem-enumeration endpoint.
-        req = self._req({"session_id": "nope", "token": ""}, registry={})
-        resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 404
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_when_cwd_unknown(self):
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "x"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=None)):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        assert json.loads(resp.text) == {
-            "dir": None, "prefix": "x", "entries": [], "truncated": False,
-        }
-
-    @pytest.mark.asyncio
-    async def test_lists_matching_entries(self, tmp_path):
-        (tmp_path / "docs").mkdir()
-        (tmp_path / "doc.txt").write_text("x")
-        (tmp_path / "other").mkdir()
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "doc"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
-            resp = await terminal.api_terminal_complete(req)
-        body = json.loads(resp.text)
-        assert body["dir"] == str(tmp_path)
-        assert body["prefix"] == "doc"
-        assert [e["name"] for e in body["entries"]] == ["docs", "doc.txt"]
-
-    @pytest.mark.asyncio
-    async def test_folders_only_narrows_listing(self, tmp_path):
-        (tmp_path / "docs").mkdir()
-        (tmp_path / "doc.txt").write_text("x")
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "doc", "folders_only": True}, registry={"s1": sess}
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
-            resp = await terminal.api_terminal_complete(req)
-        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["docs"]
-
-    @pytest.mark.asyncio
-    async def test_resolves_token_directory_against_session_cwd(self, tmp_path):
-        (tmp_path / "work").mkdir()
-        (tmp_path / "sibling").mkdir()
-        sess = _make_session(session_id="s1")
-        # `cd ../s` typed from tmp_path/work resolves into tmp_path.
-        req = self._req({"session_id": "s1", "token": "../s"}, registry={"s1": sess})
-        with patch.object(
-            terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path / "work"))
-        ):
-            resp = await terminal.api_terminal_complete(req)
-        body = json.loads(resp.text)
-        assert body["dir"] == str(tmp_path)
-        assert body["prefix"] == "s"
-        assert [e["name"] for e in body["entries"]] == ["sibling"]
-
-    @pytest.mark.asyncio
-    async def test_sensitive_directory_returns_empty_listing_shape(self, tmp_path):
-        # Same shape as the unknown-cwd branch: the client needs no special case,
-        # and the response does not reveal whether the path exists.
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "p"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             _sensitive(always=True):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        assert json.loads(resp.text) == {
-            "dir": None, "prefix": "p", "entries": [], "truncated": False,
-        }
-
-    @pytest.mark.asyncio
-    async def test_audits_sensitive_path_refusal(self, tmp_path, sel_log):
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "p"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             _sensitive(always=True):
-            await terminal.api_terminal_complete(req)
-        assert sel_log.call_args.kwargs == {
-            "caller": "testuser",
-            "operation": "terminal.complete",
-            "outcome": "denied",
-            "source": "dashboard",
-            "resources": "sensitive_path",
-        }
-
-    @pytest.mark.asyncio
-    async def test_audits_successful_listing_without_leaking_contents(self, tmp_path, sel_log):
-        # The audit payload is deliberately coarse: this route fires per
-        # keystroke, so the token and any filenames must stay out of the log.
-        (tmp_path / "secretname").mkdir()
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "secret"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
-            resp = await terminal.api_terminal_complete(req)
-        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["secretname"]
-        kwargs = sel_log.call_args.kwargs
-        assert kwargs["operation"] == "terminal.complete"
-        assert kwargs["outcome"] == "ok"
-        assert kwargs["resources"] == "listed"
-        payload = json.dumps(kwargs)
-        assert "secret" not in payload
-        assert str(tmp_path) not in payload
-
-    @pytest.mark.asyncio
-    async def test_audits_unknown_cwd_and_unknown_session(self, sel_log):
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "x"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=None)):
-            await terminal.api_terminal_complete(req)
-        assert sel_log.call_args.kwargs["resources"] == "no_cwd"
-        await terminal.api_terminal_complete(
-            self._req({"session_id": "gone", "token": ""}, registry={})
-        )
-        assert sel_log.call_args.kwargs["resources"] == "unknown_session"
-
-    @pytest.mark.asyncio
-    async def test_lists_on_discovery_pool_not_subprocess_pool(self, tmp_path):
-        # subprocess_executor's workers are shared with PTY teardown; a slow
-        # directory scan must not be able to occupy one.
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": ""}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             patch.object(terminal, "discovery_executor") as disc, \
-             patch.object(terminal, "subprocess_executor") as sub:
-            disc.return_value = None  # None → loop's default executor
-            await terminal.api_terminal_complete(req)
-        assert disc.called
-        assert not sub.called
-
-    @pytest.mark.asyncio
-    async def test_resolution_and_vetting_run_off_loop_in_one_hop(self, tmp_path):
-        # expanduser (a "~user" form triggers a synchronous name-service lookup)
-        # and realpath (can stall on an unresponsive mount) are as blocking as
-        # the scan, so neither may run inline in the coroutine — and all three
-        # share ONE executor hop so a keystroke costs one thread round-trip.
-        loop_thread = threading.current_thread()
-        seen: list[tuple[str, object]] = []
-        real_resolve = terminal._resolve_completion_dir
-        real_vet = terminal._vetted_completion_dir
-
-        def _resolve(cwd, dir_part):
-            seen.append(("resolve", threading.current_thread()))
-            return real_resolve(cwd, dir_part)
-
-        def _vet(directory):
-            seen.append(("vet", threading.current_thread()))
-            return real_vet(directory)
-
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": ""}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             patch.object(terminal, "_resolve_completion_dir", side_effect=_resolve), \
-             patch.object(terminal, "_vetted_completion_dir", side_effect=_vet), \
-             patch.object(terminal, "discovery_executor", return_value=None) as disc:
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        assert [step for step, _ in seen] == ["resolve", "vet"]
-        assert all(thread is not loop_thread for _, thread in seen)
-        assert disc.call_count == 1
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], "0"])
-    async def test_rejects_non_boolean_folders_only(self, value):
-        # bool("false") is True: coercing would silently drop every file from
-        # the listing for a client that sent the JSON string.
-        req = self._req({"session_id": "s1", "token": "", "folders_only": value})
-        resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 400
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("value", [True, False])
-    async def test_accepts_real_boolean_folders_only(self, tmp_path, value):
-        (tmp_path / "docs").mkdir()
-        (tmp_path / "doc.txt").write_text("x")
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "doc", "folders_only": value}, registry={"s1": sess}
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        names = [e["name"] for e in json.loads(resp.text)["entries"]]
-        assert names == (["docs"] if value else ["docs", "doc.txt"])
-
-    @pytest.mark.asyncio
-    async def test_omitted_folders_only_defaults_to_files_included(self, tmp_path):
-        (tmp_path / "doc.txt").write_text("x")
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "doc"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
-            resp = await terminal.api_terminal_complete(req)
-        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["doc.txt"]
-
-    @pytest.mark.asyncio
-    async def test_a_path_listing_carries_no_entry_kind(self, tmp_path):
-        # The client drops an entry that does not belong to the tier it asked for,
-        # so the path tier must not start emitting `kind` — that would silently
-        # empty every path menu.
-        (tmp_path / "docs").mkdir()
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "doc"}, registry={"s1": sess})
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
-            resp = await terminal.api_terminal_complete(req)
-        assert all("kind" not in e for e in json.loads(resp.text)["entries"])
-
-
-class TestApiTerminalCompleteCommandTier:
-    """POST /api/terminal/complete with `argv` — subcommand and flag completions.
-
-    The engine itself is covered in test_terminal_commands.py; this class covers
-    the ROUTE: tier selection, the audit vocabulary, and the response shape.
-    """
-
-    @pytest.fixture(autouse=True)
-    def sel_log(self):
-        with patch.object(terminal, "_sel") as mock_sel:
-            log = MagicMock()
-            mock_sel.return_value.log_api_access = log
-            yield log
-
-    def _req(self, body, user="testuser", registry=None):
-        req = _make_request(user=user, registry=registry)
-        req.json = AsyncMock(return_value=body)
-        return req
-
-    @staticmethod
-    def _entries(*names):
-        return [
-            terminal_commands.CmdEntry(n, f"about {n}", n.startswith("-")) for n in names
-        ]
-
-    def _complete(self, entries, reason="cmd_listed"):
-        return patch.object(
-            terminal_commands, "complete", AsyncMock(return_value=(entries, reason)),
-        )
-
-    @pytest.mark.asyncio
-    async def test_argv_selects_the_command_tier(self, tmp_path):
-        # A real directory is present, so answering with subcommands rather than its
-        # contents proves the tier was chosen by `argv`, not by what happened to be
-        # on disk.
-        (tmp_path / "docs").mkdir()
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh", "pr"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             self._complete(self._entries("create", "checkout")):
-            resp = await terminal.api_terminal_complete(req)
-        body = json.loads(resp.text)
-        assert resp.status == 200
-        assert [e["name"] for e in body["entries"]] == ["create", "checkout"]
-        assert all(e["kind"] == "sub" for e in body["entries"])
-        # `dir: null` is the existing "nothing resolved on the filesystem" signal,
-        # reused so the response needs no new top-level field.
-        assert body["dir"] is None
-        assert body["truncated"] is False
-
-    @pytest.mark.asyncio
-    async def test_passes_the_token_and_cwd_through_to_the_engine(self, tmp_path):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "cre", "argv": ["gh", "pr"]}, registry={"s1": sess},
-        )
-        engine = AsyncMock(return_value=(self._entries("create"), "cmd_listed"))
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             patch.object(terminal_commands, "complete", engine):
-            await terminal.api_terminal_complete(req)
-        assert engine.await_args.args[:3] == (["gh", "pr"], "cre", str(tmp_path))
-
-    @pytest.mark.asyncio
-    async def test_answers_flags_for_a_dash_token(self):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "--ti", "argv": ["gh", "pr", "create"]},
-            registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             self._complete(self._entries("--title")):
-            resp = await terminal.api_terminal_complete(req)
-        body = json.loads(resp.text)
-        assert [(e["name"], e["kind"]) for e in body["entries"]] == [("--title", "flag")]
-        assert body["prefix"] == "--ti"
-
-    @pytest.mark.asyncio
-    async def test_answers_even_when_the_cwd_cannot_be_read(self):
-        # A subcommand list does not depend on the working directory, so this branch
-        # is ordered BEFORE the path tier's unknown-cwd refusal.
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=None)), \
-             self._complete(self._entries("pr")):
-            resp = await terminal.api_terminal_complete(req)
-        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["pr"]
-
-    @pytest.mark.asyncio
-    async def test_does_not_fall_back_to_a_path_listing(self, tmp_path):
-        # The tiers are disjoint. Falling through would list the cwd for a word the
-        # client already decided cannot be a path.
-        (tmp_path / "docs").mkdir()
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             self._complete([], "cmd_none"):
-            resp = await terminal.api_terminal_complete(req)
-        assert json.loads(resp.text)["entries"] == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "argv", [[], "gh", ["./gh"], ["/usr/bin/gh"], [""], ["gh\n"], [7], {}]
-    )
-    async def test_rejects_a_malformed_argv_with_400(self, argv):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": argv}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_the_rejection_carries_a_machine_readable_code(self):
-        # The dashboard renders `error` verbatim into a localized UI, so the prose
-        # alone is untranslatable by construction; `code` is the contract.
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["./gh"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")):
-            resp = await terminal.api_terminal_complete(req)
-        assert json.loads(resp.text)["code"] == "terminal_invalid_argv"
-
-    @pytest.mark.asyncio
-    async def test_a_malformed_argv_never_reaches_the_engine(self):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["./gh"]}, registry={"s1": sess},
-        )
-        engine = AsyncMock()
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             patch.object(terminal_commands, "complete", engine):
-            await terminal.api_terminal_complete(req)
-        engine.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_the_path_tier_is_untouched_when_argv_is_absent(self, tmp_path):
-        (tmp_path / "docs").mkdir()
-        sess = _make_session(session_id="s1")
-        req = self._req({"session_id": "s1", "token": "doc"}, registry={"s1": sess})
-        engine = AsyncMock()
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
-             patch.object(terminal_commands, "complete", engine):
-            resp = await terminal.api_terminal_complete(req)
-        engine.assert_not_awaited()
-        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["docs"]
-
-    @pytest.mark.asyncio
-    async def test_passes_the_operator_command_map_to_the_engine(self):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["mytool"]}, registry={"s1": sess},
-        )
-        engine = AsyncMock(return_value=([], "cmd_unknown"))
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             patch.object(terminal, "_get_config",
-                          return_value={"completion": {"commands": {"mytool": "cobra"}}}), \
-             patch.object(terminal_commands, "complete", engine):
-            await terminal.api_terminal_complete(req)
-        assert engine.await_args.args[3] == {"mytool": "cobra"}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("value", [False, True, "yes", 7, [], None])
-    async def test_a_non_object_completion_config_is_not_an_error(self, value):
-        # config.json is hand-edited: `"completion": false` would make a chained
-        # `.get` raise on a boolean — an HTTP 500 on a keystroke from a typo. A
-        # non-object value means "no operator additions", which is also the default.
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-        engine = AsyncMock(return_value=([], "cmd_unknown"))
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             patch.object(terminal, "_get_config", return_value={"completion": value}), \
-             patch.object(terminal_commands, "complete", engine):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        assert engine.await_args.args[3] is None
-
-    @pytest.mark.asyncio
-    async def test_reads_the_config_off_the_event_loop(self):
-        # `_get_config` does a synchronous `read_text()` of config.json and this
-        # route fires per keystroke, so an inline read would stall every gateway
-        # task on a slow home filesystem. Asserts the thread, not the timing.
-        import threading
-        seen = {}
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-
-        def spy(_request):
-            seen["thread"] = threading.current_thread().name
-            return {}
-
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             patch.object(terminal, "_get_config", spy), \
-             self._complete([], "cmd_unknown"):
-            await terminal.api_terminal_complete(req)
-        assert "thread" in seen, "config was never read"
-        assert seen["thread"] != threading.current_thread().name
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("cfg", [False, True, "yes", 7, [], None])
-    async def test_a_non_object_terminal_config_is_not_an_error(self, cfg):
-        # Both levels are type-checked: `"terminal": false` would make
-        # `.get("completion")` raise on a boolean, an HTTP 500 from a typo.
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-        engine = AsyncMock(return_value=([], "cmd_unknown"))
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             patch.object(terminal, "_get_config", return_value=cfg), \
-             patch.object(terminal_commands, "complete", engine):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        assert engine.await_args.args[3] is None
-
-    @pytest.mark.asyncio
-    async def test_a_missing_completion_config_is_not_an_error(self):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-        engine = AsyncMock(return_value=([], "cmd_unknown"))
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             patch.object(terminal, "_get_config", return_value={}), \
-             patch.object(terminal_commands, "complete", engine):
-            resp = await terminal.api_terminal_complete(req)
-        assert resp.status == 200
-        assert engine.await_args.args[3] is None
-
-    # ── Audit ──
-    # The rule for this route is a FIXED, content-free reason vocabulary: it fires
-    # per keystroke, so a reason naming the command or flag would put the user's
-    # command line in the audit trail.
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "reason,outcome", [("cmd_listed", "ok"), ("cmd_none", "ok"), ("cmd_unknown", "ok")],
-    )
-    async def test_audits_each_engine_verdict(self, reason, outcome, sel_log):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "cre", "argv": ["gh", "pr"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             self._complete(self._entries("create") if reason == "cmd_listed" else [], reason):
-            await terminal.api_terminal_complete(req)
-        assert sel_log.call_args.kwargs == {
-            "caller": "testuser",
-            "operation": "terminal.complete",
-            "outcome": outcome,
-            "source": "dashboard",
-            "resources": reason,
-        }
-
-    @pytest.mark.asyncio
-    async def test_audits_a_refused_working_directory_as_denied(self, sel_log):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
-             self._complete([], "sensitive_path"):
-            await terminal.api_terminal_complete(req)
-        assert sel_log.call_args.kwargs["outcome"] == "denied"
-        assert sel_log.call_args.kwargs["resources"] == "sensitive_path"
-
-    @pytest.mark.asyncio
-    async def test_audits_a_malformed_argv(self, sel_log):
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "", "argv": ["./gh"]}, registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")):
-            await terminal.api_terminal_complete(req)
-        assert sel_log.call_args.kwargs["outcome"] == "denied"
-        assert sel_log.call_args.kwargs["resources"] == "invalid_argv"
-
-    @pytest.mark.asyncio
-    async def test_the_audit_never_records_what_was_typed(self, sel_log):
-        # The anti-leak proof, mirroring the path tier's own. Nothing from the
-        # command line — command, subcommand, flag, prefix, or an entry name — may
-        # appear anywhere in the event.
-        sess = _make_session(session_id="s1")
-        req = self._req(
-            {"session_id": "s1", "token": "--secret-flag", "argv": ["gh", "pr", "sneaky"]},
-            registry={"s1": sess},
-        )
-        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w/proj")), \
-             self._complete(self._entries("--secret-flag")):
-            await terminal.api_terminal_complete(req)
-        blob = repr(sel_log.call_args.kwargs)
-        for leaked in ("gh", "sneaky", "secret-flag", "/w/proj"):
-            assert leaked not in blob
-        assert sel_log.call_args.kwargs["resources"] == "cmd_listed"
-
-
-class TestApiTerminalDelete:
-    @pytest.mark.asyncio
-    async def test_rejects_unauthenticated(self):
-        req = _make_request(user=None)
-        resp = await terminal.api_terminal_delete(req)
-        assert resp.status == 401
-
-    @pytest.mark.asyncio
-    async def test_returns_404_for_unknown_session(self):
-        req = _make_request(session_id="nonexistent")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_delete(req)
-        assert resp.status == 404
-
-    @pytest.mark.asyncio
-    async def test_deletes_existing_session(self):
-        sess = _make_session()
-        registry = {"abc123": sess}
-        req = _make_request(registry=registry)
-        with patch.object(
-            terminal, "_kill_session", new_callable=AsyncMock
-        ) as mock_kill, patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_delete(req)
-        assert resp.status == 200
-        body = json.loads(resp.body)
-        assert body["deleted"] == "abc123"
-        mock_kill.assert_awaited_once_with(sess)
-        assert "abc123" not in registry
-
-    @pytest.mark.asyncio
-    async def test_closes_ws_before_kill(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(ws=ws)
-        registry = {"abc123": sess}
-        req = _make_request(registry=registry)
-        with patch.object(terminal, "_kill_session", new_callable=AsyncMock), patch.object(
-            terminal, "_sel"
-        ) as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            await terminal.api_terminal_delete(req)
-        ws.close.assert_awaited_once()
-
-
-# ── api_terminal_list ──
-
-
-class TestApiTerminalList:
-    @pytest.mark.asyncio
-    async def test_rejects_unauthenticated(self):
-        req = _make_request(user=None)
-        resp = await terminal.api_terminal_list(req)
-        assert resp.status == 401
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_list(self):
-        req = _make_request()
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_list(req)
-        body = json.loads(resp.body)
-        assert body == {"enabled": True, "sessions": []}
-
-    @pytest.mark.asyncio
-    async def test_lists_sessions_with_details(self):
-        ws = MagicMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", alive=True, ws=ws)
-        sess.cols = 120
-        sess.rows = 40
-        registry = {"s1": sess}
-        req = _make_request(registry=registry)
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_list(req)
-        body = json.loads(resp.body)
-        assert len(body["sessions"]) == 1
-        s = body["sessions"][0]
-        assert s["session_id"] == "s1"
-        assert s["pid"] == 12345
-        assert s["alive"] is True
-        assert s["cols"] == 120
-        assert s["rows"] == 40
-        assert s["connected"] is True
-
-    @pytest.mark.asyncio
-    async def test_shows_disconnected_session(self):
-        sess = _make_session(session_id="s1", alive=True, ws=None)
-        registry = {"s1": sess}
-        req = _make_request(registry=registry)
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_list(req)
-        body = json.loads(resp.body)
-        assert body["sessions"][0]["connected"] is False
-
-
-# ── api_terminal_ws ──
-
-
-class TestApiTerminalWsOrigin:
-    """The handshake must validate its Origin before anything else.
-
-    A WebSocket upgrade is a GET, and ``csrf_middleware`` checks the origin only
-    for unsafe methods, so without an in-handler check the handshake arrives
-    unvalidated. The cookie rides along automatically and SameSite=Lax does not
-    distinguish ports, so another loopback origin could otherwise drive a PTY
-    under the operator's own session.
-    """
-
-    @pytest.mark.asyncio
-    async def test_rejects_a_cross_origin_handshake(self):
-        req = _make_request(origin="http://127.0.0.1:9999")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            with pytest.raises(web.HTTPForbidden):
-                await terminal.api_terminal_ws(req)
-
-    @pytest.mark.asyncio
-    async def test_rejects_a_remote_origin(self):
-        req = _make_request(origin="https://evil.example")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            with pytest.raises(web.HTTPForbidden):
-                await terminal.api_terminal_ws(req)
-
-    @pytest.mark.asyncio
-    async def test_origin_is_checked_before_authentication(self):
-        """A cross-origin handshake is refused whether or not it is authorised.
-
-        Ordering matters for the audit trail: the rejection has to name the
-        origin rather than report an unauthenticated caller, or a CSWSH attempt
-        is indistinguishable from someone opening the panel while logged out.
-        """
-        req = _make_request(user=None, origin="http://127.0.0.1:9999")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            with pytest.raises(web.HTTPForbidden):
-                await terminal.api_terminal_ws(req)
-
-    @pytest.mark.asyncio
-    async def test_allows_the_dashboard_origin(self):
-        """An allowed Origin passes the check and reaches the later gates."""
-        req = _make_request(user=None, origin="http://localhost:5476")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_ws(req)
-        # Past the origin gate, so it fails on authentication instead.
-        assert isinstance(resp, web.Response)
-        assert resp.status == 401
-
-    @pytest.mark.asyncio
-    async def test_allows_a_loopback_client_with_no_origin(self):
-        """No Origin from loopback is a local process, not a browser page.
-
-        ``check_origin`` trusts this case and local callers depend on it.
-        """
-        req = _make_request(user=None, origin=None, remote="127.0.0.1")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_ws(req)
-        assert isinstance(resp, web.Response)
-        assert resp.status == 401
-
-    @pytest.mark.asyncio
-    async def test_rejects_a_non_loopback_client_with_no_origin(self):
-        req = _make_request(user=None, origin=None, remote="10.0.0.5")
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            with pytest.raises(web.HTTPForbidden):
-                await terminal.api_terminal_ws(req)
-
-
-class TestApiTerminalWs:
-    @pytest.mark.asyncio
-    async def test_rejects_unauthenticated(self):
-        req = _make_request(user=None)
-        with patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_ws(req)
-        assert isinstance(resp, web.Response)
-        assert resp.status == 401
-
-    @pytest.mark.asyncio
-    async def test_rejects_empty_session_id(self):
-        req = _make_request(session_id="")
-        resp = await terminal.api_terminal_ws(req)
-        assert isinstance(resp, web.Response)
-        assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rejects_oversized_session_id(self):
-        req = _make_request(session_id="a" * 65)
-        resp = await terminal.api_terminal_ws(req)
-        assert isinstance(resp, web.Response)
-        assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rejects_when_max_sessions_reached(self):
-        registry = {"s1": _make_session(), "s2": _make_session(), "s3": _make_session()}
-        req = _make_request(registry=registry, session_id="new")
-        with patch.object(terminal, "_sel") as mock_sel, patch.object(
-            terminal, "_get_config", return_value={"enabled": True, "max_sessions": 3}
-        ):
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_ws(req)
-        assert isinstance(resp, web.Response)
-        assert resp.status == 429
-
-    @pytest.mark.asyncio
-    async def test_cleans_dead_session_before_reconnect(self):
-        dead_sess = _make_session(session_id="abc123", alive=False)
-        registry = {"abc123": dead_sess}
-        req = _make_request(registry=registry, session_id="abc123")
-        with patch.object(
-            terminal, "_kill_session", new_callable=AsyncMock
-        ) as mock_kill, patch.object(terminal, "_sel") as mock_sel, patch.object(
-            terminal, "_get_config", return_value={"enabled": True, "max_sessions": 3}
-        ):
-            mock_sel.return_value.log_api_access = MagicMock()
-            # Will fail at ws.prepare since request is a mock, but dead session should be cleaned
-            with pytest.raises(Exception):
-                await terminal.api_terminal_ws(req)
-        mock_kill.assert_awaited_once_with(dead_sess)
-        # Dead session killed; placeholder reserved for new spawn
-        assert registry.get("abc123") is not dead_sess
-
-    @pytest.mark.asyncio
-    async def test_windows_conpty_spawn_failure_sends_error(self, monkeypatch):
-        """On Windows a new WS session spawns a ConPTY shell (kiro_crew.conpty);
-        the old 'not supported on Windows' refusal no longer exists. If the
-        spawn fails, the handler pops the placeholder, sends an error frame, and
-        closes. WindowsPty is mocked to raise so ``return ws`` is exercised
-        without a real pseudo-console (and without needing pywinpty on POSIX CI).
-        """
-        registry: dict = {}
-        req = _make_request(registry=registry, session_id="win-sess")
-        req.query = MagicMock()
-        req.query.get = lambda *a, **k: None
-
-        ws = AsyncMock()
-        ws.closed = False
-
-        with patch.object(terminal.platform_compat, "IS_POSIX", False), \
-             patch.object(terminal.platform_compat, "IS_WINDOWS", True), \
-             patch("kiro_crew.conpty.WindowsPty", side_effect=RuntimeError("boom")), \
-             patch.object(terminal, "_get_config", return_value={"enabled": True}), \
-             patch.object(terminal.web, "WebSocketResponse", return_value=ws), \
-             patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_ws(req)
-
-        assert resp is ws
-        assert "win-sess" not in registry
-        ws.send_str.assert_awaited_once()
-        sent = json.loads(ws.send_str.call_args.args[0])
-        assert sent["type"] == "error"
-        assert "Failed to start terminal" in sent["message"]
-        ws.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_windows_conpty_spawn_failure_skips_send_when_ws_closed(self, monkeypatch):
-        """If the socket is already closed, the Windows spawn-failure path skips
-        the error frame and close (covers the ``if not ws.closed`` false path)."""
-        registry: dict = {}
-        req = _make_request(registry=registry, session_id="win-closed")
-        req.query = MagicMock()
-        req.query.get = lambda *a, **k: None
-
-        ws = AsyncMock()
-        ws.closed = True
-
-        with patch.object(terminal.platform_compat, "IS_POSIX", False), \
-             patch.object(terminal.platform_compat, "IS_WINDOWS", True), \
-             patch("kiro_crew.conpty.WindowsPty", side_effect=RuntimeError("boom")), \
-             patch.object(terminal, "_get_config", return_value={"enabled": True}), \
-             patch.object(terminal.web, "WebSocketResponse", return_value=ws), \
-             patch.object(terminal, "_sel") as mock_sel:
-            mock_sel.return_value.log_api_access = MagicMock()
-            resp = await terminal.api_terminal_ws(req)
-
-        assert resp is ws
-        assert "win-closed" not in registry
-        ws.send_str.assert_not_awaited()
-        ws.close.assert_not_awaited()
-
-
-# ── scrollback ring buffer + redaction ──
-
-
-class TestScrollbackRedaction:
-    """The reconnect-replay scrollback feature (ported from the upstream project).
-
-    The port re-anchors redaction onto ``kiro_crew.security`` whose redactors
-    return ``(text, warnings)`` tuples (upstream's ``redaction`` module returns
-    a bare ``str``), so the helper must unpack both — a verbatim copy would
-    have crashed treating the tuple as a string.
-    """
-
-    def test_redact_terminal_strips_credentials(self):
-        # An AKIA access-key id in PTY output must be redacted before it is
-        # sent to any client (live frame or replayed scrollback).
-        out = terminal._redact_terminal(b"export AWS_KEY=AKIAIOSFODNN7EXAMPLE\n")
-        assert b"AKIAIOSFODNN7EXAMPLE" not in out
-        assert isinstance(out, bytes)
-
-    def test_redact_terminal_passes_clean_output_through(self):
-        assert terminal._redact_terminal(b"$ ls -la\n") == b"$ ls -la\n"
-
-    def test_redact_terminal_handles_invalid_utf8(self):
-        # errors="replace" keeps a stray byte from raising; output is still bytes.
-        out = terminal._redact_terminal(b"\xff\xfeok")
-        assert isinstance(out, bytes)
-        assert b"ok" in out
-
-    def test_scrollback_default_is_empty_bytearray(self):
-        sess = _make_session()
-        assert sess.scrollback == bytearray()
-
-    @pytest.mark.asyncio
-    async def test_scrollback_captured_and_replayed_on_reconnect(self, monkeypatch, tmp_path):
-        """PTY output accumulates in the scrollback ring buffer and is replayed
-        (redacted) to a client that reconnects to the same session."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/sb-sess") as ws:
-                await ws.send_bytes(b"echo marker-xyz\n")
-                # Drain at least one frame so read_pty runs and fills scrollback.
-                msg = await ws.receive(timeout=3)
-                assert msg.type == web.WSMsgType.BINARY
-                await ws.close()
-
-            sess = registry["sb-sess"]
-            # Scrollback retained after disconnect, bounded by the ring buffer.
-            assert len(sess.scrollback) > 0
-            assert len(sess.scrollback) <= terminal._SCROLLBACK_MAX
-
-            # Reconnect: the first frame must be the replayed scrollback.
-            async with client.ws_connect("/api/ws/terminal/sb-sess") as ws:
-                replay = await ws.receive(timeout=3)
-                assert replay.type == web.WSMsgType.BINARY
-                assert len(replay.data) > 0
-                await ws.close()
-
-            await terminal._kill_session(registry["sb-sess"])
-
-    @pytest.mark.asyncio
-    async def test_scrollback_trims_to_max(self, monkeypatch):
-        """When PTY output exceeds _SCROLLBACK_MAX, the buffer keeps only the
-        most recent _SCROLLBACK_MAX bytes (the trimming branch in read_pty)."""
-        sess = _make_session()
-        # Simulate the read_pty capture/trim logic directly.
-        for _ in range(0, terminal._SCROLLBACK_MAX * 2, 4096):
-            sess.scrollback.extend(b"x" * 4096)
-            if len(sess.scrollback) > terminal._SCROLLBACK_MAX:
-                sess.scrollback = sess.scrollback[-terminal._SCROLLBACK_MAX:]
-        assert len(sess.scrollback) == terminal._SCROLLBACK_MAX
-
-
-# ── reap_orphaned_terminals ──
-
-
-class TestReapOrphanedTerminals:
-    @pytest.mark.asyncio
-    async def test_reaps_disconnected_session(self):
-        sess = _make_session(session_id="s1", alive=True)
-        sess.last_ws_disconnect = time.monotonic() - 2000  # ~33 min ago (> reap threshold)
-        state = MagicMock()
-        state._terminal_sessions = {"s1": sess}
-        app = {"state": state}
-
-        with patch.object(terminal, "_kill_session", new_callable=AsyncMock) as mock_kill, patch(
-            "asyncio.sleep", side_effect=[None, asyncio.CancelledError]
-        ):
-            await terminal.reap_orphaned_terminals(app)
-        mock_kill.assert_awaited_once_with(sess)
-        assert "s1" not in state._terminal_sessions
-
-    @pytest.mark.asyncio
-    async def test_reaps_dead_process(self):
-        sess = _make_session(session_id="s1", alive=False)
-        state = MagicMock()
-        state._terminal_sessions = {"s1": sess}
-        app = {"state": state}
-
-        with patch.object(terminal, "_kill_session", new_callable=AsyncMock) as mock_kill, patch(
-            "asyncio.sleep", side_effect=[None, asyncio.CancelledError]
-        ):
-            await terminal.reap_orphaned_terminals(app)
-        mock_kill.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_skips_active_session(self):
-        sess = _make_session(session_id="s1", alive=True)
-        sess.last_ws_disconnect = None  # still connected
-        state = MagicMock()
-        state._terminal_sessions = {"s1": sess}
-        app = {"state": state}
-
-        with patch.object(terminal, "_kill_session", new_callable=AsyncMock) as mock_kill, patch(
-            "asyncio.sleep", side_effect=[None, asyncio.CancelledError]
-        ):
-            await terminal.reap_orphaned_terminals(app)
-        mock_kill.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_skips_recently_disconnected(self):
-        sess = _make_session(session_id="s1", alive=True)
-        sess.last_ws_disconnect = time.monotonic() - 60  # 1 min ago (< 15 min threshold)
-        state = MagicMock()
-        state._terminal_sessions = {"s1": sess}
-        app = {"state": state}
-
-        with patch.object(terminal, "_kill_session", new_callable=AsyncMock) as mock_kill, patch(
-            "asyncio.sleep", side_effect=[None, asyncio.CancelledError]
-        ):
-            await terminal.reap_orphaned_terminals(app)
-        mock_kill.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_handles_missing_state(self):
-        app = {"state": None}
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.reap_orphaned_terminals(app)
-        # Should not raise
-
-    @pytest.mark.asyncio
-    async def test_handles_no_terminal_sessions_attr(self):
-        state = MagicMock(spec=[])  # no attributes
-        app = {"state": state}
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.reap_orphaned_terminals(app)
-
-
-# ── Integration tests using aiohttp TestClient ──
-
-
-def _make_app(registry=None, cfg=None, user="testuser"):
-    """Build a minimal aiohttp app with terminal routes and fake auth."""
-    state = MagicMock()
-    state._terminal_sessions = registry if registry is not None else {}
-
-    @web.middleware
-    async def fake_auth(request, handler):
-        request["user"] = user
-        return await handler(request)
-
-    app = web.Application(middlewares=[fake_auth])
-    app["state"] = state
-    # The handshake validates its Origin in the handler, so the app needs the
-    # same allowlist the real gateway builds.
-    app["allowed_origins"] = {"http://localhost:5476"}
-    app.router.add_get("/api/ws/terminal/{session_id}", terminal.api_terminal_ws)
-    app.router.add_post("/api/terminal/sessions", terminal.api_terminal_create)
-    app.router.add_get("/api/terminal/sessions", terminal.api_terminal_list)
-    app.router.add_delete(
-        "/api/terminal/sessions/{session_id}",
-        terminal.api_terminal_delete,
-    )
-    return app
-
-
-@pytest.mark.xdist_group("pty_integration")
-class TestTerminalWsIntegration:
-    """Integration tests that exercise the full WebSocket PTY lifecycle.
-
-    Pinned to one xdist worker (requires ``--dist loadgroup``): each test forks
-    a real PTY shell and waits on multi-second drain budgets for interactive
-    output. Under ``-n auto`` these competed with the gateway integration
-    subprocess storm for CPU and the forked shell could go unscheduled past the
-    10s readiness budget ("shell never produced any PTY output"). Sharing one
-    group serializes the heavy PTY tests, matching the gateway-test pattern.
-    """
-
-    @pytest.mark.asyncio
-    async def test_ws_spawn_and_disconnect(self, monkeypatch, tmp_path):
-        """Connect via WS, spawn a PTY, then disconnect — session stays in registry."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/test-sess-1") as ws:
-                # Session should be registered
-                assert "test-sess-1" in registry
-                sess = registry["test-sess-1"]
-                assert terminal._sess_alive(sess)  # alive (pty or ConPTY backend)
-                await ws.close()
-
-            # After WS close, session stays (orphan reaper handles cleanup)
-            assert "test-sess-1" in registry
-            sess = registry["test-sess-1"]
-            assert sess.ws is None
-            assert sess.last_ws_disconnect is not None
-
-            # Cleanup: kill the PTY
-            await terminal._kill_session(sess)
-
-    @pytest.mark.asyncio
-    async def test_ws_ping_pong(self, monkeypatch, tmp_path):
-        """Send a ping control message, receive pong."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/ping-sess") as ws:
-                await ws.send_str(json.dumps({"type": "ping"}))
-                # Drain binary PTY frames until we get the text pong
-                for _ in range(20):
-                    msg = await ws.receive(timeout=2)
-                    if msg.type == web.WSMsgType.TEXT:
-                        break
-                data = json.loads(msg.data)
-                assert data == {"type": "pong"}
-                await ws.close()
-
-            await terminal._kill_session(registry["ping-sess"])
-
-    @pytest.mark.asyncio
-    async def test_ws_resize(self, monkeypatch, tmp_path):
-        """Send a resize control message, verify session cols/rows update."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/resize-sess") as ws:
-                await ws.send_str(
-                    json.dumps(
-                        {
-                            "type": "resize",
-                            "cols": 200,
-                            "rows": 50,
-                        }
-                    )
-                )
-                # Give a moment for the message to be processed
-                await asyncio.sleep(0.1)
-                sess = registry["resize-sess"]
-                assert sess.cols == 200
-                assert sess.rows == 50
-                await ws.close()
-
-            await terminal._kill_session(registry["resize-sess"])
-
-    @pytest.mark.asyncio
-    async def test_ws_binary_io(self, monkeypatch, tmp_path):
-        """Send binary data through WS, verify PTY receives it."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/io-sess") as ws:
-                # Send a command — the PTY should echo something back
-                await ws.send_bytes(b"echo hello\n")
-                # Read at least one binary frame back (PTY output)
-                msg = await ws.receive(timeout=3)
-                assert msg.type == web.WSMsgType.BINARY
-                assert len(msg.data) > 0
-                await ws.close()
-
-            await terminal._kill_session(registry["io-sess"])
-
-    @pytest.mark.asyncio
-    async def test_submitted_line_invalidates_the_cwd_memo(self, monkeypatch, tmp_path):
-        """A submitted line may be a `cd`, so it drops the completion route's cwd
-        memo and re-arms the title poller; a keystroke that submits nothing
-        leaves the memo intact (otherwise every character typed would force a
-        fresh cwd probe)."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async def _drain_to_pong(ws):
-            # The write loop handles frames in order, so a pong proves the
-            # preceding binary frame has already been processed.
-            await ws.send_str(json.dumps({"type": "ping"}))
-            for _ in range(40):
-                msg = await ws.receive(timeout=3)
-                if msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "pong":
-                    return
-            raise AssertionError("no pong received")
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/cwd-memo-sess") as ws:
-                sess = registry["cwd-memo-sess"]
-
-                sess.cwd_probe = (time.monotonic(), "/tmp/old")
-                await ws.send_bytes(b"c")
-                await _drain_to_pong(ws)
-                assert sess.cwd_probe is not None
-
-                await ws.send_bytes(b"d /tmp\r")
-                await _drain_to_pong(ws)
-                assert sess.cwd_probe is None
-
-                # The submitted line is the one input that can change the cwd,
-                # so it re-arms the title poller directly rather than relying on
-                # the shell's echo to do it. Stop the PTY reader first, since
-                # that echo would otherwise re-arm the session either way and
-                # the assertion would prove nothing.
-                if sess.reader_task is not None:
-                    sess.reader_task.cancel()
-                sess.frames_dirty = False
-                await ws.send_bytes(b"cd /tmp\r")
-                await _drain_to_pong(ws)
-                assert sess.frames_dirty is True
-
-                await ws.close()
-
-            await terminal._kill_session(registry["cwd-memo-sess"])
-
-    @pytest.mark.asyncio
-    async def test_ws_reconnect_existing_session(self, monkeypatch, tmp_path):
-        """Reconnect to an existing PTY session."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            # First connection
-            async with client.ws_connect("/api/ws/terminal/recon-sess") as ws:
-                await ws.close()
-
-            sess = registry["recon-sess"]
-            original_pid = terminal._sess_pid(sess)
-            assert sess.ws is None  # disconnected
-
-            # Reconnect
-            async with client.ws_connect("/api/ws/terminal/recon-sess") as ws:
-                sess = registry["recon-sess"]
-                assert terminal._sess_pid(sess) == original_pid  # same PTY
-                assert sess.ws is not None  # reconnected
-                assert sess.last_ws_disconnect is None
-                await ws.close()
-
-            await terminal._kill_session(registry["recon-sess"])
-
-    @pytest.mark.asyncio
-    async def test_ws_takeover_displaced_socket_keeps_new_ws(self, monkeypatch, tmp_path):
-        """A displaced socket's cleanup must not clobber the takeover socket.
-
-        A second window (e.g. the terminal panel popping out) reconnects to a
-        session WHILE the first window's WS is still attached. The handler
-        replaces ``sess.ws`` with the new socket; when the displaced handler's
-        write loop then unwinds, its ``finally`` block must leave ``sess.ws``
-        pointing at the live takeover socket -- clearing it would silence PTY
-        output to the new window even though it is connected.
-        """
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            ws1 = await client.ws_connect("/api/ws/terminal/takeover-sess")
-            sess = registry["takeover-sess"]
-            original_pid = terminal._sess_pid(sess)
-            first_ws = sess.ws
-            assert first_ws is not None
-
-            # Second client takes over the session while ws1 is still open.
-            ws2 = await client.ws_connect("/api/ws/terminal/takeover-sess")
-            sess = registry["takeover-sess"]
-            assert terminal._sess_pid(sess) == original_pid  # same PTY
-            takeover_ws = sess.ws
-            assert takeover_ws is not None
-            assert takeover_ws is not first_ws  # replaced by the new socket
-
-            # The displaced client closes; its server-side handler unwinds.
-            await ws1.close()
-            # Give the displaced handler's finally block a chance to run.
-            for _ in range(50):
-                await asyncio.sleep(0.05)
-                if sess.ws is takeover_ws and sess.last_ws_disconnect is None:
-                    break
-            assert sess.ws is takeover_ws  # NOT clobbered to None
-            assert sess.last_ws_disconnect is None
-
-            # And the new socket still works end-to-end (control ping).
-            await ws2.send_str(json.dumps({"type": "ping"}))
-            got_pong = False
-            for _ in range(40):
-                msg = await ws2.receive(timeout=3)
-                if msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "pong":
-                    got_pong = True
-                    break
-            assert got_pong
-
-            await ws2.close()
-            await terminal._kill_session(registry["takeover-sess"])
-
-    @pytest.mark.asyncio
-    async def test_ws_invalid_json_ignored(self, monkeypatch, tmp_path):
-        """Invalid JSON text frames are silently ignored."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/json-sess") as ws:
-                await ws.send_str("not valid json")
-                # Should not crash — send a ping to verify connection alive
-                await ws.send_str(json.dumps({"type": "ping"}))
-                # Drain binary PTY frames until we get the text pong
-                for _ in range(20):
-                    msg = await ws.receive(timeout=2)
-                    if msg.type == web.WSMsgType.TEXT:
-                        break
-                data = json.loads(msg.data)
-                assert data == {"type": "pong"}
-                await ws.close()
-
-            await terminal._kill_session(registry["json-sess"])
-
-    @pytest.mark.asyncio
-    async def test_ws_windows_spawns_conpty(self, monkeypatch, tmp_path):
-        """On Windows a new WS session spawns a ConPTY-backed shell instead of
-        the old 'not supported' refusal. WindowsPty is mocked so the test needs
-        no real pseudo-console (and runs on POSIX CI without pywinpty); forcing
-        IS_WINDOWS makes the exercised code path identical on Windows and POSIX.
-        """
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-        monkeypatch.setattr(terminal.platform_compat, "IS_POSIX", False)
-        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", True)
-
-        class _FakeWinPty:
-            def __init__(self, argv, cwd=None, env=None, cols=80, rows=24):
-                self.pid = 4321
-                self._alive = True
-
-            def read(self, size=4096):
-                return b""  # EOF: the reader loop exits cleanly
-
-            def write(self, data):
-                return len(data)
-
-            def resize(self, cols, rows):
-                pass
-
-            def isalive(self):
-                return self._alive
-
-            def terminate(self, force=True):
-                self._alive = False
-
-        monkeypatch.setattr("kiro_crew.conpty.WindowsPty", _FakeWinPty)
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/winok-sess") as ws:
-                # A ConPTY session is registered (not refused).
-                assert "winok-sess" in registry
-                sess = registry["winok-sess"]
-                assert sess.winpty is not None
-                assert sess.proc is None  # Windows backend has no asyncio proc
-                await ws.close()
-
-        if "winok-sess" in registry:
-            await terminal._kill_session(registry["winok-sess"])
-
-    @pytest.mark.skipif(
-        terminal.platform_compat.IS_WINDOWS,
-        reason="POSIX SIGINT via PTY; on Windows Ctrl+C is handled inside ConPTY",
-    )
-    @pytest.mark.asyncio
-    async def test_ws_ctrl_c_delivers_sigint(self, monkeypatch, tmp_path):
-        """Send \\x03 (Ctrl+C) and verify the child process receives SIGINT.
-
-        Deflake notes: the original version used three fixed ``asyncio.sleep``
-        calls (1.0s + 1.0s + 1.5s) which intermittently fired before the shell
-        had printed its prompt, echoed ``sleep 30``, or recovered after SIGINT
-        on a busy CI host — leaving the final ``echo SIGINT_OK`` probe stuck
-        in the input buffer of a shell that hadn't yet returned to a prompt.
-        Replaced with bounded "drain until marker appears in accumulated PTY
-        output" helpers: deterministic on a fast host, falls back to a
-        generous overall budget on a slow one.
-        """
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async def _drain_until(ws, predicate, *, budget_secs: float):
-            """Read PTY frames into an accumulator until ``predicate(buf)`` is
-            true or the overall ``budget_secs`` runs out.  Returns the
-            accumulated bytes (caller can decide whether the predicate held)."""
-            loop = asyncio.get_event_loop()
-            deadline = loop.time() + budget_secs
-            buf = bytearray()
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    return bytes(buf)
-                try:
-                    msg = await ws.receive(timeout=remaining)
-                except asyncio.TimeoutError:
-                    return bytes(buf)
-                if msg.type == web.WSMsgType.BINARY:
-                    buf.extend(msg.data)
-                    if predicate(bytes(buf)):
-                        return bytes(buf)
-                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
-                    return bytes(buf)
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/sigint-sess") as ws:
-                # Readiness gate: drive it off INPUT ECHO, not an unsolicited
-                # prompt. A login shell on a minimal build host (no MOTD, empty
-                # PS1, non-interactive-looking PTY) may emit nothing until it
-                # receives input, so waiting for a spontaneous ``$ ``/``# ``
-                # prompt is brittle and fired "shell never produced any PTY
-                # output" on the fleet. Instead send a probe and wait for the
-                # PTY line discipline to echo it back — the same proven pattern
-                # as test_ws_binary_io. This confirms the shell is interactive
-                # and consuming stdin without depending on prompt rendering.
-                await ws.send_bytes(b"echo __PTY_READY__\n")
-                ready = await _drain_until(
-                    ws,
-                    lambda b: b"__PTY_READY__" in b,
-                    budget_secs=15,
-                )
-                assert b"__PTY_READY__" in ready, (
-                    "shell never echoed the readiness probe — PTY input/echo "
-                    "path is not live"
-                )
-
-                # Run sleep in foreground; drain until we see the command
-                # echoed back (so we know the shell is processing it, not
-                # buffering it pre-prompt).
-                await ws.send_bytes(b"sleep 30\n")
-                echoed = await _drain_until(
-                    ws,
-                    lambda b: b"sleep 30" in b,
-                    budget_secs=5,
-                )
-                assert b"sleep 30" in echoed, (
-                    "shell did not echo `sleep 30` within 5s — "
-                    "input may not have reached an interactive shell"
-                )
-
-                # Send Ctrl+C (ETX byte) and drain until the prompt redraws,
-                # which is the visible signal that the foreground job has
-                # been killed and the shell is back at idle.
-                await ws.send_bytes(b"\x03")
-                await _drain_until(
-                    ws,
-                    lambda b: b"$ " in b or b"# " in b,
-                    budget_secs=5,
-                )
-
-                # Shell should still be alive after SIGINT killed sleep.
-                # Probe with an echo and drain until we see the marker.
-                await ws.send_bytes(b"echo SIGINT_OK\n")
-                tail = await _drain_until(
-                    ws,
-                    lambda b: b"SIGINT_OK" in b,
-                    budget_secs=10,
-                )
-                found = b"SIGINT_OK" in tail
-
-                sess = registry["sigint-sess"]
-                # Success: shell responded (SIGINT killed sleep, shell continued)
-                # OR process exited (signal was delivered, just killed everything)
-                assert found or sess.proc.returncode is not None
-                await ws.close()
-
-            await terminal._kill_session(registry["sigint-sess"])
-
-    @pytest.mark.asyncio
-    async def test_rest_create_list_delete(self, monkeypatch, tmp_path):
-        """Full REST lifecycle: create, list, delete."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-        # This test seeds a mock session (proc.pid=12345) and deletes it. Stub the
-        # tree-kill so teardown does no real process signalling: on POSIX
-        # os.killpg(getpgid(12345)) fails fast, but on Windows taskkill /T /PID
-        # 12345 targets a real system PID (slow timeout / could kill it). Real
-        # teardown is covered by the ConPTY integration test.
-        monkeypatch.setattr(terminal.platform_compat, "kill_process_tree_async", AsyncMock())
-
-        app = _make_app()
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            # Create
-            resp = await client.post("/api/terminal/sessions")
-            assert resp.status == 200
-            body = await resp.json()
-            sid = body["session_id"]
-            assert len(sid) == 12
-
-            # List (empty — create only returns ID, doesn't spawn PTY)
-            resp = await client.get("/api/terminal/sessions")
-            assert resp.status == 200
-
-            # Delete — session not in registry (no WS connected), returns 404
-            resp = await client.delete(f"/api/terminal/sessions/{sid}")
-            assert resp.status == 404
-
-            # Seed registry directly, then delete
-            from kiro_crew.dashboard.handlers import terminal as _term
-
-            registry = _term._get_registry(
-                type("R", (), {"app": client.app})()  # type: ignore[arg-type]
-            )
-            registry[sid] = _make_session(session_id=sid)
-            resp = await client.delete(f"/api/terminal/sessions/{sid}")
-            assert resp.status == 200
-            body = await resp.json()
-            assert body["deleted"] == sid
-            assert sid not in registry
-
-
-# ── _get_registry ──
-
-
-class TestGetRegistry:
-    def test_returns_terminal_sessions_from_state(self):
-        registry = {"s1": _make_session()}
-        req = _make_request(registry=registry)
-        result = terminal._get_registry(req)
-        assert result is registry
-
-
-# ── _TerminalSession dataclass ──
-
-
-class TestTerminalSession:
-    def test_defaults(self):
-        proc = MagicMock()
-        sess = terminal._TerminalSession(session_id="t1", master_fd=5, proc=proc)
-        assert sess.cols == 80
-        assert sess.rows == 24
-        assert sess.ws is None
-        assert sess.reader_task is None
-        assert sess.last_ws_disconnect is None
-        assert sess.created_at > 0
-
-
-# ── _is_enabled default ──
-
-
-class TestIsEnabledDefault:
-    """Terminal is enabled by default; an explicit enabled=false still disables it."""
-
-    def test_enabled_by_default_when_key_absent(self):
-        req = _make_request()
-        terminal._enabled_cache[1] = 0.0  # bust the 30s cache to force a recompute
-        with patch.object(terminal, "_get_config", return_value={}):
-            assert terminal._is_enabled(req) is True
-
-    def test_explicit_disable_is_respected(self):
-        req = _make_request()
-        terminal._enabled_cache[1] = 0.0
-        with patch.object(terminal, "_get_config", return_value={"enabled": False}):
-            assert terminal._is_enabled(req) is False
-
-
-# ── _proc_comm / _proc_cwd (live-title helpers) ──
-
-_HAS_PROC = os.path.isdir("/proc")
-
-
-@pytest.mark.skipif(not _HAS_PROC, reason="requires Linux /proc")
-class TestProcHelpers:
-    def test_proc_comm_returns_command_name_for_live_pid(self):
-        # Our own process is guaranteed alive; /proc/<pid>/comm is non-empty.
-        name = terminal._proc_comm(os.getpid())
-        assert name and isinstance(name, str)
-
-    def test_proc_comm_returns_none_for_bogus_pid(self):
-        # A pid this large effectively never exists -> open() raises OSError -> None.
-        assert terminal._proc_comm(2 ** 30) is None
-
-    def test_proc_cwd_returns_directory_for_live_pid(self):
-        cwd = terminal._proc_cwd(os.getpid())
-        assert cwd and os.path.isdir(cwd)
-
-    def test_proc_cwd_returns_none_for_bogus_pid(self):
-        assert terminal._proc_cwd(2 ** 30) is None
-
-
-# ── _session_title ──
-
-
-@pytest.mark.skipif(
-    terminal.platform_compat.IS_WINDOWS,
-    reason="foreground-command detection uses os.tcgetpgrp (POSIX-only); "
-    "_session_title returns None on Windows",
-)
-class TestSessionTitle:
-    """The tab-title label: foreground command name while one runs, else the
-    shell's cwd basename. _proc_comm/_proc_cwd and os.tcgetpgrp are patched so
-    each branch is exercised deterministically (no real PTY needed)."""
-
-    def _sess(self):
-        # _make_session gives master_fd=99 and proc.pid=12345.  # wokeignore:rule=master
-        return _make_session()
-
-    def test_returns_none_on_non_posix(self):
-        with patch.object(terminal.platform_compat, "IS_POSIX", False):
-            assert terminal._session_title(self._sess()) is None
-
-    def test_returns_none_when_fd_closed(self):
-        sess = self._sess()
-        sess.master_fd = -1  # wokeignore:rule=master
-        with patch.object(terminal.platform_compat, "IS_POSIX", True):
-            assert terminal._session_title(sess) is None
-
-    def test_returns_none_when_tcgetpgrp_raises(self):
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch("os.tcgetpgrp", side_effect=OSError):
-            assert terminal._session_title(self._sess()) is None
-
-    def test_returns_foreground_command_name(self):
-        # fg pgid (999) != shell pid (12345) -> a command is running.
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch("os.tcgetpgrp", return_value=999), \
-             patch.object(terminal, "_proc_comm", return_value="vim"):
-            assert terminal._session_title(self._sess()) == "vim"
-
-    def test_falls_back_to_cwd_basename_when_idle(self):
-        # fg pgid == shell pid -> at the prompt -> cwd basename.
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch("os.tcgetpgrp", return_value=12345), \
-             patch.object(terminal, "_proc_cwd", return_value="/home/u/my-project"):
-            assert terminal._session_title(self._sess()) == "my-project"
-
-    def test_falls_back_to_cwd_when_comm_unavailable(self):
-        # A command is running but /proc/<pgid>/comm couldn't be read.
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch("os.tcgetpgrp", return_value=999), \
-             patch.object(terminal, "_proc_comm", return_value=None), \
-             patch.object(terminal, "_proc_cwd", return_value="/tmp/scratch"):
-            assert terminal._session_title(self._sess()) == "scratch"
-
-    def test_returns_none_when_cwd_unavailable(self):
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch("os.tcgetpgrp", return_value=12345), \
-             patch.object(terminal, "_proc_cwd", return_value=None):
-            assert terminal._session_title(self._sess()) is None
-
-
-# ── one cwd probe per poll tick ──
-
-
-@pytest.mark.skipif(
-    terminal.platform_compat.IS_WINDOWS,
-    reason="the cwd/title probes are POSIX-only (os.tcgetpgrp, /proc, libproc); "
-    "both helpers return None on Windows",
-)
-class TestCwdProbeSharing:
-    """The title label and the cwd frame are two consumers of ONE answer: with no
-    foreground command the title is just the cwd's basename. On a host where
-    _proc_cwd has to fork lsof — no /proc and no libproc — asking twice per tick
-    is the entire cost of an otherwise idle terminal, so the session memo has to
-    collapse them into one probe."""
-
-    def test_memoizes_within_the_ttl(self):
-        sess = _make_session()
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch.object(terminal, "_proc_cwd", return_value="/tmp/a") as probe:
-            assert terminal._session_cwd(sess) == "/tmp/a"
-            assert terminal._session_cwd(sess) == "/tmp/a"
-        assert probe.call_count == 1
-
-    def test_reprobes_once_the_ttl_expires(self):
-        # The memo must not outlive one tick, or a `cd` would take two polls to
-        # show up in the tab title.
-        sess = _make_session()
-        sess.cwd_probe = (time.monotonic() - terminal._CWD_PROBE_TTL_S - 1, "/tmp/old")
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch.object(terminal, "_proc_cwd", return_value="/tmp/new") as probe:
-            assert terminal._session_cwd(sess) == "/tmp/new"
-        assert probe.call_count == 1
-
-    def test_title_and_cwd_frame_share_one_probe(self):
-        # Exactly the pair of calls one poll tick makes, in order.
-        sess = _make_session()
-        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
-             patch("os.tcgetpgrp", return_value=12345), \
-             patch.object(terminal, "_proc_cwd", return_value="/home/u/proj") as probe:
-            assert terminal._session_title(sess) == "proj"
-            assert terminal._session_cwd(sess) == "/home/u/proj"
-        assert probe.call_count == 1
-
-
-# ── poll_terminal_titles ──
-
-
-class TestPollTerminalTitles:
-    """One loop iteration is driven by patching asyncio.sleep to return once
-    then raise CancelledError (same pattern as the reaper tests)."""
-
-    @staticmethod
-    def _app(sess):
-        state = MagicMock()
-        state._terminal_sessions = {sess.session_id: sess} if sess else {}
-        return {"state": state}
-
-    @pytest.mark.asyncio
-    async def test_pushes_title_frame_on_change(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        with patch.object(terminal, "_session_title", return_value="vim"), \
-             patch.object(terminal, "_session_cwd", return_value=None), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        assert sess.last_title == "vim"
-        ws.send_str.assert_awaited_once()
-        assert json.loads(ws.send_str.call_args.args[0]) == {"type": "title", "text": "vim"}
-
-    @pytest.mark.asyncio
-    async def test_skips_when_title_unchanged(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        sess.last_title = "vim"
-        with patch.object(terminal, "_session_title", return_value="vim"), \
-             patch.object(terminal, "_session_cwd", return_value=None), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        ws.send_str.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_skips_when_no_title(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        with patch.object(terminal, "_session_title", return_value=None), \
-             patch.object(terminal, "_session_cwd", return_value=None), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        ws.send_str.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_skips_disconnected_session(self):
-        sess = _make_session(session_id="s1", ws=None)  # no live socket
-        with patch.object(terminal, "_session_title") as mock_title, \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        mock_title.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_does_not_probe_a_session_with_no_new_output(self):
-        # A shell cannot change directory or start a command without writing to
-        # the PTY, so a session that has produced nothing since its last probe
-        # cannot have gone stale. Probing it anyway is what made an idle
-        # terminal cost a forked lsof every second on hosts with no /proc.
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        sess.frames_dirty = False
-        with patch.object(terminal, "_session_title") as title, \
-             patch.object(terminal, "_session_cwd") as cwd, \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        title.assert_not_called()
-        cwd.assert_not_called()
-        ws.send_str.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_disarms_itself_after_probing(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        with patch.object(terminal, "_session_title", return_value="vim"), \
-             patch.object(terminal, "_session_cwd", return_value="/tmp/x"), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        assert sess.frames_dirty is False
-
-    @pytest.mark.asyncio
-    async def test_output_landing_mid_probe_re_arms_the_session(self):
-        # The flag is cleared BEFORE the probe, so a write that lands while the
-        # probe is in flight is picked up on the next tick. Clearing it after the
-        # probe would swallow that write and freeze the title until some later,
-        # unrelated output happened to re-arm it.
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-
-        def output_lands_mid_probe(s):
-            s.frames_dirty = True  # what read_pty does on every PTY read
-            return "vim"
-
-        with patch.object(terminal, "_session_title", side_effect=output_lands_mid_probe), \
-             patch.object(terminal, "_session_cwd", return_value=None), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        assert sess.frames_dirty is True
-
-    @pytest.mark.asyncio
-    async def test_swallows_send_error(self):
-        ws = AsyncMock()
-        ws.closed = False
-        ws.send_str = AsyncMock(side_effect=ConnectionResetError)
-        sess = _make_session(session_id="s1", ws=ws)
-        with patch.object(terminal, "_session_title", return_value="vim"), \
-             patch.object(terminal, "_session_cwd", return_value=None), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))  # must not raise
-        assert sess.last_title == "vim"
-
-    @pytest.mark.asyncio
-    async def test_handles_missing_state(self):
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles({"state": None})
-
-    @pytest.mark.asyncio
-    async def test_handles_no_terminal_sessions_attr(self):
-        state = MagicMock(spec=[])  # no _terminal_sessions attribute
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles({"state": state})
-
-    @pytest.mark.asyncio
-    async def test_pushes_cwd_frame_on_change(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        with patch.object(terminal, "_session_title", return_value=None), \
-             patch.object(terminal, "_session_cwd", return_value="/home/u/proj"), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        assert sess.last_cwd == "/home/u/proj"
-        ws.send_str.assert_awaited_once()
-        assert json.loads(ws.send_str.call_args.args[0]) == {"type": "cwd", "path": "/home/u/proj"}
-
-    @pytest.mark.asyncio
-    async def test_skips_when_cwd_unchanged(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        sess.last_cwd = "/home/u/proj"
-        with patch.object(terminal, "_session_title", return_value=None), \
-             patch.object(terminal, "_session_cwd", return_value="/home/u/proj"), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        ws.send_str.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_pushes_both_title_and_cwd_frames(self):
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-        with patch.object(terminal, "_session_title", return_value="vim"), \
-             patch.object(terminal, "_session_cwd", return_value="/tmp/x"), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))
-        frames = [json.loads(c.args[0]) for c in ws.send_str.await_args_list]
-        assert {"type": "title", "text": "vim"} in frames
-        assert {"type": "cwd", "path": "/tmp/x"} in frames
-
-    @pytest.mark.asyncio
-    async def test_survives_ws_detach_during_probe(self):
-        # The WS can detach (sess.ws = None) while a blocking probe runs in the
-        # executor. The poller must revalidate after the hop — never send on the
-        # dead reference, never AttributeError (which would kill the singleton
-        # task for every terminal until restart).
-        ws = AsyncMock()
-        ws.closed = False
-        sess = _make_session(session_id="s1", ws=ws)
-
-        def detach_and_return_title(s):
-            s.ws = None  # disconnect lands mid-probe
-            return "vim"
-
-        with patch.object(terminal, "_session_title", side_effect=detach_and_return_title), \
-             patch.object(terminal, "_session_cwd", return_value="/tmp/x"), \
-             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.poll_terminal_titles(self._app(sess))  # must not raise
-        ws.send_str.assert_not_awaited()

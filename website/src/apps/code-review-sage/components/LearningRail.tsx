@@ -12,7 +12,31 @@ import { sageApi } from '../api'
 import { useSage } from '../context'
 
 import { i18nT } from '../../../i18n/t'
+import { refusedLetterParams } from '../../../lib/scriptLabel'
+import ErrorNotice from '../../../components/ErrorNotice'
+import { useImeGuard } from '../../../hooks/useImeGuard'
+import { guideCaution } from '../../../guide/trustRoot'
+
+/** A refused namespace name is explained in the app's language; the backend's
+ *  English is for logs. The name is the namespace's folder, so it stays a
+ *  lowercase Latin slug on purpose, and `char` names what stopped it. A refused
+ *  letter is shown with its script and code point, because a Cyrillic or Greek
+ *  capital renders exactly like the Latin one the rule allows. Read off the
+ *  error's fields rather than `instanceof SageApiError`, so the copy does not
+ *  depend on which module instance threw. */
+function errorText(err: Error): string {
+  const { code, char } = err as Error & { code?: unknown; char?: unknown }
+  if (code !== 'invalid_namespace_name') return err.message
+  if (typeof char !== 'string' || !char) {
+    return i18nT('apps.codeReviewSage.components.learningRail.invalid_namespace_name')
+  }
+  return /^\p{L}$/u.test(char)
+    ? i18nT('apps.codeReviewSage.components.learningRail.invalid_namespace_name_letter', refusedLetterParams(char))
+    : i18nT('apps.codeReviewSage.components.learningRail.invalid_namespace_name_char', { char })
+}
+
 export default function LearningRail() {
+  const ime = useImeGuard()
   const { selectedNamespace, selectNamespace } = useSage()
   const qc = useQueryClient()
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
@@ -26,6 +50,9 @@ export default function LearningRail() {
   const settingsQuery = useQuery({
     queryKey: ['code-review-sage', 'settings'],
     queryFn: () => sageApi.settings(),
+    // putSettings sends a replace-all PUT from this cache; finite staleTime
+    // lets focus-refetch fire here (global default is Infinity).
+    staleTime: 30_000,
   })
 
   const invalidate = () => {
@@ -87,9 +114,7 @@ export default function LearningRail() {
           <div className="px-1 py-1 text-[12px] text-muted">{i18nT('apps.codeReviewSage.components.learningRail.loading')}</div>
         )}
         {nsQuery.error && (
-          <div className="px-1 py-1 text-[12px] text-danger">
-            {(nsQuery.error as Error).message}
-          </div>
+          <ErrorNotice message={(nsQuery.error as Error).message} variant="inline" askAgent className="px-1 py-1" />
         )}
 
         {nsQuery.data?.namespaces.map((ns) => {
@@ -144,7 +169,8 @@ export default function LearningRail() {
                     type="button"
                     onClick={() => setConfirmDelete(ns.name)}
                     aria-label={i18nT('apps.codeReviewSage.components.learningRail.delete_namespace', { name: ns.name })}
-                    className="flex-shrink-0 p-0.5 bg-transparent text-muted opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-danger cursor-pointer"
+                    {...guideCaution}
+                    className="flex-shrink-0 p-0.5 bg-transparent text-muted opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 hover:text-danger cursor-pointer"
                   >
                     <Trash2 size={12} />
                   </button>
@@ -194,13 +220,13 @@ export default function LearningRail() {
               value={newName}
               autoFocus
               onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && newName.trim()) createMut.mutate(newName.trim())
-                if (e.key === 'Escape') { setAdding(false); setNewName('') }
-              }}
+              {...ime.bindEnter({
+                onEnter: () => { if (newName.trim()) createMut.mutate(newName.trim()) },
+                onEscape: () => { setAdding(false); setNewName('') },
+              })}
               aria-label={i18nT('apps.codeReviewSage.components.learningRail.new_namespace_name')}
               placeholder={i18nT('apps.codeReviewSage.components.learningRail.new_namespace_2')}
-              className="flex-1 min-w-0 rounded-md border border-border bg-bg-elevated px-2 py-1 font-mono text-[12px] text-text outline-none focus:border-accent"
+              className="flex-1 min-w-0 rounded-md border border-border bg-bg-elevated px-2 py-1 font-mono text-[12px] text-text outline-hidden focus-visible:border-accent"
             />
             <button
               type="button"
@@ -213,7 +239,8 @@ export default function LearningRail() {
             </button>
           </div>
         )}
-        {err && <div className="px-1 text-[11.5px] text-danger">{err.message}</div>}
+        {/* No hand-off: the new-namespace name input above is unsaved. */}
+        {err && <ErrorNotice message={errorText(err)} variant="inline" className="px-1" />}
       </div>
     </div>
   )

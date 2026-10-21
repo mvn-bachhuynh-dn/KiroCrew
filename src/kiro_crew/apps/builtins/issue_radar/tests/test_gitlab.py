@@ -13,8 +13,10 @@ loud:
     owner/repo on a different provider or host.
   * Normalization -- the GitLab payloads must arrive in the exact GitHub-shaped
     dicts the routes, caches, and React components already consume.
-  * Client parity -- both modules must expose the same surface, so a route can
-    dispatch without knowing which provider it has.
+  * Client parity -- EVERY client module must expose the same surface, so a route
+    can dispatch without knowing which provider it has. The gate is parameterized
+    over the whole client table (GitHub, GitLab, Azure DevOps), so a new provider
+    is covered by adding one entry rather than a branch per assertion.
 """
 
 from __future__ import annotations
@@ -30,8 +32,10 @@ from unittest import mock
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.apps.builtins.issue_radar.backend import (
+    azure_client,
     github_client,
     gitlab_client,
+    gitlab_transport,
     provider,
     routes,
     store,
@@ -58,6 +62,79 @@ class TestGitlabUrlParsing(unittest.TestCase):
             gitlab_client.parse_gitlab_repo_url("https://gitlab.com/a/b/c/proj"),
             ("gitlab.com", "a/b/c", "proj"),
         )
+
+    def test_namespace_at_gitlabs_nesting_ceiling_is_accepted(self):
+        # The maximum must not refuse a namespace GitLab itself creates, so the
+        # boundary case parses. Depth comes from the bound rather than being
+        # written down again, and the count is measured off the PARSED namespace.
+        depth = gitlab_transport.MAX_NAMESPACE_SEGMENTS
+        namespace = "/".join(f"g{level}" for level in range(depth))
+        host, owner, repo = gitlab_client.parse_gitlab_repo_url(
+            f"https://gitlab.com/{namespace}/proj"
+        )
+        self.assertEqual((host, repo), ("gitlab.com", "proj"))
+        self.assertEqual(len(owner.split("/")), depth)
+
+    def test_namespace_one_level_past_the_ceiling_is_refused(self):
+        # The COUNT is bounded, not only each segment's shape: every segment here
+        # satisfies SEGMENT_RE and none is a traversal, so shape checks alone admit
+        # this URL and only the maximum refuses it.
+        namespace = "/".join(
+            f"g{level}" for level in range(gitlab_transport.MAX_NAMESPACE_SEGMENTS + 1)
+        )
+        with self.assertRaises(RepoUrlError):
+            gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/{namespace}/proj")
+
+    def test_namespace_ceiling_is_derived_from_gitlabs_ancestor_limit(self):
+        # ``ancestors.count`` excludes the group itself, so the legal path is the
+        # ancestors GitLab permits plus the group they are ancestors of.
+        self.assertEqual(
+            gitlab_transport.MAX_NAMESPACE_SEGMENTS,
+            gitlab_transport.GITLAB_MAX_GROUP_ANCESTORS + 1,
+        )
+
+    def test_segment_at_gitlabs_length_ceiling_is_accepted(self):
+        # A segment as long as GitLab's own `URL_MAX_LENGTH` must still parse, so the
+        # size bound does not refuse a group GitLab creates. The width is taken from
+        # the constant and measured back off the PARSED namespace.
+        width = gitlab_transport.GITLAB_MAX_SEGMENT_CHARS
+        host, owner, repo = gitlab_client.parse_gitlab_repo_url(
+            f"https://gitlab.com/{'a' * width}/proj"
+        )
+        self.assertEqual((host, repo), ("gitlab.com", "proj"))
+        self.assertEqual(len(owner), width)
+
+    def test_segment_one_character_past_the_length_ceiling_is_refused(self):
+        # COUNT and SIZE are separate dimensions: this URL has one group, so the
+        # nesting bound reads `len(parts) - 1 == 1` and passes it, and the character
+        # class admits every byte. Only the length bound refuses it.
+        over = "a" * (gitlab_transport.GITLAB_MAX_SEGMENT_CHARS + 1)
+        with self.assertRaises(RepoUrlError):
+            gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/{over}/proj")
+
+    def test_project_segment_is_bounded_too(self):
+        # The project is the other field the parse retains, and `project_path` puts it
+        # in the same argv element as the namespace, so its size is bounded on the
+        # same admission path rather than only the namespace's.
+        over = "a" * (gitlab_transport.GITLAB_MAX_SEGMENT_CHARS + 1)
+        with self.assertRaises(RepoUrlError):
+            gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/group/{over}")
+
+    def test_the_two_bounds_together_cap_the_whole_parsed_value(self):
+        # Neither bound alone caps what the parse returns: without the count bound the
+        # depth grows, without the size bound one segment does. Together they put a
+        # ceiling on `owner/repo`, which is what one argv element has to hold.
+        # Linux caps a single argv element at MAX_ARG_STRLEN; this is that consumer's
+        # limit, not a restatement of either bound.
+        max_arg_strlen = 131072
+        segments = gitlab_transport.MAX_NAMESPACE_SEGMENTS
+        width = gitlab_transport.GITLAB_MAX_SEGMENT_CHARS
+        widest = "/".join("a" * width for _ in range(segments))
+        _, owner, repo = gitlab_client.parse_gitlab_repo_url(
+            f"https://gitlab.com/{widest}/{'p' * width}"
+        )
+        self.assertEqual(len(owner.split("/")), segments)
+        self.assertLess(len(f"{owner}/{repo}"), max_arg_strlen)
 
     def test_deep_page_urls_resolve_to_the_project(self):
         # Users paste whatever tab they are on.
@@ -762,9 +839,10 @@ class TestMrTimelineNotesFetch(unittest.TestCase):
     """The MR timeline reads the notes endpoint ONCE.
 
     GitLab keeps inline (diff) comments in the same notes stream, so the MR
-    timeline both assembles the notes AND promotes the positioned ones. It used to
-    fetch ``{base}/notes`` twice per PR-detail load; ``_assemble_timeline`` now
-    returns the notes it fetched so the promotion reuses that one read."""
+    timeline both assembles the notes AND promotes the positioned ones.
+    ``_assemble_timeline`` returns the notes it fetched so the promotion reuses
+    that one read instead of fetching ``{base}/notes`` a second time per
+    PR-detail load."""
 
     def test_notes_endpoint_is_hit_once(self):
         note = {
@@ -970,6 +1048,101 @@ class TestMergeRequestSearchState(unittest.TestCase):
         self.assertEqual(len(out), gitlab_client.PR_SEARCH_MAX + 1)
 
 
+class TestGitlabAssignees(unittest.TestCase):
+    """GitLab addresses assignees by numeric id, so the editor's usernames have to
+    be resolved against the project roster before the write."""
+
+    MEMBERS = [
+        {"username": "alice", "id": 11, "access_level": 30},
+        {"username": "Bob", "id": 22, "access_level": 40},
+    ]
+
+    def test_resolves_usernames_to_ids_and_sends_assignee_ids(self):
+        calls = []
+
+        def fake(path, **kw):
+            calls.append((path, kw))
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": [{"username": "alice"}]}
+
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake):
+            out = gitlab_client.set_issue_assignees("g", "p", 7, ["alice"], host="gitlab.com")
+
+        write = [c for c in calls if c[1].get("method") == "PUT"][0]
+        self.assertEqual(write[1]["body"], {"assignee_ids": [11]})
+        self.assertEqual(out, ["alice"])
+
+    def test_username_match_is_case_insensitive(self):
+        """The roster spells a username with its own case ("Bob") and the picker
+        passes back exactly what it rendered, while the lookup table is keyed
+        lowercase -- so the LOOKUP side must fold case too. Without that, a real
+        member is refused as a non-member. Both the roster's own casing and a
+        lowercased variant must resolve to the same id."""
+        def fake(path, **kw):
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": [{"username": "Bob"}]}
+
+        for spelling in ("Bob", "bob", "BOB"):
+            with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake) as m:
+                gitlab_client.set_issue_assignees(
+                    "g", "p", 7, [spelling], host="gitlab.com"
+                )
+            body = [
+                c.kwargs["body"]
+                for c in m.call_args_list
+                if c.kwargs.get("method") == "PUT"
+            ][0]
+            self.assertEqual(body, {"assignee_ids": [22]}, spelling)
+
+    def test_non_member_is_refused_not_silently_dropped(self):
+        """GitLab does NOT validate assignee_ids the way GitHub validates logins: it
+        ignores an id it will not honour and answers 200. So an unresolvable
+        username must fail before the write -- otherwise the call reports success
+        for an assignment that never happened. It raises the same invalid-input
+        class GitHub's 422 maps to, so the route answers 400 on both providers."""
+        def fake(path, **kw):
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": []}
+
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake) as m:
+            with self.assertRaises(gitlab_client.ProviderInvalidInputError) as ctx:
+                gitlab_client.set_issue_assignees(
+                    "g", "p", 7, ["alice", "stranger"], host="gitlab.com"
+                )
+        self.assertIn("stranger", str(ctx.exception))
+        self.assertEqual(ctx.exception.values, ["stranger"])
+        # Refused BEFORE the write: no PUT was issued, so nothing changed.
+        self.assertEqual([c for c in m.call_args_list if c.kwargs.get("method") == "PUT"], [])
+
+    def test_clearing_skips_the_roster_read_and_sends_empty(self):
+        """Clearing needs no ids, so it must not pay a paginated roster fetch --
+        and it must still SEND the empty list, which is how GitLab unassigns."""
+        with mock.patch.object(
+            gitlab_client, "_glab_api", return_value={"assignees": []}
+        ) as m:
+            out = gitlab_client.set_issue_assignees("g", "p", 7, [], host="gitlab.com")
+        self.assertEqual(len(m.call_args_list), 1)  # no members call
+        self.assertEqual(m.call_args.kwargs["body"], {"assignee_ids": []})
+        self.assertEqual(out, [])
+
+    def test_returns_what_stuck(self):
+        """GitLab Free keeps only the first of several assignees, so the result is
+        read from the response rather than echoed from the request."""
+        def fake(path, **kw):
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": [{"username": "alice"}]}
+
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake):
+            out = gitlab_client.set_issue_assignees(
+                "g", "p", 7, ["alice", "Bob"], host="gitlab.com"
+            )
+        self.assertEqual(out, ["alice"])
+
+
 class TestProviderDispatch(unittest.TestCase):
     def test_client_for_selects_the_right_module(self):
         self.assertIs(provider.client_for(provider.RepoKey(provider="github")), github_client)
@@ -1010,14 +1183,79 @@ class TestProviderDispatch(unittest.TestCase):
         self.assertEqual(key.web_url(), "https://gitlab.acme.internal/g/sub/p")
 
 
+class TestContributedReposRowContract(unittest.TestCase):
+    """The connect picker reads every provider's rows through ONE contract:
+    keyed and labelled by ``full_name``, dated by ``last_contributed_at``.
+    GitLab rows once carried neither, so the picker rendered nameless rows whose
+    tick toggled the shared key ``undefined``."""
+
+    def test_rows_carry_full_name_and_last_contributed_at(self):
+        rows = [
+            {"path_with_namespace": "grp/sub/proj", "last_activity_at": "2999-01-02T03:04:05Z",
+             "visibility": "private"},
+            {"path_with_namespace": "grp/other", "last_activity_at": "2999-01-01T00:00:00Z",
+             "visibility": "public"},
+        ]
+        with mock.patch.object(gitlab_client, "_glab_api", return_value=rows):
+            out, truncated = gitlab_client.list_contributed_repos("me", host="gitlab.com")
+        self.assertFalse(truncated)
+        self.assertEqual([r["full_name"] for r in out], ["grp/sub/proj", "grp/other"])
+        self.assertEqual(out[0]["owner"], "grp/sub")
+        self.assertEqual(out[0]["repo"], "proj")
+        self.assertEqual(out[0]["last_contributed_at"], "2999-01-02T03:04:05Z")
+        # Every row key the GitHub client promises, so the route needs no branching.
+        gh_keys = {"owner", "repo", "full_name", "last_contributed_at"}
+        self.assertTrue(gh_keys <= set(out[1]))
+
+
 class TestClientParity(unittest.TestCase):
-    """Both client modules must expose the same surface.
+    """EVERY client module must expose the same surface.
 
     A module cannot be statically checked against ``provider.ProviderClient``, so
     this is the gate that makes the dispatch safe: if a route calls a function
-    that only GitHub implements, or the two disagree about argument order, it
-    fails here rather than at runtime for a GitLab user.
+    that only GitHub implements, or two clients disagree about argument order, it
+    fails here rather than at runtime for a GitLab or Azure DevOps user.
+
+    Parameterized over :data:`CLIENTS` rather than written pairwise: a fourth
+    provider is then one entry in that table instead of a fourth branch inside
+    every assertion -- which is what a pairwise gate silently invites, since
+    adding a client module without touching this class costs nothing and the gate
+    keeps passing while the new module is never checked at all.
     """
+
+    # Every provider client the dispatch can hand to a route, keyed by the
+    # ``provider`` value that selects it.
+    #
+    # GitHub is the REFERENCE rather than one peer among three: the routes,
+    # caches and React components were all written against its names and
+    # signatures, so a disagreement is always the OTHER client drifting. Comparing
+    # each module against GitHub (not pairwise against each other) also means a
+    # failure names the provider that drifted, instead of only reporting that the
+    # three disagree.
+    REFERENCE = "github"
+    CLIENTS = {
+        "github": github_client,
+        "gitlab": gitlab_client,
+        "azure": azure_client,
+    }
+
+    @property
+    def others(self) -> list[str]:
+        """Every client except the reference, in a stable order."""
+        return sorted(set(self.CLIENTS) - {self.REFERENCE})
+
+    def test_the_table_covers_every_registered_provider(self):
+        """A provider registered in ``provider.py`` must be gated here.
+
+        This is what keeps the parameterization honest. Without it, a fourth
+        provider could be added to ``provider.PROVIDERS`` and to the dispatch
+        while this class still compares only three modules -- and every assertion
+        below would keep passing, having never looked at the new client.
+        """
+        self.assertEqual(set(self.CLIENTS), set(provider.PROVIDERS))
+        for name, module in self.CLIENTS.items():
+            with self.subTest(provider=name):
+                self.assertIs(provider.client_for(provider.RepoKey(provider=name)), module)
 
     # Every function the routes reach through the dispatch.
     SURFACE = (
@@ -1029,7 +1267,7 @@ class TestClientParity(unittest.TestCase):
         "list_open_pulls_first_page", "list_closed_pulls",
         "get_pr_detail", "list_pr_checks", "summarize_checks", "enrich_pulls",
         "enrich_pulls_by_number", "enrichment_complete", "search_pulls", "add_issue_labels",
-        "remove_issue_label", "set_issue_state", "create_label", "probe_open_list",
+        "remove_issue_label", "set_issue_state", "set_issue_assignees", "create_label", "probe_open_list",
         "build_pr_search_query", "get_ref_summary",
         # Pull-request actions.
         "set_pr_state", "submit_pr_review", "add_issue_comment", "add_pr_comment",
@@ -1038,43 +1276,56 @@ class TestClientParity(unittest.TestCase):
         "cancel_workflow_run", "rerun_workflow_run",
     )
 
-    def test_both_modules_implement_the_whole_surface(self):
+    def test_every_module_implements_the_whole_surface(self):
         for name in self.SURFACE:
-            with self.subTest(name=name):
-                self.assertTrue(callable(getattr(github_client, name, None)), f"github: {name}")
-                self.assertTrue(callable(getattr(gitlab_client, name, None)), f"gitlab: {name}")
+            for client, module in self.CLIENTS.items():
+                with self.subTest(name=name, provider=client):
+                    self.assertTrue(
+                        callable(getattr(module, name, None)), f"{client}: {name}"
+                    )
+
+    @staticmethod
+    def _positional(module, name: str) -> list[str]:
+        return [
+            p.name
+            for p in inspect.signature(getattr(module, name)).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
 
     def test_positional_parameters_agree(self):
         """The POSITIONAL parameters must match name-for-name and in order.
 
         Keyword-only parameters are allowed to differ -- that is exactly where
-        ``host`` lives for GitLab and where each client's own timeouts live -- but
-        a positional disagreement would mean a route silently passing the wrong
-        argument (e.g. an issue number where a SHA is expected).
+        ``host`` lives for GitLab and Azure DevOps, and where each client's own
+        timeouts live -- but a positional disagreement would mean a route silently
+        passing the wrong argument (e.g. an issue number where a SHA is expected).
         """
         for name in self.SURFACE:
-            with self.subTest(name=name):
-                gh_params = [
-                    p.name
-                    for p in inspect.signature(getattr(github_client, name)).parameters.values()
-                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                ]
-                gl_params = [
-                    p.name
-                    for p in inspect.signature(getattr(gitlab_client, name)).parameters.values()
-                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                ]
-                self.assertEqual(gh_params, gl_params, f"{name} positional params differ")
+            reference = self._positional(self.CLIENTS[self.REFERENCE], name)
+            for client in self.others:
+                with self.subTest(name=name, provider=client):
+                    self.assertEqual(
+                        reference,
+                        self._positional(self.CLIENTS[client], name),
+                        f"{name}: {client} positional params differ from {self.REFERENCE}",
+                    )
 
     # Keyword-only parameters that are legitimately provider-local: the target
-    # host (GitLab needs it, GitHub is pinned to github.com) and each client's own
-    # timeout budget. EVERY other keyword-only parameter is caller-supplied and
-    # must match, because the routes pass the same kwargs to whichever client they
-    # hold.
+    # host (GitLab and Azure DevOps need it, GitHub is pinned to github.com) and
+    # each client's own timeout budget. EVERY other keyword-only parameter is
+    # caller-supplied and must match, because the routes pass the same kwargs to
+    # whichever client they hold.
     PROVIDER_LOCAL_KWARGS = frozenset({"host", "timeout"})
 
+    def _caller_kwargs(self, module, name: str) -> set[str]:
+        return {
+            p.name
+            for p in inspect.signature(getattr(module, name)).parameters.values()
+            if p.kind == p.KEYWORD_ONLY
+        } - self.PROVIDER_LOCAL_KWARGS
+
     def test_caller_supplied_keyword_arguments_agree(self):
-        """The kwargs a route passes must exist on BOTH clients.
+        """The kwargs a route passes must exist on EVERY client.
 
         Positional parity alone is not enough: if ``search_pulls`` is reached with
         ``assignee=`` / ``review_requested=`` / ``limit=`` that only the GitHub
@@ -1084,29 +1335,27 @@ class TestClientParity(unittest.TestCase):
         module cast), so it is caught here instead.
         """
         for name in self.SURFACE:
-            with self.subTest(name=name):
-                def kwargs(mod):
-                    return {
-                        p.name
-                        for p in inspect.signature(getattr(mod, name)).parameters.values()
-                        if p.kind == p.KEYWORD_ONLY
-                    } - self.PROVIDER_LOCAL_KWARGS
+            ref_kw = self._caller_kwargs(self.CLIENTS[self.REFERENCE], name)
+            for client in self.others:
+                with self.subTest(name=name, provider=client):
+                    other_kw = self._caller_kwargs(self.CLIENTS[client], name)
+                    self.assertEqual(
+                        ref_kw,
+                        other_kw,
+                        f"{name}: {self.REFERENCE}-only kwargs {sorted(ref_kw - other_kw)}, "
+                        f"{client}-only kwargs {sorted(other_kw - ref_kw)}",
+                    )
 
-                gh_kw, gl_kw = kwargs(github_client), kwargs(gitlab_client)
-                self.assertEqual(
-                    gh_kw,
-                    gl_kw,
-                    f"{name}: GitHub-only kwargs {sorted(gh_kw - gl_kw)}, "
-                    f"GitLab-only kwargs {sorted(gl_kw - gh_kw)}",
-                )
-
-    def test_both_raise_the_same_exception_classes(self):
+    def test_every_module_raises_the_same_exception_classes(self):
         # Aliases, not parallel hierarchies: otherwise routes.py's
-        # `except GhCliError` would miss every GitLab failure and return a 500.
-        self.assertIs(github_client.GhCliError, gitlab_client.GhCliError)
-        self.assertIs(github_client.GhSetupError, gitlab_client.GhSetupError)
-        self.assertIs(github_client.GhPermissionError, gitlab_client.GhPermissionError)
-        self.assertIs(github_client.RepoUrlError, gitlab_client.RepoUrlError)
+        # `except GhCliError` would miss every GitLab or Azure failure and return
+        # a 500 instead of the 502/403 the route intends.
+        reference = self.CLIENTS[self.REFERENCE]
+        for alias in ("GhCliError", "GhSetupError", "GhPermissionError", "RepoUrlError"):
+            expected = getattr(reference, alias)
+            for client in self.others:
+                with self.subTest(alias=alias, provider=client):
+                    self.assertIs(getattr(self.CLIENTS[client], alias, None), expected)
 
 
 class TestConnectParsesOffTheLoop(unittest.TestCase):
@@ -1135,18 +1384,42 @@ class TestRoutesScopeEveryStoreCall(unittest.TestCase):
         issues -- a bug with no error and no visible symptom except wrong data. The
         only ``store`` functions allowed to be called directly are the
         config-identity ones, which are keyed by provider+host instead of by root.
+
+        Scanned: ``routes.py`` and every ``http_routes`` module its handlers are
+        composed from, enumerated from the package directory so a new owner is
+        scanned without an edit here.
         """
-        source = Path(inspect.getfile(routes)).read_text(encoding="utf-8")
+        facade = Path(inspect.getfile(routes))
+        paths = [facade, *sorted((facade.parent / "http_routes").rglob("*.py"))]
+        # Not vacuous: the per-repo handlers live in the scanned files.
+        for fn in (
+            routes._handle_issues,
+            routes._handle_pull_ai,
+            routes._run_pr_action,
+            routes._rebuild_deps,
+        ):
+            self.assertIn(Path(inspect.getsourcefile(fn) or ""), paths, fn.__name__)
         allowed = {
             "list_connected_repos", "set_repo_permissions", "remove_connected_repo",
             "read_repo_settings", "write_repo_settings", "add_setting_label",
             "add_connected_repo", "is_repo_connected",
+            # Followed GitLab groups live in config.json keyed by host + path;
+            # they own no per-repo tree to scope.
+            "list_gitlab_groups", "is_gitlab_group_added", "add_gitlab_group",
+            "remove_gitlab_group",
         }
-        offenders = [
-            name
-            for name in re.findall(r"asyncio\.to_thread\(\s*store\.([a-z_]+)", source)
-            if name not in allowed
+        calls = [
+            (path.name, name)
+            for path in paths
+            for name in re.findall(
+                r"asyncio\.to_thread\(\s*store\.([a-z_]+)", path.read_text(encoding="utf-8")
+            )
         ]
+        # A floor on what the scan must find: the repositories handlers' direct
+        # config-identity reads. Fewer means the scan stopped reaching the code
+        # that makes these calls, and an empty scan would pass on nothing.
+        self.assertGreaterEqual(len(calls), 2, f"store calls found: {calls}")
+        offenders = [f"{file}: {name}" for file, name in calls if name not in allowed]
         self.assertEqual(offenders, [], f"unscoped per-repo store calls: {offenders}")
 
 

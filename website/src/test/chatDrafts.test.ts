@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { DRAFTS_KEY, DRAFT_MAX_ENTRIES, DRAFT_TTL_MS, loadDrafts, saveDrafts, setDraft, __resetForTests } from '../utils/chatDrafts'
+import { DRAFTS_KEY, DRAFT_MAX_ENTRIES, DRAFT_TTL_MS, loadDrafts, mergeIntoDraft, mergeRecoveredDraft, saveDrafts, setDraft, appendTypedText, typedDuringCreate, chatPageShouldConsumeHandoff, __resetForTests } from '../utils/chatDrafts'
 import { DRAFT_MAX_STORE_BYTES } from '../utils/draftConstants'
 
 describe('chatDrafts', () => {
@@ -279,5 +279,135 @@ describe('chatDrafts', () => {
     // get re-stamped and have their TTL reset.
     expect(calls[0]).toBe('mc-chat-drafts-ts')
     expect(calls[1]).toBe(DRAFTS_KEY)
+  })
+})
+
+/**
+ * The composer's append-merge, and the one edit it is NOT allowed to make.
+ *
+ * Both merges drop the trailing newlines before the paragraph break they are
+ * about to supply. Neither may drop trailing SPACES: two of them are a Markdown
+ * hard line break, so a blanket `/\s+$/` strip rewrites the last line of a draft
+ * the user is still holding (#4217).
+ */
+describe('draft merges keep the draft verbatim except for the newlines they replace', () => {
+  it('preserves a Markdown hard line break at the end of the kept draft', () => {
+    // "shipped  " ends in the two spaces that make a hard break. They survive.
+    expect(mergeIntoDraft('shipped  ', 'P')).toBe('shipped  \n\nP')
+    expect(mergeRecoveredDraft('line one  \nline two  ', 'P')).toBe('line one  \nline two  \n\nP')
+  })
+
+  it('preserves it even when a newline FOLLOWS the hard break', () => {
+    // The regression a matcher that opens with `[^\S\n]*` produces: it reaches
+    // back across the spaces preceding the first newline and eats the very hard
+    // break the strip exists to protect, so "line  \n" came out as "line".
+    expect(mergeIntoDraft('line  \n', 'P')).toBe('line  \n\nP')
+    expect(mergeIntoDraft('kept  \n  \n  ', 'P')).toBe('kept  \n\nP')
+  })
+
+  it('still collapses the trailing newline run it is about to replace', () => {
+    // Without this the merged draft grows blank lines the user never typed.
+    expect(mergeIntoDraft('kept\n\n', 'P')).toBe('kept\n\nP')
+    expect(mergeIntoDraft('kept\n  \n  ', 'P')).toBe('kept\n\nP')
+    // CRLF drafts must not leave their `\r` behind as a stray character.
+    expect(mergeIntoDraft('kept\r\n', 'P')).toBe('kept\n\nP')
+    expect(mergeIntoDraft('kept\r\n\r\n', 'P')).toBe('kept\n\nP')
+  })
+
+  it('appends the recovered payload below whatever was typed while it was in flight', () => {
+    // NEITHER payload may win: preferring the newer one discards the message the
+    // error row is telling the user to retry, preferring the older one loses the
+    // work they just did.
+    expect(mergeRecoveredDraft('newer work', 'the failed one')).toBe('newer work\n\nthe failed one')
+    expect(mergeRecoveredDraft('', 'the failed one')).toBe('the failed one')
+    expect(mergeRecoveredDraft('   \n ', 'the failed one')).toBe('the failed one')
+  })
+
+  it('does not duplicate a payload the composer already holds', () => {
+    // A synchronously rejected create can land before React flushes the clear.
+    expect(mergeRecoveredDraft('same text', 'same text')).toBe('same text')
+    expect(mergeRecoveredDraft(' same text\n', 'same text ')).toBe(' same text\n')
+  })
+
+  it('dedupes on EQUALITY only, never containment', () => {
+    // "please run tests first" contains the distinct payload "run tests";
+    // treating that as already restored drops the message the user must retry.
+    expect(mergeRecoveredDraft('please run tests first', 'run tests'))
+      .toBe('please run tests first\n\nrun tests')
+  })
+})
+
+describe('typedDuringCreate — text typed while a new session was being created', () => {
+  it('returns everything typed into an empty composer', () => {
+    expect(typedDuringCreate('', 'hello new session')).toBe('hello new session')
+  })
+
+  it('keeps leading whitespace typed into an empty composer', () => {
+    expect(typedDuringCreate('', '    indented code')).toBe('    indented code')
+    expect(typedDuringCreate('', '\nsecond line')).toBe('\nsecond line')
+    expect(typedDuringCreate('', '  ')).toBe('  ')
+  })
+
+  it('returns the text appended to the old draft verbatim, whitespace included', () => {
+    expect(typedDuringCreate('old draft', 'old draft fresh text')).toBe(' fresh text')
+    expect(typedDuringCreate('old draft\n', 'old draft\n\nnext line')).toBe('\nnext line')
+    expect(typedDuringCreate('old draft', 'old draft\n    indented code')).toBe('\n    indented code')
+    expect(typedDuringCreate('old draft', 'old draft   ')).toBe('   ')
+  })
+
+  it('returns null when nothing was typed', () => {
+    expect(typedDuringCreate('', '')).toBeNull()
+    expect(typedDuringCreate('old draft', 'old draft')).toBeNull()
+  })
+
+  it('returns null when the old draft itself was edited, so that text stays where it is', () => {
+    expect(typedDuringCreate('old draft', 'new draft')).toBeNull()
+    expect(typedDuringCreate('old draft', 'old')).toBeNull()
+    // A send clears the composer before its create; that is not typing.
+    expect(typedDuringCreate('the sent message', '')).toBeNull()
+  })
+})
+
+describe('appendTypedText — joining carried text onto the new composer', () => {
+  it('returns the typed text as-is into an empty composer', () => {
+    expect(appendTypedText('', 'hello')).toBe('hello')
+    expect(appendTypedText('', '   ')).toBe('   ')
+  })
+
+  it('keeps whitespace-only typing after a prefill instead of dropping it', () => {
+    expect(appendTypedText('seeded prompt', '  \n')).toBe('seeded prompt\n\n  \n')
+  })
+
+  it('joins typed text onto a prefill with a paragraph break', () => {
+    expect(appendTypedText('seeded prompt\n', 'typed')).toBe('seeded prompt\n\ntyped')
+  })
+})
+
+describe('chatPageShouldConsumeHandoff', () => {
+  const staged = { slot: 'slot-a', text: 'do the thing' }
+
+  it('consumes a hand-off staged for the active slot in single-session view', () => {
+    expect(chatPageShouldConsumeHandoff(false, 'slot-a', staged)).toBe(true)
+  })
+
+  it('ignores a hand-off staged for a different slot (Crew Member pane owns it)', () => {
+    expect(chatPageShouldConsumeHandoff(false, 'slot-a', { slot: 'member-x', text: 't' })).toBe(false)
+  })
+
+  it('ignores when there is nothing staged', () => {
+    expect(chatPageShouldConsumeHandoff(false, 'slot-a', null)).toBe(false)
+  })
+
+  it('ignores when there is no active slot', () => {
+    expect(chatPageShouldConsumeHandoff(false, null, staged)).toBe(false)
+  })
+
+  it('does NOT consume in split view even when the staged slot IS the active slot', () => {
+    // The regression this pins: in split view the anchor grid pane's slotKey IS
+    // activeSlot, so the slot match is true. Without the splitMode guard ChatPage
+    // would consume the same hand-off the pane already merged, persisting a
+    // duplicate into the hidden single-session draft that resurfaces on collapse.
+    // The grid pane must be the sole consumer while split view is active.
+    expect(chatPageShouldConsumeHandoff(true, 'slot-a', staged)).toBe(false)
   })
 })

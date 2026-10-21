@@ -1,425 +1,314 @@
-import { createContext, useContext, memo, useEffect, useMemo, useRef, useId, useCallback, useState } from 'react'
-import Clickable from './Clickable'
-import { Paperclip, X, Download, Plus, Minus, Search, Folder } from 'lucide-react'
+/**
+ * The markdown renderer, and the composition root of its pipeline.
+ *
+ * What must be decided in ONE place lives here: the ordered remark and rehype
+ * chains, the element-to-renderer map (`MD_COMPONENTS`), the per-block source
+ * passes and their order (`MarkdownBlock`), the fence dispatch (`BlockRenderer`)
+ * and the root component with its context providers. The pieces it composes
+ * live under `./markdown/`, and this module re-exports their public surface
+ * unchanged. The owner map is in website/docs/frontend-conventions.md.
+ */
+import React, { useContext, memo, useEffect, useLayoutEffect, useMemo, useCallback, useRef, useState } from 'react'
+import { capWhitespaceRuns, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
+import { REMARK_BASE_PLUGINS } from './markdown/remarkBase'
+import { canonicalChatHref, chatHrefSid, namesASession } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import remarkCjkFriendly from 'remark-cjk-friendly'
-import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough'
+import remarkAutolinkRules from '../utils/remarkAutolinkRules'
+import { remarkLatexDelimiters } from '../utils/remarkLatexDelimiters'
 import remarkMath from 'remark-math'
+import remarkParse from 'remark-parse'
+import { unified } from 'unified'
 import rehypeRaw from 'rehype-raw'
 import rehypeKatex from 'rehype-katex'
 import type { PluggableList } from 'unified'
-import type { Root as HastRoot, RootContent, Element as HastElement, Text as HastText } from 'hast'
-
-/** A hast node that owns a `children` array — either the document root or an
- *  element. Both accept `Element`/`Text` children, so our inserted glow/reveal
- *  spans are valid in either. */
-type HastParent = HastRoot | HastElement
-
-/** Splice replacement `<span>`/text nodes into a parent's children, replacing
- *  the single node at `index`. Root and Element have differently-typed children
- *  arrays (`RootContent[]` vs `ElementContent[]`) that both admit Element/Text,
- *  so this narrows on the parent kind to keep the splice type-safe. */
-function spliceChildren(parent: HastParent, index: number, nodes: Array<HastElement | HastText>): void {
-  if (parent.type === 'root') parent.children.splice(index, 1, ...nodes)
-  else parent.children.splice(index, 1, ...nodes)
-}
+import type { Element as HastElement } from 'hast'
 import '../utils/hljs'
-import { api } from '../api/client'
 import { useBlockAssembler, maskInlineCode } from '../hooks/useBlockAssembler'
-import { usePathKind, type PathKind } from '../hooks/usePathKind'
-import { fileIcon } from '../utils/fileIcons'
+import SegmentedControl from './SegmentedControl'
 import { urlTransform, ALLOWED_PROTOCOLS } from '../utils/urlTransform'
 import { safeHttpUrl } from '../lib/safeUrl'
-import { useLinkMeta } from '../lib/linkMeta'
+import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
-import { parseSourceLinkUrl } from '../utils/pullRequestLinks'
+import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
 import { JiraHostsCtx } from '../lib/jiraHosts'
+import { rearmConfigScanBudget } from '../utils/autolinkRules'
 import JiraLogo from './icons/JiraLogo'
+import SourceProviderMark from './SourceProviderMark'
 import DiffBlock from './DiffBlock'
-import MonacoCodeBlock from './MonacoCodeBlock'
+import ErrorNotice from './ErrorNotice'
+import {
+  BlockedLinkChip,
+  CredentialTag,
+  RedactedCodeBlock,
+  RedactionCardSlot,
+  RedactionProvider,
+  codeHasRedactionMarkers,
+  countCredentialTags,
+  normalizeBlockedLinks,
+  normalizeCredentialRecords,
+  rehypeRedactionMarkers,
+  useAllowHolds,
+  type RedactionMarkers,
+} from './RedactionCards'
+import FoldableDiffBlock from './FoldableDiffBlock'
+import EditableCodeBlock from './EditableCodeBlock'
+import { useRevealFailure } from './FilePathMenu'
 import { SmoothResize } from './SmoothResize'
 import type { ContentBlock } from '../types'
-
-/** Extract the artifact slug from an `/artifacts/<slug>` href. Returns null
- *  when the href isn't an artifact route. Handles a leading origin, a trailing
- *  query/hash, and percent-encoded slugs (the agent emits an encoded slug
- *  matching the canonical full-page artifact URL). */
-export function artifactSlugFromHref(href: string | null | undefined): string | null {
-  if (!href) return null
-  // Strip an optional origin so both relative (`/artifacts/x`) and absolute
-  // (`http://host/artifacts/x`) forms resolve identically.
-  let path = href
-  try { path = new URL(href, 'http://x').pathname } catch { /* keep raw */ }
-  const m = /^\/artifacts\/([^/?#]+)/.exec(path)
-  if (!m) return null
-  try { return decodeURIComponent(m[1]) } catch { return m[1] }
-}
-
-/**
- * Character-level shape of a local filesystem path: word chars, dot, dash, @,
- * ~, colon and space, separated by slashes. Anchored at both ends, so anything
- * carrying a URL scheme (`https://…`) or shell punctuation fails outright.
- *
- * Shape alone is NOT sufficient to linkify — see `isPathCandidate`.
- */
-const PATH_SHAPE_RE = /^~?(?:\.{0,2}\/)?[\w.@~/ -]*\/[\w.@~: -]*[\w.]$/
-
-/** A trailing `.ext` on the last segment, 1-8 chars — the only positive path
- *  signal available to a path that is neither rooted nor explicitly relative. */
-const EXT_RE = /\.[A-Za-z0-9]{1,8}$/
-
-/**
- * Could this inline-code text denote a local filesystem path?
- *
- * Deliberately a PRE-FILTER, not a decision. "Is `refs/heads/fix/foo` a path?"
- * is not a syntactic question — it is a filesystem question — so this only
- * decides whether spending a stat probe is worthwhile. The probe
- * (`usePathKind`) makes the actual call.
- *
- * Merely containing a slash is not enough: that matched git refs
- * (`refs/heads/…`, `origin/main`), repo slugs (`owner/repo`), MIME types
- * (`text/plain`), npm scopes (`@scope/pkg`) and dates (`2026/08/02`), every one
- * of which then rendered as a clickable "file" that could only ever 404. So a
- * candidate must carry a positive signal that it names a location:
- *
- *   - rooted (`/x`, `~/x`), or
- *   - explicitly relative (`./x`, `../x`), or
- *   - a file extension on the last segment (`src/main.py`).
- *
- * A bare two-segment identifier with no extension is rejected. Note the third
- * rule still admits `origin/feature/x.ts`; that is intentional — syntax cannot
- * settle it, and the stat probe will.
- */
-export function isPathCandidate(s: string): boolean {
-  if (!PATH_SHAPE_RE.test(s)) return false
-  if (s.startsWith('/') || s.startsWith('~') || s.startsWith('./') || s.startsWith('../')) return true
-  return EXT_RE.test(s.slice(s.lastIndexOf('/') + 1))
-}
-
-/**
- * A trailing source location: `:447`, or `:447:12` for line-and-column.
- *
- * Capped at 7 digits so a long digit run (a hash fragment, an id) is not read as
- * a line number, and so the captured value always parses to a safe integer.
- */
-const LINE_REF_RE = /:(\d{1,7})(?:-(\d{1,7})|:\d{1,7})?$/
-
-/**
- * Split a `file:line` / `file:line:col` reference into its path and line.
- *
- * Agents cite code the way compilers and stack traces do, so the location is
- * part of the token, and treating the whole token as a filename is what made
- * these chips inert: the stat probe asked the backend about
- * `…/_dispatch.py:447`, which does not exist, so the chip rendered as dead
- * text. Splitting first lets the probe ask about the file and the click carry
- * the line.
- *
- * Three shapes are accepted: a single line (`:447`), a line and column
- * (`:447:12`), and a RANGE (`:10-16`). The column is matched so it can be
- * consumed but is discarded — the reveal is line-granular, and pretending to a
- * column we then ignore would be a worse contract than not offering one. A
- * range, by contrast, IS honoured: the whole span is revealed and highlighted.
- *
- * Purely syntactic and therefore ambiguous: a file whose name genuinely ends in
- * `:12` splits into a path that does not exist. Callers resolve that by probing
- * the split path first and falling back to the unsplit text (see `InlineCode`),
- * rather than by guessing here.
- */
-export function splitLineRef(s: string): { path: string; line?: number; endLine?: number } {
-  const m = LINE_REF_RE.exec(s)
-  if (!m) return { path: s }
-  const line = Number(m[1])
-  // `:0` is not a line — Monaco and every editor number from 1 — so treat it as
-  // part of the name rather than clamping it to 1 and jumping somewhere the
-  // text never named.
-  if (!line) return { path: s }
-  const path = s.slice(0, m.index)
-  const end = m[2] ? Number(m[2]) : undefined
-  // A reversed or degenerate range (`:16-10`, `:10-0`, `:10-10`) carries no more
-  // information than its start, so it collapses to a single line rather than
-  // being silently swapped — guessing which end the author meant would be worse
-  // than honouring the number they put first.
-  if (end == null || end <= line) return { path, line }
-  return { path, line, endLine: end }
-}
-
-/** Context providing the viewed file's directory path for resolving bare relative image paths. */
-export const BasePathCtx = createContext<string | null>(null)
-
-/**
- * When true, markdown images render as small previews (a compact thumbnail the
- * user can still click to open the full-size lightbox) instead of the default
- * large inline size. User-message ("sent prompt") rendering turns this on so
- * an attached screenshot doesn't dominate the bubble, while assistant/response
- * images keep the full inline size. Default false = full size.
- */
-export const CompactImagesCtx = createContext<boolean>(false)
-
-/**
- * A per-message token appended to local image URLs.
- *
- * `/api/file-raw?path=…` addresses a file by PATH, so every impression of a file
- * an agent rewrites across turns resolves to one URL — and a browser treats one
- * URL in one document as one resource. The second `<img>` is then served from the
- * in-document memory cache with no network request at all, so the new message
- * paints the OLD bytes. Measured in Chrome: without a distinct URL the edited
- * file is never re-fetched, and no HTTP cache header changes that — `ETag`,
- * `Cache-Control: no-cache` and even `no-store` are not consulted, because the
- * request is never made.
- *
- * Making the URL per-message gives each impression its own cache entry, so a new
- * message shows the current bytes while an earlier one keeps what it fetched.
- * Stable within a message, so re-renders and streaming do not re-request.
- */
-export const ImageVersionCtx = createContext<string | null>(null)
-
-/**
- * Per-consumer override for rendered markdown LINKS.
- *
- * A provider returns its own element for the hrefs it wants to own, or null to
- * fall through to the default anchor. Issue Radar uses it to render same-repo
- * issue/PR references as in-app affordances (dashed accent underline + hover
- * preview) without this module knowing anything about issues — and without any
- * consumer having to post-process React-owned DOM.
- *
- * Only the anchor is delegated; the surrounding markdown pipeline is untouched.
- */
-export type LinkOverride = (link: { href: string; children: React.ReactNode }) => React.ReactNode | null
-export const LinkOverrideCtx = createContext<LinkOverride | null>(null)
-
-/**
- * Link-unfurl gate for the markdown subtree.
- *
- * `enabled` mirrors `cfg.dashboard.link_previews` (default OFF): the user has to
- * opt in before this machine will fetch a URL the model wrote.
- *
- * `live` means the block is STILL STREAMING. It is a hard, independent gate: a
- * URL in the streaming tail may be half-typed (`https://exa`), and resolving
- * that would send the model's in-progress text to a host nobody named. Nothing
- * is fetched while `live` is true — the chip/card simply appears once the block
- * settles.
- *
- * Both default to false, so any markdown rendered outside a provider (file
- * previews, artifact pages, app-embedded chat) keeps today's plain anchors.
- */
-export interface LinkUnfurl {
-  enabled: boolean
-  live: boolean
-}
-export const LinkUnfurlCtx = createContext<LinkUnfurl>({ enabled: false, live: false })
-
-/**
- * The href to unfurl, or null when the link must stay a plain anchor.
- *
- * Three exclusions, all deliberate:
- *  - non-http(s) (and Basic-auth userinfo) — `safeHttpUrl`. `artifact:`,
- *    `vscode:`, `mailto:`, `javascript:` and relative paths all fail here, so
- *    only an absolute web URL can ever reach the backend.
- *  - `/artifacts/<slug>` — an in-app artifact route, handled by the click
- *    interception below; unfurling it would fetch our own dashboard.
- *  - anything else same-origin — likewise an in-app dashboard route. There is no
- *    page title to show that the UI doesn't already know.
- */
-export function unfurlableHref(href: string | null | undefined): string | null {
-  if (!href || !safeHttpUrl(href)) return null
-  if (artifactSlugFromHref(href)) return null
-  try {
-    if (new URL(href).origin === window.location.origin) return null
-  } catch {
-    return null
-  }
-  return href
-}
-
-/** Resolve the unfurl target for an href under the current gate. A hook (reads
- *  context), so it is called unconditionally by both link components. */
-function useUnfurlHref(href: string | null | undefined): string | null {
-  const { enabled, live } = useContext(LinkUnfurlCtx)
-  if (!enabled || live) return null
-  return unfurlableHref(href)
-}
-
-/**
- * The single `<a>` that is a paragraph's ONLY element child, or null.
- *
- * Whitespace-only text siblings are ignored (remark leaves a trailing newline
- * text node on `<p><a>…</a></p>`), but any real text, or a second element,
- * disqualifies the paragraph — that link is inline prose and gets a chip.
- * `text` is the anchor's own visible text, used only as the probe argument for a
- * `LinkOverrideCtx` provider.
- */
-export function soleLinkInParagraph(node?: HastElement): { href: string; text: string } | null {
-  if (!node?.children) return null
-  let anchor: HastElement | null = null
-  for (const child of node.children) {
-    if (child.type === 'text') {
-      if (child.value.trim()) return null
-      continue
-    }
-    if (child.type !== 'element' || anchor || child.tagName !== 'a') return null
-    anchor = child
-  }
-  const href = anchor?.properties?.href
-  if (!anchor || typeof href !== 'string') return null
-  const text = anchor.children
-    .map((c) => (c.type === 'text' ? c.value : ''))
-    .join('')
-  return { href, text }
-}
-
-function isDarkTheme(): boolean {
-  return (document.documentElement.getAttribute('data-theme') || '').includes('dark')
-}
-
-/**
- * mermaid, loaded on first use.
- *
- * mermaid plus its eager dependencies are ~90-130 KB gzip, and this module is
- * on the critical path (every chat message renders through it) while a
- * ```mermaid fence is rare. A static import therefore put the whole diagram
- * engine in the entry chunk for every user. `MermaidBlock` already renders
- * asynchronously inside an effect, so deferring the module costs nothing.
- *
- * The promise is cached at module scope so N diagram blocks share one load, and
- * `import()` itself is idempotent regardless.
- */
-type MermaidApi = typeof import('mermaid')['default']
-
-let mermaidLoad: Promise<MermaidApi> | null = null
-
-function loadMermaid(): Promise<MermaidApi> {
-  if (!mermaidLoad) mermaidLoad = import('mermaid').then(m => m.default)
-  return mermaidLoad
-}
-
-function initMermaid(mermaid: MermaidApi): void {
-  const dark = isDarkTheme()
-  mermaid.initialize({
-    startOnLoad: false,
-    theme: dark ? 'dark' : 'default',
-    themeVariables: dark ? {
-      primaryColor: '#f59e32',
-      primaryTextColor: '#e8e6e3',
-      primaryBorderColor: '#3a3a3a',
-      lineColor: '#888',
-      secondaryColor: '#2a2a2a',
-      tertiaryColor: '#1a1a1a',
-    } : {
-      primaryColor: '#f59e32',
-      primaryTextColor: '#1a1a1a',
-      primaryBorderColor: '#ccc',
-      lineColor: '#666',
-      secondaryColor: '#fff3e0',
-      tertiaryColor: '#f5f5f5',
-    },
-    securityLevel: 'strict',
-    fontFamily: 'inherit',
-    // Throw on parse errors instead of injecting mermaid's error diagram into
-    // a temp <div id="dmermaid-*"> on document.body. That temp node is leaked
-    // when render() throws (cleanup only runs on success), so failed blocks
-    // accumulated orphaned 512px error SVGs in the DOM. With this on, the
-    // MermaidBlock .catch() shows a clean inline <pre> and nothing leaks.
-    suppressErrorRendering: true,
-  })
-}
-
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { CodeBlock } from './CodeBlock'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
+import WidgetFrame from './WidgetFrame'
+import WidgetPlaceholder from './WidgetPlaceholder'
+import { i18nT } from '../i18n/t'
+import { toDate } from '../i18n/format'
+import {
+  CompactImagesCtx,
+  ImageVersionCtx,
+  InsideLinkCtx,
+  LinkOverrideCtx,
+  LinkUnfurlCtx,
+  MdSourceCtx,
+  ParagraphNoticeSlotCtx,
+  PathActionCtx,
+  PathProbeCtx,
+  ReadOnlyCodeCtx,
+  SessionActionCtx,
+  type InsideLink,
+  type LinkUnfurl,
+  type PathActions,
+  type SessionActions,
+} from './markdown/contexts'
+import { artifactSlugFromHref, classifySessionLink, soleLinkInParagraph, useSessionChip, useUnfurlHref } from './markdown/linkTargets'
+import { dashboardPreviewRef, dashboardPreviewTargetFromHref } from '../utils/dashboardPreview'
+import { ClosedSessionNotice } from './markdown/ClosedSessionNotice'
+import { activatePath, usePathResolution } from './markdown/pathReferences'
+import { ELEMENT_OVERRIDES, sp, textOf } from './markdown/elements'
+import { InlineCode } from './markdown/InlineCode'
+import { MarkdownTable } from './markdown/MarkdownTable'
+import { ImgWithFallback } from './markdown/ImgWithFallback'
+import { DeferredMedia, MdSourceEl } from './markdown/remoteMedia'
+import { MermaidBlock } from './markdown/MermaidBlock'
+import { isGenericLang, looksLikeMarkdown } from './markdown/markdownSniff'
+import { ALLOWED_TAGS, VERBATIM_CONTENT_TAGS, rehypeSanitize, remarkVerbatimUnknownTags } from './markdown/sanitize'
+import { holdsSessionRef, rehypeMarkFencedCode, rehypeSessionRefPunctuation, rehypeSourcepos, rehypeStableRootKeys, rehypeUnwrapBlocks, remarkSoftBreaks, SESSION_REF_TRAILING } from './markdown/treeTransforms'
+import { GLOW_TAIL_CHARS, REVEAL_IDLE_SETTLE_MS, rehypeStreamingCaret, rehypeStreamingGlow, rehypeStreamingReveal } from './markdown/streamingEffects'
+import { closeCjkAutolinkBoundaries, encodeRefusedLinkDestinations } from './markdown/linkBoundaryRepair'
+import { guideUntrusted } from '../guide/guideMarkers'
 
-/** Forward the `data-sourcepos` attribute from rehypeSourcepos onto the
- *  rendered element. Used in every MD_COMPONENTS override; returns an
- *  empty-valued attribute when sourcePos is disabled (React omits it from
- *  the DOM). */
-const sp = (node?: HastElement) => {
-  const v = node?.properties?.['data-sourcepos']
-  return { 'data-sourcepos': typeof v === 'string' ? v : undefined }
-}
+export { artifactSlugFromHref, soleLinkInParagraph, unfurlableHref } from './markdown/linkTargets'
+export { isPathCandidate, splitLineRef } from './markdown/pathReferences'
+export { BasePathCtx, CompactImagesCtx, ImageVersionCtx, LinkOverrideCtx, LinkUnfurlCtx, MdSourceCtx } from './markdown/contexts'
+export type { LinkOverride, LinkUnfurl } from './markdown/contexts'
+export { MERMAID_FONTS_READY_CAP_MS } from './markdown/MermaidBlock'
+export { COPIED_FLASH_MS, COPY_FAILED_FLASH_MS } from './markdown/copyFeedback'
+export { pendingImageBoxStyle, reservedImageClass, reservedImageStyle } from './markdown/ImgWithFallback'
+export { rehypeSanitize, remarkVerbatimUnknownTags } from './markdown/sanitize'
+export { rehypeStableRootKeys } from './markdown/treeTransforms'
+export { dispatchLightbox, Lightbox } from './markdown/Lightbox'
 
-const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
-  const ref = useRef<HTMLDivElement>(null)
-  const id = useId().replace(/:/g, '_')
-  const renderedRef = useRef('')
-
-  useEffect(() => {
-    if (!ref.current || renderedRef.current === code) return
-    renderedRef.current = code
-    loadMermaid().then(mermaid => {
-      // Re-initialized per render so a theme switch between two diagrams is
-      // picked up; initialize() is cheap and idempotent.
-      initMermaid(mermaid)
-      return mermaid.render(`mermaid-${id}`, code)
-    }).then(({ svg }) => {
-      if (!ref.current) return
-      const range = document.createRange()
-      range.selectNodeContents(ref.current)
-      range.deleteContents()
-      ref.current.appendChild(range.createContextualFragment(svg))
-    }).catch(() => {
-      if (!ref.current) return
-      const pre = document.createElement('pre')
-      pre.className = 'text-danger text-[13px]'
-      pre.textContent = code
-      ref.current.textContent = ''
-      ref.current.appendChild(pre)
-    })
-  }, [code, id])
-
-  return <div ref={ref} className="my-3 flex justify-center overflow-x-auto min-h-[60px]" />
-})
-
-/** Generate a URL-safe slug from heading children (handles nested elements) */
-function textOf(node: React.ReactNode): string {
-  if (typeof node === 'string') return node
-  if (Array.isArray(node)) return node.map(textOf).join('')
-  if (isElementWithProps(node)) {
-    const props = node.props
-    if (typeof props.alt === 'string') return props.alt
-    if (props.children != null) return textOf(props.children)
-  }
-  return ''
-}
-/** Narrow a ReactNode to a ReactElement whose props may carry `alt`/`children`. */
-function isElementWithProps(
-  node: React.ReactNode,
-): node is React.ReactElement<{ alt?: string; children?: React.ReactNode }> {
-  return typeof node === 'object' && node !== null && 'props' in node
-}
-function slugify(children: React.ReactNode): string | undefined {
-  const raw = textOf(children).toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').replace(/^-+|-+$/g, '')
-  return raw || undefined
-}
+/** A leading URL scheme (`https:`, `mailto:`, `vscode:`), RFC 3986 spelling. */
+const URL_SCHEME_RE = /^[a-z][a-z\d+.-]*:/i
 
 /** Default markdown anchor, unless a `LinkOverrideCtx` provider claims the href.
  *
  * Extracted from the inline `MD_COMPONENTS.a` so it can read context (it is a
  * component, so hooks are legal here). Only ALLOWED_PROTOCOLS links (editor
  * schemes) keep in-place navigation; everything else opens in a new tab. */
-function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps) {
+type MdAnchorProps = React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps & {
+  /** Sentence punctuation that followed a session link, moved here by
+   *  `rehypeSessionRefPunctuation` so it renders before the inline notice. */
+  [SESSION_REF_TRAILING]?: string
+}
+
+function MdAnchor({ node, href, children, [SESSION_REF_TRAILING]: trailing }: MdAnchorProps) {
   const override = useContext(LinkOverrideCtx)
+  const probeEnabled = useContext(PathProbeCtx)
+  const actions = useContext(PathActionCtx)
   // The override is resolved FIRST and wins outright — Issue Radar's in-app
   // issue/PR affordance must keep beating a link preview. Feeding `null` into
   // the unfurl gate for a claimed href also means a claimed link is never
   // fetched, so the priority holds at the network boundary, not just visually.
   const claimed = href && override ? override({ href, children }) : null
-  const target = useUnfurlHref(claimed ? null : href)
-  const meta = useLinkMeta(target ?? undefined, target !== null)
-  // Jira issue URLs chip synchronously from the URL alone (icon + issue key) —
-  // no fetch, unlike the unfurl chip below. Jira instances sit behind auth, so
-  // an unfurl of one can never succeed; parsing the key out of the path is the
-  // only way these links ever get at-a-glance recognition. Self-hosted
-  // instances come through `JiraHostsCtx` from the operator allowlist.
+  // Jira, GitHub, and GitLab issue / PR / MR URLs chip synchronously from the
+  // URL alone (provider mark + reference) — no fetch, unlike the unfurl chip
+  // below, so these chips render in user messages and with `link_previews`
+  // off. Jira instances sit behind auth, so an unfurl of one can never
+  // succeed; GitHub/GitLab pages unfurl fine but only in assistant messages
+  // and only when the operator opted in, which left forge links as raw text
+  // in most contexts (#2579). The parser matches hostnames EXACTLY
+  // (`github.com` / `gitlab.com`, `www.` stripped) — a lookalike host such as
+  // `evil-github.com.attacker.test` falls through to the plain anchor.
+  // Self-hosted Jira instances come through `JiraHostsCtx` from the operator
+  // allowlist. Forge chips additionally require `safeHttpUrl`: the chip keeps
+  // the AUTHORED href (preserving e.g. `#issuecomment` fragments the parser's
+  // canonical url drops), so a credential-smuggling `user:pass@github.com`
+  // href must never be dressed up as a trusted-looking chip.
   const jiraHosts = useContext(JiraHostsCtx)
-  const jira = useMemo(() => {
+  const sessionActions = useContext(SessionActionCtx)
+  const source = useMemo(() => {
     if (!href || claimed) return null
     const link = parseSourceLinkUrl(href, [], jiraHosts)
-    return link?.provider === 'jira' ? link : null
+    if (!link) return null
+    if (link.provider === 'jira') return link
+    return safeHttpUrl(href) ? link : null
   }, [href, claimed, jiraHosts])
-  if (claimed) return <>{claimed}</>
-  if (jira) {
-    return (
-      <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
+  // A chipped link is never handed to the unfurl gate — mirroring `claimed`,
+  // so the no-fetch guarantee holds at the network boundary, not just visually.
+  const target = useUnfurlHref(claimed || source ? null : href)
+  const meta = useLinkMeta(target ?? undefined, target !== null)
+  let localHref: string | null = null
+  if (href?.startsWith('/')) {
+    try {
+      const decodedHref = decodeURIComponent(href)
+      if (!decodedHref.startsWith('//')) localHref = decodedHref
+    } catch { /* keep it a normal link */ }
+  }
+  // Where the link goes, for the code spans in its label (`InsideLinkCtx`): a
+  // scheme or a protocol-relative `//host` leaves the dashboard; anything else
+  // is a local address.
+  const linkKind: InsideLink = href && (URL_SCHEME_RE.test(href) || href.startsWith('//')) ? 'external' : 'local'
+  // Decoded but NOT narrowed to root-relative: the app mints its own share links
+  // absolute, and the recognizer's origin check is what refuses a foreign one.
+  let sessionCandidate: string | null = null
+  if (href) {
+    try {
+      sessionCandidate = decodeURIComponent(href)
+    } catch { /* keep it a normal link */ }
+  }
+  // The session parameter this href carries, verbatim. Handed to
+  // `classifySessionLink` below rather than a pre-resolved key, because that
+  // helper owns which spellings name a session — so a short `?sid=chat-1380`
+  // resolves here exactly as the same short name does in a backtick chip.
+  const sessionHrefSid = sessionCandidate ? chatHrefSid(sessionCandidate) : null
+  // Whether this href NAMES a same-origin chat session at all, by SHAPE, and
+  // independent of whether that session is currently reachable (open). A
+  // closed/unknown one is still a chat-session href — it just does not resolve in
+  // the open-tabs roster. Both spellings count, and the union is `namesASession`'s
+  // rather than re-spelled here: declining only the full key left an authored
+  // `?sid=chat-9999` to navigate to exactly the dead session view this interception
+  // exists to prevent (#9914), and a spelling added to the resolver alone would
+  // re-open that hole if this gate kept its own copy of the grammar.
+  const sessionHrefNamesSession = !!sessionHrefSid && namesASession(sessionHrefSid)
+  // Whether this renderer is wired to route sessions at all — the SAME predicate
+  // `resolveSessionChip` guards on (`onSessionOpen` AND `sessions`), so the link
+  // affordance and the click handler can never disagree. Both must be present:
+  // `ChatPage` keeps `onSessionOpen` wired but WITHHOLDS `sessions` while offline
+  // (`sessions={connected ? sessionTitles : undefined}`), and a no-controller
+  // render (e.g. an SDK `user` message row) has neither. In either case there is
+  // nothing that could switch sessions, so a `?sid=` link must stay an ordinary
+  // navigating link rather than be swallowed.
+  const sessionRouting = !!(sessionActions.onSessionOpen && sessionActions.sessions)
+  // Same gate as the inline chip, so a link and a bare key naming one session
+  // cannot disagree about whether it is reachable.
+  // A closed session the page can resume counts too (`useSessionChip`): its
+  // background probe can turn a `?sid=` the open roster does not hold into a live,
+  // resumable chip, so this — not the roster alone — is the switchable case.
+  // The label is what the reader sees standing for the session, so a notice
+  // about it says "the old run" rather than a key the prose never showed.
+  const sessionLink = useSessionChip(sessionHrefSid, sessionActions, sessionHrefSid ? textOf(children) : undefined)
+  // ONE classification drives the hover text, so the anchor never resolves the
+  // key a second time of its own — a second copy drifts, and that drift is the
+  // false "not open" tooltip (#18036). `classifySessionLink` reports `not-open`
+  // ONLY for a sid the roster genuinely does not hold (a full key the roster
+  // lacks, or a short name whose number no open slot answers to): the active
+  // session is open, and a short name we cannot pin to one slot (ambiguous, or a
+  // message with no write time) may name an open session, so both stay silent
+  // rather than lie. The extra `!sessionLink` guard keeps the tooltip off a
+  // CLOSED-but-resumable session `useSessionChip` has resolved into a live chip —
+  // "not open" would be false for a session the reader can reopen from here.
+  const sessionClass = sessionHrefSid ? classifySessionLink(sessionHrefSid, sessionActions) : null
+  const sessionHrefNotOpen = !sessionLink && sessionClass?.kind === 'not-open'
+  // The attribute carries the canonical key: a modified click goes to the browser,
+  // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
+  const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
+  const onSessionClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    // Only the PLAIN click is reinterpreted; the href stays real so Cmd+click
+    // still opens the session in its own tab.
+    const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+    if (!plainPrimaryClick) return
+    // A resolvable session opens in place. A chat-session href that does NOT
+    // resolve is swallowed rather than left to the browser. `useSessionChip`
+    // returns null in two cases, both correctly declined here:
+    //   - an unknown key, or a closed one whose probe has not answered yet — its
+    //     raw `?sid=` would navigate to a session the controller cannot load,
+    //     landing on a dead/blank view (#9914);
+    //   - the ACTIVE session's own key (`resolveSessionChip` rejects
+    //     `key === activeSession`) — a plain click is a no-op on the session you
+    //     are already in, matching the backtick chip, which renders the active
+    //     key as inert. Cmd/Ctrl/middle-click still opens the real href for
+    //     anyone who actually wants a duplicate tab.
+    //
+    // Both branches require `sessionRouting` — the renderer must actually be
+    // able to route sessions. When it cannot (offline: `sessions` withheld; or a
+    // no-controller render: neither wired), a `?sid=` link is an ordinary
+    // external link and keeps navigating as before, never a dead no-op.
+    if (sessionLink) {
+      e.preventDefault()
+      sessionLink.open(sessionLink.key)
+    } else if (sessionHrefNamesSession && sessionRouting) {
+      e.preventDefault()
+    }
+  }
+  const pathResolution = usePathResolution(
+    localHref ?? '',
+    probeEnabled
+      && !claimed
+      && !!localHref
+      && !artifactSlugFromHref(localHref)
+      && !!(actions.onFileOpen || actions.onFolderOpen),
+  )
+  // askAgent on: a transcript link holds no draft (the host composer's draft is
+  // persisted per slot), and a blocked or failed reveal is gateway-side.
+  const reveal = useRevealFailure(localHref ?? undefined)
+  const onPathClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey
+    if (pathResolution.probePending && plainPrimaryClick) {
+      e.preventDefault()
+      return
+    }
+    if (!pathResolution.candidate
+      || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')
+      || !plainPrimaryClick) return
+    e.preventDefault()
+    activatePath(
+      pathResolution.path,
+      pathResolution.kind,
+      e.shiftKey,
+      actions,
+      reveal.onError,
+      pathResolution.line,
+      pathResolution.endLine,
+    )
+  }
+  // A destination `urlTransform` REJECTED arrives here as '' — react-markdown's
+  // defaultUrlTransform sentinel for a scheme outside its allowlist (a custom
+  // scheme like `obsidian:`, a `javascript:`/`data:` payload the gate refuses
+  // on purpose, or an empty `[x]()` destination). '' is not nullish, so the
+  // plain-anchor return's `sessionHref ?? href` handed the DOM `<a href="">` —
+  // an ordinary-looking link the browser resolves against the CURRENT page, so
+  // "copy link address" yielded the dashboard's own session URL (issue #9925).
+  // A rejected destination must not be an anchor at all: render the label as
+  // inert text — no href, no target/rel, no click handlers — the same trade
+  // TrustAppModal's `safeHref` makes for an untrusted destination. The absent
+  // case (`<a>` with no href at all) is a non-navigating placeholder anyway and
+  // takes the same path. `InsideLinkCtx` is deliberately NOT provided: it only
+  // exists to keep a label's code span from stealing the enclosing anchor's
+  // click, and with no anchor the label is ordinary prose — its code spans
+  // re-enter the normal inline-code ladder (click-to-copy, and for session-key
+  // or confirmed-path shaped spans, their usual chips), pinned by the
+  // rejected-destinations tests.
+  // Punctuation `rehypeSessionRefPunctuation` lifted off the text after a
+  // session link is the sentence's own; whatever this anchor renders as, it
+  // goes back right after it, so no branch can swallow a full stop.
+  const keep = (el: React.ReactElement) => (trailing ? <>{el}{trailing}</> : el)
+  if (!href) return keep(<span {...sp(node)}>{children}</span>)
+  if (claimed) return keep(<>{claimed}</>)
+  if (source?.provider === 'jira') {
+    const jira = source
+    return keep(
+      <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] mc-md-ref-chip transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
           href={jira.url}
           target="_blank"
@@ -430,204 +319,95 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
           <JiraLogo size={12} className="shrink-0" />
           <span className="truncate max-w-[24ch]">{`${jira.repo}-${jira.number}`}</span>
         </a>
-      </span>
+      </span>,
     )
   }
-  if (target && meta) return <LinkChip meta={meta} href={target}>{children}</LinkChip>
+  const forgeLabel = source ? forgeChipLabel(source) : null
+  if (source && forgeLabel) {
+    return keep(
+      <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] mc-md-ref-chip transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={href}
+          className="inline-flex min-w-0 items-center gap-1.5 text-text no-underline focus-ring"
+        >
+          {/* The provider's logo, a registered provider's own mark, or the one
+              neutral glyph every source-link surface shares. */}
+          <SourceProviderMark provider={source.provider} size={12} />
+          <span className="truncate max-w-[32ch]">{forgeLabel}</span>
+        </a>
+      </span>,
+    )
+  }
+  if (target && meta) {
+    return keep(
+      <LinkChip meta={meta} href={target}>
+        <InsideLinkCtx.Provider value={linkKind}>{children}</InsideLinkCtx.Provider>
+      </LinkChip>,
+    )
+  }
   let ext = false
   try { ext = !!href && ALLOWED_PROTOCOLS.has(new URL(href, 'http://x').protocol) } catch { /* not a URL */ }
+  // A confirmed session link is in-app navigation, so it keeps in-place semantics.
+  // So does a `#heading` link: the renderer scrolls to it (see handleClick).
+  if (sessionLink || href?.startsWith('#')) ext = true
   return (
+    <>
     <a
       {...sp(node)}
-      href={href}
+      href={sessionHref ?? href}
+      // A `/chat?sid=` href is never a path, so the session branch wins outright.
+      // One predicate gates the handler, because a link that RESOLVES necessarily
+      // names a session by shape too — so the two branches inside the handler
+      // split the same population rather than needing different gates: resolvable
+      // switches in place, and one that names a session but does not resolve (a
+      // closed or unknown key, a short name no open session answers to, or the
+      // active session's own key) is intercepted and declined rather than left to
+      // navigate the browser to a dead `?sid=` view (#9914) or a duplicate tab.
+      onClick={sessionHrefNamesSession ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
+      title={sessionLink && !sessionLink.failure
+        ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
+        : sessionHrefNotOpen
+          ? i18nT('components.markdownRenderer.session_closed_link_disabled')
+          : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
-      className="text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent"
+      // A session link that names a session but cannot open one drops the live-link
+      // affordance rather than keeping it and doing nothing. The click is swallowed
+      // deliberately (#9914: navigating a dead `?sid=` is worse than not moving), so
+      // the accent underline was promising an action that never came — every time,
+      // for every old transcript naming a session that has since closed. Muted and
+      // unadorned is the same answer the backtick chip gives an unresolved key: no
+      // affordance, and the href stays intact so a modified click still works.
+      className={sessionHrefNamesSession && !sessionLink && sessionRouting
+        ? 'text-muted'
+        : 'text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent'}
     >
-      {children}
+      <InsideLinkCtx.Provider value={linkKind}>{children}</InsideLinkCtx.Provider>
+      {/* The not-open explanation reaches touch / keyboard / AT users as a
+          visually-hidden description APPENDED to the anchor's accessible name —
+          a native `title` renders only on mouse hover, so without this the muted
+          link stayed the "dead link or bug?" mystery #10344 reported for exactly
+          those users. It is a trailing span (not an `aria-label`) so the link's
+          own text stays the accessible NAME and screen readers still announce it
+          — the review finding on #18036 was that an `aria-label` REPLACED the
+          text, making several such links sound identical. Same string, gated by
+          the same `not-open` classification, so it never claims a state we cannot
+          verify (the ambiguous / no-timestamp cases stay silent here too). */}
+      {sessionHrefNotOpen && (
+        <span className="sr-only">{` (${i18nT('components.markdownRenderer.session_closed_link_disabled')})`}</span>
+      )}
     </a>
-  )
-}
-
-/**
- * Whether inline-code chips may issue stat probes.
- *
- * False while a message streams. Mid-stream a path arrives one chunk at a time,
- * and the prefixes are themselves valid candidates — `/Users` is a real
- * directory on the way to `/Users/me/project/file.ts` — so probing every chunk
- * would burn requests and briefly render the wrong affordance before settling.
- * Chips stay inert until the text stops moving.
- */
-const PathProbeCtx = createContext<boolean>(true)
-
-/**
- * Where a confirmed path chip sends its activation.
- *
- * A context because `MD_COMPONENTS` is module-level — the `code` renderer cannot
- * receive MarkdownRenderer's props directly. Both handlers are optional: most of
- * the ~30 MarkdownRenderer call sites pass neither, and those fall back to the
- * OS file manager.
- */
-type PathActions = { onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void }
-const PathActionCtx = createContext<PathActions>({})
-
-/**
- * Act on a confirmed path chip.
- *
- * `reveal` is the shift-modifier / no-handler escape hatch: hand the path to the
- * OS file manager, which understands both files and directories.
- *
- * `line` (from a `file:447` chip) is passed to the file handler so it can scroll
- * to and flash that line. It is dropped on the two fallback routes on purpose:
- * `revealPath` selects a file in Finder/Explorer, which has no notion of a line,
- * and a directory does not have one either.
- */
-function activatePath(path: string, kind: PathKind, reveal: boolean, actions: PathActions, line?: number, endLine?: number): void {
-  if (reveal) { api.revealPath(path); return }
-  if (kind === 'dir') {
-    // No folder handler wired: fall back to the OS file manager rather than
-    // silently doing nothing.
-    if (actions.onFolderOpen) actions.onFolderOpen(path)
-    else api.revealPath(path)
-    return
-  }
-  if (!actions.onFileOpen) { api.revealPath(path); return }
-  // Called with ONE argument when there is no line, not with an explicit
-  // `undefined`: the handler is also the app's general-purpose file opener, and
-  // an omitted argument keeps a chip click indistinguishable from every other
-  // caller of it.
-  if (line != null) actions.onFileOpen(path, endLine != null ? { line, endLine } : { line })
-  else actions.onFileOpen(path)
-}
-
-const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font-mono'
-
-/**
- * Inline `code` span, upgraded to a click-to-open chip only once the backend has
- * confirmed the text names something that exists.
- *
- * The old behaviour linkified on regex match alone, which produced two bad
- * outcomes: a directory opened the file viewer and rendered "file not found"
- * (wrong — it exists), and non-paths that merely contain a slash (git refs,
- * repo slugs) became dead links. So the default is inverted here: plain text
- * unless proven otherwise.
- *
- * Binds its OWN click/key handlers rather than relying on delegation from the
- * container. That is what makes the affordance honest: the chip is the control
- * (`role="button"`, focusable, Enter/Space), the wrapper stays presentational,
- * and a `<code>` that arrives from raw HTML gets no handler at all — so a forged
- * chip cannot borrow the container's.
- */
-function InlineCode({ children, ...props }: { children?: React.ReactNode } & Record<string, unknown>) {
-  const codeStr = String(children).replace(/\n$/, '')
-  const probeEnabled = useContext(PathProbeCtx)
-  const actions = useContext(PathActionCtx)
-  const raw = codeStr.trim()
-  // Split `file.py:447` BEFORE probing, not just before the click. Candidacy is
-  // decided on the split path too: `src/main.py:447` fails the extension test as
-  // one token (it ends in digits, not `.py`), so testing the raw text would keep
-  // rejecting exactly the citations this is meant to admit.
-  const { path: stripped, line, endLine } = splitLineRef(raw)
-  const strippedCandidate = probeEnabled && isPathCandidate(stripped)
-  // Colons are legal in POSIX filenames, so `report:12` may name a real file or
-  // directory. Both spellings are therefore probed CONCURRENTLY — not the split
-  // one first with the literal as a fallback — because when both exist the
-  // fallback order would silently open the sibling the reader did not name, in an
-  // editor where a subsequent save would write to the wrong file. Two HEADs for a
-  // suffixed chip is the price of that being unambiguous; `usePathKind` caches and
-  // de-duplicates, and an unsuffixed chip still costs one.
-  //
-  // Derived from `strippedCandidate` rather than re-running the pre-filter on the
-  // raw text, because the pre-filter CANNOT see the literal form: `src/report.py:12`
-  // fails the extension test as one token (the suffix hides the `.py`), so testing
-  // it directly left relative citations — the majority form — with only one probe
-  // and no sibling precedence at all. If the split path is worth a probe then so is
-  // the literal spelling of the same path; that pairs them for every suffixed
-  // candidate instead of only rooted ones.
-  const rawCandidate = line != null && strippedCandidate
-  const strippedKind = usePathKind(strippedCandidate ? stripped : null)
-  const rawKind = usePathKind(rawCandidate ? raw : null)
-  // The literal text wins whenever it resolves: the reader clicked THAT name, and
-  // the split is only our interpretation of it. So there is no line to reveal.
-  const rawWins = rawKind === 'file' || rawKind === 'dir'
-  const kind = rawWins ? rawKind : strippedKind
-  const targetLine = rawWins ? undefined : line
-  const targetEndLine = rawWins ? undefined : endLine
-  // Withhold the affordance until EVERY probe in flight has reported. Rendering it
-  // on the split path's verdict alone would leave a window in which a click opened
-  // the split path even though the literal name exists — the same wrong-file
-  // outcome, just narrower.
-  const probePending = (strippedCandidate && strippedKind === undefined)
-    || (rawCandidate && rawKind === undefined)
-
-  // `data-path` / `data-path-kind` describe a chip THIS component rendered, so
-  // only it may set them. rehypeSanitize allowlists every `data-*` attribute
-  // (isAllowedAttr: `k.startsWith('data')`), so raw HTML arrives here with a
-  // forged pair intact; spreading it would publish attributes claiming a
-  // backend-confirmed path that was never probed. Drop any inbound copy.
-  const safeProps = Object.fromEntries(
-    Object.entries(props).filter(([k]) => !k.toLowerCase().startsWith('data-path')),
-  )
-
-  if (probePending || (kind !== 'file' && kind !== 'dir')) {
-    return <code className={CHIP_BASE} {...safeProps}>{children}</code>
-  }
-  const isDir = kind === 'dir'
-  const path = rawWins ? raw : stripped
-  // A leading glyph is what makes "this is actionable" legible at rest. Without
-  // one, a confirmed chip and an inert one differ only on hover, so a reader
-  // cannot tell which paths the backend actually resolved. Files use the same
-  // per-extension icon set as the Files tab and the folder browser, so a .md and
-  // a .json chip are distinguishable — but rendered monochrome at the folder
-  // glyph's weight, because inline in prose this is an affordance marker, not
-  // decoration. Decorative either way: the path text carries the meaning.
-  //
-  // The glyph is an INLINE atom and the chip stays a plain inline box. Making the
-  // chip `inline-flex` to align the glyph turned it atomic, so a long path could
-  // no longer break across lines and overflowed its container instead — the
-  // render gate caught this as layout/unbreakable-token on the artifacts surface.
-  const Glyph = isDir ? Folder : fileIcon(path)
-  /** stopPropagation keeps the container's artifact-link delegation from also
-   *  firing for a click that this chip has already handled. */
-  const act = (e: { shiftKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
-    e.preventDefault()
-    e.stopPropagation()
-    activatePath(path, kind, e.shiftKey, actions, targetLine, targetEndLine)
-  }
-  return (
-    <code
-      className={`${CHIP_BASE} cursor-pointer hover:underline`}
-      role="button"
-      tabIndex={0}
-      onClick={act}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
-      {...safeProps}
-      data-path={path}
-      data-path-kind={kind}
-      data-path-line={targetLine}
-      data-path-end-line={targetEndLine}
-      // The resolved path leads the tooltip, not just the instruction. A native
-      // tooltip paints in the browser's own layer, above page content, and any
-      // element overlaying the chip must be pointer-events-none to let the click
-      // reach it — so hovering always discloses the real target even when
-      // surrounding markup visually covers the chip's text. It also shows a long
-      // path in full when layout truncates it.
-      //
-      // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
-      // to. That keeps the disclosure honest without a second catalog string:
-      // the location is already in the text the user is hovering.
-      title={`${raw}\n${isDir
-        ? i18nT('components.markdownRenderer.click_to_browse_shift_click_to_reveal_in_finder')
-        : i18nT('components.markdownRenderer.click_to_open_shift_click_to_reveal_in_finder')}`}
-    >
-      <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
-      {targetLine != null && raw.length > stripped.length
-        // Keep the location suffix atomic. A range is the case that actually
-        // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
-        // ending at line 10 until the eye reaches the next line. The path itself
-        // stays breakable, since that is what lets a long citation wrap at all.
-        ? <>{stripped}<span className="whitespace-nowrap">{raw.slice(stripped.length)}</span></>
-        : children}
-    </code>
+    {/* The sentence's own punctuation, before the notice: "See the old run."
+        keeps its full stop beside the link, and the notice follows the
+        sentence instead of splitting it. */}
+    {trailing}
+    <ClosedSessionNotice failure={sessionLink?.failure} name={sessionLink?.title ?? ''} />
+    {reveal.error && (
+      <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-link-reveal-error" />
+    )}
+    </>
   )
 }
 
@@ -639,182 +419,175 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
  * (see `MdAnchor`), a link standing alone is a card. `LinkCard` replaces the
  * `<p>` rather than nesting inside it, so the card is a block-level sibling of
  * the surrounding paragraphs.
+ *
+ * Jira issue URLs take a synchronous branch of the same rule, mirroring
+ * `MdAnchor`'s chip: Jira instances sit behind auth, so the unfurl fetch can
+ * never be relied on to produce a preview for them. The card is built from the
+ * URL alone (provider mark, issue key, instance host) with NO request, and
+ * recognition is the same allowlist-gated parse as the chip (`JiraHostsCtx`).
+ * It obeys the same `enabled`/`live` gate as the fetched card, so ungated
+ * surfaces (file previews, artifact pages, sourcePos mode) and streaming tails
+ * keep today's inline chip.
  */
 function MdParagraph({ node, children }: React.HTMLAttributes<HTMLParagraphElement> & ExtraProps) {
   const override = useContext(LinkOverrideCtx)
+  const { enabled: cardsOn, live } = useContext(LinkUnfurlCtx)
+  const jiraHosts = useContext(JiraHostsCtx)
   const sole = soleLinkInParagraph(node)
-  const target = useUnfurlHref(sole?.href)
+  const jira = useMemo(() => {
+    if (!sole?.href || !cardsOn || live) return null
+    const link = parseSourceLinkUrl(sole.href, [], jiraHosts)
+    return link?.provider === 'jira' ? link : null
+  }, [sole?.href, cardsOn, live, jiraHosts])
+  // A recognized Jira link never reaches the unfurl machinery: its card is
+  // synchronous, so handing the href on would only add a fetch whose result
+  // is discarded.
+  const target = useUnfurlHref(jira ? null : sole?.href)
   // Same priority rule as MdAnchor: a link the override owns stays an in-app
   // affordance inside an ordinary paragraph, never a card. The provider is a
   // pure render prop (Issue Radar's returns a RefLink element), and the probe
   // only runs when a card is otherwise on the table.
-  const claimed = !!(target && override && override({ href: target, children: sole?.text }))
+  const cardHref = jira ? sole?.href ?? null : target
+  const claimed = !!(cardHref && override && override({ href: cardHref, children: sole?.text }))
   const unfurl = claimed ? null : target
   const meta = useLinkMeta(unfurl ?? undefined, unfurl !== null)
+  if (jira && !claimed) {
+    // `jira.url` (the parser's canonical form), NEVER `sole.href`: this branch
+    // sits before the `safeHttpUrl()` rejection the unfurl path gets, so the
+    // raw href could still carry Basic-auth userinfo. The canonical URL is
+    // rebuilt from hostname+port alone — credentials cannot survive into it —
+    // and it is the same target the inline chip's anchor already uses.
+    return (
+      <LinkCard
+        meta={jiraCardMeta(jira)}
+        href={jira.url}
+        icon={<JiraLogo size={18} className="shrink-0" />}
+      />
+    )
+  }
   if (unfurl && meta) return <LinkCard meta={meta} href={unfurl} />
-  return <p {...sp(node)} className="my-1.5 leading-relaxed">{children}</p>
+  // A paragraph holding a session reference draws a slot right after itself,
+  // where that reference's closed-session notice renders (`ClosedSessionNotice`
+  // portals into it). Below the paragraph, the notice leaves the sentence whole
+  // whether the reference ends it or sits mid-sentence. Only such a paragraph
+  // gets the slot, so every other paragraph keeps its exact DOM.
+  if (holdsSessionRef(node)) return <ParagraphWithNoticeSlot node={node}>{children}</ParagraphWithNoticeSlot>
+  return <p {...sp(node)} className="my-1 leading-6">{children}</p>
 }
 
-const MD_COMPONENTS: Components = {
-  code({ className, children, ...props }) {
-    const match = /language-(\w+)/.exec(className || '')
-    const lang = match?.[1]
-    const codeStr = String(children).replace(/\n$/, '')
+function ParagraphWithNoticeSlot({ node, children }: { node?: HastElement; children?: React.ReactNode }) {
+  // State, not a ref: the slot element must exist before a notice can portal
+  // into it, and the provider's value has to change once it does.
+  const [slot, setSlot] = useState<HTMLElement | null>(null)
+  return (
+    <ParagraphNoticeSlotCtx.Provider value={slot}>
+      <p {...sp(node)} className="my-1 leading-6">{children}</p>
+      {/* A `div` so the notices stack as blocks; empty, it takes no height. */}
+      <div ref={setSlot} data-paragraph-notices="" />
+    </ParagraphNoticeSlotCtx.Provider>
+  )
+}
 
+/**
+ * Synthetic `LinkMeta` for the Jira card, from the parsed URL alone: the issue
+ * key is the title and the instance host is the domain — the same information
+ * the inline chip carries, in card layout. No description on purpose: main has
+ * no Jira issue fetch, and inventing one here would put this card behind auth.
+ */
+function jiraCardMeta(link: PullRequestLink): LinkMeta {
+  let domain = ''
+  try { domain = new URL(link.url).host } catch { /* unreachable: link.url came out of the parser */ }
+  return {
+    url: link.url,
+    title: `${link.repo}-${link.number}`,
+    description: '',
+    siteName: '',
+    domain,
+    icon: '',
+    iconDark: '',
+    fetchedAt: 0,
+  }
+}
+
+const MD_COMPONENTS = {
+  code({ className, children, ...props }) {
+    // Only a <code> inside a <pre> may render a block-level component here
+    // (CodeBlock / MermaidBlock / ExcalidrawBlock are each rooted in a <div>).
+    // rehypeMarkFencedCode stamps those with `data-fenced`; a bare <code> in
+    // prose stays inline whatever class it carries, because a <div> inside the
+    // enclosing <p> crashes React's reconciler. That comment carries the full
+    // reasoning. `data-fenced` is destructured out so it never reaches the DOM.
+    const { 'data-fenced': fenced, 'data-cred-base': credBase, ...rest } = props as Record<string, unknown>
+    if (fenced === undefined) return <InlineCode {...rest}>{children}</InlineCode>
+
+    // remark-rehype stamps `language-<first word of the info string>`; keep the
+    // whole tag (`error-report`, `c++`, `asp.net`), not just its leading `\w+`
+    // run, so the header label and highlighter hint match what the author
+    // wrote. A class token has no whitespace, so `\S+` is the whole tag. Same
+    // rule as FENCE_OPEN (useBlockAssembler) / fixCodeFences.
+    const match = /language-(\S+)/.exec(className || '')
+    const lang = match?.[1]
+    // An empty fence has no children; String(undefined) would show "undefined".
+    const codeStr = String(children ?? '').replace(/\n$/, '')
+
+    // `rehypeRedactionMarkers` stamps the ordinal of this block's first
+    // credential tag when it holds any this reply has a record for. It is
+    // checked before the diagram and special-fence renderers, which would
+    // otherwise show the placeholder without its lock tag and card.
+    if (typeof credBase === 'string') return <RedactedCodeBlock code={codeStr} lang={lang} base={Number(credBase)} />
     if (lang === 'mermaid') return <MermaidBlock code={codeStr} />
     if (lang === 'excalidraw') return <ExcalidrawBlock code={codeStr} />
-
-    if (!className) return <InlineCode {...props}>{children}</InlineCode>
 
     return <CodeBlock code={codeStr} lang={lang} complete={true} />
   },
   pre({ children }) { return <>{children}</> },
-  table({ node, children }) { return <div className="overflow-x-auto my-3"><table {...sp(node)} className="w-full border-collapse text-sm">{children}</table></div> },
-  th({ node, children }) { return <th {...sp(node)} className="text-left text-muted text-[13px] font-medium px-3 py-2 border-b border-border bg-bg-elevated">{children}</th> },
-  td({ node, children }) { return <td {...sp(node)} className="px-3 py-2 border-b border-border text-sm">{children}</td> },
+  // The message bubble sets `overflow-wrap:anywhere; word-break:break-word`
+  // (AssistantMessage.tsx / UserMessage.tsx) so an unbreakable token can never
+  // widen a message past the viewport. Table cells must NOT inherit either one.
+  // `anywhere` participates in MIN-CONTENT sizing, so every cell's min-content
+  // collapsed to a single character — removing the one guarantee that keeps a
+  // table readable (a table is never squeezed below min-content). On a phone a
+  // wide table then compressed until each cell wrapped one CHARACTER per line,
+  // vertically. Verified: resetting `overflow-wrap` alone is NOT enough, because
+  // Chrome still shrinks columns on the inherited `word-break:break-word`, which
+  // splits `$765.72` into `$76 / 5.72`. Both are reset here.
+  //
+  // With word-based column widths restored, `min-w-full` (NOT `w-full`) lets a
+  // table wider than the viewport overflow to its real width and scroll inside
+  // the wrapper, while a narrow table still fills the container. A genuinely
+  // oversized token now widens its column instead of breaking, which the
+  // horizontal scroll already handles. Those classes now live on
+  // `MarkdownTable`, which also adds the copy row beneath the table.
+  table({ node, children }) { return <MarkdownTable node={node}>{children}</MarkdownTable> },
+  ...ELEMENT_OVERRIDES,
   a: MdAnchor,
-  blockquote({ node, children }) { return <blockquote {...sp(node)} className="border-l-[3px] border-accent pl-3 my-2 text-muted italic">{children}</blockquote> },
-  hr({ node }) { return <hr {...sp(node)} className="border-border my-4" /> },
-  h1({ node, children }) { const id = slugify(children); return <h1 {...sp(node)} id={id} className="text-xl font-bold mt-4 mb-2 text-text-strong">{children}</h1> },
-  h2({ node, children }) { const id = slugify(children); return <h2 {...sp(node)} id={id} className="text-lg font-bold mt-3 mb-2 text-text-strong">{children}</h2> },
-  h3({ node, children }) { const id = slugify(children); return <h3 {...sp(node)} id={id} className="text-base font-semibold mt-3 mb-1.5 text-text-strong">{children}</h3> },
-  h4({ node, children }) { const id = slugify(children); return <h4 {...sp(node)} id={id} className="text-sm font-semibold mt-2 mb-1 text-text-strong">{children}</h4> },
-  h5({ node, children }) { const id = slugify(children); return <h5 {...sp(node)} id={id} className="text-sm font-medium mt-2 mb-1 text-text-strong">{children}</h5> },
-  h6({ node, children }) { const id = slugify(children); return <h6 {...sp(node)} id={id} className="text-[13px] font-medium mt-2 mb-1 text-muted">{children}</h6> },
-  ul({ node, children, className }) { const isTasks = className?.includes('contains-task-list'); return <ul {...sp(node)} className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-disc pl-8 my-2 space-y-1 marker:text-muted'}>{children}</ul> },
-  ol({ node, children, className }) { const isTasks = className?.includes('contains-task-list'); return <ol {...sp(node)} className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-decimal pl-8 my-2 space-y-1 marker:text-muted'}>{children}</ol> },
-  li({ node, children, className }) {
-    const isTask = className?.includes('task-list-item')
-    if (!isTask) return <li {...sp(node)} className="text-sm leading-relaxed">{children}</li>
-    // Task items use block flow, NOT flex. The previous `flex items-start` row
-    // broke two ways: (1) an item containing a NESTED list (tasks.md shape)
-    // laid the child <ul> out BESIDE the text; (2) any item long enough to
-    // wrap turned each inline chunk (text node / code chip) into a separate
-    // flex item, so text wrapped inside one chunk while siblings floated next
-    // to it — and flex min-width:auto blocked wrapping entirely, forcing
-    // horizontal scroll. Block flow + hanging indent (pl/-indent pair) keeps
-    // the checkbox aligned with the first line and wrapped lines under the
-    // text; nested lists reset the indent and drop below.
-    //
-    // `text-indent` is inherited, so a LOOSE task list (blank line between
-    // items) needs care: remark-rehype wraps each item's content in <p> and
-    // puts the checkbox inside the FIRST <p>. The first <p> should keep the
-    // hanging indent, but every subsequent <p>/block would otherwise inherit
-    // the -1.25rem and jut left into the checkbox gutter — hence the
-    // `[&>p:not(:first-child)]:indent-0` reset. The checkbox margin/alignment
-    // uses a descendant combinator (`[&_input…]`) rather than direct-child so
-    // it also lands on the loose-mode checkbox nested inside that first <p>.
+  p: MdParagraph,
+  img: ImgWithFallback,
+  video({ node, children }) { return <DeferredMedia tag="video" node={node}>{children}</DeferredMedia> },
+  audio({ node, children }) { return <DeferredMedia tag="audio" node={node}>{children}</DeferredMedia> },
+  source: MdSourceEl,
+  // Custom element names the `rehypeRedactionMarkers` pass injects after
+  // sanitize. `Components` is keyed by the intrinsic HTML tags, so the custom
+  // keys are added through the assertion below rather than inline — react-markdown
+  // resolves the component by tag name at runtime regardless of the static type.
+  'blocked-link'({ node }: { node?: HastElement }) {
+    const p = node?.properties
     return (
-      <li
-        {...sp(node)}
-        className="text-sm leading-relaxed break-words pl-5 -indent-5 [&_input[type=checkbox]]:mr-1.5 [&_input[type=checkbox]]:align-middle [&>ul]:indent-0 [&>ol]:indent-0 [&>p:not(:first-child)]:indent-0 [&>ul]:mt-1 [&>ol]:mt-1"
-      >
-        {children}
-      </li>
+      <BlockedLinkChip
+        domain={String(p?.domain ?? '')}
+        placeholder={String(p?.placeholder ?? '')}
+        block={String(p?.block ?? '')}
+        tail={String(p?.tail ?? '')}
+      />
     )
   },
-  p: MdParagraph,
-  strong({ node, children }) { return <strong {...sp(node)} className="font-semibold text-text-strong">{children}</strong> },
-  em({ node, children }) { return <em {...sp(node)} className="italic">{children}</em> },
-  img: ImgWithFallback,
-}
-
-/** Markdown image with a React-rendered Paperclip fallback when the URL is
- *  broken. The fallback is React-rendered rather than a hand-built SVG swapped
- *  in via .replaceWith(), so it never mutates DOM React owns — which could
- *  otherwise trigger "removeChild on Node" reconciliation crashes. */
-function ImgWithFallback({
-  node: _node,
-  src,
-  alt,
-  ...props
-}: React.ImgHTMLAttributes<HTMLImageElement> & ExtraProps) {
-  const [errored, setErrored] = useState(false)
-  const [loaded, setLoaded] = useState(false)
-  const basePath = useContext(BasePathCtx)
-  const compact = useContext(CompactImagesCtx)
-  const version = useContext(ImageVersionCtx)
-  if (!src) return null
-  const isLocal = src.startsWith('/') || src.startsWith('~') || src.startsWith('.')
-    || (basePath && !src.startsWith('http'))
-  let url: string
-  if (isLocal) {
-    if (basePath && !src.startsWith('/') && !src.startsWith('~')) {
-      const resolved = basePath.replace(/\/[^/]*$/, '') + '/' + src
-      url = `/api/file-raw?path=${encodeURIComponent(resolved)}`
-    } else {
-      url = `/api/file-raw?path=${encodeURIComponent(src)}`
-    }
-    // See ImageVersionCtx: without this every impression of a rewritten file
-    // shares one cache entry and a new message renders the previous bytes. The
-    // backend reads only `path`, so the extra parameter is inert server-side.
-    if (version) url += `&v=${encodeURIComponent(version)}`
-  } else {
-    url = src
-  }
-  if (errored) {
-    return (
-      <span className="text-sm text-muted inline-flex items-center gap-1">
-        <Paperclip size={14} aria-hidden="true" />
-        {' ' + (alt || src)}
-      </span>
-    )
-  }
-  // SVGs authored with only a `viewBox` (no width/height) carry no intrinsic
-  // size. Under the max-w/max-h-only CSS below they collapse to ~0px and look
-  // missing — so uploading several SVGs appears to render only the ones that
-  // happen to declare width/height. Give SVGs a definite width basis; the
-  // viewBox aspect ratio then derives the height, clamped by max-h.
-  const isSvg = /\.svg([?#]|$)/i.test(src)
-  // Reserve vertical layout space BEFORE the bytes decode. A markdown image has
-  // no intrinsic dimensions in the source, so without this it lays out at ~0px
-  // until the network/decode completes, then snaps to its natural height —
-  // shoving every sibling below it (still-streaming text, the next block) down
-  // in one discrete jump. For a user reading a streaming message (or lazily
-  // loading an image below the fold) that reads as a "flash". Holding a
-  // min-height placeholder until `onLoad` reserves the space up front and
-  // bounds the on-load shift; the placeholder is released once loaded so the
-  // final layout is pixel-exact and history/completed images carry no floor.
-  // The floor is a heuristic (markdown gives us no aspect ratio): 120px sits
-  // below the common screenshot/diagram case (which then benefits) but above
-  // small icons/badges — for a sub-120px raster image the on-load change is a
-  // bounded (<=120px) collapse, an accepted residual since such images are
-  // uncommon in markdown. SVGs already get a definite width basis (their viewBox
-  // derives the height), so they need no placeholder. See
-  // MarkdownRenderer.streamingImageShift.test.tsx.
-  const imgStyle: React.CSSProperties | undefined = isSvg
-    ? { width: compact ? '240px' : '760px', height: 'auto' }
-    : (loaded ? undefined : { minHeight: '120px' })
-  // Sent-prompt (user message) images render as a small preview so an attached
-  // screenshot doesn't dominate the bubble; the lightbox still opens full size
-  // on click. Response images keep the large inline size. See CompactImagesCtx.
-  // The className stays inline in the JSX attribute (rather than hoisted to a
-  // variable) so the i18n lint's className exemption still recognizes these as
-  // class strings, not untranslated copy.
-  return (
-    <span className="block my-2">
-      {/* The <img> is the lightbox trigger; dispatchLightbox needs the image
-          element itself as currentTarget and the [data-lightbox-image] query
-          relies on it being an <img>, so it can't be a <button>. Keyboard users
-          reach the same lightbox via other focusable controls; a visible <img>
-          preview is presentational here. */}
-      {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
-      <img
-        src={url} alt={alt || ''} loading="lazy"
-        className={compact
-          ? 'max-w-[min(100%,240px)] max-h-[180px] object-contain rounded-md border border-border cursor-pointer hover:opacity-90 transition-opacity'
-          : 'max-w-[min(100%,760px)] max-h-[60vh] object-contain rounded-md border border-border cursor-pointer hover:opacity-90 transition-opacity'}
-        style={imgStyle}
-        onClick={(e) => dispatchLightbox(e.currentTarget)}
-        data-lightbox-image=""
-        title={alt || src}
-        onLoad={() => setLoaded(true)}
-        onError={() => setErrored(true)}
-        {...props}
-      />
-    </span>
-  )
-}
+  'cred-tag'({ node }: { node?: HastElement }) {
+    return <CredentialTag ordinal={Number(node?.properties?.ordinal)} placeholder={String(node?.properties?.placeholder ?? '')} />
+  },
+  'redaction-card-slot'({ node }: { node?: HastElement }) {
+    return <RedactionCardSlot ids={String(node?.properties?.ids ?? '')} />
+  },
+} as Components
 
 // Disable single-$ inline math so currency strings like `$9.99` don't
 // accidentally trigger KaTeX math parsing. With singleDollarTextMath=true (the
@@ -824,237 +597,6 @@ function ImgWithFallback({
 // and crashing the whole dashboard with "DOMException: String contains an
 // invalid character" during completeWork. Only $$...$$ display-math blocks
 // are treated as math now; single $ is plain text.
-
-/**
- * Rehype plugin: ALLOWLIST-based HTML sanitization of the HAST tree.
- * Unknown/unrecognized tags are converted to escaped text (renders literally)
- * rather than passed to React as elements -- prevents React error #290 crashes
- * from bare XML tags like `<dynamoDBClient>` in agent output.
- */
-const ALLOWED_TAGS = new Set([
-  // Block structure
-  'div', 'span', 'p', 'br', 'hr',
-  // Headings
-  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-  // Lists
-  'ul', 'ol', 'li',
-  // Inline formatting
-  'strong', 'b', 'em', 'i', 'del', 's', 'u', 'mark', 'small',
-  'sup', 'sub', 'kbd', 'abbr', 'cite', 'q', 'var', 'samp',
-  // Code
-  'code', 'pre',
-  // Links & media
-  'a', 'img', 'picture', 'source', 'video', 'audio',
-  // Tables
-  'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption', 'colgroup', 'col',
-  // Semantic blocks
-  'blockquote', 'details', 'summary', 'figure', 'figcaption',
-  // Semantic HTML5 structure (remark-gfm emits <section> for footnotes)
-  'section', 'article', 'header', 'footer', 'nav', 'aside', 'time',
-  // Forms (only checkbox for GFM task lists -- further constrained below)
-  'input',
-  // Misc safe elements
-  'dl', 'dt', 'dd', 'ruby', 'rt', 'rp', 'wbr',
-  // SVG (inline diagrams)
-  'svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'text', 'g', 'defs', 'use',
-  'tspan', 'ellipse', 'lineargradient', 'radialgradient', 'stop', 'title', 'desc', 'clippath', 'marker',
-  // Math (rehypeKatex pipeline -- pass through rehypeRaw)
-  'math', 'inlinemath',
-])
-const DANGEROUS_PROTOCOLS = ['javascript:', 'data:', 'vbscript:']
-const cleanUrl = (url: string) => url.replace(/[\x00-\x1f\x7f]/g, '').trim().toLowerCase()
-
-/**
- * Attribute ALLOWLIST (replaces the former on-handler / protocol denylist).
- *
- * frontend-security: for an allowlisted element we now KEEP only the attributes
- * explicitly permitted for it and DROP everything else — so `style`,
- * `formaction`, `srcset`-on-the-wrong-tag, unknown `on*` handlers, etc. are all
- * removed by default rather than only the handful we remembered to block.
- *
- * Matching is case-insensitive because hast camelCases some property names
- * (`viewBox`, `colSpan`, `ariaHidden`, `data-*` → `dataSourcepos`); we always
- * compare on the lowercased key. `aria*`/`data*` prefixes are allowed wholesale
- * (inert, a11y/metadata only).
- */
-const GLOBAL_ATTRS = new Set([
-  'classname', 'class', 'id', 'title', 'dir', 'lang', 'role', 'align',
-])
-const TAG_ATTRS: Record<string, Set<string>> = {
-  a: new Set(['href', 'name', 'target', 'rel']),
-  img: new Set(['src', 'alt', 'width', 'height', 'loading']),
-  input: new Set(['type', 'checked', 'disabled']),
-  ol: new Set(['start', 'type', 'reversed']),
-  li: new Set(['value']),
-  td: new Set(['colspan', 'rowspan', 'headers']),
-  th: new Set(['colspan', 'rowspan', 'scope', 'headers']),
-  col: new Set(['span', 'width']),
-  colgroup: new Set(['span', 'width']),
-  source: new Set(['src', 'srcset', 'type', 'media', 'sizes']),
-  video: new Set(['src', 'controls', 'width', 'height', 'poster', 'loop', 'muted', 'preload']),
-  audio: new Set(['src', 'controls', 'loop', 'muted', 'preload']),
-  details: new Set(['open']),
-  time: new Set(['datetime']),
-}
-// SVG-family elements share a pool of inert presentation/geometry attributes.
-const SVG_TAGS = new Set([
-  'svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'text', 'g',
-  'defs', 'use', 'tspan', 'ellipse', 'lineargradient', 'radialgradient', 'stop',
-  'clippath', 'marker',
-])
-const SVG_ATTRS = new Set([
-  'viewbox', 'xmlns', 'fill', 'stroke', 'strokewidth', 'strokelinecap',
-  'strokelinejoin', 'strokedasharray', 'strokeopacity', 'fillopacity',
-  'fillrule', 'cliprule', 'clippath', 'opacity', 'transform', 'd', 'points',
-  'x', 'y', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'rx', 'ry', 'width',
-  'height', 'offset', 'stopcolor', 'stopopacity', 'gradientunits',
-  'gradienttransform', 'preserveaspectratio', 'markerwidth', 'markerheight',
-  'refx', 'refy', 'orient',
-])
-/** True when `key` is a permitted attribute for element `tag` (both lowercased). */
-function isAllowedAttr(tag: string, key: string): boolean {
-  const k = key.toLowerCase()
-  if (k.startsWith('aria') || k.startsWith('data')) return true
-  if (GLOBAL_ATTRS.has(k)) return true
-  if (TAG_ATTRS[tag]?.has(k)) return true
-  if (SVG_TAGS.has(tag) && SVG_ATTRS.has(k)) return true
-  return false
-}
-
-/** Elements that cannot have children per HTML spec (used by escapedNodeTree). */
-const VOID_ELEMENTS = new Set(['img', 'br', 'hr', 'input', 'source', 'wbr', 'col'])
-
-/** HAST element node shape (subset used by sanitize pipeline). */
-interface HastNode {
-  type: string
-  tagName?: string
-  value?: string
-  properties?: Record<string, unknown>
-  children?: HastNode[]
-}
-
-/** Tags never reconstructed — even as escaped text, faithful reconstruction of
- * executable elements is a liability. They collapse to an [unsupported:] marker. */
-const UNSAFE_RECONSTRUCT_TAGS = new Set([
-  'script', 'style', 'iframe', 'object', 'embed', 'form', 'link', 'meta', 'base', 'noscript',
-])
-
-const textNode = (value: string): HastNode => ({ type: 'text', value })
-
-/** Convert a non-allowlisted element into a SAFE HAST element tree for display.
- *
- * frontend-security: no HTML string is ever materialized from untrusted content.
- * The node's source form is represented as a `<span class="escaped-tag">` whose
- * children are discrete TEXT fragments — the `<` / `>` delimiters live in their
- * own text nodes, separate from the tag/attribute content — so no single string
- * anywhere in the tree contains parseable markup, and React renders text nodes
- * safely by construction. Filters retained from the sanitizer: `on*` handler
- * attributes dropped, tag/attr names restricted to a safe charset, and
- * dangerous-protocol attribute values (javascript:/data:/vbscript:) dropped.
- */
-function escapedNodeTree(node: HastNode): HastNode {
-  const tag = (node.tagName ?? '').replace(/[^a-zA-Z0-9-]/g, '')
-  const wrap = (children: HastNode[]): HastNode => ({
-    type: 'element',
-    tagName: 'span',
-    properties: { className: ['escaped-tag'] },
-    children,
-  })
-  if (UNSAFE_RECONSTRUCT_TAGS.has(tag.toLowerCase())) {
-    return wrap([textNode(`[unsupported: ${tag}]`)])
-  }
-  const attrs = node.properties
-    ? Object.entries(node.properties)
-        .filter(([k]) => k !== 'className' && !/^on/i.test(k) && /^[a-zA-Z0-9_:-]+$/.test(k))
-        .filter(([, v]) => typeof v !== 'string' || !DANGEROUS_PROTOCOLS.some(p => cleanUrl(v).startsWith(p)))
-        .map(([k, v]) => (v === true ? k : `${k}="${String(v)}"`))
-        .join(' ')
-    : ''
-  const children: HastNode[] = [textNode('<'), textNode(attrs ? `${tag} ${attrs}` : tag), textNode('>')]
-  for (const c of node.children || []) {
-    if (c.type === 'text') children.push(textNode(c.value ?? ''))
-    else if (c.type === 'element') children.push(escapedNodeTree(c))
-  }
-  if (!VOID_ELEMENTS.has(tag)) {
-    children.push(textNode('</'), textNode(tag), textNode('>'))
-  }
-  return wrap(children)
-}
-
-/**
- * Exported so every markdown surface in the product shares ONE sanitize policy.
- *
- * Any renderer that admits raw HTML (`rehype-raw`) needs this immediately after
- * it, and a second surface must never carry its own copy of the allowlist: the
- * policy is security-relevant, so a fork would silently drift out of step with
- * this one. The plugin is pure (no React, no styling), so a surface that cannot
- * reuse the component itself can still reuse the policy.
- */
-export function rehypeSanitize() {
-  return (tree: HastNode) => {
-    const walk = (node: HastNode, parent: HastNode, index: number) => {
-      // TS strict-null: HastNode.children is `HastNode[] | undefined`. Callers only
-      // recurse into nodes whose children array they are iterating, so this cannot
-      // happen for a well-formed HAST tree — guard defensively and move on.
-      if (!parent.children) return index + 1
-      if (node.type === 'element') {
-        const tagLower = (node.tagName || '').toLowerCase()
-
-        // Allowlist check: unknown tags become a safe element tree of text
-        // fragments (no HTML string is ever built from untrusted content)
-        if (!ALLOWED_TAGS.has(tagLower)) {
-          parent.children.splice(index, 1, escapedNodeTree(node))
-          return index + 1  // skip past the replacement (already safe)
-        }
-
-        // input: only allow GFM task-list checkboxes
-        if (tagLower === 'input') {
-          if (node.properties?.type === 'checkbox') {
-            node.properties = { type: 'checkbox', checked: !!node.properties.checked, disabled: true }
-          } else {
-            parent.children.splice(index, 1)
-            return index
-          }
-        }
-
-        // Attribute ALLOWLIST: keep only attributes permitted for this element;
-        // drop everything else (was: a denylist that stripped on*/protocol/srcdoc
-        // and kept the rest). Retained URL-bearing attrs still get the
-        // dangerous-protocol check below.
-        if (node.properties) {
-          for (const [key, val] of Object.entries(node.properties)) {
-            if (!isAllowedAttr(tagLower, key)) {
-              delete node.properties[key]
-              continue
-            }
-            if (typeof val === 'string') {
-              const cleaned = cleanUrl(val)
-              if (DANGEROUS_PROTOCOLS.some(p => cleaned.startsWith(p))) {
-                // Allow data:image/* on img src (inline base64 images)
-                if (node.tagName === 'img' && key === 'src' && cleaned.startsWith('data:image/')) {
-                  continue
-                }
-                delete node.properties[key]
-              }
-            }
-          }
-        }
-      }
-      if (node.children) {
-        for (let i = 0; i < node.children.length; i++) {
-          const result = walk(node.children[i], node, i)
-          if (typeof result === 'number') i = result - 1  // re-check after splice
-        }
-      }
-    }
-    if (tree.children) {
-      for (let i = 0; i < tree.children.length; i++) {
-        const result = walk(tree.children[i], tree, i)
-        if (typeof result === 'number') i = result - 1
-      }
-    }
-  }
-}
 
 // CommonMark has a known emphasis defect (commonmark/commonmark-spec#650): a
 // closing `**` is only right-flanking when it is NOT preceded by punctuation, or
@@ -1068,335 +610,59 @@ export function rehypeSanitize() {
 // delimiters are classified), and the strikethrough companion AFTER, because it
 // extends gfm's own `~~` construct.
 const REMARK_PLUGINS: PluggableList = [
-  remarkCjkFriendly,
-  remarkGfm,
-  remarkCjkFriendlyGfmStrikethrough,
+  // FIRST: depth bound, CJK-friendly emphasis, gfm and its strikethrough
+  // companion, in the order `remarkBase.ts` explains. Shared with the
+  // rich-text copy so both parse a reply the same way.
+  ...REMARK_BASE_PLUGINS,
   [remarkMath, { singleDollarTextMath: false }],
+  // LaTeX-native `\( … \)` / `\[ … \]` → the same math nodes remark-math emits,
+  // from ELIGIBLE TEXT NODES only (code, html, link destinations and reference
+  // definitions are other node types and are never touched). After remark-math
+  // so `$$` math is already tokenized; before the verbatim pass -- and told
+  // which paired tags that pass will show as literal source, so text inside
+  // them is never converted (a `<customBlock>` shown verbatim must not carry
+  // a rendered KaTeX span in the middle of its source).
+  [remarkLatexDelimiters, { verbatimTag: (tag: string) => VERBATIM_CONTENT_TAGS.has(tag) || !ALLOWED_TAGS.has(tag) }],
+  // After gfm so an autolink literal is already a `link` node, but BEFORE the
+  // verbatim pass, which retypes an unknown tag to text and hides it.
+  remarkAutolinkRules,
+  remarkVerbatimUnknownTags,
 ]
-const REHYPE_PLUGINS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeSanitize, rehypeKatex]
 
-// Matches one source line break plus any leading tabs/spaces, so a trailing
-// space before the break doesn't survive as its own text node. Mirrors the
-// pattern used by the `remark-breaks` package.
-const SOFT_BREAK_RE = /[\t ]*(?:\r?\n|\r)/g
-
-/**
- * remark plugin: turn soft line breaks (a lone source newline inside a
- * paragraph, which CommonMark otherwise collapses to a space) into hard breaks
- * (mdast `break` → <br>). This is an inlined equivalent of the `remark-breaks`
- * package, kept local to avoid adding a runtime dependency.
- *
- * Opt-in via MarkdownRenderer's `softBreaks` prop and used ONLY for user
- * messages: the chat input lets people press Shift+Enter for a newline, so
- * those breaks must survive rendering. Assistant/LLM markdown keeps standard
- * CommonMark soft-break-collapse.
- *
- * Operates on `text` nodes only, so fenced code, inline code, math, and raw
- * HTML (whose content lives in `.value`, not `.children`) are untouched, and
- * blank-line block separators — already parsed as distinct blocks — are not
- * affected, so lists and paragraphs keep their normal block spacing. That is
- * what lets user messages drop container-level `white-space: pre-wrap`, which
- * had made react-markdown's inter-block newline text nodes render as literal
- * blank lines and inflated list/paragraph gaps.
- */
-function remarkSoftBreaks() {
-  const visit = (node: { type?: string; value?: string; children?: unknown[] }) => {
-    if (!node || !Array.isArray(node.children)) return
-    const out: unknown[] = []
-    for (const raw of node.children) {
-      const child = raw as { type?: string; value?: string; children?: unknown[] }
-      if (child.type === 'text' && typeof child.value === 'string' && /[\r\n]/.test(child.value)) {
-        const value = child.value
-        let start = 0
-        SOFT_BREAK_RE.lastIndex = 0
-        let match: RegExpExecArray | null
-        while ((match = SOFT_BREAK_RE.exec(value))) {
-          if (match.index > start) out.push({ type: 'text', value: value.slice(start, match.index) })
-          out.push({ type: 'break' })
-          start = match.index + match[0].length
-        }
-        if (start < value.length) out.push({ type: 'text', value: value.slice(start) })
-      } else {
-        visit(child)
-        out.push(child)
-      }
-    }
-    node.children = out
-  }
-  return (tree: unknown) => visit(tree as { children?: unknown[] })
-}
+// `rehypeBoundRawDepth` sits ahead of `rehypeRaw`: raw HTML that would nest
+// past the depth bound is downgraded to text before rehype-raw's recursive
+// hast conversion can overflow on it.
+// `rehypeSessionRefPunctuation` runs after the sanitizer so the marker it
+// stamps is the only one a session reference can carry into `MdAnchor` / `InlineCode`.
+const REHYPE_PLUGINS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeSessionRefPunctuation, rehypeKatex]
 
 // User-message variant: base remark chain plus soft-break → hard-break.
 const REMARK_PLUGINS_WITH_BREAKS: PluggableList = [...REMARK_PLUGINS, remarkSoftBreaks]
 
-/**
- * Rehype plugin that copies each hast element's source `position` onto a
- * `data-sourcepos` HTML attribute in CommonMark format `startLine:startCol-endLine:endCol`.
- * Used by the inline-commenting flow to map selection DOM → source coordinates.
- * Replaces the deprecated `sourcePos` option removed in react-markdown v10.
- */
-function rehypeSourcepos() {
-  return (tree: HastRoot) => {
-    const walk = (node: HastRoot | RootContent) => {
-      if (node.type === 'element' && node.position?.start) {
-        const s = node.position.start, e = node.position.end ?? s
-        node.properties = node.properties || {}
-        node.properties['data-sourcepos'] = `${s.line}:${s.column}-${e.line}:${e.column}`
-      }
-      if ('children' in node && node.children) for (const c of node.children) walk(c)
-    }
-    walk(tree)
-  }
-}
-const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeSanitize, rehypeKatex, rehypeSourcepos]
+const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeSessionRefPunctuation, rehypeKatex, rehypeSourcepos]
 // NOTE: remark plugin config is shared via REMARK_PLUGINS above (singleDollarTextMath:
 // false). The sourcepos variant only differs in the rehype chain.
 
-/** Number of trailing characters glowed while a message streams. */
-const GLOW_TAIL_CHARS = 30
+// Which regions are off-limits (code, existing links, raw HTML, math) is NOT
+// decided by hand-rolled scanning — it is read off remark's own parse of the
+// source. Anything inside a fence, an indented block, an inline-code span
+// (including a multi-line one), an existing link/image, an angle autolink, a raw
+// HTML tag, or a math span simply never becomes an autolink-literal node, so it
+// is unreachable here by construction. Built from the SAME `REMARK_PLUGINS` the
+// render pipeline uses, so a future plugin addition cannot make the span-finder
+// and the renderer disagree about what a link is.
+const AUTOLINK_PARSER = unified().use(remarkParse).use(REMARK_PLUGINS).freeze()
 
-/**
- * Rehype plugin: wrap the message's trailing text in a
- * `<span class="streaming-glow">` so the newest streamed words shimmer.
- *
- * Operates on the parsed HAST tree (not the markdown source and not the live
- * DOM), so it: (a) never builds a raw HTML string with LLM content — the span
- * is a real element node react-markdown renders as a React `<span>`; (b) never
- * bisects a markdown token — by this stage `**bold**` is already a `<strong>`
- * element, so splitting the last *text* node is always safe; (c) doesn't mutate
- * React-owned DOM, so it can't cause reconciliation crashes.
- *
- * Glows the whole last text node when it's short, else its last GLOW_TAIL_CHARS
- * on a space boundary (never mid-word). Skips text inside code/pre.
- */
-function rehypeStreamingGlow(options?: { tailChars?: number }) {
-  const tailChars = options?.tailChars ?? GLOW_TAIL_CHARS
-  return (tree: HastRoot) => {
-    // Collect every eligible text node (non-whitespace, not inside code/pre);
-    // the streaming tail is the last one. Using an array (rather than a
-    // closure-mutated `let`) keeps TypeScript's control-flow narrowing happy.
-    const candidates: { parent: HastParent; index: number; value: string }[] = []
-    const walk = (node: RootContent, parent: HastParent, index: number, inCode: boolean) => {
-      if (node.type === 'text') {
-        if (!inCode && node.value && node.value.trim()) {
-          candidates.push({ parent, index, value: node.value })
-        }
-        return
-      }
-      const code = inCode || (node.type === 'element' && (node.tagName === 'code' || node.tagName === 'pre'))
-      if ('children' in node && node.children) {
-        for (let i = 0; i < node.children.length; i++) walk(node.children[i], node, i, code)
-      }
-    }
-    for (let i = 0; i < tree.children.length; i++) walk(tree.children[i], tree, i, false)
-    const target = candidates[candidates.length - 1]
-    if (!target) return
-    const { parent, index, value } = target
-    let cut: number
-    if (value.length <= tailChars) {
-      cut = 0
-    } else {
-      const sp = value.lastIndexOf(' ', value.length - tailChars)
-      cut = sp > 0 ? sp : value.length - tailChars
-    }
-    const before = value.slice(0, cut)
-    const tail = value.slice(cut)
-    if (!tail.trim()) return
-    const span: HastElement = {
-      type: 'element',
-      tagName: 'span',
-      properties: { className: ['streaming-glow'] },
-      children: [{ type: 'text', value: tail }],
-    }
-    const beforeNode: HastText = { type: 'text', value: before }
-    spliceChildren(parent, index, before ? [beforeNode, span] : [span])
-  }
+/** `closeCjkAutolinkBoundaries` over the renderer's own grammar. NOT safe while
+ *  `data-sourcepos` is in play: it shifts later columns (see MarkdownBlock). */
+export function fixCjkAutolinkBoundaries(content: string): string {
+  return closeCjkAutolinkBoundaries(content, AUTOLINK_PARSER)
 }
 
-/** Split a text run into individual characters for per-char animation. */
-const REVEAL_CHAR_RE = /[\s\S]/g
-
-/** How many trailing characters of the streaming tail carry the reveal fade.
- *  Only this growing EDGE is sub-opaque; text that has settled behind it is
- *  left as plain, fully-opaque text nodes. Sized to comfortably cover the
- *  smooth buffer's per-frame reveal wave (MAX_CPS burst) so genuinely-new text
- *  still materializes over several frames. */
-const REVEAL_FADE_CHARS = 32
-/** Opacity of the newest (tip) character; older chars ramp linearly to 1 across
- *  REVEAL_FADE_CHARS. Kept well above 0 so a mid-stream PAUSE never leaves the
- *  trailing words hard to read — the reveal is a gentle materialization, not a
- *  fade-from-invisible. */
-const REVEAL_MIN_OPACITY = 0.6
-
-/** How long the rendered content must sit unchanged before the reveal edge is
- *  settled to full opacity. `--ft-o` is POSITIONAL, so only the tip advancing
- *  raises a character's opacity. This matters for exactly one case: a stream
- *  that PAUSES mid-turn (the gap while the model composes tool arguments), where
- *  `streaming` is still true and nothing advances the tip, leaving the last
- *  REVEAL_FADE_CHARS characters pinned as low as REVEAL_MIN_OPACITY for the
- *  whole pause. A FINISHED stream is already self-healing and needs nothing:
- *  rehypeStreamingReveal is only in the pipeline while `glow` is set, and
- *  `glow` follows `isStreaming`, so the spans are dropped on the next re-parse.
- *  Do not "simplify" this into `animOn = !!smooth && streaming` — that only
- *  covers the self-healing case and cannot cover a pause, where streaming is
- *  true by definition. */
-const REVEAL_IDLE_SETTLE_MS = 500
-
-/** Opacity for a character `d` positions back from the streaming tip (d=0 is
- *  the newest char). Deliberately a pure function of POSITION, not of mount
- *  time — this is the streaming-flash fix. react-markdown re-parses the whole
- *  tail every frame, and when a newly-revealed char COMPLETES a markdown token
- *  (inline `code`, **bold**, a [link], a heading/list marker, …) the subtree
- *  restructures, so React unmounts/remounts the `.ft-word` spans for text that
- *  was ALREADY on screen. A mount-triggered CSS keyframe (like `ft-char-fade`)
- *  would re-run on every such remount → a visible flash, right at the active
- *  edge where the eye is. With position-derived opacity a
- *  remounted span re-appears at the IDENTICAL opacity, so it cannot re-fade;
- *  only the tip advancing changes a char's opacity, giving a smooth
- *  materialization. Confirmed by src/test/streamingFlashRepro.test.tsx. */
-function revealOpacity(d: number): number {
-  if (d >= REVEAL_FADE_CHARS - 1) return 1
-  const o = REVEAL_MIN_OPACITY + (1 - REVEAL_MIN_OPACITY) * (d / (REVEAL_FADE_CHARS - 1))
-  return Math.round(o * 100) / 100
-}
-
-/**
- * Rehype plugin: wrap the streaming tail's TRAILING EDGE in `<span
- * class="ft-word" style="--ft-o:…">` so each character carries a
- * position-derived opacity (see revealOpacity). Only the last
- * REVEAL_FADE_CHARS characters are wrapped; text that has settled behind the
- * edge stays as plain, fully-opaque text nodes.
- *
- * Text inside `code`/`pre` (rendered by the code components) and
- * `.streaming-glow` is skipped. Atomic block components (fenced code, widgets,
- * mermaid, diffs) are separate non-text blocks and are not faded here.
- *
- * The reveal is driven by CSS opacity that is a pure function of each char's
- * distance to the tip — NOT a mount-triggered animation — so react-markdown's
- * per-frame re-parse (which remounts edge spans whenever a markdown token
- * completes) can never re-fire the fade on already-visible text. That
- * remount-immunity is the streaming-flash fix. This plugin runs AFTER
- * rehypeSanitize in the pipeline, so the inline `--ft-o` style it adds is not
- * stripped by the attribute allowlist. On stream end the plugin drops out and
- * the tail reverts to plain text (clean for selection/copy).
- */
-function rehypeStreamingReveal() {
-  return (tree: HastRoot) => {
-    const candidates: { parent: HastParent; index: number; value: string }[] = []
-    const walk = (node: RootContent, parent: HastParent, index: number, skip: boolean) => {
-      if (node.type === 'text') {
-        if (!skip && node.value && node.value.trim()) {
-          candidates.push({ parent, index, value: node.value })
-        }
-        return
-      }
-      const cls = node.type === 'element' ? node.properties?.className : undefined
-      const isGlow = Array.isArray(cls) && cls.includes('streaming-glow')
-      // Skip text inside `pre` (fenced code/diff render via their own
-      // components) and the glow window. Inline `code` is NOT skipped so it
-      // char-fades like the surrounding prose — fenced blocks are separate
-      // non-markdown blocks, so any `code` reached here is inline.
-      const next = skip || isGlow || (node.type === 'element' && node.tagName === 'pre')
-      if ('children' in node && node.children) {
-        for (let i = 0; i < node.children.length; i++) walk(node.children[i], node, i, next)
-      }
-    }
-    for (let i = 0; i < tree.children.length; i++) walk(tree.children[i], tree, i, false)
-    if (candidates.length === 0) return
-    // Wrap only the trailing REVEAL_FADE_CHARS characters, walking candidates
-    // from the last (deepest in document order) backward and spending a shared
-    // budget. Everything before the edge is left as-is (plain text). `fromEnd`
-    // tracks how many wrapped chars lie AFTER the current candidate so each
-    // span gets an opacity derived from its distance to the streaming tip.
-    let budget = REVEAL_FADE_CHARS
-    let fromEnd = 0
-    for (let c = candidates.length - 1; c >= 0 && budget > 0; c--) {
-      const { parent, index, value } = candidates[c]
-      // Keep the leading (settled) portion of the boundary node as a plain text
-      // node; only wrap its trailing chars. A char-exact cut is fine because
-      // opacity is continuous — the boundary char lands at ~1.0, matching the
-      // adjacent plain text, so there is no visible seam.
-      const cut = value.length > budget ? value.length - budget : 0
-      budget -= (value.length - cut)
-      const head = value.slice(0, cut)
-      const tail = value.slice(cut)
-      const tokens = tail.match(REVEAL_CHAR_RE)
-      if (!tokens || tokens.length === 0) continue
-      // tokens are in document order; the last token of the last candidate is
-      // the tip. distance-from-tip for tokens[i] = fromEnd + (last - i).
-      const spans: Array<HastElement | HastText> = tokens.map((tok, i) => ({
-        type: 'element',
-        tagName: 'span',
-        properties: { className: ['ft-word'], style: `--ft-o:${revealOpacity(fromEnd + (tokens.length - 1 - i))}` },
-        children: [{ type: 'text', value: tok }],
-      }))
-      fromEnd += tokens.length
-      // Splice highest index first (candidates ascend in document order, so
-      // walking c downward gives descending indices within a shared parent),
-      // keeping earlier candidates' indices valid.
-      spliceChildren(parent, index, head ? [{ type: 'text', value: head } as HastText, ...spans] : spans)
-    }
-  }
-}
-
-/**
- * Rehype plugin: append an inline blinking caret (`<span class="streaming-caret">`)
- * immediately after the message's LAST trailing text node, so it sits inline at
- * the end of the streamed text (on the same line as the final word) rather than
- * on a new line below the block.
- *
- * Runs only while streaming (added under MarkdownBlock's `glow` gate, which is
- * true only for the last markdown block), so exactly one caret is injected. The
- * caret is a childless element node — the glow/reveal plugins that run after it
- * only touch text nodes, so it is left untouched and the trailing text still
- * gets its shimmer/fade. On stream end the plugin drops out and the caret
- * disappears with no leftover node (clean for selection/copy).
- *
- * Falls back to appending at the tree root only when there is no eligible text
- * yet (e.g. the block is pure code) — a rare edge where a new-line caret is
- * acceptable.
- */
-function rehypeStreamingCaret() {
-  return (tree: HastRoot) => {
-    const candidates: { parent: HastParent; index: number }[] = []
-    const walk = (node: RootContent, parent: HastParent, index: number) => {
-      if (node.type === 'text') {
-        if (node.value && node.value.trim()) candidates.push({ parent, index })
-        return
-      }
-      // Block code: exclude entirely — the caret never belongs inside a fenced
-      // code/diff block.
-      if (node.type === 'element' && node.tagName === 'pre') return
-      // Inline code: record the <code> element itself as a candidate at the
-      // PARENT level (and don't recurse into its text children), so the caret
-      // lands AFTER the inline code, not before it. Without this, a message
-      // ending in `` `code` `` would splice the caret ahead of the <code>.
-      if (node.type === 'element' && node.tagName === 'code') { candidates.push({ parent, index }); return }
-      if (node.type === 'element' && node.children) {
-        for (let i = 0; i < node.children.length; i++) walk(node.children[i], node, i)
-      }
-    }
-    if (tree.children) {
-      for (let i = 0; i < tree.children.length; i++) walk(tree.children[i], tree, i)
-    }
-    const caret: HastElement = {
-      type: 'element',
-      tagName: 'span',
-      properties: { className: ['streaming-caret'], 'aria-hidden': 'true' },
-      children: [],
-    }
-    const target = candidates[candidates.length - 1]
-    if (target) {
-      // Insert as the next sibling of the last visible node (text run or inline
-      // <code>) so it renders inline right after the final content. Narrow on
-      // the parent kind (RootContent[] vs ElementContent[]) to keep the insert
-      // type-safe — spliceChildren removes a node, so it can't do an insert.
-      if (target.parent.type === 'root') target.parent.children.splice(target.index + 1, 0, caret)
-      else target.parent.children.splice(target.index + 1, 0, caret)
-    } else if (tree.children) {
-      tree.children.push(caret)
-    }
-  }
+/** `encodeRefusedLinkDestinations` over the renderer's own grammar. NOT safe
+ *  while `data-sourcepos` is in play, for the same reason. */
+export function fixUnencodedLinkDestinations(content: string): string {
+  return encodeRefusedLinkDestinations(content, AUTOLINK_PARSER)
 }
 
 export function fixCodeFences(s: string): string {
@@ -1418,13 +684,20 @@ export function fixCodeFences(s: string): string {
     if (inFence || num === undefined) return match
     return num + '\\.' + trail
   })
-  // Ensure blank line before opening fences that are glued to preceding text
-  s = s.replace(/([^\n])(\n?)(```\w*\n)/g, (_, pre, nl, fence) =>
+  // Ensure blank line before opening fences that are glued to preceding text.
+  // The info string may be a tag (FENCE_OPEN's tag rule in useBlockAssembler,
+  // after optional whitespace) plus an optional `{...}` attribute block, and
+  // nothing more: a ``` run followed by more words is a mid-sentence mention,
+  // and moving it onto its own line would open a fence over the prose after it.
+  s = s.replace(/([^\n])(\n?)(```(?:[ \t]*[^`\s]+)?(?:[ \t]+\{[^`\n]*\})?[ \t\r]*\n)/g, (_, pre, nl, fence) =>
     nl ? pre + nl + fence : pre + '\n\n' + fence
   )
   // Split closing fences glued to trailing text: ```358KB → ```\n358KB
-  // Preserves valid opening fences (```diff, ```json5, ```c++) via negative lookahead
-  s = s.replace(/^(```)(?![a-zA-Z][\w+#-]*\s*$)(.+)$/gm, '$1\n$2')
+  // Preserves valid opening fences (```diff, ``` python, ```c++, ```asp.net)
+  // via negative lookahead: optional info-string whitespace may precede a tag
+  // that starts with a letter and continues as a backtick-free info string,
+  // while a size like ```358KB still splits.
+  s = s.replace(/^(```)(?!\s*[a-zA-Z][^`]*$)(.+)$/gm, '$1\n$2')
   // Split opening fences glued to uppercase text
   s = s.replace(/```([A-Z])/g, '```\n$1')
   return s
@@ -1527,7 +800,8 @@ function deferIncompleteStreamingTable(content: string): string {
   return lines.slice(0, start).join('\n')
 }
 
-const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl, markers }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; markers?: RedactionMarkers }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Declared before the early return below — Rules of Hooks.
   //
   // `sourcePos` force-disables unfurl: the inline-commenting flow maps a DOM
@@ -1544,6 +818,19 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   // streaming transitions or when the agent emits protocol markup as text.
   // Both passes preserve mentions inside inline-code spans.
   let clean = stripStrayToolUseTags(stripStrayWidgetTags(content))
+  // Cap whitespace runs before parsing. Tree depth is bounded on the parsed
+  // tree (see markdownDepthBound), but the parser's own per-line container
+  // scan is O(depth), so a list indented to hundreds of levels costs seconds
+  // before any tree exists. Lexical, construct-agnostic, and an identity on
+  // any message without a whitespace run wider than 256 columns.
+  //
+  // Gated off in sourcePos mode, like every other column-shifting pass in
+  // this function: `data-sourcepos` maps a DOM selection back to source
+  // coordinates, and a shortened run would shift every later column on that
+  // line and anchor a comment to the wrong occurrence. The crash bound does
+  // not depend on the cap (the tree bounds hold either way); only the
+  // parser-time bound is given up on that surface.
+  if (!sourcePos) clean = capWhitespaceRuns(clean)
   // `glow` marks the live streaming tail block: while streaming, hold back an
   // incomplete trailing table so it doesn't paint as pipe text then snap into a
   // <table> when the delimiter row arrives.
@@ -1563,10 +850,41 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
     if (smooth) tail.push(rehypeStreamingReveal)
     rehypePlugins = [...baseRehype, ...tail]
   }
+  // After sanitize (baseRehype ends with it) and after the streaming tail, so
+  // the injected marker elements are not stripped and the glow/reveal passes
+  // have already claimed the trailing text. Only added when the message
+  // carries records, so every other surface is untouched.
+  if (markers && (markers.ordinals.size > 0 || markers.domains.size > 0)) {
+    rehypePlugins = [...rehypePlugins, [rehypeRedactionMarkers, markers]]
+  }
+  // Last, so it wraps the root shape every other plugin has finished producing:
+  // an earlier position would let a later plugin read `div` where it expects the
+  // block itself.
+  rehypePlugins = [...rehypePlugins, rehypeStableRootKeys]
+  // `fixCodeFences` runs FIRST: its later passes CREATE code blocks the raw
+  // source did not have (blank line before a fence glued to preceding text,
+  // splitting a closing fence glued to trailing text). Rewriting boundaries
+  // before that would judge such a region as prose and leave a literal `<…>`
+  // inside what ends up displayed as code.
+  //
+  // `sourcePos` mode maps a DOM selection back to source coordinates through
+  // `data-sourcepos` for inline commenting. fixCjkAutolinkBoundaries inserts two
+  // characters per fixed URL, which shifts every later column on that line and
+  // would anchor a comment to the wrong occurrence — so that surface keeps the
+  // unfixed (but coordinate-accurate) render.
+  const fenced = fixCodeFences(clean)
+  // `fixUnencodedLinkDestinations` runs BEFORE the CJK pass: repairing a
+  // refused `[text](url)` turns the URL's autolinked head back into a real
+  // link node, so the CJK boundary pass must judge the repaired shape, not
+  // the broken one. Both passes shift columns, so both are gated off in
+  // sourcePos mode together.
+  const prepared = sourcePos ? fenced : fixCjkAutolinkBoundaries(fixUnencodedLinkDestinations(fenced))
   const md = (
-    <ReactMarkdown remarkPlugins={softBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS} rehypePlugins={rehypePlugins} urlTransform={urlTransform} components={MD_COMPONENTS}>
-      {fixCodeFences(clean)}
-    </ReactMarkdown>
+    <MdSourceCtx.Provider value={prepared}>
+      <ReactMarkdown remarkPlugins={softBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS} rehypePlugins={rehypePlugins} urlTransform={urlTransform} components={MD_COMPONENTS}>
+        {prepared}
+      </ReactMarkdown>
+    </MdSourceCtx.Provider>
   )
   const body = sourcePos ? <div data-block-start={startLine ?? 1}>{md}</div> : md
   // The provider carries no DOM node, so sourcepos / lightbox scoping upstream
@@ -1575,10 +893,72 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   return <LinkUnfurlCtx.Provider value={unfurlCtx}>{body}</LinkUnfurlCtx.Provider>
 })
 
-import WidgetFrame from './WidgetFrame'
-import WidgetPlaceholder from './WidgetPlaceholder'
+/** Languages whose fenced content IS markdown, so a rendered view is
+ *  meaningful. Kept in sync with `NESTABLE_LANGS` in useBlockAssembler for the
+ *  markup/doc subset a reader would want rendered — mdx is included because its
+ *  markdown structure still renders, its JSX just passes through as text. */
+const MARKDOWN_LANGS = new Set(['markdown', 'md', 'mdx'])
+function isMarkdownLang(lang?: string): boolean {
+  return lang != null && MARKDOWN_LANGS.has(lang.toLowerCase())
+}
 
-import { i18nT } from '../i18n/t'
+/** A ```markdown fence, or an untagged / generic one whose content is clearly
+ *  markdown. Any real language (```python, ```bash) is never sniffed. */
+function isMarkdownBlock(lang: string | undefined, content: string): boolean {
+  if (isMarkdownLang(lang)) return true
+  return isGenericLang(lang) && looksLikeMarkdown(content)
+}
+
+/** A markdown content card in the chat transcript: a ```markdown fence with a
+ *  Formatted | Raw view toggle in the upper right, matching the segmented
+ *  control tool detail cards carry (see pages/chat/ToolDetails.tsx). Formatted
+ *  renders through the same pipeline as agent prose; Raw is the verbatim source
+ *  with the edit affordance, which keeps editing Raw-only. Opens Formatted; the
+ *  control overrides per card. Only mounted for a COMPLETE fence — see the
+ *  caller in BlockRenderer. */
+const MarkdownContentCard = memo(function MarkdownContentCard(
+  { content, lang }: { content: string; lang?: string },
+) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const [view, setView] = useState<'formatted' | 'raw'>('formatted')
+
+  return (
+    <div className="my-2">
+      <div className="flex items-center justify-end mb-1">
+        <SegmentedControl<'formatted' | 'raw'>
+          segments={[
+            {
+              key: 'formatted',
+              label: i18nT('components.markdownCard.formatted'),
+              tooltip: i18nT('components.markdownCard.render_the_markdown_headings_lists_tables_links'),
+            },
+            {
+              key: 'raw',
+              label: i18nT('components.markdownCard.raw'),
+              tooltip: i18nT('components.markdownCard.show_the_exact_markdown_source'),
+            },
+          ]}
+          value={view}
+          onChange={setView}
+          layoutId="md-card-view"
+          collapse={false}
+        />
+      </div>
+      {/* Both views stay MOUNTED; the inactive one is hidden with `hidden`
+          rather than unmounted. EditableCodeBlock's Raw scratch editor holds
+          unsaved local edits in its own state, so unmounting it on a toggle to
+          Formatted would silently discard them. Keeping it mounted preserves
+          that state across any number of view switches. */}
+      <div className={view === 'formatted' ? undefined : 'hidden'}>
+        <MarkdownBlock content={content} />
+      </div>
+      <div className={view === 'raw' ? undefined : 'hidden'}>
+        <EditableCodeBlock code={content} lang={lang} complete={true} />
+      </div>
+    </div>
+  )
+})
+
 /** Try to extract a file path from chat text immediately preceding a diff
  * block. Tools sometimes emit "Created /path/to/file:" or "Modified ..."
  * before a bare diff with no +++/--- headers; this hint lets DiffBlock's
@@ -1608,13 +988,50 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode, markers }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean; markers?: RedactionMarkers }) {
+  const readOnlyCodeCtx = useContext(ReadOnlyCodeCtx)
+  // A fence holding lock tags renders them in place whatever its language:
+  // the diagram, diff and formatted-markdown renderers would show the
+  // placeholder without its tag and card (see RedactedCodeBlock).
+  if (
+    (block.type === 'code' || block.type === 'diff' || block.type === 'mermaid' || block.type === 'excalidraw')
+    && block.complete && markers && markers.ordinals.size > 0
+    && codeHasRedactionMarkers(block.content, markers.base, markers.credentials)
+  ) {
+    const lang = block.type === 'code' ? block.language : block.type
+    return <RedactedCodeBlock code={block.content} lang={lang} base={markers.base} />
+  }
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
         ? extractPathHintFromText(prevBlock.content)
         : undefined
-      const node = <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
+      // `collapseDiffs` is the CHAT TRANSCRIPT's opt-in, and only its opt-in.
+      // A fence in an assistant message is the model's own retelling of a
+      // change, and several of them bury the prose. Everywhere else this
+      // renderer is used — artifacts, specs, knowledge documents, the
+      // changelog, review reports — the patch IS the content, and collapsing
+      // it would take the text out of the DOM for find-in-page, whole-surface
+      // selection and printing.
+      //
+      // `foldKey` is slot + message + the fence's line, which is the identity
+      // the block list already keys on: stable across streaming, so an opened
+      // patch survives a re-mount. All THREE parts are required. Keyed on the
+      // line alone, two messages whose fences start on the same line would
+      // share one entry and open together; without the slot, a fork — which
+      // preserves the parent's message timestamps — would collide with the
+      // session it was forked from. Without a key the state is local, which
+      // only costs the re-mount memory.
+      const foldKey = slotKey != null && messageTs != null && block.startLine != null
+        ? `${slotKey}:${messageTs}:${block.startLine}`
+        : undefined
+      // A finalized fence that never closed may have swallowed the rest of the
+      // reply, so the chat must not leave it folded: the same chip stays
+      // mounted, opens itself and says why it looks wrong.
+      const node = !collapseDiffs
+        ? <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} />
+        : <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} foldKey={foldKey}
+            warning={block.unclosed ? i18nT('components.markdownRenderer.unclosed_diff_warning') : undefined} />
       // Smooth mode: wrap so the block height eases as lines arrive. The wrapper
       // is mounted for the whole message lifecycle (smooth is constant) so the
       // child never remounts when streaming flips to complete.
@@ -1631,30 +1048,70 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
         <div className="my-2 p-3 bg-bg-elevated border border-border rounded-md text-muted text-[12px] italic animate-pulse">{i18nT('components.markdownRenderer.generating_diagram')}</div>
       )
     case 'code': {
-      const node = <MonacoCodeBlock code={block.content} lang={block.language} complete={block.complete} />
-      // Height-grow only — streaming code is a single highlighted innerHTML blob
-      // (no per-line nodes), so per-line content animation isn't applied here.
+      // A ```markdown / ```md / ```mdx fence (or an untagged one that is
+      // clearly markdown, see isMarkdownBlock) is the "markdown content card":
+      // today it renders verbatim source with an edit affordance. In the chat
+      // transcript (`mdCardToggle`) give it a Formatted | Raw segmented control
+      // like tool detail cards carry, so long docs can be read rendered. Raw is
+      // the pre-toggle EditableCodeBlock, so the edit affordance stays Raw-only.
+      // Only fenced content whose CLOSE has arrived is offered a rendered view:
+      // a half-streamed markdown source would flip structure as delimiters land.
+      if (mdCardToggle && block.complete && isMarkdownBlock(block.language, block.content)) {
+        const mdNode = <MarkdownContentCard content={block.content} lang={block.language} />
+        return smooth ? <SmoothResize enabled={!block.complete}>{mdNode}</SmoothResize> : mdNode
+      }
+      // `readOnlyCode`: the content is a record the reader must not be able to
+      // touch -- an approval's command awaiting authorization. EditableCodeBlock's
+      // Raw scratch editor edits a local copy that is never written back, so a
+      // pencil there lets someone edit the block and then Approve the ORIGINAL
+      // command while looking at their edit. Plain CodeBlock keeps copy only.
+      const node = readOnlyCode || readOnlyCodeCtx
+        ? <CodeBlock code={block.content} lang={block.language} complete={block.complete} />
+        : <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
+      // Height-grow only — streaming code renders as one plain <pre> text node
+      // so per-line content animation isn't applied here.
       return smooth ? <SmoothResize enabled={!block.complete}>{node}</SmoothResize> : node
     }
     case 'widget':
       return block.complete
-        ? <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} widgetIndex={widgetIndex} slotKey={slotKey} />
+        ? <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} slotKey={slotKey} />
         : <WidgetPlaceholder title={block.language} />
     case 'markdown':
       // `live` = this block is the streaming tail (see MarkdownRenderer). ORed
       // with the block's own `complete` flag so a provisional block is treated
       // as live too, whatever produced it.
-      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} />
+      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} markers={markers} />
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false, blockedLinks, redactions, redactionCoach = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean; /** Raw `meta.blocked_links` off the assistant message — the step-3 suspicious-URL records this message's redaction placeholders render from. Validated here; absent/malformed leaves every placeholder as plain text. */ blockedLinks?: unknown; /** Raw `meta.redactions` off the assistant message: one record per credential placeholder, validated here. */ redactions?: unknown; /** This reply is the session's first with removed values: show the one-time coach after its first such block. */ redactionCoach?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
+  // One message = one config-rule scan pool. The blocks below each mount their
+  // OWN remark tree, so the rearm cannot live at the plugin's tree entry — a
+  // fence-heavy message would restore the pool once per block and multiply the
+  // 50ms ceiling by the block count. Render-phase on purpose (same discipline
+  // as ChatPage's registry write): the pool must be full before the first
+  // block's synchronous remark pass, and parent-then-children render order
+  // guarantees exactly that. Double-invoke under StrictMode is harmless — the
+  // pool is refilled before any drain either way.
+  rearmConfigScanBudget()
 
   /** Chip activation lives on the chip itself (see InlineCode); this handler is
-   *  only the artifact-link delegation it has always been. */
+   *  only link delegation: `#heading` jumps, `/artifacts/<slug>` links and
+   *  staged-dashboard links. */
   const handleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const el = e.target as HTMLElement
+    // `#heading` links scroll within THIS message, never the whole document:
+    // several renderers coexist and may repeat one heading.
+    const frag = e.defaultPrevented ? null : el.closest('a[href^="#"]')
+    if (frag) {
+      e.preventDefault()
+      let id = frag.getAttribute('href')!.slice(1)
+      try { id = decodeURIComponent(id) } catch { /* keep it raw */ }
+      Array.from(e.currentTarget.querySelectorAll('[id]')).find(n => n.id === id)?.scrollIntoView({ block: 'start' })
+      return
+    }
     // e.target may be an inline child of the `/artifacts/<slug>` anchor (e.g.
     // <em>/<code>), so walk up with closest(). preventDefault stops the
     // relative href from navigating full-page instead of opening the panel.
@@ -1669,31 +1126,91 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
         }
       }
     }
+    // A staged dashboard's link opens beside the chat, through the same host
+    // action. Only a PLAIN click: Cmd/Ctrl/Alt/Shift-click and middle-click keep
+    // the real href, so the browser can still open the URL itself.
+    if (onArtifactOpen && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      const anchor = el.closest('a[href]') as HTMLAnchorElement | null
+      const previewTarget = dashboardPreviewTargetFromHref(anchor?.getAttribute('href'))
+      if (previewTarget) {
+        e.preventDefault()
+        onArtifactOpen(dashboardPreviewRef(previewTarget))
+      }
+    }
   }, [onArtifactOpen])
+
+  // Repeated headings get GitHub's -1/-2 suffixes so each `#` link has one target.
+  // `ids` remembers each heading's [own slug, id written here]: an id that still
+  // equals what we wrote keeps its slug; anything else is React's fresh slug.
+  const rootRef = useRef<HTMLDivElement>(null)
+  const ids = useRef(new WeakMap<Element, [string, string]>())
+  useLayoutEffect(() => {
+    const seen = new Map<string, number>()
+    rootRef.current?.querySelectorAll('h1[id],h2[id],h3[id],h4[id],h5[id],h6[id]').forEach(h => {
+      const prev = ids.current.get(h)
+      const slug = prev && prev[1] === h.id ? prev[0] : h.id
+      const n = seen.get(slug) ?? 0
+      seen.set(slug, n + 1)
+      h.id = n ? `${slug}-${n}` : slug
+      ids.current.set(h, [slug, h.id])
+    })
+  })
 
   /** Stable identity so every chip in a long transcript doesn't re-render when
    *  this component does. */
   const pathActions = useMemo<PathActions>(() => ({ onFileOpen, onFolderOpen }), [onFileOpen, onFolderOpen])
-
-  // Pre-compute the widget index for each widget block (0-based ordinal of
-  // widgets within this message). WidgetFrame uses (messageTs, widgetIndex)
-  // to derive a stable slug when the agent didn't emit an explicit one, so
-  // bookmark state survives refreshes and prevents save→refresh duplicates.
-  // Memoized so each BlockRenderer gets a stable widgetIndex reference
-  // between renders, so it doesn't defeat memo() if anyone later wraps
-  // BlockRenderer.
-  //
-  // Must run before any conditional return — Rules of Hooks. (rawMode flips
-  // via a settings toggle which usually re-mounts this component anyway,
-  // but we keep hook order strict for safety.)
-  const widgetIndices = useMemo(() => {
-    const out: number[] = new Array(blocks.length).fill(-1)
-    let n = 0
-    for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i].type === 'widget') { out[i] = n; n++ }
-    }
-    return out
-  }, [blocks])
+  // The message's redaction records, validated once. The sets are what the
+  // injection pass gates on; the full records ride down through context.
+  // A host allowed from a card still open keeps that card's records here:
+  // the reloaded reply shows the host's links as plain links and no longer
+  // carries them.
+  const replyKey = slotKey && messageTs ? `${slotKey}|${messageTs}` : undefined
+  const holds = useAllowHolds(replyKey)
+  const ownBlocked = useMemo(() => normalizeBlockedLinks(blockedLinks), [blockedLinks])
+  const heldDomains = useMemo(() => {
+    const own = new Set(ownBlocked.map(r => r.domain))
+    return new Set([...holds.keys()].filter(d => !own.has(d)))
+  }, [ownBlocked, holds])
+  const blockedRecords = useMemo(
+    () => heldDomains.size ? [...ownBlocked, ...[...heldDomains].flatMap(d => holds.get(d)?.records ?? [])] : ownBlocked,
+    [ownBlocked, heldDomains, holds],
+  )
+  const credentialRecords = useMemo(() => normalizeCredentialRecords(redactions), [redactions])
+  const blockedDomains = useMemo(() => new Set(blockedRecords.map(r => r.domain)), [blockedRecords])
+  const credentialMap = useMemo(() => new Map(credentialRecords.map(r => [r.ordinal, r])), [credentialRecords])
+  const credentialOrdinals = useMemo(() => new Set(credentialMap.keys()), [credentialMap])
+  const sessionActions = useMemo<SessionActions>(
+    // The write time the SHORT-name chip needs. Absent, non-absolute, or
+    // unparseable yields undefined, and a short name then resolves to NOTHING —
+    // fail closed, because this is compared against server-clock slot mint epochs
+    // and a wrong comparison opens the wrong conversation silently.
+    //
+    // Validated, not trusted: `messageTs` is DECLARED `string` but crosses an API
+    // boundary that does not enforce it, and the transcript endpoint really does
+    // send epoch NUMBERS (see the fixture in `playwright/voice-recovery.spec.ts`).
+    // Calling a string method on that value threw and blanked the transcript, so
+    // the shape is checked here rather than assumed.
+    //
+    // A number is an epoch and already absolute; `toDate` owns the
+    // seconds-vs-milliseconds rule for the whole app, so it is not re-guessed here.
+    // A STRING has to carry `Z` or an explicit `±HH:MM`: `Date.parse('2026-09-11T23:39:00')`
+    // reads a bare local time, so the same row would mean a different instant per
+    // viewer timezone, and a viewer behind UTC shifts it forward far enough to let a
+    // slot minted after the row pass the check.
+    () => {
+      const raw: unknown = messageTs
+      const absolute = typeof raw === 'number'
+        || (typeof raw === 'string' && /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw.trim()))
+      const when = absolute ? toDate(raw as string | number) : null
+      return {
+        onSessionOpen,
+        sessions,
+        activeSession,
+        writtenAtEpoch: when ? Math.floor(when.getTime() / 1000) : undefined,
+      }
+    },
+    [onSessionOpen, sessions, activeSession, messageTs],
+  )
 
   // Index of the last markdown block — the streaming tail that gets the glow
   // (only when `glow` is set). -1 if the message ends in a non-markdown block.
@@ -1701,6 +1218,17 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i].type === 'markdown') return i
     return -1
   }, [blocks])
+  // Each block renders its own sub-document, so the credential ordinal its
+  // first tag carries is the count of tags in every block before it.
+  const blockMarkers = useMemo<Array<RedactionMarkers | undefined>>(() => {
+    if (credentialOrdinals.size === 0 && blockedDomains.size === 0) return blocks.map(() => undefined)
+    let base = 0
+    return blocks.map((b, block) => {
+      const m: RedactionMarkers = { ordinals: credentialOrdinals, domains: blockedDomains, held: heldDomains, credentials: credentialMap, base, block }
+      base += countCredentialTags(b.content)
+      return m
+    })
+  }, [blocks, credentialOrdinals, blockedDomains, heldDomains, credentialMap])
 
   // Settle the reveal edge once the content stops changing, and NEVER un-settle
   // it. One-way is the whole point: `.ft-word` spans persist across chunks
@@ -1737,23 +1265,35 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   // re-mounts don't re-fade.
   const animOn = !!smooth
   const animClass = animOn ? ' ft-anim-smooth' : ''
-  // `ft-idle` is folded into streamClass rather than interpolated separately so
-  // the root element below stays byte-identical to base. The repo's
-  // accessible-interactive-elements rule greps ADDED lines for a non-role div or
-  // span carrying a click handler (check-added: true), so merely re-touching that
-  // line trips a WCAG-affordance gate even though this change adds no affordance
-  // -- the element and its handler are untouched.
+  // The root tag below is laid out one attribute per line: the repo's
+  // accessible-interactive-elements rule greps ADDED lines for a non-role div
+  // or span carrying a click handler (check-added: true), so an attribute can
+  // join the tag only if no single added line holds both the element and its
+  // handler. The element, its class list and its delegating handler are the
+  // base's; `data-tip-flow` is the one addition.
   const streamClass =
     (animOn && streaming ? ' ft-streaming' : '') +
     (animOn && revealIdle ? ' ft-idle' : '')
 
   return (
     // Presentational content wrapper for rendered markdown blocks. The onClick is
-    // pure event delegation for `/artifacts/<slug>` links only — path chips bind
+    // pure event delegation for `#heading` and `/artifacts/<slug>` links — path chips bind
     // their own handlers (see InlineCode), so this wrapper is not an interactive
-    // control and carries no role.
+    // control and carries no role. `data-image-scope` is the lightbox's grouping
+    // root; `data-tip-flow` is the InstantTip flow container (one rendered
+    // message, so a chip's bubble opens off the words it reports on) — two
+    // attributes on the one per-message root, each owned by its feature.
+    // `data-guide-untrusted`: authored content is never a guide target.
     // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
-    <div className={`group${animClass}${streamClass}`} onClick={handleClick} data-image-scope="">
+    <div
+      ref={rootRef}
+      className={`group${animClass}${streamClass}`}
+      onClick={handleClick}
+      data-image-scope=""
+      data-tip-flow=""
+      // Authored content: nothing in it is a control a guide points at.
+      {...guideUntrusted}
+    >
       {/* PathProbeCtx: suppress path stat probes while the message is still
           streaming, so partial paths ('/Users' en route to '/Users/me/x.ts')
           neither burn requests nor flash the wrong affordance.
@@ -1761,16 +1301,22 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           module-level, so the renderer cannot pass these down as props. */}
       <PathProbeCtx.Provider value={!streaming}>
       <PathActionCtx.Provider value={pathActions}>
+      <SessionActionCtx.Provider value={sessionActions}>
       {/* CompactImagesCtx: user-message ("sent prompt") callers pass compactImages
           so their attached images render as small previews. The provider wraps the
           blocks here (a context Provider renders no DOM node, so data-image-scope /
           lightbox scoping on the div above is unaffected) and lives in this module
           so a caller that mocks it in tests never needs to re-export the context. */}
       <CompactImagesCtx.Provider value={compactImages}>
+      {/* Remote media is always click-to-load; deferral is unconditional inline. */}
       {/* ImageVersionCtx: scopes local image URLs to this message so an agent
           rewriting one file across turns is not served the previous bytes from
           the in-document resource cache. */}
       <ImageVersionCtx.Provider value={messageTs ?? null}>
+      {/* RedactionProvider: this reply's credential and blocked-link records,
+          and which of their cards is open. A Provider renders no DOM node, so
+          the scoping on the wrapper div above is unaffected. */}
+      <RedactionProvider credentials={credentialRecords} blockedLinks={blockedRecords} slotKey={slotKey} replyKey={replyKey} messageTs={messageTs} coached={redactionCoach && credentialRecords.length > 0}>
         {blocks.map((block, i) => (
           // Key on startLine (stable across streaming) instead of block.type, so
           // a code -> diff reclassification mid-stream doesn't unmount the
@@ -1781,7 +1327,6 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             key={block.startLine != null ? `line-${block.startLine}` : `idx-${i}`}
             block={block} prevBlock={blocks[i - 1]} onFileOpen={onFileOpen} sourcePos={sourcePos}
             messageTs={messageTs}
-            widgetIndex={widgetIndices[i] >= 0 ? widgetIndices[i] : undefined}
             slotKey={slotKey}
             glow={glow && i === lastMarkdownIdx}
             // Same gate `glow` uses — the last markdown block of a streaming
@@ -1793,289 +1338,18 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             unfurl={linkPreviews}
             smooth={smooth}
             softBreaks={softBreaks}
+            collapseDiffs={collapseDiffs}
+            mdCardToggle={mdCardToggle}
+            readOnlyCode={readOnlyCode}
+            markers={blockMarkers[i]}
           />
         ))}
+      </RedactionProvider>
       </ImageVersionCtx.Provider>
       </CompactImagesCtx.Provider>
+      </SessionActionCtx.Provider>
       </PathActionCtx.Provider>
       </PathProbeCtx.Provider>
     </div>
   )
 })
-
-type LightboxImage = { src: string; alt: string }
-type LightboxDetail = { images: LightboxImage[]; index: number }
-
-/** Lightbox zoom (enlarge) bounds. `1` is fit-to-screen; each step scales the
- *  fit box up so the image can overflow the viewport and be panned via the
- *  scrollable overlay. */
-const LIGHTBOX_ZOOM_MIN = 1
-const LIGHTBOX_ZOOM_MAX = 5
-const LIGHTBOX_ZOOM_STEP = 0.5
-
-/** True when a keyboard event originates from an editable element, so global
- *  printable-key shortcuts (like the lightbox 'd' download) don't hijack typing. */
-function isEditableTarget(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null
-  if (!el || typeof el.tagName !== 'string') return false
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true
-}
-
-/** Derive a download filename for a lightbox image. Local images are served
- *  as `/api/file-raw?path=<abs>`, so prefer the basename of that path; for
- *  other URLs fall back to the pathname basename, then the alt text. */
-function lightboxFilename(image: LightboxImage): string {
-  try {
-    const u = new URL(image.src, window.location.href)
-    const p = u.searchParams.get('path')
-    const fromPath = p ? p.split(/[\\/]/).pop() : ''
-    if (fromPath) return fromPath
-    const fromName = u.pathname.split('/').pop()
-    if (fromName && fromName.includes('.')) return decodeURIComponent(fromName)
-  } catch {
-    // image.src is not a parseable URL (e.g. a bare data: payload) -- fall through.
-  }
-  const altName = (image.alt || '').trim().replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '')
-  return altName || 'image'
-}
-
-/** Download the given lightbox image to the user's machine. Fetches the
- *  already-served bytes (same-origin for /api/file-raw, or data:/blob:) into a
- *  blob and triggers a browser download. If the fetch is blocked (e.g. a
- *  cross-origin remote image with no CORS), falls back to opening the image in
- *  a new tab so the user can save it manually. */
-async function downloadLightboxImage(image: LightboxImage): Promise<void> {
-  const name = lightboxFilename(image)
-  try {
-    const res = await fetch(image.src)
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const blob = await res.blob()
-    const objUrl = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = objUrl
-    a.download = name
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(objUrl), 1000)
-  } catch {
-    window.open(image.src, '_blank', 'noopener,noreferrer')
-  }
-}
-
-/** Build the lightbox payload for an image click. The set is "all images
- *  inside the nearest [data-image-scope] ancestor"; for markdown messages
- *  that's a MarkdownRenderer instance (one per chat message), and for the
- *  chat-input thumbnail strip it's the strip's outer div. */
-export function dispatchLightbox(target: HTMLImageElement): void {
-  const scope = target.closest('[data-image-scope]') as HTMLElement | null
-  let detail: LightboxDetail = { images: [{ src: target.src, alt: target.alt }], index: 0 }
-  if (scope) {
-    const els = Array.from(scope.querySelectorAll<HTMLImageElement>('img[data-lightbox-image]'))
-    if (els.length > 0) {
-      detail = {
-        images: els.map(el => ({ src: el.src, alt: el.alt })),
-        index: Math.max(0, els.indexOf(target)),
-      }
-    }
-  }
-  window.dispatchEvent(new CustomEvent('lightbox', { detail }))
-}
-
-/** Lightbox overlay -- mount once in the app, listens for 'lightbox' custom
- *  events. Escape closes; ArrowLeft/ArrowRight navigate within the image set
- *  (clamped at the ends). Accepts both the structured { images, index }
- *  payload and the legacy { src, alt } single-image shape. */
-export function Lightbox() {
-  const [state, setState] = useState<LightboxDetail | null>(null)
-  // Zoom (enlarge) factor for the current image. 1 = fit-to-screen; larger
-  // values scale the fit box up so the image overflows into the scrollable
-  // overlay. Reset to 1 whenever the shown image changes (see effect below).
-  const [zoom, setZoom] = useState(1)
-  const zoomIn = useCallback(() => setZoom(z => Math.min(LIGHTBOX_ZOOM_MAX, +(z + LIGHTBOX_ZOOM_STEP).toFixed(2))), [])
-  const zoomOut = useCallback(() => setZoom(z => Math.max(LIGHTBOX_ZOOM_MIN, +(z - LIGHTBOX_ZOOM_STEP).toFixed(2))), [])
-  // Pan offset (px) for dragging an enlarged image around. Only meaningful when
-  // zoom > 1. The image element itself is the drag surface; a small movement
-  // threshold distinguishes a pan-drag from a click (which steps the zoom).
-  const [pan, setPan] = useState({ x: 0, y: 0 })
-  const imgRef = useRef<HTMLImageElement>(null)
-  const dragRef = useRef({ startX: 0, startY: 0, baseX: 0, baseY: 0, moved: 0, active: false, dragging: false })
-  const [dragging, setDragging] = useState(false)
-  // Live zoom for the pointer/clamp closures (avoids stale-closure math in the
-  // fire-and-forget pointer handlers and the post-layout re-clamp effect).
-  const zoomRef = useRef(zoom)
-  zoomRef.current = zoom
-  // Clamp a candidate pan so the image can't be flung entirely off-screen. Zoom
-  // is applied as a CSS `scale()` transform, so the *visual* size is the layout
-  // box (offsetWidth/Height) times the current zoom; travel is allowed up to
-  // half that overflow beyond the viewport.
-  const clampPan = useCallback((x: number, y: number) => {
-    const el = imgRef.current
-    if (!el) return { x, y }
-    const z = zoomRef.current
-    const maxX = Math.max(0, (el.offsetWidth * z - window.innerWidth) / 2)
-    const maxY = Math.max(0, (el.offsetHeight * z - window.innerHeight) / 2)
-    return { x: Math.min(maxX, Math.max(-maxX, x)), y: Math.min(maxY, Math.max(-maxY, y)) }
-  }, [])
-  // End a drag on either pointerup OR pointercancel (touch/pen interrupted, or
-  // capture lost) so `active`/`dragging` never latch on with no contact held.
-  const endDrag = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
-    const d = dragRef.current
-    if (d.active) { try { e.currentTarget.releasePointerCapture(e.pointerId) } catch { /* no capture */ } }
-    d.active = false
-    if (d.dragging) { d.dragging = false; setDragging(false) }
-  }, [])
-  // Keep a fresh ref so the global keydown handler (subscribed once per open)
-  // can read the current image for the download shortcut without a stale closure.
-  const stateRef = useRef<LightboxDetail | null>(null)
-  stateRef.current = state
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as Partial<LightboxDetail> & Partial<LightboxImage> | undefined
-      if (!detail) { setState(null); return }
-      if (Array.isArray(detail.images) && detail.images.length > 0) {
-        const raw = Number.isInteger(detail.index) ? (detail.index as number) : 0
-        const idx = Math.max(0, Math.min(raw, detail.images.length - 1))
-        setState({ images: detail.images, index: idx })
-      } else if (typeof detail.src === 'string') {
-        setState({ images: [{ src: detail.src, alt: detail.alt || '' }], index: 0 })
-      }
-    }
-    window.addEventListener('lightbox', handler)
-    return () => window.removeEventListener('lightbox', handler)
-  }, [])
-  const isOpen = state !== null
-  // Reset the zoom whenever the lightbox opens/closes or the shown image
-  // changes, so each image starts fit-to-screen rather than inheriting the
-  // previous one's zoom.
-  useEffect(() => { setZoom(LIGHTBOX_ZOOM_MIN) }, [isOpen, state?.index])
-  // On any zoom change, recentre at fit and otherwise re-clamp the existing pan
-  // to the new (smaller/larger) bounds — zooming out must not strand the image
-  // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
-  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan])
-  useEffect(() => {
-    if (!isOpen) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        setState(null)
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault()
-        setState(s => (s && s.index > 0 ? { ...s, index: s.index - 1 } : s))
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault()
-        setState(s => (s && s.index < s.images.length - 1 ? { ...s, index: s.index + 1 } : s))
-      } else if ((e.key === '+' || e.key === '=') && !isEditableTarget(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault()
-        zoomIn()
-      } else if ((e.key === '-' || e.key === '_') && !isEditableTarget(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault()
-        zoomOut()
-      } else if (e.key === '0' && !isEditableTarget(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault()
-        setZoom(LIGHTBOX_ZOOM_MIN)
-      } else if ((e.key === 'd' || e.key === 'D') && !isEditableTarget(e.target)) {
-        e.preventDefault()
-        const cur = stateRef.current
-        if (cur) void downloadLightboxImage(cur.images[cur.index])
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [isOpen, zoomIn, zoomOut])
-  if (!state) return null
-  const img = state.images[state.index]
-  const zoomed = zoom > LIGHTBOX_ZOOM_MIN
-  return (
-    <Clickable className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center overflow-hidden cursor-pointer" onClick={() => setState(null)}>
-      {/* Inner wrapper centres the image; when enlarged, the image is dragged
-          around via a translate transform (see pointer handlers) rather than
-          scrollbars — a flex-centred overflow container can't scroll to its
-          hidden top/left edges, so drag-to-pan is the reliable mechanism. */}
-      <div className="flex items-center justify-center w-full h-full">
-        {/* The image is a drag surface for panning when zoomed; zoom itself
-            lives in the toolbar + keyboard. A plain click only stops the
-            backdrop-close from firing (clicking the image should not dismiss
-            the viewer). Escape / the toolbar buttons are the keyboard paths,
-            so this presentational <img> needs no key handler. */}
-        {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
-        <img
-          ref={imgRef}
-          src={img.src}
-          alt={img.alt}
-          draggable={false}
-          className={`select-none object-contain rounded-lg shadow-2xl ${dragging ? '' : 'transition-transform duration-150'} ${zoomed ? (dragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-default'}`}
-          style={{ maxWidth: '90vw', maxHeight: '90vh', transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: 'center' }}
-          onDragStart={e => e.preventDefault()}
-          onPointerDown={e => {
-            if (zoom <= LIGHTBOX_ZOOM_MIN) return // nothing to pan at fit
-            e.preventDefault()
-            try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* unsupported */ }
-            dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: pan.x, baseY: pan.y, moved: 0, active: true, dragging: false }
-          }}
-          onPointerMove={e => {
-            const d = dragRef.current
-            if (!d.active) return
-            const dx = e.clientX - d.startX
-            const dy = e.clientY - d.startY
-            d.moved = Math.max(d.moved, Math.hypot(dx, dy))
-            if (d.moved > 4 && !d.dragging) { d.dragging = true; setDragging(true) }
-            setPan(clampPan(d.baseX + dx, d.baseY + dy))
-          }}
-          onPointerUp={endDrag}
-          onPointerCancel={endDrag}
-          onClick={e => { e.stopPropagation() }}
-        />
-      </div>
-      {/* Control cluster sits on its own translucent, blurred pill so the
-          white icons stay legible even when a light/enlarged image is panned
-          up behind the toolbar. */}
-      <div className="fixed top-4 right-4 flex items-center gap-0.5 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-1 py-1">
-        {/* Zoom segment: − / reset (magnifier) / + always visible as a group. */}
-        <button
-          aria-label={i18nT('components.markdownRenderer.zoom_out')}
-          title={i18nT('components.markdownRenderer.zoom_out')}
-          disabled={zoom <= LIGHTBOX_ZOOM_MIN}
-          className="text-white/90 hover:text-white p-1.5 rounded-full hover:bg-white/15 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-          onClick={(e) => { e.stopPropagation(); zoomOut() }}
-        >
-          <Minus className="lucide-inline" aria-hidden="true" />
-        </button>
-        <button
-          aria-label={i18nT('components.markdownRenderer.reset_zoom')}
-          title={i18nT('components.markdownRenderer.reset_zoom')}
-          disabled={zoom <= LIGHTBOX_ZOOM_MIN}
-          className="text-white/90 hover:text-white p-1.5 rounded-full hover:bg-white/15 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-          onClick={(e) => { e.stopPropagation(); setZoom(LIGHTBOX_ZOOM_MIN) }}
-        >
-          <Search className="lucide-inline" aria-hidden="true" />
-        </button>
-        <button
-          aria-label={i18nT('components.markdownRenderer.zoom_in')}
-          title={i18nT('components.markdownRenderer.zoom_in')}
-          disabled={zoom >= LIGHTBOX_ZOOM_MAX}
-          className="text-white/90 hover:text-white p-1.5 rounded-full hover:bg-white/15 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-          onClick={(e) => { e.stopPropagation(); zoomIn() }}
-        >
-          <Plus className="lucide-inline" aria-hidden="true" />
-        </button>
-        <span className="w-px h-5 bg-white/20 mx-0.5" aria-hidden="true" />
-        <button
-          aria-label={i18nT('components.markdownRenderer.download_image')}
-          title={i18nT('components.markdownRenderer.download_d')}
-          className="text-white/90 hover:text-white p-1.5 rounded-full hover:bg-white/15 transition-colors"
-          onClick={(e) => { e.stopPropagation(); void downloadLightboxImage(img) }}
-        >
-          <Download className="lucide-inline" aria-hidden="true" />
-        </button>
-        <button
-          aria-label={i18nT('components.markdownRenderer.close')}
-          className="text-white/90 hover:text-white p-1.5 rounded-full hover:bg-white/15 transition-colors"
-          onClick={() => setState(null)}
-        >
-          <X className="lucide-inline" aria-hidden="true" />
-        </button>
-      </div>
-    </Clickable>
-  )
-}

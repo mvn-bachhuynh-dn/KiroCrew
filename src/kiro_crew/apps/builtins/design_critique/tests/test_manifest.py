@@ -36,9 +36,6 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[6]
 APP_JSON = APP_ROOT / "app.json"
 
-# Where the frontend serves /app-assets/** from.
-APP_ASSETS_DIR = REPO_ROOT / "website" / "public" / "app-assets" / "design-critique"
-
 APP_NAME = "design-critique"
 
 # The dashboard's BuiltinAppRoute resolves a SINGLE path param; its guard regex
@@ -47,7 +44,9 @@ APP_NAME = "design-critique"
 # but then silently redirect to chat, shipping a dead nav entry.
 ROUTE_GUARD_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._~-]*$")
 
-# The five automation scripts the skill ships and the docs it depends on.
+# The six automation scripts the skill ships and the docs it depends on.
+# ssrf-guard.mjs is imported by capture-build.mjs and capture-site.mjs, so a
+# package without it ships captures that fail at import time.
 _SKILL_REQUIRED_FILES = (
     "SKILL.md",
     "frameworks/main-checklist.md",
@@ -56,6 +55,7 @@ _SKILL_REQUIRED_FILES = (
     "scripts/discover-routes.mjs",
     "scripts/ensure-playwright.mjs",
     "scripts/render.mjs",
+    "scripts/ssrf-guard.mjs",
 )
 
 # The asset URLs declared in app.json, keyed by manifest field name.

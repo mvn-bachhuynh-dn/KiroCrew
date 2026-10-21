@@ -20,10 +20,10 @@ import re
 import stat as stat_mod
 import time
 from pathlib import Path
-from typing import Any, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
+from kiro_crew.json_line import parse_json_object_line
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +36,6 @@ _SPILL_DIR_NAME = "mcp_spill"
 
 # Max age (seconds) for spill files — older ones are cleaned on startup.
 _SPILL_MAX_AGE_SECS = 24 * 60 * 60  # 24 hours
-
-# Regex to extract a JSON-RPC id from the first ~4 KiB of a drained oversize
-# chunk. Handles both string ids ("id":"some-string") and integer ids (id:42).
-_ID_REGEX = re.compile(rb'"id"\s*:\s*("(?:[^"\\]|\\.)*?"|\d+)')
 
 
 def _spill_dir() -> Path:
@@ -55,15 +51,22 @@ def _sanitize_server_name(name: str) -> str:
 def cleanup_old_spill_files() -> int:
     """Delete spill files older than 24h. Returns count deleted. Best-effort.
 
-    Symlink-hardened: ``is_dir()``/``is_file()``/``stat()`` all FOLLOW
+    Link-hardened: ``is_dir()``/``is_file()``/``stat()`` all FOLLOW
     symlinks, so an agent that swapped the spill dir (or planted a link
     inside it) could otherwise aim this sweep at an arbitrary directory and
     have the gateway delete 24h-old files there (confused deputy). The dir
     itself and every entry are checked with lstat semantics; links are
     skipped, never followed.
+
+    ``is_link_or_junction``, not ``Path.is_symlink()``: a Windows directory
+    JUNCTION is a reparse point ``is_symlink()`` answers False for while
+    ``is_dir()`` answers True, and it is the only directory link an
+    unprivileged Windows writer can plant. An ``is_symlink()`` guard let a
+    junction at the spill dir name through, so the sweep followed it and
+    deleted 24h-old files under the junction's target.
     """
     spill_dir = _spill_dir()
-    if spill_dir.is_symlink() or not spill_dir.is_dir():
+    if platform_compat.is_link_or_junction(spill_dir) or not spill_dir.is_dir():
         return 0
     now = time.time()
     deleted = 0
@@ -85,28 +88,6 @@ def cleanup_old_spill_files() -> int:
     return deleted
 
 
-def extract_id_from_bytes(data: bytes) -> Optional[Any]:
-    """Parse the JSON-RPC 'id' field from the first ~4 KiB of raw bytes.
-
-    Returns the id value (str or int) or None if unparseable.
-    """
-    prefix = data[:4096]
-    m = _ID_REGEX.search(prefix)
-    if m is None:
-        return None
-    raw = m.group(1)
-    if raw.startswith(b'"'):
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-    else:
-        try:
-            return int(raw)
-        except ValueError:
-            return None
-
-
 def maybe_spill_response(
     line: bytes,
     server_name: str,
@@ -120,13 +101,9 @@ def maybe_spill_response(
     if len(line) <= threshold_bytes:
         return line
 
-    try:
-        msg = json.loads(line.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return line  # not JSON — pass through
-
-    if not isinstance(msg, dict):
-        return line
+    msg = parse_json_object_line(line)
+    if msg is None:
+        return line  # not a JSON object — pass through
 
     # Only spill tool/call results (has result.content list with text items)
     result = msg.get("result")
@@ -153,10 +130,13 @@ def maybe_spill_response(
         filename = f"{safe_server}-{request_id}-{timestamp}.json"
 
         spill_dir = _spill_dir()
-        # Never operate through a symlinked spill dir (agent-swappable): an
+        # Never operate through a linked spill dir (agent-swappable): an
         # attacker-planted link would redirect the write outside the data home.
-        if spill_dir.is_symlink():
-            logger.warning("spill dir is a symlink — refusing to spill")
+        # ``is_link_or_junction``, not ``Path.is_symlink()``: a Windows directory
+        # JUNCTION is a reparse point ``is_symlink()`` answers False for, and it
+        # is the only directory link an unprivileged Windows writer can plant.
+        if platform_compat.is_link_or_junction(spill_dir):
+            logger.warning("spill dir is a link — refusing to spill")
             return line
         # Not a bare mkdir(mode=0o700): that is umask-masked, is ignored for
         # an already-existing directory, and is inert on Windows -- yet this

@@ -1,4 +1,4 @@
-"""Regression tests for CSE scan findings 2026-08-05.
+"""Security invariants for a batch of CSE scan findings.
 
 SEC-3F9C863A: search_for_context limit must be server-clamped
 SEC-8746A074: Teams/Webex must not log raw email addresses
@@ -26,9 +26,9 @@ class TestSearchForContextLimitCap:
     """The limit query param must be clamped to [1, 100]."""
 
     def _parse_limit_from_source(self):
-        """Extract the limit clamp from knowledge.py source to verify it's bounded."""
+        """Extract the limit clamp from knowledge_agent_context.py source to verify it's bounded."""
         src = (Path(__file__).resolve().parent.parent
-               / "src" / "kiro_crew" / "dashboard" / "handlers" / "knowledge.py")
+               / "src" / "kiro_crew" / "dashboard" / "handlers" / "knowledge_agent_context.py")
         text = src.read_text(encoding="utf-8")
         # Find the search_for_context function's limit line
         match = re.search(r'limit\s*=\s*min\((\d+),\s*max\((\d+),', text)

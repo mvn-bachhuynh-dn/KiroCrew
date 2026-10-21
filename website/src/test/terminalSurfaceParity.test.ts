@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 
 /**
  * The terminal is reachable from two places — the docked bottom panel and a chat
@@ -45,7 +45,7 @@ describe('terminal surface parity', () => {
     // terminal implementation, and the completion menu would not follow it.
     const sites = files
       .filter(f => /new Terminal\s*\(/.test(readFileSync(f, 'utf8')))
-      .map(f => f.slice(SRC.length + 1))
+      .map(f => relative(SRC, f).split(sep).join('/'))
     expect(sites).toEqual(['components/CliPanel.tsx'])
   })
 
@@ -57,7 +57,7 @@ describe('terminal surface parity', () => {
     // Docked bottom panel and chat side-panel tab. Both render the shared host,
     // so both get path completion AND the command tier with no per-surface wiring.
     expect(read('components/BottomTerminalPanel.tsx')).toMatch(/CliPanel/)
-    expect(read('pages/chat/SidePanel.tsx')).toMatch(/<CliPanel\b/)
+    expect(read('pages/chat/SidePanelTabBodies.tsx')).toMatch(/<CliPanel\b/)
   })
 
   it('passes the session id and visibility through to the completion menu', () => {

@@ -1,4 +1,4 @@
-"""Tests for deploy Round 14 fixes.
+"""Tests for three deploy fixes.
 
 F1: reaper.sh must not treat transient CloudFront errors as "distribution
     gone" (only NoSuchDistribution may fall through to bucket/OAC deletion).
@@ -13,7 +13,10 @@ import re
 from pathlib import Path
 
 SRC = Path(__file__).parent.parent / "src" / "kiro_crew"
-HANDLERS = (SRC / "deploy" / "handlers.py").read_text(encoding="utf-8")
+HANDLERS = "".join(
+    (SRC / "deploy" / name).read_text(encoding="utf-8")
+    for name in ("handlers_guards.py", "handlers_content.py", "handlers_sites.py", "handlers.py")
+)
 REAPER_SH = (
     SRC / "deploy" / "skills" / "artifact-deploy" / "scripts" / "reaper.sh"
 ).read_text(encoding="utf-8")

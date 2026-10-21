@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
+import { SIDE_PANEL_HEIGHT_KEY, SIDE_PANEL_WIDTH_KEY, sidePanelDimKey } from '../pages/chat/sidePanelWidth'
 import { gcOrphanedStorage, gcSessionStorage } from './storageGc'
 
 /**
@@ -31,6 +32,7 @@ const HEIGHTS = 'vc_heights_'
 const TOUCHED = 'kirocrew:touched-files:'
 const PANEL_TABS = 'mc-panel-tabs:'
 const ACTIVITY = 'mc-activity-open:'
+const DASHBOARD_DISMISSED = 'mc-task-dashboard-dismissed:'
 
 describe('gcOrphanedStorage', () => {
   beforeEach(() => {
@@ -137,6 +139,18 @@ describe('gcOrphanedStorage', () => {
     })
   })
 
+  it('collects an orphaned dashboard-dismissed flag and keeps a live one', () => {
+    // The retired status-tile dock wrote one flag per slot on click, and a
+    // browser that ran it still holds them. Without this family in
+    // SESSION_PREFIXES every dismissed session left a key behind.
+    localStorage.setItem(`${DASHBOARD_DISMISSED}chat-1-1`, '1')
+    localStorage.setItem(`${DASHBOARD_DISMISSED}chat-2-2`, '1')
+
+    expect(gcOrphanedStorage(new Set(['chat-2-2']))).toBe(1)
+    expect(localStorage.getItem(`${DASHBOARD_DISMISSED}chat-1-1`)).toBeNull()
+    expect(localStorage.getItem(`${DASHBOARD_DISMISSED}chat-2-2`)).toBe('1')
+  })
+
   it('does not delete a key whose remainder is empty', () => {
     // `vc_heights_` with nothing after it yields '' — falsy, so it is skipped
     // rather than deleted as an orphan of the empty session.
@@ -171,22 +185,104 @@ describe('gcSessionStorage', () => {
     expect(localStorage.getItem(`${HEIGHTS}chat-1-1`)).toBe('{}')
   })
 
+  it('removes the dashboard-dismissed flag of the deleted session only', () => {
+    localStorage.setItem(`${DASHBOARD_DISMISSED}chat-1-1`, '1')
+    localStorage.setItem(`${DASHBOARD_DISMISSED}chat-1-10`, '1')
+
+    gcSessionStorage('chat-1-1')
+
+    expect(localStorage.getItem(`${DASHBOARD_DISMISSED}chat-1-1`)).toBeNull()
+    expect(localStorage.getItem(`${DASHBOARD_DISMISSED}chat-1-10`)).toBe('1')
+  })
+
   it('is a no-op for an empty session key', () => {
     localStorage.setItem(`${HEIGHTS}chat-1-1`, '{}')
     gcSessionStorage('')
     expect(localStorage.getItem(`${HEIGHTS}chat-1-1`)).toBe('{}')
   })
 
-  it('matches on prefix, so a longer sibling key is also removed', () => {
-    // `startsWith(prefix + sessionKey)` is a PREFIX test, not equality: a
-    // session id that is a prefix of another id collects the other one's keys
-    // too. Pinned so the blast radius is known rather than discovered.
+  it('stops at a boundary, so a longer sibling key survives', () => {
+    // The session id has to end where the key ends or at a ':' delimiter.
+    // Without that boundary, deleting a slot whose id prefixes a live
+    // sibling's id takes the sibling's state with it.
     localStorage.setItem(`${HEIGHTS}chat-1-1`, '{}')
     localStorage.setItem(`${HEIGHTS}chat-1-10`, '{}')
 
     gcSessionStorage('chat-1-1')
 
     expect(localStorage.getItem(`${HEIGHTS}chat-1-1`)).toBeNull()
-    expect(localStorage.getItem(`${HEIGHTS}chat-1-10`)).toBeNull()
+    expect(localStorage.getItem(`${HEIGHTS}chat-1-10`)).toBe('{}')
+  })
+
+  it('spares the parked slot-less preference but not a same-named slot\u2019s other state', () => {
+    localStorage.setItem('mc-busy-send-mode:no-slot', 'steer')
+    localStorage.setItem(`${HEIGHTS}no-slot`, '{}')
+
+    gcSessionStorage('no-slot')
+
+    // Belongs to no slot, so no slot's teardown owns it.
+    expect(localStorage.getItem('mc-busy-send-mode:no-slot')).toBe('steer')
+    // A real slot sharing the sentinel's name still loses what it does own,
+    // or deleting and recreating it would restore stale caches.
+    expect(localStorage.getItem(`${HEIGHTS}no-slot`)).toBeNull()
+  })
+
+  it('removes a per-slot send-mode preference without touching a sibling', () => {
+    localStorage.setItem('mc-busy-send-mode:foo', 'queue')
+    localStorage.setItem('mc-busy-send-mode:foobar', 'steer')
+    localStorage.setItem('mc-busy-send-mode:no-slot', 'steer')
+
+    gcSessionStorage('foo')
+
+    expect(localStorage.getItem('mc-busy-send-mode:foo')).toBeNull()
+    expect(localStorage.getItem('mc-busy-send-mode:foobar')).toBe('steer')
+    // The slot-less sentinel belongs to no session.
+    expect(localStorage.getItem('mc-busy-send-mode:no-slot')).toBe('steer')
+  })
+})
+
+describe('per-chat side panel size keys', () => {
+  // Keys are built with the real writer, so a writer that drifts from the
+  // prefixes in SESSION_PREFIXES turns these tests red instead of leaking.
+  const widthOf = (slot: string) => sidePanelDimKey(SIDE_PANEL_WIDTH_KEY, slot)
+  const heightOf = (slot: string) => sidePanelDimKey(SIDE_PANEL_HEIGHT_KEY, slot)
+
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  it('the boot sweep removes a gone chat\'s width and height and keeps a live one\'s', () => {
+    localStorage.setItem(widthOf('chat-1-1'), '520')
+    localStorage.setItem(heightOf('chat-1-1'), '300')
+    localStorage.setItem(widthOf('chat-2-2'), '640')
+    localStorage.setItem(heightOf('chat-2-2'), '410')
+
+    expect(gcOrphanedStorage(new Set(['chat-2-2']))).toBe(2)
+    expect(localStorage.getItem(widthOf('chat-1-1'))).toBeNull()
+    expect(localStorage.getItem(heightOf('chat-1-1'))).toBeNull()
+    expect(localStorage.getItem(widthOf('chat-2-2'))).toBe('640')
+    expect(localStorage.getItem(heightOf('chat-2-2'))).toBe('410')
+  })
+
+  it('deleting a chat removes its sizes without touching a sibling whose id extends it', () => {
+    localStorage.setItem(widthOf('foo'), '520')
+    localStorage.setItem(heightOf('foo'), '300')
+    localStorage.setItem(widthOf('foobar'), '640')
+
+    gcSessionStorage('foo')
+
+    expect(localStorage.getItem(widthOf('foo'))).toBeNull()
+    expect(localStorage.getItem(heightOf('foo'))).toBeNull()
+    expect(localStorage.getItem(widthOf('foobar'))).toBe('640')
+  })
+
+  it('never collects the bare fallback size every chat reads', () => {
+    // An empty slot writes the bare key; it belongs to no chat.
+    localStorage.setItem(widthOf(''), '480')
+    localStorage.setItem(heightOf(''), '260')
+
+    expect(gcOrphanedStorage(new Set())).toBe(0)
+    expect(localStorage.getItem(SIDE_PANEL_WIDTH_KEY)).toBe('480')
+    expect(localStorage.getItem(SIDE_PANEL_HEIGHT_KEY)).toBe('260')
   })
 })

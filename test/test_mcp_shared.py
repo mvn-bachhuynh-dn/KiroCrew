@@ -1,4 +1,12 @@
-"""Tests for mcp_shared: _read_message framing detection and respond output."""
+"""Tests for mcp_shared: _read_message framing detection and respond output.
+
+This module also pins the SEL audit ``call_tool_with_logging`` writes: its redacted
+resources and its ``tool_kind``. ``run_mcp_stdio_loop``'s busy queue, the frames it
+cannot use and its exit once its install is pruned live in
+``test_mcp_shared_stdio_loop.py``, and the caller identity and per-session tool policy it
+applies in ``test_mcp_shared_caller_identity.py``; the shared loop harness, request
+builders and framing reset in ``mcp_shared_helpers.py``.
+"""
 
 from __future__ import annotations
 
@@ -10,9 +18,18 @@ import sys
 from unittest.mock import patch
 
 import pytest
+from mcp_shared_helpers import (  # noqa: F401 -- the autouse fixture, and re-exports for importers
+    _framing_undetected,
+    _initialize,
+    _LoopHarness,
+    _slow_then_echo,
+    _tools_call,
+    _tools_call_with_caller,
+)
+from stray_line_helpers import STRAY_LINES, too_deep_to_decode
 
 import kiro_crew.mcp_shared as mcp_shared
-from kiro_crew.mcp_shared import _read_message, respond
+from kiro_crew.mcp_shared import SKIP, _read_message, respond
 
 
 def _make_stdin(data: bytes):
@@ -40,9 +57,11 @@ class _ShortReadBuffer:
         self._pos = 0
         self._chunk = chunk
 
-    def readline(self) -> bytes:
+    def readline(self, size: int = -1) -> bytes:
         nl = self._data.find(b"\n", self._pos)
         end = len(self._data) if nl == -1 else nl + 1
+        if size >= 0:
+            end = min(end, self._pos + size)
         line = self._data[self._pos : end]
         self._pos = end
         return line
@@ -60,15 +79,12 @@ class _ShortReadStdin:
 
 
 class TestReadMessageContentLength:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_reads_content_length_message(self):
         msg = {"jsonrpc": "2.0", "method": "initialize", "id": 1}
         stdin = _make_stdin(_content_length_frame(msg))
         result = _read_message(stdin)
         assert result == msg
-        assert mcp_shared._use_content_length is True
+        assert mcp_shared._framing == "content-length"
 
     def test_reads_multibyte_utf8(self):
         msg = {
@@ -89,15 +105,14 @@ class TestReadMessageContentLength:
         assert _read_message(stdin) == msg1
         assert _read_message(stdin) == msg2
 
-    def test_malformed_length_continues(self):
-        """Malformed Content-Length skips to next message, flag stays False."""
+    def test_malformed_length_ends_the_stream_and_picks_no_framing(self):
+        """The body behind a length nobody can read cannot be delimited, so the
+        stream ends rather than read later frames joined to it."""
         bad = b"Content-Length: abc\r\n\r\n"
-        good_msg = {"jsonrpc": "2.0", "id": 2}
-        data = bad + json.dumps(good_msg).encode("utf-8") + b"\n"
+        data = bad + json.dumps({"jsonrpc": "2.0", "id": 2}).encode("utf-8") + b"\n"
         stdin = _make_stdin(data)
-        result = _read_message(stdin)
-        assert result == good_msg
-        assert mcp_shared._use_content_length is False
+        assert _read_message(stdin) is None
+        assert mcp_shared._framing != "content-length"
 
     def test_invalid_json_in_content_length_frame_continues(self):
         """Invalid JSON body with correct Content-Length skips to next message."""
@@ -105,8 +120,8 @@ class TestReadMessageContentLength:
         good_msg = {"jsonrpc": "2.0", "id": 3}
         good = json.dumps(good_msg).encode("utf-8") + b"\n"
         stdin = _make_stdin(bad + good)
-        result = _read_message(stdin)
-        assert result == good_msg
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good_msg
 
     def test_true_truncation_continues(self):
         """Content-Length larger than available body consumes remaining bytes, skips to next."""
@@ -153,24 +168,167 @@ class TestReadMessageContentLength:
         result = _read_message(stdin)
         assert result is None  # incomplete body discarded, never partially parsed
 
+    @pytest.mark.parametrize("stray", sorted(STRAY_LINES))
+    def test_a_body_that_is_not_an_object_is_one_skipped_frame(self, stray):
+        body = STRAY_LINES[stray]().rstrip(b"\n")
+        framed = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin(framed + _content_length_frame(good))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+
+    def test_an_unparseable_body_is_answered_under_its_recovered_id(self, monkeypatch):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        body = b'{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"s":"\xff"}}'
+        framed = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin(framed + _content_length_frame(good))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+        [(args, kwargs)] = answered
+        assert args[0] == 7 and kwargs["error"]["code"] == mcp_shared.JSONRPC_PARSE_ERROR
+
+    @pytest.mark.parametrize(
+        "big",
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": "x" * 64}},
+            # The MCP TypeScript SDK writes the id last.
+            {
+                "method": "ping",
+                "params": {"pad": "x" * 64, "id": "nested"},
+                "jsonrpc": "2.0",
+                "id": 1,
+            },
+        ],
+        ids=["id-first", "id-last"],
+    )
+    def test_a_body_over_the_cap_is_drained_and_answered(self, monkeypatch, big):
+        """Drained in bounded reads, never held whole, and answered with the id it
+        carries at its top level: dropped silently, its caller waited forever."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        monkeypatch.setattr(mcp_shared, "MAX_CONTENT_LENGTH_BYTES", 60)
+        monkeypatch.setattr(mcp_shared, "_DRAIN_CHUNK_BYTES", 5)
+        # Long enough for the top-level ``method`` member, which marks a request.
+        monkeypatch.setattr(mcp_shared, "ID_PROBE_BYTES", 48)
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin(_content_length_frame(big) + _content_length_frame(good))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+        [(args, kwargs)] = answered
+        assert args[0] == 1
+        assert kwargs["error"]["code"] == mcp_shared.JSONRPC_INVALID_REQUEST
+
+    @pytest.mark.parametrize(
+        "big",
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": "x" * 64}},
+            {
+                "method": "ping",
+                "params": {"pad": "x" * 64, "id": "nested"},
+                "jsonrpc": "2.0",
+                "id": 1,
+            },
+        ],
+        ids=["id-first", "id-last"],
+    )
+    def test_a_bare_line_over_the_cap_is_drained_and_answered(self, monkeypatch, big):
+        """A bare-JSON line is held to the same ceiling as a Content-Length
+        body: drained in bounded reads, never parsed or returned, and answered
+        with its top-level id. The next line still reads whole."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        monkeypatch.setattr(mcp_shared, "MAX_CONTENT_LENGTH_BYTES", 60)
+        monkeypatch.setattr(mcp_shared, "_DRAIN_CHUNK_BYTES", 5)
+        monkeypatch.setattr(mcp_shared, "ID_PROBE_BYTES", 48)
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin((json.dumps(big) + "\n" + json.dumps(good) + "\n").encode("utf-8"))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+        [(args, kwargs)] = answered
+        assert args[0] == 1
+        assert kwargs["error"]["code"] == mcp_shared.JSONRPC_INVALID_REQUEST
+
+    @pytest.mark.parametrize("end", [b"\n", b"\r\n", b""], ids=["lf", "crlf", "eof"])
+    def test_a_bare_line_at_the_cap_is_read_whole(self, monkeypatch, end):
+        """The ceiling counts the body, not its terminator."""
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: None)
+        msg = {"jsonrpc": "2.0", "id": 3, "method": "ping"}
+        body = json.dumps(msg).encode("utf-8")
+        monkeypatch.setattr(mcp_shared, "MAX_CONTENT_LENGTH_BYTES", len(body))
+        assert _read_message(_make_stdin(body + end)) == msg
+
+    @pytest.mark.parametrize("end", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+    def test_a_bare_line_one_past_the_cap_is_refused(self, monkeypatch, end):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        body = json.dumps({"jsonrpc": "2.0", "id": 4, "method": "ping"}).encode("utf-8")
+        monkeypatch.setattr(mcp_shared, "MAX_CONTENT_LENGTH_BYTES", len(body) - 1)
+        good = {"id": 5, "method": "x"}  # shorter than the cap
+        stdin = _make_stdin(body + end + json.dumps(good).encode("utf-8") + b"\n")
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+        assert [a[0] for a, _ in answered] == [4]
+
+    def test_the_body_cap_is_the_gateways_read_limit(self):
+        """The constant's comment says so; a copy could drift without a test."""
+        from kiro_crew.mcp_gateway import pool
+
+        assert mcp_shared.MAX_CONTENT_LENGTH_BYTES == pool._DEFAULT_READ_BUFFER_LIMIT
+
+    @pytest.mark.parametrize("length", [10**20, 2**62], ids=["over-ssize", "2**62"])
+    def test_a_length_past_any_drainable_size_ends_the_stream_loudly(self, length, caplog):
+        """Draining to it would swallow every later request, and one
+        ``raw.read`` of it raises OverflowError or MemoryError."""
+        later = _content_length_frame({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        stdin = _make_stdin(f"Content-Length: {length}\r\n\r\n".encode("ascii") + later)
+        with caplog.at_level("ERROR", logger=mcp_shared.__name__):
+            assert _read_message(stdin) is None
+        assert any("framing is lost" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b"Content-Length: abc",
+            b"Content-Length: -5",
+            b"Content-Length: \xff",
+            b"Content-Length: " + b"9" * 5000,
+        ],
+        ids=["word", "negative", "undecodable", "over-digit-limit"],
+    )
+    def test_an_unreadable_length_on_a_framed_stream_ends_it_loudly(
+        self, header, monkeypatch, caplog
+    ):
+        """A body follows the header, and with no length it cannot be delimited:
+        every later frame would be read joined to it and answered as unparseable."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        first = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        body = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"}).encode("utf-8")
+        later = _content_length_frame({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+        stdin = _make_stdin(_content_length_frame(first) + header + b"\r\n\r\n" + body + later)
+        assert _read_message(stdin) == first
+        with caplog.at_level("ERROR", logger=mcp_shared.__name__):
+            assert _read_message(stdin) is None
+        assert any("framing is lost" in r.getMessage() for r in caplog.records)
+        assert answered == []
+
 
 class TestReadMessageBareJson:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_reads_bare_json(self):
         msg = {"jsonrpc": "2.0", "method": "initialize", "id": 1}
         stdin = _make_stdin(json.dumps(msg).encode("utf-8") + b"\n")
         result = _read_message(stdin)
         assert result == msg
-        assert mcp_shared._use_content_length is False
+        assert mcp_shared._framing != "content-length"
 
     def test_skips_invalid_json(self):
         good_msg = {"jsonrpc": "2.0", "id": 1}
         data = b"not json\n" + json.dumps(good_msg).encode("utf-8") + b"\n"
         stdin = _make_stdin(data)
-        result = _read_message(stdin)
-        assert result == good_msg
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good_msg
 
     def test_eof_returns_none(self):
         stdin = _make_stdin(b"")
@@ -180,13 +338,87 @@ class TestReadMessageBareJson:
         msg = {"jsonrpc": "2.0", "id": 1}
         data = b"\n\n" + json.dumps(msg).encode("utf-8") + b"\n"
         stdin = _make_stdin(data)
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) is SKIP
         assert _read_message(stdin) == msg
+
+    @pytest.mark.parametrize("stray", sorted(STRAY_LINES))
+    def test_a_stray_line_is_one_skipped_frame_not_eof(self, stray):
+        """``None`` is EOF to both loop call sites, so a ``null`` line returned
+        as ``None`` would end the server, as would any raise here."""
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        stdin = _make_stdin(STRAY_LINES[stray]() + json.dumps(msg).encode("utf-8") + b"\n")
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == msg
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"n":' + b"9" * 5000 + b"}}\n",
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"s":"\xff"}}\n',
+            b'{"method":"tools/list","params":{"s":"\xff"},"jsonrpc":"2.0","id":7}\n',
+        ],
+        ids=["over-digit-limit", "undecodable", "undecodable-id-last"],
+    )
+    def test_an_unparseable_request_is_answered_under_its_recovered_id(self, monkeypatch, line):
+        """Answered, so its caller does not wait for its own timeout while pings
+        are still answered and nothing sees the server as wedged."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        stdin = _make_stdin(line + b'{"jsonrpc":"2.0","id":2,"method":"ping"}\n')
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        [(args, kwargs)] = answered
+        assert args[0] == 7
+        assert kwargs["error"]["code"] == mcp_shared.JSONRPC_PARSE_ERROR
+
+    def test_an_unparseable_request_too_deep_to_decode_is_answered(self, monkeypatch):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        line = (
+            '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":' + too_deep_to_decode() + "}\n"
+        ).encode()
+        assert _read_message(_make_stdin(line)) is SKIP
+        assert [a[0] for a, _ in answered] == [7]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"not json\n",
+            b'{"method":"log","params":{"id":99,"s":"\xff"}}\n',
+            # A response: its id is the client's own, never this server's to answer.
+            b'{"jsonrpc":"2.0","id":3,"result":{"s":"\xff"}}\n',
+            b'{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"\xff"}}\n',
+        ],
+        ids=["log-line", "nested-id-only", "response", "error-response"],
+    )
+    def test_a_line_that_is_not_a_request_with_an_id_is_dropped_unanswered(self, monkeypatch, line):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        assert _read_message(_make_stdin(line)) is SKIP
+        assert answered == []
+
+    def test_a_header_shaped_line_on_a_bare_stream_is_noise(self):
+        """Honouring it would read the requests behind it as a body."""
+        first = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        second = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        data = b"".join(
+            [
+                json.dumps(first).encode("utf-8") + b"\n",
+                b"Content-Length: 40\r\n",
+                b"\r\n",
+                json.dumps(second).encode("utf-8") + b"\n",
+            ]
+        )
+        stdin = _make_stdin(data)
+        assert _read_message(stdin) == first
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) is SKIP  # the blank separator line
+        assert _read_message(stdin) == second
+        assert mcp_shared._framing != "content-length"
 
 
 class TestRespondFraming:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_respond_bare_json(self):
         out = io.StringIO()
         with patch("sys.stdout", out):
@@ -198,8 +430,8 @@ class TestRespondFraming:
         assert parsed["id"] == 1
         assert parsed["result"] == {"ok": True}
 
-    def test_respond_content_length(self):
-        mcp_shared._use_content_length = True
+    def test_respond_content_length(self, monkeypatch):
+        monkeypatch.setattr(mcp_shared, "_framing", "content-length")
         out = io.BytesIO()
         with patch("sys.stdout") as mock_stdout:
             mock_stdout.buffer = out
@@ -232,11 +464,9 @@ class TestRespondStdoutFdSnapshot:
     """
 
     def setup_method(self):
-        mcp_shared._use_content_length = False
         mcp_shared.release_stdout_fd()
 
     def teardown_method(self):
-        mcp_shared._use_content_length = False
         mcp_shared.release_stdout_fd()
 
     @staticmethod
@@ -333,8 +563,8 @@ class TestRespondStdoutFdSnapshot:
         assert parsed["id"] == 1
         assert parsed["result"] == {"ok": True}
 
-    def test_response_survives_dup2_devnull_content_length(self):
-        mcp_shared._use_content_length = True
+    def test_response_survives_dup2_devnull_content_length(self, monkeypatch):
+        monkeypatch.setattr(mcp_shared, "_framing", "content-length")
         read_fd, restore = self._redirect_stdout_to_pipe()
         try:
             with self._stdout_on_fd1():
@@ -389,7 +619,14 @@ class TestRespondStdoutFdSnapshot:
         assert json.loads(out.getvalue().strip())["id"] == 4
 
     def test_falls_back_when_snapshot_fd_is_broken(self):
-        """A closed/unusable snapshot fd must fall back, not lose the response."""
+        """An unusable snapshot fd must fall back, not lose the response.
+
+        The unusable descriptor is a real, open, read-only one: ``os.write``
+        gives the same kernel EBADF a closed fd would, so this stays a genuine
+        syscall failure rather than a patched raise (that variant is
+        ``test_clean_failure_still_falls_back``) -- but the fd table is left
+        untouched, which the closed-fd spelling could not promise.
+        """
         out = io.StringIO()
         read_fd, restore = self._redirect_stdout_to_pipe()
         try:
@@ -398,13 +635,20 @@ class TestRespondStdoutFdSnapshot:
         finally:
             restore()
         os.close(read_fd)
-        # Close the snapshot behind respond()'s back so os.write raises EBADF.
-        os.close(mcp_shared._stdout_fd)
+        # Do NOT close the snapshot: freeing the NUMBER while _stdout_fd still
+        # holds it lets another thread's open() in this worker be handed it, and
+        # respond() would then write the JSON-RPC frame into that unrelated
+        # stream -- the exact hazard mcp_shared.respond()'s own comment names.
+        # release_stdout_fd() does the owner-correct close and clears the global
+        # in one step, so no stale number is ever visible to respond().
+        mcp_shared.release_stdout_fd()
+        mcp_shared._stdout_fd = os.open(os.devnull, os.O_RDONLY)
         try:
             with patch("sys.stdout", out):
                 respond(5, {"ok": True})
             assert json.loads(out.getvalue().strip())["id"] == 5
         finally:
+            os.close(mcp_shared._stdout_fd)
             mcp_shared._stdout_fd = None
 
     def test_write_all_loops_on_short_writes(self):
@@ -491,9 +735,7 @@ class TestRespondStdoutFdSnapshot:
     def test_run_loop_releases_fd_on_exit(self):
         """``run_mcp_stdio_loop`` must not leak the dup across invocations."""
         with patch.object(mcp_shared, "_read_message", lambda _stdin: None):
-            mcp_shared.run_mcp_stdio_loop(
-                "test-server", "0.1.0", lambda: [], lambda _n, _a: "ok"
-            )
+            mcp_shared.run_mcp_stdio_loop("test-server", "0.1.0", lambda: [], lambda _n, _a: "ok")
         assert mcp_shared._stdout_fd is None
 
 
@@ -502,6 +744,62 @@ class TestCallToolWithLoggingRedaction:
     credential passed in a free-text arg (e.g. artifact_post_comment ``text``,
     artifact_delete_comment ``reason``) can't be persisted verbatim in the audit
     log even when the per-tool handler only scrubbed its own egress copy."""
+
+    @pytest.mark.parametrize("failure", ["", "validation", "execution"])
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "memory_recall",
+            "search_chat_history",
+            "learn_add",
+            "spawn_run",
+            "spawn_continue",
+            "spawn_steer",
+            "spawn_sub_agents",
+            "session_send",
+            "register_hook",
+            "task_run",
+            "workflow_author",
+            "workflow_run",
+            "workflow_rerun_subtree",
+            "cron_add",
+            "cron_update",
+        ],
+    )
+    def test_session_body_tools_audit_outcome_without_retaining_payload(self, failure, tool):
+        from kiro_crew.validation import ValidationError
+
+        captured = {}
+
+        class Audit:
+            def log_tool_invocation(self, **kwargs):
+                captured.update(kwargs)
+
+        query = "PERSONAL_QUERY_CANARY"
+
+        def validate(_name, raw):
+            if failure == "validation":
+                raise ValidationError(query, "invalid query field")
+            return raw
+
+        def recall(_name, _args):
+            return f"Error: {query}" if failure else "recalled context"
+
+        with patch.object(mcp_shared, "sel", return_value=Audit()):
+            result = mcp_shared.call_tool_with_logging(
+                tool,
+                {"query": query, "context_summary": query},
+                validate,
+                recall,
+                session_key="dashboard:alice",
+                downstream_service="kirocrew-core",
+            )
+
+        assert captured["tool_name"] == tool
+        assert captured["session_key"] == "dashboard:alice"
+        assert captured["outcome"] == ("failed" if failure else "completed")
+        assert query not in json.dumps(captured)
+        assert result.startswith("Error:") if failure else result == "recalled context"
 
     def test_args_redacted_before_sel_log(self):
         from kiro_crew.mcp_shared import call_tool_with_logging
@@ -535,360 +833,65 @@ class TestCallToolWithLoggingRedaction:
         assert "slug" in captured.get("resources", "")
 
 
-# --- run_mcp_stdio_loop busy-queue behavior (Mesh-3020) ----------------------
-#
-# A tools/call arriving while a worker is busy used to be silently dropped:
-# no response was ever written, so the client waited forever. These tests
-# drive the real loop over a pipe-backed stdin (select() needs a real fd)
-# and assert queued calls are answered FIFO once the worker frees. The
-# worker-thread + select() interleave is POSIX-only (the Windows loop
-# dispatches synchronously), so gate the class accordingly.
+class TestCallToolWithLoggingKind:
+    """``tool_kind`` classifies the invocation; it must not hold the caller.
 
-from kiro_crew import platform_compat  # noqa: E402
-
-
-class _LoopHarness:
-    """Run run_mcp_stdio_loop in a thread against a pipe-backed stdin.
-
-    Responses are captured by patching mcp_shared.respond; SEL and tool-policy
-    resolution are stubbed out so the loop needs no gateway environment.
+    The wrapper passed ``session_key`` as ``tool_kind``, so every row it wrote --
+    the bulk of the agent tool surface, across all five MCP servers -- carried a
+    high-cardinality session key where a kind belongs, sitting in the same file as
+    correctly-kinded rows written directly by callers. The field looked populated
+    and trustworthy while carrying no kind at all.
     """
 
-    def __init__(self, monkeypatch, call_tool_fn, loop_kwargs: dict | None = None):
-        import os
-        import sys
-        import threading
-        from unittest.mock import MagicMock
+    _CALLER = "dashboard:chat-7"
 
-        self.responses: list = []  # (req_id, result, error)
-        rfd, self._wfd = os.pipe()
-        self._stdin = io.TextIOWrapper(io.open(rfd, "rb"))
-        monkeypatch.setattr(sys, "stdin", self._stdin)
-        monkeypatch.setattr(mcp_shared, "respond", self._record)
-        monkeypatch.setattr(mcp_shared, "_resolve_excluded_tools", lambda *a: set())
-        self.sel_mock = MagicMock()
-        monkeypatch.setattr(mcp_shared, "sel", lambda: self.sel_mock)
-        self._os = os
-        self._thread = threading.Thread(
-            target=mcp_shared.run_mcp_stdio_loop,
-            args=("test-server", "0.0.0", lambda: [], call_tool_fn),
-            kwargs=loop_kwargs or {},
-            daemon=True,
-        )
-        self._thread.start()
+    def _capture(self, *, raises: bool = False) -> dict:
+        from kiro_crew.mcp_shared import call_tool_with_logging
+        from kiro_crew.validation import ValidationError
 
-    def _record(self, req_id, result, error=None) -> None:
-        self.responses.append((req_id, result, error))
+        captured: dict = {}
 
-    def send(self, msg: dict) -> None:
-        self._os.write(self._wfd, (json.dumps(msg) + "\n").encode("utf-8"))
+        class _FakeSel:
+            def log_tool_invocation(self, **kw):
+                captured.update(kw)
 
-    def wait_for(self, predicate, timeout: float = 5.0) -> bool:
-        import time
+        def _validate(_name, raw):
+            if raises:
+                raise ValidationError("slug", "bad arg")
+            return raw
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(0.05)
-        return predicate()
-
-    def close(self) -> None:
-        self._os.close(self._wfd)
-        self._thread.join(timeout=5.0)
-
-
-def _tools_call(req_id, tool_name: str) -> dict:
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": {}},
-    }
-
-
-def _slow_then_echo():
-    """Return (call_tool_fn, started_event, release_event) for a blockable tool."""
-    import threading
-
-    started = threading.Event()
-    release = threading.Event()
-
-    def call_tool(name, args):
-        if name == "slow":
-            started.set()
-            release.wait(timeout=10.0)
-        return f"done:{name}"
-
-    return call_tool, started, release
-
-
-@pytest.mark.skipif(
-    not platform_compat.IS_POSIX,
-    reason="worker-thread + select() interleave is POSIX-only",
-)
-class TestStdioLoopBusyQueue:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
-    def test_tools_call_while_busy_is_queued_and_answered_fifo(self, monkeypatch):
-        import time
-
-        call_tool, started, release = _slow_then_echo()
-        harness = _LoopHarness(monkeypatch, call_tool)
-        try:
-            harness.send(_tools_call(201, "slow"))
-            assert started.wait(timeout=5.0)
-            harness.send(_tools_call(202, "fast"))
-            harness.send(_tools_call(203, "fast"))
-            # Give the busy read loop a beat to buffer both calls
-            time.sleep(0.3)
-            assert harness.responses == []  # nothing answered while busy
-            release.set()
-            assert harness.wait_for(lambda: len(harness.responses) >= 3)
-            assert [r[0] for r in harness.responses] == [201, 202, 203]
-            assert all(r[2] is None for r in harness.responses)
-        finally:
-            release.set()
-            harness.close()
-
-    def test_cancelled_queued_call_gets_no_response_and_loop_continues(self, monkeypatch):
-        import time
-
-        call_tool, started, release = _slow_then_echo()
-        harness = _LoopHarness(monkeypatch, call_tool)
-        try:
-            harness.send(_tools_call(301, "slow"))
-            assert started.wait(timeout=5.0)
-            harness.send(_tools_call(302, "fast"))
-            # Let the read loop consume 302 before the cancel arrives: two
-            # back-to-back pipe writes can coalesce into one buffered read,
-            # in which case cancel-of-queued is best-effort (same as the
-            # pre-existing in-flight cancel race).
-            time.sleep(0.3)
-            harness.send(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/cancelled",
-                    "params": {"requestId": 302},
-                }
-            )
-            time.sleep(0.3)
-            release.set()
-            assert harness.wait_for(lambda: any(r[0] == 301 for r in harness.responses))
-            # Loop must still serve new calls after skipping the cancelled one
-            harness.send(_tools_call(303, "fast"))
-            assert harness.wait_for(lambda: any(r[0] == 303 for r in harness.responses))
-            assert not any(r[0] == 302 for r in harness.responses)
-        finally:
-            release.set()
-            harness.close()
-
-    def test_queue_overflow_returns_busy_error(self, monkeypatch):
-        import time
-
-        monkeypatch.setattr(mcp_shared, "PENDING_CALLS_MAX", 1)
-        call_tool, started, release = _slow_then_echo()
-        harness = _LoopHarness(monkeypatch, call_tool)
-        try:
-            harness.send(_tools_call(401, "slow"))
-            assert started.wait(timeout=5.0)
-            harness.send(_tools_call(402, "fast"))  # fills the queue
-            time.sleep(0.2)
-            harness.send(_tools_call(403, "fast"))  # overflow
-            assert harness.wait_for(lambda: any(r[0] == 403 for r in harness.responses))
-            overflow = next(r for r in harness.responses if r[0] == 403)
-            assert overflow[2] is not None and overflow[2]["code"] == -32000
-            # The rejection is a tool-invocation decision and must be SEL-audited
-            assert any(
-                call.kwargs.get("outcome") == "rejected_busy"
-                for call in harness.sel_mock.log_tool_invocation.call_args_list
-            )
-            release.set()
-            assert harness.wait_for(
-                lambda: {401, 402} <= {r[0] for r in harness.responses}
-            )
-        finally:
-            release.set()
-            harness.close()
-
-    def test_ping_still_answered_while_busy(self, monkeypatch):
-        call_tool, started, release = _slow_then_echo()
-        harness = _LoopHarness(monkeypatch, call_tool)
-        try:
-            harness.send(_tools_call(501, "slow"))
-            assert started.wait(timeout=5.0)
-            harness.send({"jsonrpc": "2.0", "id": 599, "method": "ping"})
-            assert harness.wait_for(lambda: any(r[0] == 599 for r in harness.responses))
-            release.set()
-            assert harness.wait_for(lambda: any(r[0] == 501 for r in harness.responses))
-        finally:
-            release.set()
-            harness.close()
-
-
-# --- Caller-identity extension through the stdio loop (PR #422 round 18) -----
-
-
-def _initialize(req_id) -> dict:
-    return {"jsonrpc": "2.0", "id": req_id, "method": "initialize", "params": {}}
-
-
-def _tools_call_with_caller(req_id, tool_name: str, session_key: str) -> dict:
-    from kiro_crew.mcp_caller import CallerContext, build_caller_meta
-
-    msg = _tools_call(req_id, tool_name)
-    msg["params"]["_meta"] = build_caller_meta(
-        CallerContext(session_key=session_key, from_gateway=True)
-    )
-    return msg
-
-
-class TestStdioLoopCallerIdentity:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
-    def test_initialize_advertises_capability_when_opted_in(self, monkeypatch):
-        # GPT 5.6 round 18 HIGH: without the advertisement gatewayd treats
-        # the backend as single-session and never injects the caller block,
-        # so the whole per-call identity path would be dead code.
-        harness = _LoopHarness(
-            monkeypatch, lambda n, a: "ok", {"advertise_caller_identity": True}
-        )
-        try:
-            harness.send(_initialize(1))
-            assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            caps = harness.responses[0][1]["capabilities"]
-            assert caps["experimental"] == {
-                "kirocrew.caller-identity": {"schemaVersion": 1}
-            }
-        finally:
-            harness.close()
-
-    def test_initialize_omits_capability_by_default(self, monkeypatch):
-        # kirocrew-cron does NOT consume per-call identity — it must stay
-        # single-session (gatewayd refuses to pool non-advertising backends).
-        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
-        try:
-            harness.send(_initialize(1))
-            assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert "experimental" not in harness.responses[0][1]["capabilities"]
-        finally:
-            harness.close()
-
-    def test_tool_sees_current_caller_from_meta(self, monkeypatch):
-        # The dispatch loop must install the gateway-injected caller for the
-        # duration of the call and clear it afterwards.
-        from kiro_crew import mcp_caller
-
-        seen: list = []
-
-        def call_tool(name, args):
-            ctx = mcp_caller.current_caller()
-            seen.append(ctx.session_key if ctx else None)
+        def _inner(_name, _args):
             return "ok"
 
-        harness = _LoopHarness(monkeypatch, call_tool)
-        try:
-            harness.send(_tools_call_with_caller(11, "echo", "dashboard:chat-3"))
-            assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert seen == ["dashboard:chat-3"]
-            assert mcp_caller.current_caller() is None  # cleared after dispatch
-        finally:
-            harness.close()
-
-    def test_excluded_tool_audit_attributes_caller_session(self, monkeypatch):
-        # GPT 5.6 round 18 MEDIUM: in a shared backend the env var attributes
-        # rejection audits to "mcp" or the wrong session — the parsed caller
-        # identity must win when present.
-        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
-        monkeypatch.setattr(
-            mcp_shared, "_resolve_excluded_tools", lambda *a: {"blocked"}
-        )
-        try:
-            harness.send(_tools_call_with_caller(21, "blocked", "dashboard:chat-9"))
-            assert harness.wait_for(
-                lambda: harness.sel_mock.log_tool_invocation.call_count >= 1
+        with patch("kiro_crew.mcp_shared.sel", return_value=_FakeSel()):
+            call_tool_with_logging(
+                "artifact_list",
+                {"slug": "doc"},
+                _validate,
+                _inner,
+                session_key=self._CALLER,
+                downstream_service="kirocrew-core",
             )
-            kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
-            assert kw["outcome"] == "rejected_excluded"
-            assert kw["session_key"] == "dashboard:chat-9"
-        finally:
-            harness.close()
+        assert captured, "the wrapper wrote no audit row at all"
+        return captured
 
-    def test_failed_tool_audit_attributes_caller_session(self, monkeypatch):
-        def boom(name, args):
-            raise RuntimeError("kaput")
+    def test_the_success_row_does_not_put_the_caller_in_tool_kind(self):
+        captured = self._capture()
+        assert captured.get("tool_kind", "") != self._CALLER
 
-        harness = _LoopHarness(monkeypatch, boom)
-        try:
-            harness.send(_tools_call_with_caller(31, "echo", "dashboard:chat-5"))
-            assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert harness.wait_for(
-                lambda: harness.sel_mock.log_tool_invocation.call_count >= 1
-            )
-            kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
-            assert kw["outcome"] == "failed"
-            assert kw["session_key"] == "dashboard:chat-5"
-        finally:
-            harness.close()
+    def test_the_validation_failure_row_does_not_either(self):
+        """The other call site. It was the same copy of the same wrong variable,
+        so fixing only the success path would leave every rejected call mislabeled.
+        """
+        captured = self._capture(raises=True)
+        assert captured["outcome"] == "failed"
+        assert captured.get("tool_kind", "") != self._CALLER
 
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_the_caller_is_still_recorded_on_both_paths(self, raises):
+        """Guards the obvious wrong fix: dropping the caller instead of the kind.
 
-class TestPerSessionToolPolicy:
-    """Pooled backends must not bleed one session's policy into another
-    (GPT 5.6 PR #422 round 20)."""
-
-    def _reset(self):
-        # Full module-state reset: the negative-cache timestamps are shared
-        # process globals — a failure-path test from another file in the
-        # same shard leaves them set, short-circuiting this test to
-        # fail-open set() (exactly what happened on CI shard 3).
-        mcp_shared._excluded_tools_by_session.clear()
-        mcp_shared._last_failure_time = 0.0
-        mcp_shared._last_startup_race_time = 0.0
-        mcp_shared._failure_count = 0
-
-    def setup_method(self):
-        self._reset()
-
-    def teardown_method(self):
-        self._reset()
-
-    def test_cache_is_keyed_per_session(self, monkeypatch):
-        calls: list = []
-
-        def fake_urlopen(req, timeout=0):
-            import io
-
-            calls.append(req.headers.get("X-session-key"))
-            body = (
-                b'{"exclude": ["tool_a"]}'
-                if req.headers.get("X-session-key") == "dashboard:chat-1"
-                else b'{"exclude": ["tool_b"]}'
-            )
-
-            class _Resp(io.BytesIO):
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *a):
-                    return False
-
-            return _Resp(body)
-
-        monkeypatch.setattr(mcp_shared, "loopback_urlopen", fake_urlopen)
-        monkeypatch.setattr(
-            mcp_shared.KiroCrewConfig,
-            "load",
-            classmethod(lambda cls: type("C", (), {"dashboard": type("D", (), {"url": "http://localhost:5476"})()})()),
-        )
-        monkeypatch.setattr(mcp_shared, "_read_internal_secret", lambda: "s3cr3t", raising=False)
-
-        a = mcp_shared._resolve_excluded_tools("dashboard:chat-1")
-        b = mcp_shared._resolve_excluded_tools("dashboard:chat-2")
-        assert a == {"tool_a"}
-        assert b == {"tool_b"}  # NOT session-1's cached policy
-        # Cache hit path: no third HTTP call for a repeat lookup.
-        n = len(calls)
-        assert mcp_shared._resolve_excluded_tools("dashboard:chat-1") == {"tool_a"}
-        assert len(calls) == n
+        ``session_key`` is what SEL stores as ``caller_identity``, and it is the
+        field the ownership and attribution questions are answered from.
+        """
+        assert self._capture(raises=raises)["session_key"] == self._CALLER

@@ -1,8 +1,26 @@
+/**
+ * MarkdownRenderer's core suite: list indentation, the streaming caret, currency
+ * dollars versus math, XSS sanitization, task lists, the path-chip pre-filter and
+ * chips, and Lightbox keyboard navigation. The mcwidget and <tool_use> strips and
+ * softBreaks are pinned in MarkdownRenderer.textPasses.test.tsx, and the
+ * LaTeX-native delimiters in MarkdownRenderer.latexDelimiters.test.tsx.
+ */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, act, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import MarkdownRenderer, { Lightbox, dispatchLightbox, isPathCandidate, splitLineRef } from '../components/MarkdownRenderer'
 import { __resetPathKindCache } from '../hooks/usePathKind'
+import { kindsRequestCount, kindsRequestPaths, kindsResponse, probedPaths, stubPathKinds } from './pathKindStub'
 import { api } from '../api/client'
+
+// The chip's reveal hint is now gated on branding.directLocal: a remote session
+// degrades shift+click to a clipboard copy, so revealHintFor only promises
+// Finder/Explorer/file-manager on a direct-local gateway. The platform-aware
+// hint assertions below therefore mount against a local session; the remote
+// (directLocal:false) copy wording is pinned in MarkdownRenderer.contextmenu.test.tsx.
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: true }),
+}))
 
 type LightboxDetail = { images: { src: string; alt: string }[]; index: number }
 
@@ -101,7 +119,7 @@ describe('MarkdownRenderer XSS sanitization', () => {
 
   it('strips event handler attributes', () => {
     const { container } = render(
-      <MarkdownRenderer content={'<img src="x" onerror="alert(1)">'} />
+      <MarkdownRenderer content={'<img src="/api/file-raw?path=x" onerror="alert(1)">'} />
     )
     const img = container.querySelector('img')
     expect(img?.getAttribute('onerror')).toBeNull()
@@ -118,6 +136,78 @@ describe('MarkdownRenderer XSS sanitization', () => {
     }
     // Verify no javascript: anywhere in the output
     expect(container.innerHTML).not.toContain('javascript:')
+  })
+
+  // Issue #9925: urlTransform rejects a destination by returning '' (react-
+  // markdown's defaultUrlTransform sentinel). '' is not nullish, so the plain-
+  // anchor branch rendered `<a href="">` — an ordinary-looking link whose
+  // address the browser resolves against the CURRENT PAGE, so "copy link
+  // address" yielded the dashboard's own session URL. A rejected destination
+  // must not be an anchor at all.
+  describe('rejected link destinations (#9925)', () => {
+    it('renders a non-allowlisted custom scheme as inert text, not an empty anchor', () => {
+      const { container } = render(
+        <MarkdownRenderer content={'[obsidian://open?vault=Notes](obsidian://open?vault=Notes)'} />
+      )
+      // The label survives as visible text…
+      expect(container.textContent).toContain('obsidian://open?vault=Notes')
+      // …but there is no anchor, and specifically nothing carrying href="".
+      expect(container.querySelector('a')).toBeNull()
+      expect(container.querySelector('[href=""]')).toBeNull()
+    })
+
+    it('renders an empty markdown destination as inert text', () => {
+      const { container } = render(<MarkdownRenderer content={'[label]()'} />)
+      expect(container.textContent).toContain('label')
+      expect(container.querySelector('a')).toBeNull()
+      expect(container.querySelector('[href=""]')).toBeNull()
+    })
+
+    // The ABSENT case is a distinct input value from the '' sentinel reaching
+    // the same `!href` predicate: raw-HTML `<a>bare</a>` is sanitizer-allowed
+    // and arrives with href === undefined. Pinned so a future narrowing of the
+    // guard to the sentinel alone (href === '') cannot silently restore a
+    // styled non-navigating anchor for the absent case.
+    it('renders a raw-HTML anchor with no href attribute as inert text', () => {
+      const { container } = render(<MarkdownRenderer content={'<a>bare</a>'} />)
+      expect(container.textContent).toContain('bare')
+      expect(container.querySelector('a')).toBeNull()
+    })
+
+    it('keeps inline markdown inside the inert label', () => {
+      const { container } = render(<MarkdownRenderer content={'[a `code` label](obsidian://x)'} />)
+      const code = container.querySelector('code')
+      expect(code).not.toBeNull()
+      expect(code!.textContent).toBe('code')
+      expect(container.querySelector('a')).toBeNull()
+      // With no anchor, InsideLinkCtx is deliberately not provided: the label
+      // is ordinary prose, so its code span re-enters the normal inline-code
+      // ladder and regains the click-to-copy affordance an in-link span is
+      // denied (contrast MarkdownRenderer.inlineCodeInLink.test.tsx).
+      expect(code).toHaveAttribute('role', 'button')
+    })
+
+    // Control: the guard must be scoped to the rejection sentinel — a plain
+    // https:// destination passes defaultUrlTransform unchanged and must keep
+    // rendering a real anchor with its exact href.
+    it('control: an https:// link still renders a real anchor with its exact href', () => {
+      const { container } = render(
+        <MarkdownRenderer content={'[docs](https://example.com/docs?q=1)'} />
+      )
+      const a = container.querySelector('a')
+      expect(a).not.toBeNull()
+      expect(a!.getAttribute('href')).toBe('https://example.com/docs?q=1')
+    })
+
+    // Control: an allowlisted editor scheme is rescued by urlTransform, so it
+    // must also keep its anchor.
+    it('control: a vscode:// link keeps its anchor and href', () => {
+      const url = 'vscode://file/home/user/project'
+      const { container } = render(<MarkdownRenderer content={`[open](${url})`} />)
+      const a = container.querySelector('a')
+      expect(a).not.toBeNull()
+      expect(a!.getAttribute('href')).toBe(url)
+    })
   })
 
   it('preserves safe HTML elements like details/summary', () => {
@@ -195,9 +285,119 @@ describe('isPathCandidate — path chip pre-filter', () => {
     expect(isPathCandidate('../sibling/file.json')).toBe(true)
   })
 
+  it('accepts a directory named with a trailing separator (issue #9409)', () => {
+    // PATH_SHAPE_RE requires the string to END in a name character, so a
+    // trailing `/` fails the shape and the directory chip renders dead -- even
+    // though the same directory without the slash classifies. A single trailing
+    // separator is dropped before the shape test so both forms behave alike.
+    expect(isPathCandidate('/home/you/other/notes/')).toBe(true)
+    expect(isPathCandidate('/home/you/other/notes')).toBe(true) // control: already worked
+    expect(isPathCandidate('~/\u6587\u6863/\u8bf4\u660e/')).toBe(true) // Unicode terminal segment, trailing slash
+    expect(isPathCandidate('./src/')).toBe(true)
+    expect(isPathCandidate('C:\\Users\\me\\')).toBe(true) // drive-rooted, trailing backslash
+    expect(isPathCandidate('C:/Users/me/')).toBe(true) // drive-rooted, trailing forward slash
+  })
+
+  it('rejects a command line that carries a path argument or a flag', () => {
+    // A space then a second root or a flag means several shell words, not one
+    // path; the probe could never confirm the whole span.
+    expect(isPathCandidate('sudo xcode-select -s /Applications/Xcode.app')).toBe(false)
+    expect(isPathCandidate('open ~/Downloads/report.pdf')).toBe(false)
+    expect(isPathCandidate('python ./scripts/run.py')).toBe(false)
+    expect(isPathCandidate('cp a.txt ../backup/a.txt')).toBe(false)
+    expect(isPathCandidate('type C:\\Users\\me\\notes.md')).toBe(false)
+    expect(isPathCandidate('tail --follow logs/app.log')).toBe(false)
+  })
+
+  it('still accepts paths whose names contain spaces and dashes', () => {
+    expect(isPathCandidate('/Users/me/Library/Application Support/x.json')).toBe(true)
+    expect(isPathCandidate('docs/Report - final.md')).toBe(true)
+    expect(isPathCandidate('My Docs/notes.md')).toBe(true)
+    expect(isPathCandidate('C:\\Program Files (x86)\\app.txt')).toBe(true)
+    // A dash glued to more of the name is not a flag: the word after it runs
+    // into a dot or a separator instead of ending at a space.
+    expect(isPathCandidate('docs/Report -final.md')).toBe(true)
+    expect(isPathCandidate('~/Music/Artist -Live.mp3')).toBe(true)
+    expect(isPathCandidate('Backup -old/x.md')).toBe(true)
+  })
+
+  it('refuses a name with a space right before a separator, by design', () => {
+    // A space then a root reads the same as a command and its path argument
+    // (`cat /draft.md`); losing the rare real name is the accepted cost.
+    expect(isPathCandidate('notes /draft.md')).toBe(false)
+  })
+
+  it('a trailing separator does not rescue a non-path -- no widening (issue #9409)', () => {
+    // The strip re-tests the same rules, so a trailing slash classifies only a
+    // string whose slash-less form is already a candidate. These stay rejected
+    // because their slash-less forms are rejected.
+    expect(isPathCandidate('owner/repo/')).toBe(false)
+    expect(isPathCandidate('refs/heads/fix/')).toBe(false)
+    expect(isPathCandidate('text/plain/')).toBe(false)
+    expect(isPathCandidate('2026/08/02/')).toBe(false)
+    expect(isPathCandidate('and/or/')).toBe(false)
+    // UNC is refused on the ORIGINAL string, so the strip cannot launder a
+    // host-naming shape into a probe.
+    expect(isPathCandidate('//host/share/')).toBe(false)
+    expect(isPathCandidate('\\\\host\\share\\')).toBe(false)
+  })
+
   it('accepts a bare relative path when the last segment has an extension', () => {
     expect(isPathCandidate('src/main.py')).toBe(true)
     expect(isPathCandidate('website/src/components/MarkdownRenderer.tsx')).toBe(true)
+  })
+
+  it('accepts Unicode segments in rooted, home-relative and explicitly relative paths', () => {
+    // Filenames are not ASCII-only. Each shape class from the ASCII cases
+    // above must also classify when its segments carry CJK, accented or
+    // Cyrillic letters (issue #6483: \w rejected these before the stat probe).
+    expect(isPathCandidate('/a/b/产品文档-v1.0.md')).toBe(true) // CJK, rooted
+    expect(isPathCandidate('/home/user/notes/café-menü')).toBe(true) // accented, rooted, no extension
+    expect(isPathCandidate('~/документы/отчёт.txt')).toBe(true) // Cyrillic, home-relative
+    expect(isPathCandidate('~/文档/说明')).toBe(true) // CJK terminal segment, no extension
+    expect(isPathCandidate('./docs/仕様書.md')).toBe(true) // CJK, explicitly relative
+    expect(isPathCandidate('../архив/старый-отчёт')).toBe(true) // Cyrillic, parent-relative
+  })
+
+  it('accepts combining marks — NFD-decomposed and mark-requiring scripts', () => {
+    // macOS returns NFD-decomposed filenames (é as e + U+0301), and Indic
+    // scripts need combining marks even under NFC — both are \p{M}, not
+    // \p{L}. Written as escapes so the source encoding cannot renormalize.
+    expect(isPathCandidate('/home/user/notes/cafe\u0301-menu\u0308')).toBe(true)
+    expect(isPathCandidate('~/दस्तावेज़/रिपोर्ट.md')).toBe(true) // Devanagari (virama/matra/nukta)
+  })
+  it('accepts emoji segments — pictographs, flags and ZWJ sequences', () => {
+    // Emoji are filename-legal but are neither \p{L}, \p{M} nor \p{N}.
+    // Escapes keep the exact code points visible in review.
+    expect(isPathCandidate('notes/\u{1F389} plan.md')).toBe(true) // pictograph, relative + ext
+    expect(isPathCandidate('~/trips/\u{1F1EF}\u{1F1F5} Japan')).toBe(true) // flag = two regional indicators
+    expect(isPathCandidate('/home/me/\u{1F469}\u200D\u{1F4BB} work/todo.txt')).toBe(true) // ZWJ sequence
+    expect(isPathCandidate('/home/me/party \u{1F389}')).toBe(true) // emoji as the LAST character
+    expect(isPathCandidate('C:\\Users\\me\\\u{1F389}\\plan.md')).toBe(true) // drive-rooted shape
+    // No root and no extension is still prose, emoji or not.
+    expect(isPathCandidate('\u{1F389}/\u{1F38A}')).toBe(false)
+    expect(isPathCandidate('party')).toBe(false)
+    expect(isPathCandidate('\u{1F389}')).toBe(false)
+  })
+
+
+  it('accepts a bare relative path whose Unicode basename has an ASCII extension', () => {
+    // The extension positive-signal must not require the whole basename to be
+    // ASCII — only the trailing `.ext` is the signal.
+    expect(isPathCandidate('src/产品文档-v1.0.md')).toBe(true)
+    expect(isPathCandidate('docs/résumé.pdf')).toBe(true)
+  })
+
+  it('still rejects slash-separated Unicode prose with no positive path signal', () => {
+    // Same rule as ASCII `and/or`: a bare two-segment identifier without a
+    // root, explicit-relative prefix, or extension is not a candidate.
+    expect(isPathCandidate('要么这样/要么那样')).toBe(false)
+    expect(isPathCandidate('и/или')).toBe(false)
+    expect(isPathCandidate('entweder/oder')).toBe(false)
+    // Shape-level pin: fullwidth colon U+FF1A is \p{Po}, outside the widened
+    // class, so this is rejected by PATH_SHAPE_RE itself — not by the
+    // extension gate — pinning that Unicode punctuation stays excluded.
+    expect(isPathCandidate('/文档：说明/文件.md')).toBe(false)
   })
 
   it('rejects git refs — the regression that made this gate necessary', () => {
@@ -220,6 +420,142 @@ describe('isPathCandidate — path chip pre-filter', () => {
     expect(isPathCandidate('https://example.com/path/file.txt')).toBe(false)
     expect(isPathCandidate('4a72aec5f04d3f44ba8042931226db051242d48a')).toBe(false)
     expect(isPathCandidate('someIdentifier')).toBe(false)
+  })
+
+  it('accepts drive-rooted Windows paths, either separator', () => {
+    // A Windows gateway names its files with `\` and roots them on a drive
+    // letter, so the POSIX-only shape rejected every absolute Windows path
+    // before the stat probe. The chip then degraded to the click-to-copy
+    // fallback, which is what a Windows user reported as "clicking only copies
+    // the address instead of opening the sidebar".
+    expect(isPathCandidate('C:\\Users\\me\\Documents\\notes.md')).toBe(true)
+    expect(isPathCandidate('C:/Users/me/Documents/notes.md')).toBe(true)
+    expect(isPathCandidate('c:\\temp\\a.txt')).toBe(true) // lowercase drive letter
+    expect(isPathCandidate('D:\\repo\\file.ts')).toBe(true)
+  })
+
+  it('accepts a drive-rooted Windows path with no extension — rootedness is the signal', () => {
+    // Exactly the POSIX rule: `/Users` needs no extension because it is rooted,
+    // so `C:\Windows` must not need one either. A bare drive root is a real
+    // directory and the file manager can reveal it.
+    expect(isPathCandidate('C:\\Windows')).toBe(true)
+    expect(isPathCandidate('C:\\')).toBe(true)
+  })
+
+  it('REFUSES UNC in either spelling — a stat on one is an outbound SMB credential probe', () => {
+    // Security boundary, not a gap. This pre-filter classifies markdown that may
+    // be attacker-authored, and a UNC path names a HOST: admitting one would let
+    // that text make the gateway stat `\\\\attacker.example\\share\\x`, which on
+    // Windows opens an SMB connection offering the host's NTLM credentials. The
+    // same line `WINDOWS_ABS_PATH_RE` (utils/urlTransform.ts) holds for image
+    // `src` values. Refused ahead of every other test, because the extension
+    // rule below would otherwise readmit it — `report.txt` has one.
+    expect(isPathCandidate('\\\\server\\share\\report.txt')).toBe(false)
+    expect(isPathCandidate('\\\\server\\share')).toBe(false)
+    expect(isPathCandidate('\\\\attacker.example\\share\\x.txt')).toBe(false)
+    // The Win32 extended-length prefix is the same leading shape, so it is
+    // refused too rather than being special-cased into the drive rule.
+    expect(isPathCandidate('\\\\?\\C:\\Users\\me\\notes.md')).toBe(false)
+    // The forward-slash spelling resolves to the SAME share on Windows, so it is
+    // refused too. `MdAnchor` already holds this line for a decoded `//` link
+    // destination; leaving it open here would be the same vector under a
+    // different coat of paint.
+    expect(isPathCandidate('//server/share/report.txt')).toBe(false)
+    // MIXED pairs, both orders. Windows reads any two leading separators as a
+    // UNC root regardless of kind, so a regex matching two of the SAME kind
+    // admitted these -- and the leading separator is then eaten by the relative
+    // prefix group, leaving `.txt` to satisfy the extension rule and send a real
+    // stat probe to the gateway. Refusing per-character rather than per-spelling
+    // is what closes the shape instead of enumerating it.
+    expect(isPathCandidate('\\/attacker.example\\share\\evil.txt')).toBe(false)
+    expect(isPathCandidate('/\\attacker.example\\share\\evil.txt')).toBe(false)
+    expect(isPathCandidate('\\/server/share/report.txt')).toBe(false)
+    expect(isPathCandidate('/\\server/share/report.txt')).toBe(false)
+    expect(isPathCandidate('//attacker.example/share/x.txt')).toBe(false)
+    // Nothing is lost on POSIX: one slash names the same file and still passes.
+    expect(isPathCandidate('/server/share/report.txt')).toBe(true)
+  })
+
+  it('accepts the decided filename punctuation on Windows', () => {
+    // Two review rounds each found one more legal character (parentheses, then
+    // the apostrophe in `C:\\Users\\O'Neil`), which is an allowlist being
+    // discovered one bug report at a time. These pin the whole decided set so a
+    // third round has nothing left to find.
+    expect(isPathCandidate('C:\\Program Files (x86)\\app.txt')).toBe(true)
+    expect(isPathCandidate('C:\\Program Files (x86)')).toBe(true)
+    expect(isPathCandidate('C:/Program Files (x86)/node/node.exe')).toBe(true)
+    expect(isPathCandidate("C:\\Users\\O'Neil\\notes.md")).toBe(true)
+    expect(isPathCandidate('C:\\data\\report [final].csv')).toBe(true)
+    expect(isPathCandidate('C:\\logs\\run#42.txt')).toBe(true)
+    expect(isPathCandidate('C:\\etc\\x={y}\\conf.ini')).toBe(true)
+  })
+
+  it('accepts the same punctuation on POSIX — one filesystem convention', () => {
+    // Admitted on both shapes deliberately: an asymmetry that fixed Windows and
+    // left the POSIX spelling failing would just be the next bug report.
+    expect(isPathCandidate('/Users/me/App (old).md')).toBe(true)
+    expect(isPathCandidate('/Users/me/Screenshot (1).png')).toBe(true)
+    expect(isPathCandidate("/Users/o'neil/notes.md")).toBe(true)
+    expect(isPathCandidate('/var/tmp/a+b.tar.gz')).toBe(true)
+    expect(isPathCandidate('/opt/app/v1,2/notes.md')).toBe(true)
+    expect(isPathCandidate('/srv/100%/index.html')).toBe(true)
+    expect(isPathCandidate('~/docs/report (final).pdf')).toBe(true)
+    expect(isPathCandidate("src/O'Brien (draft).md")).toBe(true)
+    // A closing bracket may END a path, so these classify as directories.
+    expect(isPathCandidate('/Users/me/App (old)')).toBe(true)
+    expect(isPathCandidate('/Users/me/data [2026]')).toBe(true)
+  })
+
+  it('keeps shell control operators OUT of the repertoire', () => {
+    // The exclusions are what keep the anchored shape from matching a command.
+    // Each of these carries an extension, so only the character class refuses it.
+    expect(isPathCandidate('$HOME/x.txt')).toBe(false)
+    expect(isPathCandidate('a&&b/c.sh')).toBe(false)
+    expect(isPathCandidate('cmd;rm/x.sh')).toBe(false)
+    expect(isPathCandidate('a|b/c.txt')).toBe(false)
+    expect(isPathCandidate('a>b/c.txt')).toBe(false)
+    expect(isPathCandidate('glob*/x.txt')).toBe(false)
+    expect(isPathCandidate('what?/x.txt')).toBe(false)
+  })
+
+  it('still refuses punctuated prose and a punctuated UNC share', () => {
+    // Widening the repertoire never widens the positive-signal rule: prose with
+    // neither a root nor an extension is still not a candidate, and the UNC
+    // refusal runs ahead of the shape tests.
+    expect(isPathCandidate('foo/bar (baz)')).toBe(false)
+    expect(isPathCandidate('and/or (maybe)')).toBe(false)
+    expect(isPathCandidate('\\\\server\\Program Files (x86)\\x.txt')).toBe(false)
+  })
+
+  it('accepts explicitly relative and extension-bearing backslash paths', () => {
+    expect(isPathCandidate('.\\src\\main.py')).toBe(true)
+    expect(isPathCandidate('..\\sibling\\file.json')).toBe(true)
+    expect(isPathCandidate('src\\main.py')).toBe(true)
+  })
+
+  it('accepts Unicode segments in a rooted Windows path', () => {
+    expect(isPathCandidate('C:\\Users\\me\\产品文档-v1.0.md')).toBe(true)
+    expect(isPathCandidate('C:\\Пользователи\\отчёт.txt')).toBe(true)
+  })
+
+  it('rejects backslash-joined text that is not a path — no positive signal', () => {
+    // Admitting `\` as a separator must not turn every backslash-joined token
+    // into a chip. Each of these lacks a root, an explicit-relative prefix and
+    // an extension, so the same rule that rejects `owner/repo` rejects them —
+    // on every platform, since the pre-filter cannot know the gateway's OS.
+    expect(isPathCandidate('\\n')).toBe(false) // escape sequence in inline code
+    expect(isPathCandidate('\\t')).toBe(false)
+    expect(isPathCandidate('HKEY_LOCAL_MACHINE\\Software\\Foo')).toBe(false) // registry key
+    expect(isPathCandidate('CORP\\alice')).toBe(false) // domain-qualified login
+    expect(isPathCandidate('domain\\user')).toBe(false)
+  })
+
+  it('reads the basename across either separator when applying the extension gate', () => {
+    // `lastIndexOf('/')` returns -1 for a backslash path and hands the whole
+    // string to the extension test, so a dotted DIRECTORY name would be read as
+    // an extension on the file. The basename here is `notes`, which has none.
+    expect(isPathCandidate('project\\v1.2\\notes')).toBe(false)
+    expect(isPathCandidate('project\\v1.2\\notes.md')).toBe(true)
   })
 })
 
@@ -303,13 +639,9 @@ describe('splitLineRef — file:line references', () => {
 describe('MarkdownRenderer path chips — stat gate', () => {
   const realFetch = globalThis.fetch
 
-  /** Stub the HEAD probe with a real Headers instance, so header lookup behaves
-   *  exactly as it does against the live endpoint. */
-  function stubKind(kind: 'file' | 'dir' | null, ok = true) {
-    const headers = new Headers(kind ? { 'X-Path-Kind': kind } : {})
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok, status: ok ? 200 : 404, headers } as Response),
-    ) as unknown as typeof fetch
+  /** Answer the batched kind probe with `kind` for every path. */
+  function stubKind(kind: 'file' | 'dir' | null, _ok = true) {
+    stubPathKinds(() => kind)
   }
 
   beforeEach(() => { __resetPathKindCache() })
@@ -329,12 +661,87 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     })
   })
 
+  it('opens a confirmed Markdown file link in the file viewer instead of navigating to the chat route', async () => {
+    const fn = stubPathKinds(asked => (asked === '/home/user/a.md' ? 'file' : null))
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md:12)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(probedPaths(fn)).toHaveLength(2))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md:12"]')
+    expect(anchor).not.toBeNull()
+    await waitFor(() => {
+      fireEvent.click(anchor!)
+      expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+    })
+  })
+
+  it('swallows a plain Markdown file-link click while its path probe is pending', async () => {
+    let resolveProbe: ((response: Response) => void) | undefined
+    let probeInit: RequestInit | undefined
+    globalThis.fetch = vi.fn((_url: unknown, init?: RequestInit) => {
+      probeInit = init
+      return new Promise<Response>((resolve) => { resolveProbe = resolve })
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(false)
+    expect(onFileOpen).not.toHaveBeenCalled()
+
+    resolveProbe?.(kindsResponse(kindsRequestPaths(probeInit), () => 'file'))
+  })
+
+  it('does not probe a decoded root-relative UNC path', async () => {
+    globalThis.fetch = vi.fn() as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    render(<MarkdownRenderer content={'[open](/%2Fserver/share/report.md)'} onFileOpen={onFileOpen} />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
+  it('prefers a literal Markdown link filename over its line-reference sibling', async () => {
+    const fn = stubPathKinds(asked => (asked === '/tmp/report.md' || asked === '/tmp/report.md:12' ? 'file' : null))
+    const onFileOpen = vi.fn()
+    const { getByRole } = render(
+      <MarkdownRenderer content={'[open](/tmp/report.md%3A12)'} onFileOpen={onFileOpen} />,
+    )
+    await waitFor(() => expect(probedPaths(fn)).toHaveLength(2))
+    await waitFor(() => {
+      fireEvent.click(getByRole('link', { name: 'open' }))
+      expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.md:12')
+    })
+  })
+
+  it('leaves an unconfirmed root-relative application link to navigate normally', async () => {
+    stubKind(null, false)
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[docs](/docs/page)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
+
+    const anchor = container.querySelector('a[href="/docs/page"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(true)
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
   it('leaves an inert chip glyph-free, so the affordance stays meaningful', async () => {
     stubKind(null, false)
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    expect(code.querySelector('svg')).toBeNull()
+    // Nothing VISIBLE, rather than no element at all: a path-shaped span holds an
+    // `opacity-0` copy of the glyph so a confirmation arriving later cannot change
+    // the paragraph's width (MarkdownRenderer.chipGlyphReserve.test.tsx). An
+    // invisible icon carries no affordance, so what this guards is unchanged —
+    // a real glyph must never reach a chip the backend did not confirm.
+    expect(code.querySelector('svg:not([class*="opacity-0"])')).toBeNull()
+    // A non-path chip copies, so it wears the copy cursor — not the pointer hand
+    // and glyph that mark a chip whose click opens something.
+    expect(code.className).toContain('cursor-copy')
     expect(code.className).not.toContain('cursor-pointer')
   })
 
@@ -351,11 +758,12 @@ describe('MarkdownRenderer path chips — stat gate', () => {
   })
 
   it('leaves a path that is not on disk as plain text', async () => {
-    stubKind(null, false) // 404 + X-Path-Kind: missing (header absent here)
+    stubKind(null, false) // the batch answers `missing`
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    expect(code.className).not.toContain('cursor-pointer')
+    // Not a path, so it is the copy chip: copy cursor, no path data.
+    expect(code.className).toContain('cursor-copy')
     expect(code.dataset.pathKind).toBeUndefined()
   })
 
@@ -370,6 +778,52 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
       expect(code.getAttribute('title')).toContain('/home/user/a.md')
+    })
+  })
+
+  /**
+   * The instruction half of that tooltip names an application, and the shift+click
+   * it describes calls `api.revealPath` — which shells out on the GATEWAY. So the
+   * sentence follows the gateway's platform, never the browser's, and a directory
+   * carries different wording from a file because clicking one browses rather than
+   * opens.
+   */
+  it.each([
+    ['darwin', 'file', 'Click to open / Shift+click to reveal in Finder'],
+    ['win32', 'file', 'Click to open / Shift+click to open in File Explorer'],
+    // The sentinel a non-owner dashboard user (and a failed probe) receives.
+    ['gateway', 'file', 'Click to open / Shift+click to show in file manager'],
+    ['darwin', 'dir', 'Click to browse / Shift+click to reveal in Finder'],
+    ['win32', 'dir', 'Click to browse / Shift+click to open in File Explorer'],
+    ['linux', 'dir', 'Click to browse / Shift+click to show in file manager'],
+  ])('names the reveal target in the hint for %s / %s', async (platform, kind, hint) => {
+    const isDir = kind === 'dir'
+    stubKind(isDir ? 'dir' : 'file', !isDir)
+    const path = isDir ? '/Users/me/workspace' : '/home/user/a.md'
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    qc.setQueryData(['kiro-prerequisite'], { platform })
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <MarkdownRenderer content={`\`${path}\``} />
+      </QueryClientProvider>,
+    )
+    await waitFor(() => {
+      const code = container.querySelector('code[data-path-kind]')!
+      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl/Cmd+click to copy`)
+    })
+  })
+
+  it('still renders a chip in a tree that has no QueryClientProvider', async () => {
+    // Popout frames and Mochi's Electron windows mount with a bare `createRoot`,
+    // where `useQuery` throws "No QueryClient set". Reading the platform must not
+    // make a chip unrenderable there — it falls back to the generic wording.
+    stubKind('file')
+    const { container } = render(<MarkdownRenderer content={'`/home/user/a.md`'} />)
+    await waitFor(() => {
+      const code = container.querySelector('code[data-path-kind]')!
+      expect(code.getAttribute('title')).toBe(
+        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl/Cmd+click to copy',
+      )
     })
   })
 
@@ -389,21 +843,27 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled()
   })
 
-  it('probes each distinct path once however many chips mention it', async () => {
+  it('does not probe a Markdown file link while the message is still streaming', async () => {
     stubKind('file')
+    render(<MarkdownRenderer content={'[open](/Users/me/pro)'} streaming onFileOpen={vi.fn()} />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+  })
+
+  it('probes each distinct path once however many chips mention it', async () => {
+    const fn = stubPathKinds(() => 'file')
     render(<MarkdownRenderer content={'`/home/user/a.md` and again `/home/user/a.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
-    expect((globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1)
+    expect(kindsRequestCount(fn)).toBe(1)
+    expect(probedPaths(fn)).toEqual(['/home/user/a.md'])
   })
 })
 
 describe('MarkdownRenderer path chips — activation routing', () => {
   const realFetch = globalThis.fetch
 
-  function stubKind(kind: 'file' | 'dir', ok: boolean) {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok, status: ok ? 200 : 404, headers: new Headers({ 'X-Path-Kind': kind }) } as Response),
-    ) as unknown as typeof fetch
+  function stubKind(kind: 'file' | 'dir', _ok: boolean) {
+    stubPathKinds(() => kind)
   }
 
   beforeEach(() => { __resetPathKindCache() })
@@ -443,7 +903,7 @@ describe('MarkdownRenderer path chips — activation routing', () => {
 
   it('falls back to reveal-in-OS for a directory when no folder handler is wired', async () => {
     stubKind('dir', false)
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(<MarkdownRenderer content={'`/Users/me/ws`'} onFileOpen={vi.fn()} />)
     const chip = await waitFor(() => {
       const c = container.querySelector('code[data-path-kind="dir"]')
@@ -451,13 +911,15 @@ describe('MarkdownRenderer path chips — activation routing', () => {
       return c!
     })
     fireEvent.click(chip)
-    expect(reveal).toHaveBeenCalledWith('/Users/me/ws')
+    // Now routed through the shared `revealOrOpen` helper, which passes the
+    // explicit 'reveal' action to the transport call.
+    expect(reveal).toHaveBeenCalledWith('/Users/me/ws', 'reveal')
   })
 
   it('shift-click reveals instead of opening', async () => {
     stubKind('file', true)
     const onFileOpen = vi.fn()
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(
       <MarkdownRenderer content={'`/home/user/a.md`'} onFileOpen={onFileOpen} />,
     )
@@ -467,7 +929,7 @@ describe('MarkdownRenderer path chips — activation routing', () => {
       return c!
     })
     fireEvent.click(chip, { shiftKey: true })
-    expect(reveal).toHaveBeenCalledWith('/home/user/a.md')
+    expect(reveal).toHaveBeenCalledWith('/home/user/a.md', 'reveal')
     expect(onFileOpen).not.toHaveBeenCalled()
   })
 
@@ -502,15 +964,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
    *  Needed here because the whole point is that ONE of two candidate spellings
    *  resolves and the other does not. */
   function stubPaths(known: string[]) {
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const hit = known.includes(asked)
-      return Promise.resolve({
-        ok: hit,
-        status: hit ? 200 : 404,
-        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    return stubPathKinds(asked => (known.includes(asked) ? 'file' : null))
   }
 
   const chipOf = (container: HTMLElement) => waitFor(() => {
@@ -589,15 +1043,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
     // hides the `.py`. Testing the raw text directly therefore left relative
     // citations — the majority form — with one probe and NO sibling precedence, so
     // this opened `src/report.py` even though `src/report.py:12` also exists.
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const known = asked === 'src/report.py' || asked === 'src/report.py:12'
-      return Promise.resolve({
-        ok: known,
-        status: known ? 200 : 404,
-        headers: new Headers(known ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    stubPathKinds(asked => (asked === 'src/report.py' || asked === 'src/report.py:12' ? 'file' : null))
     const onFileOpen = vi.fn()
     const { container } = render(
       <MarkdownRenderer content={'`src/report.py:12`'} onFileOpen={onFileOpen} />,
@@ -612,11 +1058,10 @@ describe('MarkdownRenderer path chips — file:line references', () => {
   it('charges the second probe only where there are two spellings to compare', async () => {
     // The extra request buys unambiguous precedence, so it must not be spent on a
     // chip that carries no line reference.
-    stubPaths(['/a/b.md'])
+    const fn = stubPaths(['/a/b.md'])
     const { container } = render(<MarkdownRenderer content={'`/a/b.md`'} />)
     await chipOf(container)
-    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls
-    expect(calls).toHaveLength(1)
+    expect(probedPaths(fn)).toEqual(['/a/b.md'])
   })
 
   it('picks the per-extension glyph from the stripped path', async () => {
@@ -649,16 +1094,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
     // `/tmp/report` at line 12 — in an editor, so a later save would write to a
     // file the reader never named. The literal text they clicked has to win, and
     // here that means the folder route, not the file route.
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      if (asked === '/tmp/report') {
-        return Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
-      }
-      if (asked === '/tmp/report:12') {
-        return Promise.resolve({ ok: false, status: 404, headers: new Headers({ 'X-Path-Kind': 'dir' }) } as Response)
-      }
-      return Promise.resolve({ ok: false, status: 404, headers: new Headers() } as Response)
-    }) as unknown as typeof fetch
+    stubPathKinds(asked => (asked === '/tmp/report' ? 'file' : asked === '/tmp/report:12' ? 'dir' : null))
     const onFileOpen = vi.fn()
     const onFolderOpen = vi.fn()
     const { container } = render(
@@ -678,24 +1114,27 @@ describe('MarkdownRenderer path chips — file:line references', () => {
   })
 
   it('stays inert until every probe in flight has reported', async () => {
-    // Both probes are concurrent, and the split one can land first. Rendering the
-    // affordance on that verdict alone leaves a window where a click opens the
-    // split path even though the literal name exists.
+    // The split verdict can be known before the literal one: here an earlier
+    // mention already resolved the split path, so it answers from cache while the
+    // literal path's request is still out. Rendering the affordance on that
+    // verdict alone leaves a window where a click opens the split path even
+    // though the literal name exists.
+    stubPaths(['/tmp/report'])
+    const warm = render(<MarkdownRenderer content={'`/tmp/report`'} />)
+    await chipOf(warm.container)
+    warm.unmount()
     let releaseRaw: (() => void) | undefined
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      if (asked === '/tmp/report') {
-        return Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
-      }
-      // Hold the literal-path verdict open so the split one lands first.
+    globalThis.fetch = vi.fn((_url: unknown, init?: RequestInit) => {
+      // Hold the literal-path verdict open.
       return new Promise<Response>(res => {
-        releaseRaw = () => res({ ok: false, status: 404, headers: new Headers() } as Response)
+        releaseRaw = () => res(kindsResponse(kindsRequestPaths(init), () => null))
       })
     }) as unknown as typeof fetch
     const { container } = render(<MarkdownRenderer content={'`/tmp/report:12`'} />)
-    // The split path has resolved as a file by now, but the chip must not offer
-    // itself while the literal path is unknown.
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+    // The split path is a known file, but the chip must not offer itself while
+    // the literal path is unknown.
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+    expect(probedPaths(globalThis.fetch as unknown as { mock: { calls: unknown[][] } })).toEqual(['/tmp/report:12'])
     expect(container.querySelector('code[data-path-kind]')).toBeNull()
     await act(async () => { releaseRaw?.(); await Promise.resolve() })
     const chip = await chipOf(container)
@@ -706,15 +1145,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
   it('drops the line when the target turns out to be a directory', async () => {
     // Only the split path exists, and it is a directory. `/Users/me/ws:12` is not
     // a real name here, so the literal probe misses and the split path is used.
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const isDir = asked === '/Users/me/ws'
-      return Promise.resolve({
-        ok: false,
-        status: 404,
-        headers: new Headers(isDir ? { 'X-Path-Kind': 'dir' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    stubPathKinds(asked => (asked === '/Users/me/ws' ? 'dir' : null))
     const onFolderOpen = vi.fn()
     const onFileOpen = vi.fn()
     const { container } = render(
@@ -733,14 +1164,15 @@ describe('MarkdownRenderer path chips — file:line references', () => {
 
   it('shift-click still reveals the file itself, without the line', async () => {
     stubPaths(['/Users/me/src/_dispatch.py'])
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const onFileOpen = vi.fn()
     const { container } = render(
       <MarkdownRenderer content={'`/Users/me/src/_dispatch.py:447`'} onFileOpen={onFileOpen} />,
     )
     fireEvent.click(await chipOf(container), { shiftKey: true })
-    // Finder/Explorer selects a file; it has no notion of a line.
-    expect(reveal).toHaveBeenCalledWith('/Users/me/src/_dispatch.py')
+    // Finder/Explorer selects a file; it has no notion of a line. Routed through
+    // the shared helper, which passes the explicit 'reveal' action.
+    expect(reveal).toHaveBeenCalledWith('/Users/me/src/_dispatch.py', 'reveal')
     expect(onFileOpen).not.toHaveBeenCalled()
   })
 
@@ -750,6 +1182,137 @@ describe('MarkdownRenderer path chips — file:line references', () => {
     await Promise.resolve()
     expect(globalThis.fetch).not.toHaveBeenCalled()
     expect(container.querySelector('code[data-path-kind]')).toBeNull()
+  })
+})
+
+
+/**
+ * Windows paths, end to end through the chip: pre-filter -> stat probe -> chip.
+ *
+ * The pre-filter cases above pin the syntax decision in isolation; these pin the
+ * RENDERED consequence, which is what the bug report was actually about. Before
+ * this fix a Windows absolute path failed `isPathCandidate`, so no probe was ever
+ * issued and `InlineCode` fell through to the click-to-copy `CopyableCode`
+ * fallback — a Windows user clicking a path the agent had just written got the
+ * address on their clipboard instead of the file in the sidebar.
+ */
+describe('MarkdownRenderer path chips — Windows paths', () => {
+  const realFetch = globalThis.fetch
+
+  /** Answers `file` only for the paths listed, 404 otherwise, and records every
+   *  path the component actually asked about — the absence of a probe is the
+   *  pre-fix symptom, so the call list is itself an assertion target. */
+  function stubPaths(known: string[]): string[] {
+    const asked: string[] = []
+    stubPathKinds(p => {
+      asked.push(p)
+      return known.includes(p) ? 'file' : null
+    })
+    return asked
+  }
+
+  beforeEach(() => { __resetPathKindCache() })
+  afterEach(() => { globalThis.fetch = realFetch; vi.restoreAllMocks() })
+
+  it('renders a drive-qualified path as a chip and opens it, instead of copying', async () => {
+    const win = 'C:\\Users\\me\\Documents\\notes.md'
+    stubPaths([win])
+    const onFileOpen = vi.fn()
+    const { container } = render(
+      <MarkdownRenderer content={'`' + win + '`'} onFileOpen={onFileOpen} />,
+    )
+    const chip = await waitFor(() => {
+      const c = container.querySelector('code[data-path-kind="file"]') as HTMLElement | null
+      expect(c).not.toBeNull()
+      return c!
+    })
+    expect(chip.getAttribute('data-path')).toBe(win)
+    fireEvent.click(chip)
+    expect(onFileOpen).toHaveBeenCalledWith(win)
+  })
+
+  it('probes both drive spellings, and never probes a backslash UNC path', async () => {
+    const back = 'C:\\Users\\me\\notes.md'
+    const fwd = 'D:/repo/main.ts'
+    const unc = '\\\\server\\share\\report.txt'
+    const asked = stubPaths([back, fwd, unc])
+    const { container } = render(
+      <MarkdownRenderer content={'`' + back + '`, `' + fwd + '` and `' + unc + '`'} />,
+    )
+    await waitFor(() => {
+      expect(container.querySelectorAll('code[data-path-kind="file"]')).toHaveLength(2)
+    })
+    expect(asked).toContain(back)
+    expect(asked).toContain(fwd)
+    // The stub would have answered `file` for the UNC path, so a chip for it
+    // would have rendered. It never resolved because it was never asked — that
+    // absent request IS the SMB-probe guard.
+    expect(asked).not.toContain(unc)
+  })
+
+  it("renders `C:\\Users\\O'Neil` as a chip and opens it", async () => {
+    const win = "C:\\Users\\O'Neil\\notes.md"
+    stubPaths([win])
+    const onFileOpen = vi.fn()
+    const { container } = render(
+      <MarkdownRenderer content={'`' + win + '`'} onFileOpen={onFileOpen} />,
+    )
+    const chip = await waitFor(() => {
+      const c = container.querySelector('code[data-path-kind="file"]') as HTMLElement | null
+      expect(c).not.toBeNull()
+      return c!
+    })
+    expect(chip.getAttribute('data-path')).toBe(win)
+    fireEvent.click(chip)
+    expect(onFileOpen).toHaveBeenCalledWith(win)
+  })
+
+  it('renders `C:\\Program Files (x86)` as a chip and opens it', async () => {
+    const win = 'C:\\Program Files (x86)\\app\\config.json'
+    stubPaths([win])
+    const onFileOpen = vi.fn()
+    const { container } = render(
+      <MarkdownRenderer content={'`' + win + '`'} onFileOpen={onFileOpen} />,
+    )
+    const chip = await waitFor(() => {
+      const c = container.querySelector('code[data-path-kind="file"]') as HTMLElement | null
+      expect(c).not.toBeNull()
+      return c!
+    })
+    expect(chip.getAttribute('data-path')).toBe(win)
+    fireEvent.click(chip)
+    expect(onFileOpen).toHaveBeenCalledWith(win)
+  })
+
+  it('carries the line number from a Windows file:line citation', async () => {
+    const win = 'C:\\repo\\src\\main.ts'
+    stubPaths([win])
+    const onFileOpen = vi.fn()
+    const { container } = render(
+      <MarkdownRenderer content={'`' + win + ':42`'} onFileOpen={onFileOpen} />,
+    )
+    const chip = await waitFor(() => {
+      const c = container.querySelector('code[data-path-kind="file"]') as HTMLElement | null
+      expect(c).not.toBeNull()
+      return c!
+    })
+    fireEvent.click(chip)
+    expect(onFileOpen).toHaveBeenCalledWith(win, { line: 42 })
+  })
+
+  it('issues NO probe for backslash text that is not a path, and leaves it a copy chip', async () => {
+    // The guard on widening the separator: a registry key and an escape sequence
+    // must not become chips, and must not even cost a request. `data-path-kind`
+    // absent is the click-to-copy fallback still being in charge.
+    const asked = stubPaths([])
+    const { container } = render(
+      <MarkdownRenderer content={'`HKEY_LOCAL_MACHINE\\Software\\Foo` and `\\n`'} />,
+    )
+    await waitFor(() => {
+      expect(container.querySelectorAll('code').length).toBeGreaterThan(0)
+    })
+    expect(container.querySelector('code[data-path-kind]')).toBeNull()
+    expect(asked).toEqual([])
   })
 })
 
@@ -768,11 +1331,9 @@ describe('MarkdownRenderer path chips — forgery resistance', () => {
    * always opened what they saw).
    */
   it('ignores a chip forged via raw HTML with a hidden path', async () => {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response),
-    ) as unknown as typeof fetch
+    stubPathKinds(() => 'file')
     const onFileOpen = vi.fn()
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(
       <MarkdownRenderer
         content={'<code data-path-kind="file" data-path="/etc/hosts">totally harmless</code>'}
@@ -998,148 +1559,5 @@ describe('Lightbox keyboard navigation', () => {
     // A click after the drag must not change zoom (stays 2x) or close anything.
     act(() => { fireEvent.click(imgEl()) })
     expect(imgEl().getAttribute('style')).toContain('scale(2)')
-  })
-})
-
-describe('MarkdownRenderer mcwidget strip is inline-code-aware', () => {
-  it('preserves prose when an unclosed widget tag appears inside an inline-code span', () => {
-    // The `<mcwidget[\s\S]*$` alternative must not eat from the literal opening
-    // tag (inside backticks) to end-of-block, or it drops the rest of the prose.
-    const content = 'In a chat: ask the agent to emit any `<mcwidget>` (e.g. "render a CR queue widget"), then click Bookmark.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('emit any')
-    expect(text).toContain('render a CR queue widget')
-    expect(text).toContain('click Bookmark')
-  })
-
-  it('preserves a balanced inline-code mention of a widget tag pair', () => {
-    const content = 'Use `<mcwidget>hello</mcwidget>` to embed HTML.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('to embed HTML')
-  })
-
-  it('preserves real prose AFTER a backtick-wrapped tag mention earlier in the block', () => {
-    const content = [
-      '- Sidebar shows Artifacts',
-      '- In a chat: ask the agent to emit any `<mcwidget>` (e.g. "render a CR queue widget")',
-      '- Navigate to /artifacts',
-    ].join('\n')
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('Sidebar shows Artifacts')
-    expect(text).toContain('render a CR queue widget')
-    expect(text).toContain('Navigate to /artifacts')
-  })
-})
-
-describe('MarkdownRenderer strips leaked <tool_use> protocol markup', () => {
-  it('strips a complete <tool_use>...</tool_use> block and renders surrounding markdown', () => {
-    // When the agent leaks the full Anthropic tool_use wrapper as text, the
-    // unknown <tool_use> element would otherwise trap the JSON body (including
-    // escaped \n literals) into a single paragraph, dropping all the headers and
-    // rating callouts. The strip pass removes the wrapper and its body so the
-    // surrounding prose renders normally.
-    const content = [
-      "I'll generate the review.",
-      '',
-      '<tool_use> {"tool_calls": [{"tool_name": "write_file", "parameters": {"file_path": "/tmp/x.md", "content": "### Heading\\n\\n**Rating:** Mixed"}}]} </tool_use>',
-      '',
-      'Review saved.',
-    ].join('\n')
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain("I'll generate the review.")
-    expect(text).toContain('Review saved.')
-    // Tag itself and its JSON body must NOT leak through
-    expect(text).not.toContain('tool_calls')
-    expect(text).not.toContain('write_file')
-    expect(text).not.toContain('<tool_use>')
-    // getElementsByTagName (not querySelector('tool_use')): happy-dom parses the
-    // arg as a CSS selector and rejects the bare `tool_use` tag name as invalid,
-    // whereas getElementsByTagName takes a literal tag name on every engine.
-    expect(container.getElementsByTagName('tool_use')).toHaveLength(0)
-  })
-
-  it('strips an unclosed <tool_use> opener (mid-stream)', () => {
-    // During streaming the closing tag may not have arrived yet. The strip
-    // regex falls through to the `<tool_use[\s\S]*$` alternative and removes
-    // everything from the opener to end of block.
-    const content = 'Working on it…\n\n<tool_use> {"tool_calls": [{"tool_name": "write_'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('Working on it')
-    expect(text).not.toContain('tool_calls')
-    expect(text).not.toContain('write_')
-  })
-
-  it('strips multiple <tool_use> blocks in the same message', () => {
-    const content = [
-      'First action:',
-      '<tool_use>{"a": 1}</tool_use>',
-      'Second action:',
-      '<tool_use>{"b": 2}</tool_use>',
-      'Done.',
-    ].join('\n')
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('First action:')
-    expect(text).toContain('Second action:')
-    expect(text).toContain('Done.')
-    expect(text).not.toContain('"a"')
-    expect(text).not.toContain('"b"')
-  })
-
-  it('preserves <tool_use> mentions inside inline-code spans', () => {
-    // Author documenting the protocol in prose: e.g. `<tool_use>` should
-    // remain visible. The strip pass uses the same maskInlineCode helper as
-    // the widget strip, so backtick-wrapped tag mentions are not removed.
-    const content = 'When the agent emits a literal `<tool_use>` tag, the dashboard now strips it.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('<tool_use>')
-    expect(text).toContain('the dashboard now strips it.')
-  })
-
-  it('does NOT strip <tool_use> mentions inside fenced code blocks', () => {
-    // When the agent is documenting the protocol in a code block, the tags
-    // are real content — the fence makes the markdown renderer treat them
-    // as literal text and the strip pass operates on markdown blocks only,
-    // not extracted code blocks. Regression guard for documentation messages.
-    const content = '```\n<tool_use>{"x": 1}</tool_use>\n```'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('<tool_use>')
-    expect(text).toContain('"x"')
-  })
-})
-
-describe('MarkdownRenderer softBreaks', () => {
-  it('converts a soft line break to <br> when softBreaks is set', () => {
-    const { container } = render(<MarkdownRenderer content={'line one\nline two'} softBreaks />)
-    expect(container.querySelectorAll('br').length).toBe(1)
-    expect(container.textContent).toContain('line one')
-    expect(container.textContent).toContain('line two')
-  })
-
-  it('collapses a soft line break by default (no softBreaks, no <br>)', () => {
-    const { container } = render(<MarkdownRenderer content={'line one\nline two'} />)
-    expect(container.querySelector('br')).toBeNull()
-  })
-
-  it('does not inject <br> between loose list items — block spacing stays normal', () => {
-    // A blank line between items makes a "loose" list. The soft-break plugin
-    // must only touch soft breaks inside text; block separators (parsed as
-    // distinct blocks) stay untouched, so list items keep normal spacing and
-    // no literal blank line is rendered between them.
-    const { container } = render(<MarkdownRenderer content={'1. first\n\n2. second'} softBreaks />)
-    expect(container.querySelectorAll('ol > li').length).toBe(2)
-    expect(container.querySelector('br')).toBeNull()
-  })
-
-  it('preserves multiple soft breaks in a paragraph as multiple <br> when softBreaks is set', () => {
-    const { container } = render(<MarkdownRenderer content={'a\nb\nc'} softBreaks />)
-    expect(container.querySelectorAll('br').length).toBe(2)
   })
 })

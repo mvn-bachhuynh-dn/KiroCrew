@@ -1,12 +1,30 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
+// './all' for the zh-CN catalog: these cases switch language to exercise
+// resolution and persistence, and `changeLanguage` refuses in dev when the
+// target has no registered catalog.
+import './all'
 import { LanguageProvider, useLanguage } from './LanguageProvider'
 import { LANG_STORAGE_KEY } from './detect'
 import { api } from '../api/client'
+import { i18next } from './index'
+
+const changeLanguageControl = vi.hoisted(() => ({
+  call: vi.fn<(code: string) => Promise<boolean>>(),
+}))
+
+vi.mock('./index', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./index')>()
+  changeLanguageControl.call.mockImplementation(async (code) => {
+    await actual.changeLanguage(code)
+    return true
+  })
+  return { ...actual, changeLanguage: changeLanguageControl.call }
+})
 
 /** Fresh QueryClient per test so the ['theme-boot'] cache never leaks across cases. */
 function wrap(children: ReactNode, boot: { language?: string } = {}) {
@@ -21,13 +39,14 @@ function wrap(children: ReactNode, boot: { language?: string } = {}) {
 
 /** Surfaces the context so assertions can read it. */
 function Probe() {
-  const { language, resolved, detected, setLanguage, syncFailed } = useLanguage()
+  const { language, resolved, detected, setLanguage, syncFailed, catalogFailed } = useLanguage()
   return (
     <div>
       <span data-testid="choice">{language || '(auto)'}</span>
       <span data-testid="resolved">{resolved}</span>
       <span data-testid="detected">{detected}</span>
       <span data-testid="sync">{syncFailed ? 'failed' : 'ok'}</span>
+      <span data-testid="catalog">{catalogFailed ? 'failed' : 'ok'}</span>
       <button onClick={() => setLanguage('zh-CN')}>to-zh</button>
       <button onClick={() => setLanguage('')}>to-auto</button>
     </div>
@@ -133,9 +152,20 @@ describe('LanguageProvider', () => {
     await waitFor(() => expect(document.documentElement.lang).toBe('zh-CN'))
   })
 
+  it('keeps <html lang> on the rendered language when the switch does not happen', async () => {
+    // A catalog that fails to load leaves i18next on its current language;
+    // stand that in by making the underlying switch a no-op.
+    await i18next.changeLanguage('en')
+    vi.spyOn(i18next, 'changeLanguage').mockResolvedValue((() => '') as never)
+    localStorage.setItem(LANG_STORAGE_KEY, 'zh-CN')
+    wrap(<Probe />)
+    expect(screen.getByTestId('resolved').textContent).toBe('zh-CN')
+    await waitFor(() => expect(document.documentElement.lang).toBe('en'))
+  })
+
   // A regional tag must land on the bare code, or the locale-specific font
-  // override keyed on it — `html:lang(ja)`, `html:lang(ko)` — never matches and the
-  // script silently renders through the Simplified Chinese alias.
+  // override keyed on it — `html:lang(ja)`, `html:lang(ko)` — never matches and
+  // Kana / Hangul fall through to the untagged OS cascade instead of their aliases.
   it.each([['ja-JP', 'ja'], ['ko-KR', 'ko']])(
     'normalizes the %s browser tag for the locale-specific font override',
     async (tag, expected) => {
@@ -249,5 +279,61 @@ describe('LanguageProvider — an empty server value must not erase a local choi
     wrap(<Probe />, { language: '' })
     await waitFor(() => expect(screen.getByTestId('resolved')).toHaveTextContent('en'))
     expect(screen.getByTestId('choice')).toHaveTextContent('(auto)')
+  })
+})
+
+describe('LanguageProvider cross-tab boot ordering', () => {
+  it('keeps a cross-tab choice when an older boot response arrives later', async () => {
+    let resolveBoot!: (value: { language: string }) => void
+    const bootPromise = new Promise<{ language: string }>((resolve) => {
+      resolveBoot = resolve
+    })
+    vi.spyOn(api, 'themeBoot').mockReturnValue(bootPromise as never)
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <LanguageProvider><Probe /></LanguageProvider>
+      </QueryClientProvider>,
+    )
+
+    localStorage.setItem(LANG_STORAGE_KEY, 'zh-CN')
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: LANG_STORAGE_KEY,
+        newValue: 'zh-CN',
+        storageArea: localStorage,
+      }))
+    })
+    await waitFor(() => expect(screen.getByTestId('choice')).toHaveTextContent('zh-CN'))
+
+    resolveBoot({ language: 'en' })
+    await waitFor(() => {
+      expect(qc.getQueryData(['theme-boot'])).toEqual({ language: 'en' })
+    })
+
+    expect(screen.getByTestId('choice')).toHaveTextContent('zh-CN')
+    expect(localStorage.getItem(LANG_STORAGE_KEY)).toBe('zh-CN')
+  })
+})
+
+describe('LanguageProvider — catalog failures are reported', () => {
+  it('sets catalogFailed when the selected catalog does not load', async () => {
+    changeLanguageControl.call.mockResolvedValueOnce(false)
+
+    wrap(<Probe />, { language: '' })
+
+    await waitFor(() => expect(screen.getByTestId('catalog')).toHaveTextContent('failed'))
+  })
+
+  it('clears catalogFailed after a later switch succeeds', async () => {
+    changeLanguageControl.call.mockResolvedValueOnce(false)
+    wrap(<Probe />, { language: '' })
+    await waitFor(() => expect(screen.getByTestId('catalog')).toHaveTextContent('failed'))
+
+    changeLanguageControl.call.mockResolvedValueOnce(true)
+    await userEvent.click(screen.getByText('to-zh'))
+
+    await waitFor(() => expect(screen.getByTestId('catalog')).toHaveTextContent('ok'))
   })
 })

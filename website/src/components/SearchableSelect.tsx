@@ -2,8 +2,11 @@ import { useCallback, useMemo, useRef, useState } from 'react'
 import { Check, ChevronDown, Search } from 'lucide-react'
 import { Popover, PopoverTrigger, PopoverContent } from './ui/popover'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useImeGuard } from '../hooks/useImeGuard'
+import { cn } from '../lib/utils'
 
 import { i18nT } from '../i18n/t'
+import { useInsideDialog } from './overlayRoot'
 
 /**
  * Searchable single-select dropdown for lists too long to scan.
@@ -31,6 +34,14 @@ export interface SearchableSelectOption {
   sublabel?: string
   /** Extra text the filter matches but never displays. */
   keywords?: string
+  /**
+   * CSS font stack to render this row's own text in, for a list whose rows ARE a
+   * sample of what they select — a font picker showing each family in that
+   * family, so the choice is visible before it is made. A font stack rather than
+   * a style object on purpose: the narrow type is the promise, so the row can
+   * never become a general styling hook.
+   */
+  previewFontFamily?: string
   disabled?: boolean
 }
 
@@ -42,12 +53,56 @@ export interface SearchableSelectProps {
   triggerFallback?: string
   /** Filter-box placeholder. Defaults to a generic "Search…". */
   searchPlaceholder?: string
+  /**
+   * Let the filter box double as free text: PASSING this shapes the row that
+   * offers whatever is typed, and its presence is what enables free text at all.
+   *
+   * For a list that can only ever be a SAMPLE of the valid values — installed
+   * fonts, where the browser can only confirm names it is handed — rather than a
+   * closed enumeration like the IANA timezones. It returns everything but the
+   * `value`, so the row can carry a preview and so the copy stays in the caller's
+   * catalog; there is no default label, because a bare echo of the typed text
+   * reads as an option that already exists.
+   */
+  customValueOption?: (typed: string) => Omit<SearchableSelectOption, 'value'>
+  /**
+   * Optional action row at the top of the list (e.g. "List all installed
+   * fonts…"). Fires `onSelect` instead of `onChange` and does not close the
+   * popup, so a slow action can repopulate `options` in place. Mirrors
+   * `SimpleSelect`'s `action`.
+   */
+  action?: { label: string; onSelect: () => void }
+  /**
+   * One-line outcome of the last `action` run, rendered inside the popup next to
+   * it. The popup overlays the settings row below the trigger, so an action's
+   * result reported there would be hidden behind the very list it describes.
+   */
+  actionStatus?: string
   disabled?: boolean
   /** Set on the trigger so an external <label htmlFor> can address it. */
   id?: string
   className?: string
   style?: React.CSSProperties
   'aria-label'?: string
+  /** Set on the trigger, so a note about the current value is read with the field. */
+  'aria-describedby'?: string
+  /**
+   * Pass true when this selector renders INSIDE a Radix modal dialog (e.g. the
+   * crew-capabilities editor). The popup then mounts its own react-remove-scroll
+   * instance, which takes over the wheel lock from the host dialog's — without it
+   * the host lock cancels wheel events over this portal (outside the dialog's
+   * lock container and shards) and the list cannot scroll. Deliberately opt-in:
+   * on an ordinary page a modal popup would lock page scroll, swallow the first
+   * click on a neighbouring field, and aria-hide the rest of the page —
+   * regressions, not protections, when there is no host dialog to coexist with.
+   * Outside a dialog the shared Popover ignores it.
+   */
+  modal?: boolean
+}
+
+/** Row text style, from the option's font stack — the only styling a row exposes. */
+function preview(opt: SearchableSelectOption): React.CSSProperties | undefined {
+  return opt.previewFontFamily ? { fontFamily: opt.previewFontFamily } : undefined
 }
 
 /** Case-insensitive AND-match over every whitespace-separated token, so
@@ -64,24 +119,43 @@ export default function SearchableSelect({
   onChange,
   triggerFallback,
   searchPlaceholder,
+  customValueOption,
+  action,
+  actionStatus,
   disabled,
   id,
   className,
   style,
   'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
+  modal: modalProp = false,
 }: SearchableSelectProps) {
+  // The shared Popover is modal only inside a Radix dialog, so focus handling
+  // follows the modality it actually gets (components/overlayRoot).
+  const insideDialog = useInsideDialog()
+  const modal = modalProp && insideDialog
   const [open, setOpen] = useState(false)
   const [filter, setFilter] = useState('')
   const triggerRef = useRef<HTMLButtonElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const ime = useImeGuard()
 
   const selected = options.find(o => o.value === value)
 
   const filtered = useMemo(() => {
-    const tokens = filter.trim().toLowerCase().split(/\s+/).filter(Boolean)
-    return options.filter(o => matches(o, tokens))
-  }, [options, filter])
+    const typed = filter.trim()
+    const tokens = typed.toLowerCase().split(/\s+/).filter(Boolean)
+    const rows = options.filter(o => matches(o, tokens))
+    // The free-text row goes LAST, so Enter still commits the top real match and
+    // the typed value is offered rather than imposed. It is the only row when
+    // nothing matched, which is exactly when the escape hatch is needed.
+    if (customValueOption && typed
+      && !rows.some(o => o.value.toLowerCase() === typed.toLowerCase())) {
+      rows.push({ value: typed, ...customValueOption(typed) })
+    }
+    return rows
+  }, [options, filter, customValueOption])
 
   // Radix returns focus to the trigger itself on close, so this only has to
   // flip the state; keeping the name matches the hook's contract.
@@ -101,12 +175,28 @@ export default function SearchableSelect({
     // filter box — so the hook must not also grab focus for the list.
     hasFilterInput: true,
     // `useListboxKeyboard` gates its Enter branch on `filteredCount === 1`, but
-    // combobox convention commits the top match whenever the list is non-empty:
-    // typing "los ang" and pressing Enter should not sit silent just because two
-    // rows still match. Reporting 1 whenever anything matches routes Enter here,
-    // and `choose(filtered[0])` picks the row the user is looking at.
-    filteredCount: filtered.length > 0 ? 1 : 0,
-    onEnterSingleMatch: () => { const o = filtered[0]; if (o) choose(o) },
+    // combobox convention commits the top match whenever the user has NARROWED
+    // the list: typing "los ang" and pressing Enter should not sit silent just
+    // because two rows still match. Reporting 1 whenever anything matches routes
+    // Enter here, and `onEnterSingleMatch` picks the row the user is looking at.
+    //
+    // Gated on a non-empty filter, because on an UNFILTERED list `filtered[0]` is
+    // merely the first row, not a match for anything the user expressed. Opening
+    // the picker and pressing Enter would otherwise commit it and overwrite the
+    // saved value — with a "default" row at the top, that silently discards the
+    // user's choice.
+    filteredCount: filter.trim() && filtered.length > 0 ? 1 : 0,
+    // An exact value or label match wins over the top row: a row whose label
+    // merely CONTAINS the typed text (e.g. "Inherit (kirocrew)") must not shadow
+    // the option the user typed in full. Only real options qualify: the
+    // free-text row's value IS the typed text and stays an offer, not a default.
+    onEnterSingleMatch: () => {
+      const typed = filter.trim().toLowerCase()
+      const exact = filtered.find(r => options.includes(r)
+        && (r.value.toLowerCase() === typed || r.label.toLowerCase() === typed))
+      const o = exact ?? filtered[0]
+      if (o) choose(o)
+    },
     closeToTrigger,
   })
 
@@ -114,19 +204,21 @@ export default function SearchableSelect({
     <Popover
       open={open}
       onOpenChange={o => { setOpen(o); if (!o) setFilter('') }}
+      modal={modal}
     >
       <PopoverTrigger
         ref={triggerRef}
         id={id}
         disabled={disabled}
         aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
         aria-haspopup="listbox"
-        className={[
+        className={cn(
           'flex items-center justify-between w-full px-3 py-2 rounded-md text-sm border border-border bg-bg-elevated text-text',
-          'hover:border-border-strong transition-all cursor-pointer outline-none',
+          'hover:border-border-strong transition-all cursor-pointer outline-hidden',
           'focus-visible:border-accent disabled:opacity-40 disabled:pointer-events-none',
-          className || '',
-        ].join(' ').trim()}
+          className,
+        )}
         style={style}
       >
         <span className="truncate text-left min-w-0">
@@ -143,9 +235,18 @@ export default function SearchableSelect({
         // keydown reaches window-level Escape handlers and closes the host
         // surface too — the fix mirrors ui/select.tsx's SelectContent.
         onEscapeKeyDown={e => e.stopPropagation()}
+        // Modal only: the focus trap is still live when closeToTrigger runs,
+        // so the deterministic focus return must happen at FocusScope teardown.
+        // Non-modal keeps Radix's own semantics — its hasInteractedOutside guard
+        // does NOT reclaim focus after an outside click, so the field the user
+        // clicked keeps the caret; overriding it in non-modal mode would yank
+        // focus back one macrotask after the click landed.
+        onCloseAutoFocus={modal ? e => { e.preventDefault(); triggerRef.current?.focus() } : undefined}
         // Exactly the trigger's width — see the note in ui/select.tsx's
         // SelectContent. No `min-w` floor: it would overhang the trigger.
-        className="w-[var(--radix-popover-trigger-width)] max-h-[300px] p-0 flex flex-col overflow-hidden"
+        // `min()` caps at the Radix-provided available height so the popup
+        // never overflows a short viewport (small phone, tight bottom-sheet).
+        className="w-[var(--radix-popover-trigger-width)] max-h-[min(300px,var(--radix-popover-content-available-height))] p-0 flex flex-col overflow-hidden"
       >
         <div className="p-2 border-b border-border flex items-center gap-2">
           <Search size={13} className="text-muted shrink-0" aria-hidden />
@@ -154,18 +255,22 @@ export default function SearchableSelect({
             type="text"
             value={filter}
             onChange={e => setFilter(e.target.value)}
+            {...ime.bindComposition<HTMLInputElement>()}
             onKeyDown={e => {
-              // An IME confirms a composition with Enter. Letting that through
-              // would commit `filtered[0]` and close the picker instead of
-              // accepting the composed text — so every CJK user typing into this
-              // box would lose their input on the first Enter. `isComposing` is
-              // true for exactly the keystrokes the IME owns.
-              if (e.nativeEvent.isComposing) return
+              // An IME confirms a composition with Enter. Letting that through would
+              // commit `filtered[0]` and close the picker instead of accepting the
+              // composed text — so every CJK user typing into this box would lose their
+              // input on the first Enter. The guard is the host's rather than the native
+              // flag alone, because WebKit dispatches that committing keydown AFTER
+              // `compositionend`, where the native flag already reads false.
+              // `isComposing`, not `claimEnter`: this handler also carries the arrow keys,
+              // and claiming those would suppress list navigation.
+              if (ime.isComposing(e)) return
               onListKeyDown(e)
             }}
             placeholder={searchPlaceholder ?? i18nT('components.searchableSelect.search')}
             aria-label={searchPlaceholder ?? i18nT('components.searchableSelect.search')}
-            className="flex-1 min-w-0 bg-transparent border-0 outline-none text-[13px] text-text placeholder:text-muted"
+            className="flex-1 min-w-0 bg-transparent border-0 outline-hidden text-[13px] text-text placeholder:text-muted"
           />
         </div>
         <div
@@ -176,8 +281,38 @@ export default function SearchableSelect({
           // programmatically focusable so the interactive role is reachable.
           tabIndex={-1}
           onKeyDown={onListKeyDown}
-          className="flex-1 min-h-0 overflow-y-auto p-1"
+          className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-1"
         >
+          {action && (
+            // Inside the list, but a `button` rather than an `option`: it commits
+            // no value. `data-option` enrols it in the roving-focus ring
+            // (useListboxKeyboard matches `[data-option],[role="option"]`) so an
+            // Arrow key reaches it — the hook's Tab branch closes the popup, so a
+            // control placed outside the list is pointer-only. Same shape as
+            // AgentDropdownList's set-default control.
+            <div
+              role="button"
+              data-option
+              tabIndex={-1}
+              onClick={action.onSelect}
+              onKeyDown={e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  action.onSelect()
+                }
+              }}
+              className="flex w-full cursor-pointer select-none items-center rounded-md px-3 py-1.5 text-[13px]
+                text-accent outline-hidden transition-colors hover:bg-bg-hover focus:bg-bg-hover"
+            >
+              {action.label}
+            </div>
+          )}
+          {actionStatus && (
+            <div className="px-3 py-1.5 text-[12px] text-muted" role="status">
+              {actionStatus}
+            </div>
+          )}
           {filtered.length === 0 && (
             <div className="px-3 py-2 text-[13px] text-muted italic">
               {i18nT('components.searchableSelect.no_matches')}
@@ -201,7 +336,7 @@ export default function SearchableSelect({
                 aria-disabled={opt.disabled || undefined}
                 onClick={() => choose(opt)}
                 className={[
-                  'relative flex w-full cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] text-left outline-none transition-colors',
+                  'relative flex w-full cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] text-left outline-hidden transition-colors',
                   'focus:bg-bg-hover hover:bg-bg-hover aria-disabled:pointer-events-none aria-disabled:opacity-50',
                   isSel ? 'bg-accent-subtle text-accent font-semibold hover:bg-accent-subtle' : '',
                 ].join(' ')}
@@ -213,9 +348,12 @@ export default function SearchableSelect({
                     pixels from its zone name, so the eye had to track across
                     empty space to pair the two. The check indicator keeps its
                     right edge via `ml-auto`. */}
-                <span className="truncate min-w-0">{opt.label}</span>
+                <span className="truncate min-w-0" style={preview(opt)}>{opt.label}</span>
                 {opt.sublabel && (
-                  <span className={`shrink-0 text-[11px] ${isSel ? 'text-accent/70' : 'text-muted'}`}>
+                  <span
+                    className={`shrink-0 text-[11px] ${isSel ? 'text-accent/70' : 'text-muted'}`}
+                    style={preview(opt)}
+                  >
                     {opt.sublabel}
                   </span>
                 )}

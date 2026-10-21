@@ -1,6 +1,6 @@
 """Tests for sandbox backend probe classification + detect_backend cache policy.
 
-Incident 2026-07-18: one transient fork() failure during a cron spawn burst was
+A transient fork() failure during a cron spawn burst can be
 cached by ``detect_backend()`` as "no sandbox backend", fail-closing every
 subsequent spawn for ~1 hour until gateway restart. These tests pin the fix:
 
@@ -29,6 +29,10 @@ import pytest
 
 import kiro_crew.sandbox as sb
 
+# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+# so the shared macOS handle caches are put back after each one (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
+
 _EAGAIN_REASON = "fork failed with errno 11 (EAGAIN)"
 # The probe now mirrors the launcher's SPLIT sequence and names the failing
 # step, so a permanent denial reads as the NEWNS call rather than a combined
@@ -54,11 +58,37 @@ def clean_backend(monkeypatch):
     monkeypatch.setattr(
         sb, "_KIRO_INTERNAL_SETTINGS_PATH", "/nonexistent/kirocrew-test/amazon-internal.json"
     )
+    _join_warm_thread()
     sb.reset_backend()
-    sb._warm_thread = None
     monkeypatch.setattr(sb.time, "sleep", lambda _s: None)
     yield
+    _join_warm_thread()
     sb.reset_backend()
+
+
+def _join_warm_thread() -> None:
+    """Join any background warm thread before clearing module state.
+
+    Nulling ``sb._warm_thread`` only drops the handle — a probe thread a prior
+    test started keeps running and later writes ``_backend`` / the failure record
+    directly. Dropped into the next test's window it lands AFTER ``reset_backend()``:
+    on a user-namespace-capable worker it sets ``_backend == "namespace"``, so
+    ``_probe_unshare``'s warm-cache fast path returns early and the off-loop retry
+    (``time.sleep``) never runs — the order-dependent flake. The sibling
+    ``test_sandbox_remedy.py`` fixture joins for the same reason; mirror it here so
+    no stray thread survives into the next test.
+
+    Duck-typed on purpose: some tests plant a lightweight stand-in (a
+    ``SimpleNamespace`` with ``start``/``is_alive`` but no ``join``, or a faked
+    ``threading.Thread``) as the handle. Those never run a real probe, so there is
+    nothing to join — only a handle that exposes a callable ``join`` is waited on.
+    """
+    thread = sb._warm_thread
+    join = getattr(thread, "join", None)
+    is_alive = getattr(thread, "is_alive", None)
+    if callable(join) and callable(is_alive) and is_alive():
+        join(timeout=10)
+        assert not is_alive(), "sandbox warm thread did not finish"
     sb._warm_thread = None
 
 
@@ -249,10 +279,19 @@ def test_probe_child_killed_by_signal_is_transient(monkeypatch):
             def __call__(self, *a):
                 return 0
 
+        class mount:
+            # The probe binds mount(2) alongside unshare(2) for its third step;
+            # this fake never reaches it (the child is "killed" before reporting).
+            argtypes = None
+            restype = None
+
+            def __call__(self, *a):
+                return 0
+
     fake_libc = FakeLibC()
     monkeypatch.setattr(_ct, "CDLL", lambda *a, **kw: fake_libc)
 
-    ok, transient, reason, _remedy = sb._probe_unshare_once()
+    ok, transient, reason, _remedy = sb._probe_unshare_via_fork()
     assert ok is False
     assert transient is True
     assert "signal 9" in reason
@@ -516,14 +555,14 @@ def test_probe_unshare_fast_path_on_loop_when_backend_set(monkeypatch):
     ))
 
     async def _check():
-        # We're on a running event loop — previously this would defer and return False
+        # We're on a running event loop, so the probe runs inline rather than deferring
         return sb._probe_unshare()
 
     result = asyncio.run(_check())
     assert result is True
 
 
-# ── Mechanism-specific no-backend guidance (issue #1639) ──
+# ── Mechanism-specific no-backend guidance ──
 #
 # The generic "install a sandbox backend, or opt out" text is actively unhelpful
 # on the most common affected host, stock Ubuntu 23.10+, where a backend exists
@@ -610,7 +649,7 @@ class TestNoBackendGuidanceNamesTheRightRemedy:
         ],
     )
     def test_the_path_is_shell_quoted_for_safe_pasting(self, monkeypatch, hostile):
-        """Raised as blocking in review of #1653.
+        """The printed path is shell-quoted so a hostile filename is safe to paste.
 
         This message is printed for the user to paste into a shell, and a filename
         is attacker-influenced in exactly the cases that matter — a downloaded or
@@ -634,7 +673,7 @@ class TestNoBackendGuidanceNamesTheRightRemedy:
     def test_the_remedy_names_a_cli_the_appimage_user_actually_has(
         self, monkeypatch, tmp_path
     ):
-        """Raised as a design concern in review of #1653.
+        """The AppImage mechanism's no-backend guidance is self-contained.
 
         The AppImage is documented as needing "no Python, pip, npm, or Node", so
         this persona has no `kirocrew` on PATH — the CLI lives inside the bundle.

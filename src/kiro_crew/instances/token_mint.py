@@ -20,12 +20,21 @@ Security (standard practices):
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
+import os
 import re
+import shutil
 
 from kiro_crew.config.paths import CONFIG_DIR_NAME, LEGACY_CONFIG_DIR_NAME
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.deploy.engine import tool_spawn_env
+from kiro_crew.instances.constants import (
+    DEFAULT_MINT_TIMEOUT_SECS,
+    DEFAULT_SSM_MINT_TIMEOUT_SECS,
+    MINT_TIMEOUT_CEILING_SECS,
+    TTL_PATTERN,
+)
+from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
 
@@ -34,25 +43,40 @@ logger = logging.getLogger(__name__)
 DEFAULT_REMOTE_BIN = "$HOME/.local/bin/kirocrew"
 
 # Non-interactive SSH shells don't source ~/.zshrc, so PATH may be minimal. Each
-# candidate is a full path the remote shell can exec directly.
+# candidate is a full path the remote shell can exec directly. The third entry
+# is the managed-launcher directory :data:`kiro_crew.env._EXTRA_PATH_DIRS`
+# already searches locally: a remote provisioned by such an installer has its
+# ``kirocrew`` there and in neither of the first two; without this entry every
+# mint on such a remote exits 127 and only ``remote_bin`` gets it past that.
 REMOTE_BIN_CANDIDATES: tuple[str, ...] = (
     "$HOME/.local/bin/kirocrew",  # install.sh / source install
     "$HOME/.kirocrew-app/.venv/bin/kirocrew",  # one-liner installer venv
+    "$HOME/.toolbox/bin/kirocrew",  # managed launcher dir (see env._EXTRA_PATH_DIRS)
+)
+
+# Printed on the exit-127 path after the per-candidate diagnosis. The ladder
+# can never be complete, and the escape hatch exists -- the instance's
+# ``remote_bin`` field -- but an error that only lists what was tried leaves
+# the operator to find that field on their own. The example is in ``~/`` form
+# because that is the spelling the validator accepts (``$`` is refused).
+REMOTE_BIN_HINT = (
+    "if kirocrew is installed elsewhere on this host, set the instance's "
+    "remote_bin setting to its path, e.g. ~/.local/bin/kirocrew"
 )
 
 # ttl accepted by `kirocrew token --ttl`: a positive integer with an h/m suffix
 # (e.g. "20h", "30m"). Validated to keep it out of the remote command unchecked.
-_TTL_RE = re.compile(r"^[1-9][0-9]{0,3}[hm]$")
+_TTL_RE = re.compile(TTL_PATTERN)
 
 # Extract the JWT from a `kirocrew token` URL: http://localhost:7777?token=eyJ...
 # (also matches https://.../?token=...&foo=bar).
 _TOKEN_RE = re.compile(r"[?&]token=([^\s&]+)")
 
-# Bare KiroCrew-token / JWT shape, used to scrub a token that reached stdout
+# Bare Kiro Crew token / JWT shape, for scrubbing a token that reached stdout
 # outside a URL before a stdout tail is put into an exception message.
 #
 # The segment count is `{1,4}` REPEATED, not a fixed `head.payload.sig` triple:
-# `generate_token` (dashboard/token_auth.py) mints `payload.signature` — only
+# `generate_token` (dashboard/token_auth_tokens.py) mints `payload.signature` — only
 # TWO segments — so a three-segment pattern would never match the shape this app
 # actually produces, leaving the scrub layer inert against its own tokens. The
 # upper bound covers a compact JWE (five segments) so a partial match cannot
@@ -76,8 +100,8 @@ _OUTPUT_TAIL_CHARS = 300
 _OUTPUT_SCAN_CHARS = _OUTPUT_TAIL_CHARS * 8
 
 # Stand-in for the run touching the scan window's left edge: the slice may have
-# cut it out of the middle of a secret, leaving a suffix the token patterns can
-# no longer recognise.
+# cut it out of the middle of a secret, leaving a suffix the token patterns
+# cannot recognise.
 #
 # The floor is deliberately LOW rather than set to the window-minus-tail
 # "reachability" distance. A clipped fragment 2000+ chars from the end looks
@@ -92,11 +116,54 @@ _CLIPPED_RUN_RE = re.compile(r"^[A-Za-z0-9_\-.=+/%%:?&]{%d,}" % _CLIPPED_RUN_MIN
 _CLIPPED_MARKER = "<clipped>"
 
 # How long to wait for the remote `kirocrew token` to return before giving up.
-_DEFAULT_MINT_TIMEOUT_SECS = 30.0
+# Canonical default lives in instances.constants (user-tunable via
+# ``instances.mint_timeout_secs``); aliased here for the local call sites.
+_DEFAULT_MINT_TIMEOUT_SECS = DEFAULT_MINT_TIMEOUT_SECS
+
+
+def _mint_timeout_advice(timeout_secs: float) -> str:
+    """Name the setting that budgets a mint, for the end of a timeout message.
+
+    Both transports share it so the next step reads the same over SSH and SSM.
+    A budget already at ``MINT_TIMEOUT_CEILING_SECS`` cannot be raised (the
+    config loader clamps it), so that case points at the host instead. The one
+    setting overrides the mint budget of BOTH transports, so the advice says so:
+    a value picked for a slow SSH host could otherwise lower every SSM crew's
+    budget below its own default.
+    """
+    if timeout_secs >= MINT_TIMEOUT_CEILING_SECS:
+        return (
+            "This budget is already at its maximum, so check that the host is "
+            "reachable rather than raising it."
+        )
+    return (
+        "If the host is reachable but slow to answer, raise the budget with "
+        "`kirocrew config set instances.mint_timeout_secs <value>` and connect again. "
+        "The setting applies to SSH and SSM mints alike, so keep it at or above "
+        f"{DEFAULT_SSM_MINT_TIMEOUT_SECS:g}s if any crew connects over SSM."
+    )
 
 
 class TokenMintError(Exception):
     """Raised when minting a remote token fails."""
+
+
+class HopRetiredError(TokenMintError):
+    """The crew holding our hop says that hop is not ours to ride.
+
+    Separate from every other mint failure because the two call for OPPOSITE
+    handling. A transport error -- a timeout, a refused connection, a malformed
+    reply -- means try again, and the refresh loop's deliberate non-terminal retry
+    exists for exactly that. This means the hop is gone: the parent still answers,
+    and what it answers is that the crew is not connected there, or not there at
+    all. Retrying cannot recover it, and the forward we still hold is pointed at a
+    port the parent is now free to give to a different crew, which is how one
+    crew's bearer token reaches another crew's gateway.
+
+    So this one is terminal for the forward, and a bare ``False`` could not say so:
+    the caller would have to infer "gone" from "failed" and would tear down a
+    working chain on a network blip.
+    """
 
 
 def _validate_ttl(ttl: str) -> str:
@@ -112,7 +179,7 @@ def _validate_ttl(ttl: str) -> str:
 def ttl_to_seconds(ttl: str) -> int:
     """Convert a validated ``<int>[hm]`` ttl string to seconds.
 
-    Used to schedule proactive token refresh before the cap. Raises
+    Schedules proactive token refresh before the cap. Raises
     :class:`TokenMintError` for a malformed ttl.
     """
     ttl = _validate_ttl(ttl)
@@ -200,6 +267,28 @@ def build_candidate_command(
             "  fi;",
             "done;",
             f'echo "kirocrew binary not found in any of: {", ".join(candidates)}" >&2;',
+            'echo "candidate diagnosis:" >&2;',
+            f"for b in {expanded}; do",
+            '  if [ -L "$b" ]; then',
+            '    __t=$(readlink -f "$b" 2>/dev/null);',
+            '    if [ -z "$__t" ] || [ ! -e "$__t" ]; then',
+            '      echo "  $b: DANGLING symlink -> $(readlink "$b" 2>/dev/null) (target missing)" >&2;',
+            "    else",
+            '      echo "  $b: symlink -> $__t (not executable)" >&2;',
+            "    fi;",
+            '  elif [ ! -e "$b" ]; then',
+            '    echo "  $b: absent" >&2;',
+            "  else",
+            '    echo "  $b: present, NOT executable" >&2;',
+            "  fi;",
+            '  case "$b" in',
+            "    */.venv/bin/*)",
+            '      __v="${b%/bin/*}";',
+            '      if [ -x "$__v/bin/python" ]; then echo "    $__v/bin/python present" >&2; else echo "    $__v/bin/python MISSING" >&2; fi;',
+            "      ;;",
+            "  esac;",
+            "done;",
+            f'echo "{REMOTE_BIN_HINT}" >&2;',
             "exit 127",
         ]
     )
@@ -321,24 +410,105 @@ def build_remote_token_command(
     )
 
 
-def _build_ssh_argv(ssh_host: str, remote_command: str) -> list[str]:
+def _build_ssh_argv(
+    ssh_host: str, remote_command: str, *, connect_timeout_secs: float = 10.0
+) -> list[str]:
     """Build the local ``ssh`` argv (no local shell) to run *remote_command*.
 
     ``BatchMode=yes`` fails fast instead of hanging on an interactive password
-    prompt; ``ConnectTimeout`` bounds the TCP connect. ``ssh_host`` is validated
-    by the caller (registry / tunnel manager) before reaching here.
+    prompt; ``ConnectTimeout`` bounds the TCP connect (and, on OpenSSH >= 8.6,
+    the banner/KEX exchange — which is where a slow ProxyCommand spends its
+    time, so the mint passes its own configurable budget here instead of the
+    10s fail-fast default). ``-n`` redirects ssh's own stdin from the null
+    device: every caller here runs a remote command and none of them writes the
+    child's stdin, and an inherited console-less stdin keeps the channel open
+    after the remote command exits (notably through a ``ProxyCommand``), so ssh
+    waits for an EOF that never arrives. ``ssh_host`` is validated by the caller
+    (registry / tunnel manager) before reaching here.
     """
     return [
         "ssh",
+        "-n",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=10",
+        f"ConnectTimeout={max(1, round(connect_timeout_secs))}",
         "-o",
         "AddressFamily=inet",
         ssh_host,
         remote_command,
     ]
+
+
+def resolve_ssh_bin() -> str:
+    """Resolve ``ssh`` against the INHERITED ``PATH``, or return the bare name.
+
+    Only the inherited ``PATH`` is searched — the exact set the bare ``"ssh"``
+    argv head already executed from — so this changes WHICH binary runs in no
+    case. Its purpose is to make the head absolute, which is what lets
+    :func:`kiro_crew.deploy.engine.tool_spawn_env` widen the child's ``PATH``
+    for the ``ProxyCommand`` it will run. A miss returns the bare name, which that
+    helper leaves unwidened, so a host with no ``ssh`` on ``PATH`` fails exactly
+    as before rather than exec'ing one found only in the widened dirs.
+
+    Scans the filesystem: call it off the event loop (:func:`ssh_spawn_argv_env`
+    is the sync unit meant for ``asyncio.to_thread``).
+    """
+    env_path = os.environ.get("PATH", "")
+    found = shutil.which("ssh", path=env_path) if env_path else None
+    return found or "ssh"
+
+
+def ssh_spawn_argv_env(argv: list[str]) -> tuple[list[str], dict[str, str]]:
+    """The ``(argv, env)`` to spawn an ``ssh`` argv built by this package with.
+
+    ``ssh`` itself sits in the system bin dir, but a host routed through a
+    ``~/.ssh/config`` ``ProxyCommand`` runs that command under the ssh child's
+    ``PATH`` — and a GUI-launched gateway's is launchd's minimal one, where the
+    ``session-manager-plugin`` an SSM-based proxy looks
+    up by name is not. So the head is resolved absolutely and the env is the
+    same :func:`~kiro_crew.deploy.engine.tool_spawn_env` the SSM transport's
+    ``aws`` child gets: one widening rule for both transports.
+
+    Every ssh spawn site (tunnel, token mint, remote restart, diagnostics probes)
+    goes through this, so none of them can be the one that still fails. Runs a
+    PATH scan; call it via ``asyncio.to_thread`` from async code.
+    """
+    head = resolve_ssh_bin() if argv[0] == "ssh" else argv[0]
+    return [head, *argv[1:]], tool_spawn_env(head)
+
+
+# stderr phrases meaning the ``ProxyCommand`` could not find a program it runs:
+# SSM-based proxies' own "plugin missing" wording, and a POSIX shell's
+# "not found" for a ProxyCommand whose first word is not on the PATH ssh gave it
+# (bash/zsh: "command not found"; dash/bash `exec`: "exec: foo: not found").
+PROXY_TOOL_MISSING_SIGNALS: tuple[str, ...] = (
+    "session-manager-plugin is not installed",
+    "sessionmanagerplugin is not found",
+    "command not found",
+    ": not found",
+)
+
+# The PATH is named in the message so the reader can see what was searched; a
+# very long one keeps its tail, where the widened dirs are appended.
+_PATH_IN_MESSAGE_CHARS = 400
+
+
+def proxy_tool_missing_message(child_path: str) -> str:
+    """Operator-facing cause for a ``ProxyCommand`` whose program was not found.
+
+    Names the ``PATH`` the ssh child actually had, because the failure only
+    happens when that differs from the user's terminal (a GUI-launched gateway),
+    and "run setup again" cannot fix a binary that is installed but not on it.
+    """
+    shown = child_path or "<empty>"
+    if len(shown) > _PATH_IN_MESSAGE_CHARS:
+        shown = "…" + shown[-_PATH_IN_MESSAGE_CHARS:]
+    return (
+        "a program your ssh config's ProxyCommand runs was not found on the PATH "
+        f"the gateway gave ssh ({shown}); install it or make it reachable from that "
+        "PATH (e.g. start the gateway from a terminal), then reconnect"
+    )
 
 
 def _redacted_output_tail(stdout: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
@@ -353,10 +523,13 @@ def _redacted_output_tail(stdout: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     Why stripping is mandatory: unlike stderr, stdout is the one stream that
     *does* carry the minted JWT on success. This tail is only ever built on a
     failure path, but a partially-successful remote (URL printed, then a
-    non-zero exit) could still put a live credential in it — so the token is
-    substituted out FIRST, before the generic credential/exfil redactors run,
-    and the result is truncated to the last *limit* chars (the tail, because the
-    reason is the last thing printed).
+    non-zero exit) could still put a live credential in it. The generic
+    credential/exfil redactors run FIRST: the exfiltration-URL pass keys on the
+    token-bearing URL shape, so scrubbing the token value first would disarm it
+    and let a suspicious destination survive. The token-specific
+    ``_TOKEN_RE`` / ``_JWT_RE`` substitutions run AFTER as belt-and-suspenders
+    for token shapes the generic passes miss. The result is truncated to the
+    last *limit* chars (the tail, because the reason is the last thing printed).
 
     Why the scan is bounded: the scrubbers cost ~1s per MB of stdout and `re`
     holds the GIL, so scanning an unbounded remote payload stalls the gateway's
@@ -373,9 +546,9 @@ def _redacted_output_tail(stdout: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     window = stdout
     if len(window) > _OUTPUT_SCAN_CHARS:
         window = _CLIPPED_RUN_RE.sub(_CLIPPED_MARKER, window[-_OUTPUT_SCAN_CHARS:], count=1)
-    stripped = _TOKEN_RE.sub(lambda m: m.group(0)[0] + "token=<redacted>", window)
-    stripped = _JWT_RE.sub("<redacted>", stripped)
-    safe = redact_exfiltration_urls(redact_credentials(stripped)[0])[0]
+    safe = redact(window)
+    safe = _TOKEN_RE.sub(lambda m: m.group(0)[0] + "token=<redacted>", safe)
+    safe = _JWT_RE.sub("<redacted>", safe)
     return safe.strip()[-limit:]
 
 
@@ -415,7 +588,10 @@ async def mint_remote_token(
     remote_command = build_remote_token_command(
         remote_bin, ttl=ttl, port=remote_port, embed_parent_port=embed_parent_port
     )
-    argv = _build_ssh_argv(ssh_host, remote_command)
+    argv, env = await asyncio.to_thread(
+        ssh_spawn_argv_env,
+        _build_ssh_argv(ssh_host, remote_command, connect_timeout_secs=timeout_secs),
+    )
     logger.info("Minting token on %s (ttl=%s)", ssh_host, ttl)  # no token in logs
 
     try:
@@ -423,6 +599,7 @@ async def mint_remote_token(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
     except OSError as e:
         raise TokenMintError(f"failed to spawn ssh for {ssh_host}: {e}") from e
@@ -430,19 +607,20 @@ async def mint_remote_token(
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError as e:
-        proc.kill()
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        raise TokenMintError(f"timed out minting token on {ssh_host} after {timeout_secs}s") from e
+        await kill_and_reap(proc)
+        raise TokenMintError(
+            f"timed out minting token on {ssh_host} after {timeout_secs}s; ssh had not "
+            f"returned the token when the budget ran out. If the host is reached "
+            f"through a jump host or proxy, the mint pays that handshake again; "
+            f"otherwise the host may not be answering. {_mint_timeout_advice(timeout_secs)}"
+        ) from e
 
     stdout = stdout_b.decode("utf-8", "replace")
     stderr = stderr_b.decode("utf-8", "replace").strip()
     # stderr is proxy-controlled (WSSH banner etc.); redact credentials/exfil URLs
     # before surfacing it in an exception that may reach logs/status. The token
     # only ever appears on stdout, never stderr.
-    safe_stderr = redact_exfiltration_urls(redact_credentials(stderr)[0])[0] if stderr else ""
+    safe_stderr = redact(stderr) if stderr else ""
 
     if proc.returncode != 0:
         # stderr may carry the "binary not found" diagnostic — safe to log; it
@@ -453,10 +631,14 @@ async def mint_remote_token(
         # branch, so the "only ever built on a failure path" invariant that
         # _redacted_output_tail documents is enforced by control flow rather than
         # merely asserted — the success path never touches stdout holding a token.
-        raise TokenMintError(
-            f"remote token mint on {ssh_host} exited {proc.returncode}: "
-            f"{_with_stdout_tail(safe_stderr or '<no stderr>', _redacted_output_tail(stdout))}"
-        )
+        detail = _with_stdout_tail(safe_stderr or "<no stderr>", _redacted_output_tail(stdout))
+        # 255 is ssh's OWN failure status. A remote command that is not found
+        # exits 127 with the same "command not found" wording from the REMOTE
+        # shell, which is not a ProxyCommand problem and must not be named one.
+        low = stderr.lower()
+        if proc.returncode == 255 and any(sig in low for sig in PROXY_TOOL_MISSING_SIGNALS):
+            detail = f"{proxy_tool_missing_message(env.get('PATH', ''))}: {detail}"
+        raise TokenMintError(f"remote token mint on {ssh_host} exited {proc.returncode}: {detail}")
 
     token = parse_token_from_stdout(stdout)
     if not token:
@@ -474,6 +656,8 @@ async def run_remote_kirocrew(
     remote_bin: str = "",
     marker_port: int | None = None,
     timeout_secs: float = 60.0,
+    connect_timeout_secs: float = 10.0,
+    stdout_tail: bool = False,
 ) -> tuple[int, str]:
     """Run ``kirocrew <subcommand>`` on *ssh_host* over SSH.
 
@@ -487,29 +671,50 @@ async def run_remote_kirocrew(
     (same fix as token mint), instead of the blind PATH candidate search. This
     is what makes the dashboard "restart remote" action work on a host whose
     ``~/.local/bin/kirocrew`` points at an uninstalled worktree.
+
+    *connect_timeout_secs* — this is the same one-shot ssh-exec shape as
+    :func:`mint_remote_token`, so it pays the same proxy handshake cost on
+    CONNECT (OpenSSH >= 8.6 counts banner/KEX against ``ConnectTimeout``).
+    Callers should pass the resolved ``instances.mint_timeout_secs`` budget
+    rather than leaving the 10s fail-fast default, or a restart on a
+    slow-proxy host fails on the connect even after the user tuned the
+    tunable for exactly this. Independent of *timeout_secs* (the overall
+    wait_for budget): the outer wait_for is still the ultimate bound
+    regardless of what ``ConnectTimeout`` allows internally.
+
+    *stdout_tail* — on a non-zero exit, append a redacted tail of the remote's
+    stdout to the message. For a subcommand such as ``update``, which prints
+    its failure reasons to stdout; off by default, so ``restart`` keeps its
+    stderr-only message.
     """
     remote_command = build_remote_command(
         remote_bin, subcommand, marker_port=_validate_port(marker_port)
     )
-    argv = _build_ssh_argv(ssh_host, remote_command)
+    argv, env = await asyncio.to_thread(
+        ssh_spawn_argv_env,
+        _build_ssh_argv(ssh_host, remote_command, connect_timeout_secs=connect_timeout_secs),
+    )
     logger.info("Running 'kirocrew %s' on %s", subcommand, ssh_host)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
     except OSError as e:
         return -1, f"failed to spawn ssh: {e}"
     try:
-        _out, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError:
-        proc.kill()
-        with contextlib.suppress(ProcessLookupError):
-            await proc.wait()
+        await kill_and_reap(proc)
         return -1, f"timed out after {timeout_secs}s"
     err = err_b.decode("utf-8", "replace").strip()
     # Proxy-controlled stderr (e.g. a WSSH banner) can carry credential-looking
     # text or exfil URLs; redact before returning since callers surface this tail.
-    safe_err = redact_exfiltration_urls(redact_credentials(err)[0])[0] if err else ""
-    return (proc.returncode if proc.returncode is not None else -1), safe_err[:300]
+    safe_err = redact(err) if err else ""
+    rc = proc.returncode if proc.returncode is not None else -1
+    if stdout_tail and rc != 0:
+        safe_out = _redacted_output_tail(out_b.decode("utf-8", "replace"))
+        return rc, _with_stdout_tail(safe_err[:300], safe_out)
+    return rc, safe_err[:300]

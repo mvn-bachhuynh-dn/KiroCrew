@@ -69,7 +69,7 @@ def _hang_on(marker: str):
 
 
 async def test_ceiling_returns_completed_agent_results() -> None:
-    """The regression: a timeout used to return agent_results={} and lose the lot."""
+    """A timeout must not return agent_results={} and lose the lot."""
     res = await _runner(agent_fn=_hang_on("never-returns"), timeout_secs=0.2).run(
         SCRIPT_TWO_THEN_HANG, run_id="wf_ceiling", now=NOW
     )
@@ -134,9 +134,11 @@ async def test_budget_ceiling_returns_completed_agent_results() -> None:
 async def test_agent_results_checkpoint_as_each_call_lands() -> None:
     """Results must reach the host DURING the run, not only at its end."""
     seen: list[tuple[int, object, bool, str]] = []
+    fingerprints: list[str] = []
 
-    def _sink(call_index: int, *, result, ok: bool, error: str) -> None:
+    def _sink(call_index: int, *, result, ok: bool, error: str, fingerprint: str) -> None:
         seen.append((call_index, result, ok, error))
+        fingerprints.append(fingerprint)
 
     script = (
         'META = {"name": "checkpointed"}\n'
@@ -153,6 +155,9 @@ async def test_agent_results_checkpoint_as_each_call_lands() -> None:
         (0, "echo:one", True, ""),
         (1, "echo:two", True, ""),
     ]
+    # Each call's replay identity lands with its result, one distinct per prompt.
+    assert len(fingerprints) == 2 and all(fingerprints)
+    assert fingerprints[0] != fingerprints[1]
 
 
 async def test_checkpoint_sink_failure_never_breaks_the_run() -> None:
@@ -230,8 +235,8 @@ async def runner_bg(registry: RunRegistry, script: str, run_id: str) -> str:
 
 
 async def test_terminal_merge_never_erases_checkpoints() -> None:
-    """``_drive`` used to assign ``handle.agent_results = agent_results or {}``,
-    so any terminal path handing back an empty map wiped the checkpoints."""
+    """``_drive`` must not assign ``handle.agent_results = agent_results or {}``,
+    so any terminal path handing back an empty map would wipe the checkpoints."""
     registry = RunRegistry()
     registry.record_agent_result("missing-run", 0, result="x")  # no-op, must not raise
 

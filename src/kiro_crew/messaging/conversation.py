@@ -20,10 +20,41 @@ Stdlib-only apart from the sibling ``link`` helper; the seeding hook is injected
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Callable, Generic, Hashable, Optional, TypeVar
+from typing import Any, Callable, Generic, Hashable, Optional, TypeVar
 
 from kiro_crew.messaging.link import should_rotate_generation
+
+logger = logging.getLogger(__name__)
+
+
+async def reserve_new_generation(
+    sessions: Any,
+    session_key: str,
+    *,
+    channel_type: str,
+) -> bool:
+    """Persist *session_key* before acknowledging an explicit ``/new``.
+
+    ``SessionMap.reserve_generation`` marks the stable bucket dirty without
+    blocking the event loop; ``aflush`` is the durability point whose disk write
+    runs in a worker thread. A failed write leaves the in-memory bump intact but
+    returns ``False`` so the channel can warn that restart safety was not saved.
+    """
+    try:
+        sessions.reserve_generation(session_key)
+        await sessions.aflush()
+    except Exception:
+        logger.warning(
+            "%s: could not reserve new generation session=%s",
+            channel_type,
+            session_key,
+            exc_info=True,
+        )
+        return False
+    return True
+
 
 #: Conversation-identity key type. Channels key by whatever identifies a peer
 #: (Telegram ``user_id`` int, WeCom ``userid`` str).
@@ -83,6 +114,23 @@ class ConversationState(Generic[K]):
 
     def current_gen(self, key: K) -> int:
         return self._get(key).gen
+
+    def last_active(self, key: K) -> float:
+        """The activity timestamp :meth:`maybe_rotate` last recorded, ``0.0`` if none."""
+        return self._get(key).last_active
+
+    def reseed(self, key: K) -> int:
+        """Re-read *key*'s generation from ``seed_fn`` and return it.
+
+        For a conversation whose bucket just changed (a channel ``/agent``
+        switch puts the agent in the key): the counter must follow the NEW
+        bucket's persisted generations, or a later ``/new`` could land on one
+        of that bucket's older conversations instead of a fresh one.
+        """
+        s = self._get(key)
+        s.gen = max(0, self.seed_fn(key)) if self.seed_fn is not None else 0
+        s.awaiting_compact = False
+        return s.gen
 
     def set_awaiting(self, key: K) -> None:
         self._get(key).awaiting_compact = True

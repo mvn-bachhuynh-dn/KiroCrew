@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useSelector } from 'react-redux'
+import { useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
 import type { RootState } from '../store'
-import type { CronJob, SubagentInfo } from '../types'
+import { agentOrDefaultLabel } from '../utils/agentLabel'
+import { defaultAgentQuery } from '../api/defaultAgentQuery'
+import { recencyEpoch } from '../components/commandPalette/providers/recentsProvider'
 
 export interface AgentSource {
   id: string
@@ -31,17 +34,30 @@ function shortName(s: string, max = 45): string {
 export function useAgentSync() {
   const slots = useSelector((s: RootState) => s.dashboard.slots)
   const [extras, setExtras] = useState<AgentSource[]>([])
+  // Slots created before the default was stamped into metadata at creation
+  // carry agent:'' — label them with the default custom agent (a template),
+  // the agent such a slot actually runs, falling back to the literal 'default'
+  // until the fetch lands. Deliberately NOT useAgents(0): that hook reads the
+  // whole execution-choice catalog (see its docstring), and this view-only
+  // surface needs only the one name. The shared ['default-agent'] query reads
+  // GET /api/config/default-agent — no lock, no write — and useWebSocket's
+  // refresh invalidation keeps a long-lived Worlds/popout surface from pinning
+  // a stale name after the default changes.
+  const { data: defaultAgentData } = useQuery({ ...defaultAgentQuery, select: d => d.default_template })
+  const defaultAgent = defaultAgentData ?? ''
 
-  const slotAgents = useMemo<AgentSource[]>(() => slots.map(sl => ({
+  const slotAgents = useMemo<AgentSource[]>(() => [...slots]
+    .sort((a, b) => recencyEpoch(b) - recencyEpoch(a))
+    .map(sl => ({
     id: 'slot-' + sl.key, name: shortName(sl.title || sl.key),
-    label: sl.agent || 'default', kind: 'slot' as const,
+    label: agentOrDefaultLabel(sl.agent, defaultAgent), kind: 'slot' as const,
     running: sl.running, detail: sl.messages + ' msgs',
     lastMessage: sl.last_message || '',
     waitingForInput: !!sl.waiting_for_input,
     pendingApproval: sl.pending_approval_info
       ? { tool: sl.pending_approval_info.tool, requestId: sl.pending_approval_info.request_id }
       : null,
-  })), [slots])
+  })), [slots, defaultAgent])
 
   useEffect(() => {
     let cancelled = false
@@ -53,11 +69,12 @@ export function useAgentSync() {
 
     const pollCron = async () => {
       try {
-        const cronData = await api.crons() as CronJob[]
-        cronResult = cronData.filter(c => c.enabled).slice(0, 3).map(cr => ({
+        const cronData = await api.crons()
+        const jobs = Array.isArray(cronData.jobs) ? cronData.jobs : []
+        cronResult = jobs.filter(c => c.enabled || c.is_running === true).slice(0, 3).map(cr => ({
           id: 'cron-' + cr.id, name: shortName(cr.name || cr.id),
           label: 'cron', kind: 'cron' as const,
-          running: cr.last_status === 'running', detail: cr.schedule,
+          running: cr.is_running === true, detail: cr.schedule,
         }))
       } catch { /* ignore */ }
       update()
@@ -66,8 +83,9 @@ export function useAgentSync() {
 
     const pollSpawn = async () => {
       try {
-        const spawnData = await api.spawnList() as SubagentInfo[]
-        spawnResult = spawnData.filter(s => !s.done).slice(0, 3).map(sp => ({
+        const spawnData = await api.spawnList()
+        const children = Array.isArray(spawnData.agents) ? spawnData.agents : []
+        spawnResult = children.filter(s => !s.done).slice(0, 3).map(sp => ({
           id: 'spawn-' + sp.id, name: shortName(sp.task, 45),
           label: 'spawn', kind: 'spawn' as const,
           running: !sp.done, detail: sp.done ? 'done' : 'running',

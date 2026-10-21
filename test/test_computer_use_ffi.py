@@ -1,6 +1,6 @@
 """Behavioural tests for the ctypes layer, driven by FAKE frameworks.
 
-Exercises the REAL bodies in ``computer_use/macos_ffi.py`` — the bind pass, the
+Exercises the REAL bodies in ``computer_use/macos_ffi.py`` and its owners — the bind pass, the
 CFString lifetime discipline, the type-checked AX reads, the private-event-source
 key posting, the non-variadic scroll and the in-process ImageIO encode — against
 in-Python stand-ins for CoreFoundation / ApplicationServices / CoreGraphics /
@@ -53,6 +53,10 @@ import pytest
 from kiro_crew import platform_compat
 from kiro_crew.computer_use import macos_ffi, snapshot_macos
 from kiro_crew.computer_use.types import ComputerUseUnsupported, SnapshotRequest
+
+# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+# so the shared macOS handle caches are put back after each one (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
 
 # Sentinel handle values. Distinct and non-zero so a truthiness bug (treating a
 # valid handle as NULL) shows up as a wrong branch rather than passing by luck.
@@ -1524,7 +1528,7 @@ def test_post_text_sends_unicode_and_still_zeroes_the_flags(fakes: _Fakes):
 
 def test_post_text_delivers_an_astral_character_as_one_event(fakes: _Fakes):
     """A surrogate pair goes out in ONE event, not as two lone surrogates."""
-    macos_ffi.post_text(637, "\U0001F600")
+    macos_ffi.post_text(637, "\U0001f600")
     counts = [
         count
         for (_e, count, _text) in fakes.calls_named(fakes.cg, "CGEventKeyboardSetUnicodeString")
@@ -1553,12 +1557,12 @@ def test_post_text_types_NOTHING_when_a_character_cannot_be_encoded(fakes: _Fake
 
 def test_post_text_still_types_the_whole_string_when_every_char_encodes(fakes: _Fakes):
     """The guard must not reject legitimate text (astral + accented + ASCII)."""
-    macos_ffi.post_text(637, "a\U0001F600é")
+    macos_ffi.post_text(637, "a\U0001f600é")
     typed = [
         text
         for (_e, _count, text) in fakes.calls_named(fakes.cg, "CGEventKeyboardSetUnicodeString")
     ]
-    assert typed == ["a", "a", "\U0001F600", "\U0001F600", "é", "é"]
+    assert typed == ["a", "a", "\U0001f600", "\U0001f600", "é", "é"]
 
 
 # ── scroll: the variadic hazard and the AX fallback ──

@@ -9,9 +9,11 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.kiro_prerequisite import (
     KIRO_CLI_LOGIN_COMMAND,
     KIRO_CLI_SSO_LOGIN_COMMAND,
+    KIRO_CLI_UPDATE_COMMAND,
     OFFICIAL_INSTALL_DOCS_URL,
     KiroPrerequisiteService,
     PrerequisiteStatus,
@@ -20,10 +22,11 @@ from kiro_crew.kiro_prerequisite import (
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
-_LOCAL_DASHBOARD_OWNER_SUBJECTS = frozenset({"local-app", "local-startup"})
 
 
-def _not_ready_snapshot(initial_setup_complete: bool = False) -> dict[str, Any]:
+def _not_ready_snapshot(
+    initial_setup_complete: bool = False, probe_error: str = ""
+) -> dict[str, Any]:
     """A retryable not-ready snapshot for when a status probe cannot run.
 
     Shaped exactly like ``KiroPrerequisiteService.snapshot()`` (built from the
@@ -34,6 +37,9 @@ def _not_ready_snapshot(initial_setup_complete: bool = False) -> dict[str, Any]:
     probe does not demote a returning user to first-run — reporting ``False``
     here makes the SPA restore the full-screen first-run setup gate for someone
     who finished setup long ago.
+
+    ``probe_error`` names why the probe could not run, so the gate has a
+    diagnostic to show instead of a bare not-ready with nothing behind it.
     """
 
     result: dict[str, Any] = asdict(
@@ -41,6 +47,7 @@ def _not_ready_snapshot(initial_setup_complete: bool = False) -> dict[str, Any]:
             platform="gateway",
             installed=True,
             initial_setup_complete=initial_setup_complete,
+            probe_error=probe_error,
         )
     )
     # See _LEGACY_IDLE_OPERATION: a pre-upgrade tab crashes without this key.
@@ -64,15 +71,14 @@ def _caller(request: web.Request) -> str:
 
 
 def _is_dashboard_owner(request: web.Request) -> bool:
-    """Return whether a signed dashboard identity may operate host setup."""
+    """Return whether a signed dashboard identity may operate host setup.
 
-    state = request.app["state"]
-    owner_id = str(getattr(state, "owner_id", "") or "")
-    caller = str(request.get("user") or "")
-    return request.get("app") == "" and (
-        (owner_id and caller == owner_id)
-        or (not owner_id and caller in _LOCAL_DASHBOARD_OWNER_SUBJECTS)
-    )
+    Delegates to the shared predicate rather than re-deriving it: the rule (a
+    configured owner matched exactly, or a signed machine-local bootstrap subject
+    when none is configured) belongs in one place, and a second copy is how the
+    two drift apart.
+    """
+    return is_owner_dashboard_request(request)
 
 
 async def _dashboard_owner_only(request: web.Request) -> web.Response | None:
@@ -135,15 +141,20 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
         raise
     except web.HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         # A transient probe failure must not surface as a 500 that flashes the
         # full-screen "could not check Kiro CLI" gate. Report a retryable
         # not-ready snapshot so the dashboard keeps polling. (The probe layer
         # already degrades most failures; this is the last-resort backstop.)
         # The first-run bit is read from the data home, not the probe, so it
         # survives this path and keeps a returning user out of first-run setup.
+        # The exception is named in ``probe_error`` (owner-only payload) so the
+        # screen can say WHY rather than only that it could not check.
         logger.warning("Kiro prerequisite status probe failed", exc_info=True)
-        snapshot = _not_ready_snapshot(bool(service.initial_setup_complete))
+        snapshot = _not_ready_snapshot(
+            bool(service.initial_setup_complete),
+            probe_error=f"{type(exc).__name__}: {exc}"[:400],
+        )
     if _is_dashboard_owner(request):
         return web.json_response({**snapshot, "setup_allowed": True})
 
@@ -162,6 +173,9 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
             "docs_url": OFFICIAL_INSTALL_DOCS_URL,
             "login_command": KIRO_CLI_LOGIN_COMMAND,
             "sso_login_command": KIRO_CLI_SSO_LOGIN_COMMAND,
+            # Redacted and present for shape stability: non-owners never learn
+            # which executable the gateway host resolved.
+            "bundled_cli": False,
             "setup_allowed": False,
             # Redacted like the rest of this block: the failure kind and probe
             # detail describe the HOST's sandbox posture (kernel knobs, errnos),
@@ -172,6 +186,11 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
             "sandbox_failure_kind": "",
             "sandbox_detail": "",
             "sandbox_remedy": "",
+            # Same redaction, same shape-stability reason: whether the probe timed out
+            # is a statement about how slow the HOST is, and only the owner can act on
+            # it. Present rather than omitted because a consumer that reads
+            # ``undefined`` branches on it as though the absence meant something.
+            "probe_timed_out": False,
             # Redacted for the same reason as the block above, and kept present
             # for the same shape-stability reason: only the owner can act on a
             # missing spec (the repair is an owner-gated POST). A non-owner on an
@@ -180,6 +199,14 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
             # withholding them costs them nothing.
             "missing_agent_specs": [],
             "agent_spec_repair_error": "",
+            # Same shape-stability reason: a non-owner cannot act on an outdated
+            # CLI (the update is an owner-gated POST), so acp_supported is
+            # reported healthy, update_command carries the standard command
+            # string, and cli_update_error is blank. Present rather than omitted
+            # so a consumer reading these keys never branches on ``undefined``.
+            "acp_supported": True,
+            "update_command": KIRO_CLI_UPDATE_COMMAND,
+            "cli_update_error": "",
             # See _LEGACY_IDLE_OPERATION: a pre-upgrade tab crashes without this,
             # and the payload shape must not vary by caller either way.
             "operation": legacy_idle_operation(),
@@ -205,4 +232,25 @@ async def api_kiro_prerequisite_repair_specs(request: web.Request) -> web.Respon
     if denied is not None:
         return denied
     snapshot = await _service(request).repair_agent_specs(_caller(request))
+    return web.json_response({**snapshot, "setup_allowed": True})
+
+
+async def api_kiro_prerequisite_update_cli(request: web.Request) -> web.Response:
+    """POST /api/kiro-prerequisite/update-cli — run the CLI's in-place self-update.
+
+    A POST for the same reason as repair-specs: the spawn must be origin-checked
+    and audited, and both barriers are method-scoped. Offered only to remedy a
+    too-old kiro-cli that lacks the ``acp`` subcommand Kiro Crew launches every
+    session through. Unlike the install/sign-in steps (which Kiro Crew only
+    names), this one runs ``kiro-cli update`` FOR the owner — the CLI's own
+    self-update, the same command the auto-update path already runs.
+
+    Returns 200 with the post-update snapshot (``cli_update_error`` empty on
+    success): it runs to completion within the request, like repair-specs.
+    """
+
+    denied = await _dashboard_owner_only(request)
+    if denied is not None:
+        return denied
+    snapshot = await _service(request).update_cli(_caller(request))
     return web.json_response({**snapshot, "setup_allowed": True})

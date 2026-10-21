@@ -1,42 +1,22 @@
-"""Contract tests for the stateless ``ask_question`` MCP tool (issue #755).
+"""Contract tests for the MCP ``ask_question`` tool's advertised surface.
 
-``ask_question`` no longer resolves a user-scoped token or blocks on a
-server-side HTTP round-trip. It VALIDATES its arguments and returns a session
-DIRECTIVE — a human confirmation plus an opaque marker carrying the validated
-questions (and NO session key). The session-aware consumer
-(``dashboard.chat_runner._run_chat``'s ``EVENT_TOOL_RESULT`` handler) decodes the
-marker and, via ``dashboard.session_directive_apply.apply_session_directive``,
-posts a NON-BLOCKING question card to ITS OWN slot; the agent then ends its turn
-and the user's answer arrives as an ordinary next message.
-
-The tests split along that seam:
-
-* **Tool contract** — call the tool via ``_call_tool_inner`` and assert the
-  returned directive decodes to the validated questions on a default install,
-  and that a non-dashboard session gets a plain ``[OPTIONS:]`` steer (NO
-  directive).
-* **Applier** — call ``apply_session_directive(..., "ask_question", ...)`` with
-  a fake state exposing ``post_question_card`` and assert the card is posted to
-  the slot's key, that the confirmation tells the model to END its turn, and
-  that a no-client post steers the model to ask in plain text instead.
-
-The former mock-dashboard HTTP server, the ``_post_user`` user-token handshake,
-the socket-timeout margin, and the answered/timeout/error round-trip tests are
-gone: that logic no longer exists — the tool is stateless and the card is posted
-in-process by the applier.
+``ask_question`` is ALWAYS blocking: with an attested dashboard session it opens
+a card on that session's own slot and returns the answers as its tool result
+(the blocking path is covered in ``test_ask_question_blocking.py``). It is NOT a
+session directive. Without an attested dashboard session it refuses in plain
+text -- no directive, no out-of-band post -- so an answer can never come back as
+a user-role message. These tests pin the schema, the description and those
+refusals.
 """
 
 from __future__ import annotations
-
-import asyncio
 
 import pytest
 
 import kiro_crew.mcp_core as mcp_core
 from kiro_crew import session_directive
-from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.mcp_core import _call_tool, _call_tool_inner
-from kiro_crew.validation import ValidationError, validate_ask_user_question
+from kiro_crew.validation import ValidationError
 
 QUESTIONS = [
     {
@@ -47,17 +27,10 @@ QUESTIONS = [
 ]
 
 
-def _validated_questions() -> list:
-    """The questions exactly as the tool validates them — the authoritative deep
-    AskUserQuestion validation/normalization, which is what the directive and
-    the applier now carry (not the shallow schema)."""
-    return validate_ask_user_question({"questions": QUESTIONS})
-
-
 @pytest.fixture()
 def default_install(monkeypatch):
     """Default install: the strict resolver has no accepted identity source and
-    returns ``""``, so ask_question RETURNS a directive rather than refusing.
+    returns ``""``, so there is no session to block on and ask_question refuses.
     (Pooling off, unsandboxed, kiro-cli backend.)"""
     monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
     return monkeypatch
@@ -66,22 +39,18 @@ def default_install(monkeypatch):
 # ── Tool contract ─────────────────────────────────────────────────────────────
 
 
-def test_ask_question_returns_directive_with_validated_questions(default_install):
-    """A valid call on a default install returns a directive that decodes to the
-    validated questions payload — no session key, no HTTP round-trip."""
-    result = _call_tool_inner("ask_question", {"questions": QUESTIONS})
-    args = session_directive.decode(result, "ask_question")
-    assert args == {"questions": _validated_questions()}
+def test_unattested_caller_gets_a_plain_refusal_not_a_directive(default_install, gateway_posts):
+    """With no attested session there is no card to block on. The tool says so in
+    its result -- it publishes no directive and posts nothing, so no answer can
+    ever come back as a user message."""
+    result = _call_tool("ask_question", {"questions": QUESTIONS})
+    assert session_directive.decode(result, "ask_question") is None
+    assert "only works from a dashboard chat session" in result
+    assert "[OPTIONS:" in result
+    assert gateway_posts == []
 
 
-def test_ask_question_directive_confirmation_tells_the_model_to_end_its_turn(default_install):
-    """The human-visible confirmation must instruct the model to end its turn so
-    the non-blocking card can be answered as the next message."""
-    result = _call_tool_inner("ask_question", {"questions": QUESTIONS})
-    assert "end your turn" in result.lower()
-
-
-def test_non_dashboard_session_is_refused_with_options_hint(monkeypatch):
+def test_non_dashboard_session_is_refused_with_options_hint(monkeypatch, gateway_posts):
     """A non-empty, non-dashboard key (Slack/Discord) has no question card, so
     the tool steers to the [OPTIONS:] tag and emits NO directive."""
     monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "slack:C1")
@@ -90,6 +59,19 @@ def test_non_dashboard_session_is_refused_with_options_hint(monkeypatch):
     assert "[OPTIONS:" in result
     # It is a plain message, not a directive.
     assert session_directive.decode(result, "ask_question") is None
+    # A refusal must not publish: no marker, no parked record.
+    assert gateway_posts == []
+
+
+def test_surfaced_channel_session_is_refused(monkeypatch, gateway_posts):
+    """A channel session with an open dashboard tab is still refused: its agent answers to the channel."""
+    import kiro_crew.mcp_tools.control as control
+
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "slack:C1")
+    monkeypatch.setattr(control, "has_dashboard_surface", lambda sk: True)
+    result = _call_tool_inner("ask_question", {"questions": QUESTIONS})
+    assert "only works from a dashboard chat session" in result
+    assert gateway_posts == []
 
 
 def test_questions_is_required(default_install):
@@ -116,53 +98,45 @@ def test_ask_question_is_advertised_in_the_tool_list():
     assert "[OPTIONS:" in spec["description"]
 
 
-# ── Applier (dashboard.session_directive_apply) ───────────────────────────────
+def test_advertised_description_states_the_blocking_contract():
+    """The description is what an agent reads BEFORE its first call, so it has to
+    match the tool. On the dashboard the call blocks and the answers are its
+    RESULT, so the agent must continue rather than end its turn; the directive
+    fallback (no attached dashboard) is the one case that still ends the turn,
+    and the result says so when it happens.
+    """
+    spec = next(t for t in mcp_core._list_tools() if t["name"] == "ask_question")
+    lowered = spec["description"].lower()
+    assert "blocks until the user responds" in lowered
+    assert "tool's result" in lowered
+    assert "do not end your turn" in lowered
+    assert "replied in chat" in lowered
+    # The old non-blocking instruction would now strand the agent: it would end
+    # the turn while the card it just posted is still waiting on this very call.
+    assert "non-blocking" not in lowered
+    assert "next ordinary message" not in lowered
 
 
-class _FakeSlot:
-    key = "chat-1-1700000000"
+def test_timeout_secs_is_not_advertised_but_is_still_accepted(default_install):
+    """`timeout_secs` cannot do anything here: the directive carries only the
+    questions, so nothing downstream reads a deadline. It is therefore absent
+    from the advertised schema — a knob with no effect should not be offered to a
+    model — while remaining a lenient field so a caller that still passes it gets
+    its card rather than a validation error.
+    """
+    spec = next(t for t in mcp_core._list_tools() if t["name"] == "ask_question")
+    assert "timeout_secs" not in spec["inputSchema"]["properties"]
+    assert "timeout_secs" not in spec["description"]
+
+    result = _call_tool_inner("ask_question", {"questions": QUESTIONS, "timeout_secs": 60})
+    assert not result.startswith("Error")
 
 
-class _FakeState:
-    """Fake dashboard state exposing only ``post_question_card``.
-
-    ``post_question_card(slot_key, questions)`` returns the number of clients the
-    card reached (mirrors the real broadcast-count contract)."""
-
-    def __init__(self, clients: int):
-        self._clients = clients
-        self.calls: list[tuple[str, list]] = []
-
-    async def post_question_card(self, slot_key, questions) -> int:
-        self.calls.append((slot_key, questions))
-        return self._clients
+# ── Not a directive ────────────────────────────────────────────────────────────
 
 
-def test_applier_posts_the_card_to_the_slot_and_ends_the_turn():
-    """The card is posted to slot.key with the validated questions, and the
-    confirmation tells the model to END ITS TURN."""
-    state = _FakeState(clients=1)
-    slot = _FakeSlot()
-    questions = _validated_questions()
-    result = asyncio.run(
-        apply_session_directive(
-            state, slot, "dashboard:chat-1-1700000000", "ask_question", {"questions": questions}
-        )
-    )
-    assert state.calls == [(slot.key, questions)]
-    assert "end your turn" in result.lower()
-
-
-def test_applier_with_no_attached_client_steers_to_plain_text():
-    """When post_question_card returns 0 (no dashboard client attached), the
-    confirmation tells the model to ask in plain text instead."""
-    state = _FakeState(clients=0)
-    slot = _FakeSlot()
-    result = asyncio.run(
-        apply_session_directive(
-            state, slot, "dashboard:chat-1-1700000000", "ask_question",
-            {"questions": _validated_questions()},
-        )
-    )
-    assert len(state.calls) == 1
-    assert "plain text" in result.lower()
+def test_ask_question_is_not_a_session_directive():
+    """ask_question blocks and returns its answers as the tool result. Registered
+    as a directive, its result was tagged as a refused directive and the applier
+    would post a non-blocking card whose answer arrives as a user message."""
+    assert "ask_question" not in session_directive.DIRECTIVE_TOOLS

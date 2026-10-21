@@ -2,18 +2,19 @@
  * Surface registry — single source of truth for top-level navigation
  * destinations in the dashboard.
  *
- * The left rail contains a mix of static built-in nav items (Chat, Autopilot,
+ * The left rail contains a mix of static built-in nav items (Chat,
  * Notifications, Settings, ...) and dynamic app nav items (loaded from
  * installed apps). Both kinds register here through one shape: a `Surface`
- * describes a nav destination plus how its badge count is derived. `App.tsx`
- * iterates the registry exactly once to render nav items and their badges;
+ * describes a nav destination plus how its badge count is derived.
+ * `shell/nav/navItems.ts` iterates the registry exactly once (`NAV_ITEMS`), and
+ * `App.tsx` renders the nav items and their badges from it;
  * `ChatPage` resolves the slot filter via `surface.slotMode` instead of a
  * hardcoded comparison; new surfaces (built-in or third-party) register one
  * entry and everything else (route, badge, slot routing) just works.
  *
  * Slot-bearing vs non-slot surfaces:
- * - **Slot-bearing** surfaces (`slotMode` set) — Chat (`''`), Autopilot
- *   (`'orchestrator'`), and any future modes — pull their badge count from
+ * - **Slot-bearing** surfaces (`slotMode` set) — Chat (`''`) and any future
+ *   modes — pull their badge count from
  *   `selectUnreadByMode(slotMode)`. These are also the surfaces ChatPage
  *   filters slots into.
  * - **Non-slot** surfaces (no `slotMode`) — Notifications and third-party
@@ -39,19 +40,11 @@ import type { RootState } from '../store'
 import { readPreviewFlag } from '../utils/previewFlags'
 
 import { i18nT } from '../i18n/t'
-export type SurfaceGroup = 'Main' | 'Apps' | 'Platform' | 'Bottom'
-
-/**
- * Marks a registry literal as a machine value rather than rendered copy.
- *
- * Keep this wrapper narrow: `label` fallbacks in the built-in registry are
- * unreachable when `labelKey` is present (enforced by navLabels.test.tsx), and
- * `group` is a routing bucket. Other surface strings such as `badgeLabel` and
- * `activityLabel` are rendered and must not use this helper.
- */
-export function surfaceMachineValue<T extends string>(value: T): T {
-  return value
-}
+import type { SurfaceGroup } from './surfaceData'
+// Defined beside the pure surface data so the find_ui generator can read that
+// data without importing the store; re-exported so call sites keep one import.
+export { surfaceMachineValue } from './surfaceData'
+export type { SurfaceGroup } from './surfaceData'
 
 /** Anything that can appear as a top-level destination in the left rail. */
 export interface Surface {
@@ -141,16 +134,40 @@ export interface Surface {
   /**
    * Gate this surface behind a preview flag (a key from
    * `utils/previewFlags.ts`). While the flag is off, the surface is not
-   * advertised anywhere in the UI — no rail row, no Search Everywhere result —
-   * so an unpolished page can sit on `main` without being released.
+   * advertised anywhere in the UI — no rail row, no Search Everywhere result,
+   * and no contribution to the browser-tab attention count
+   * (`selectAllSurfacesAttention` skips it) — so an unpolished page can sit on
+   * `main` without being released.
    *
-   * Unlike `hiddenFromNav` (a permanent "rendered elsewhere" marker), this is
-   * temporary and conditional: the surface stays in `getBuiltinSurfaces()` so
-   * its label/badge wiring is still covered by tests, and consumers read
-   * `getAdvertisedSurfaces()` instead. Its route stays registered in `App.tsx`,
-   * which is what makes the surface reachable once the flag is on.
+   * Unlike `hiddenFromNav` (a permanent "rendered elsewhere" marker, which DOES
+   * still contribute to the attention count because it is advertised, just not
+   * on the rail), this is temporary and conditional: the surface stays in
+   * `getBuiltinSurfaces()` so its label/badge wiring is still covered by tests,
+   * and consumers read `getAdvertisedSurfaces()` instead. Its route stays
+   * registered in `App.tsx`, which is what makes the surface reachable once the
+   * flag is on.
    */
   previewFlag?: string
+  /**
+   * Mark this surface as a PROMOTABLE SUB-ITEM: a destination that normally
+   * lives inside another surface's secondary panel (Agent Capabilities'
+   * Steering files, Skills, Hooks), which the user may promote onto the rail.
+   *
+   * It is registered exactly like any other surface — so it stays in
+   * `getBuiltinSurfaces()` and every registry-wide invariant, `labelKey`
+   * coverage included, keeps covering it — but it occupies a rail row only
+   * while its navId is in the user's pinned set (`lib/navPinned.ts`). That
+   * read is per render and comes from localStorage, so it cannot be expressed
+   * here: `shell/nav/appRail.tsx` applies it in the ONE derivation that feeds every rail
+   * list, for the same reason `previewFlag` is filtered there.
+   *
+   * Unlike `hiddenFromNav` (a permanent "rendered elsewhere" marker) this is
+   * conditional and user-controlled, and unlike `previewFlag` the surface is
+   * fully released — an unpinned sub-item is still advertised everywhere a
+   * destination can be found, because it IS reachable inside its host panel.
+   * Only the rail row is opt-in.
+   */
+  pinnable?: boolean
 }
 
 const _builtins: Surface[] = []
@@ -234,6 +251,20 @@ export function getAdvertisedSurfaces(): readonly Surface[] {
 }
 
 /**
+ * The promotable sub-items a user may pin to the rail — advertised surfaces
+ * carrying `pinnable`.
+ *
+ * Named rather than left as an inline `.filter(s => s.pinnable)` at each call
+ * site for the reason `getAdvertisedSurfaces()` gives just above: a call site
+ * that reaches for the unfiltered list and forgets the predicate renders a row
+ * the user never asked for, and the failure is silent. Preview gating is
+ * applied first, so a sub-item of an unreleased surface is not offered.
+ */
+export function getPinnableSurfaces(): readonly Surface[] {
+  return getAdvertisedSurfaces().filter(s => s.pinnable)
+}
+
+/**
  * Find the slot-bearing surface whose `slotMode` matches the given mode.
  * Useful for tools that want to resolve a `mode` string to its surface
  * descriptor (icon, label, route). Returns `undefined` if no surface
@@ -261,7 +292,7 @@ export function filterSlotsBySurface(slots: readonly ChatSlot[], slotMode: strin
  *
  * Used by `ChatPage` to scope the sidebar's "show only unread" toggle: its
  * tooltip count and auto-drain effect read this list, so without scoping a
- * cross-mode unread (e.g. an autopilot slot becoming unread while you're on
+ * cross-mode unread (e.g. a dashboard slot becoming unread while you're on
  * /chat) would inflate the toggle's count even though the sidebar's visible
  * session list — built from `filterSlotsBySurface` — wouldn't show it.
  *
@@ -342,11 +373,25 @@ export function selectSurfaceActivityCount(navId: string): (state: RootState) =>
  * selectors directly (no `.find()` per call) so it's O(surfaces) on each
  * Redux state change rather than O(surfaces²); the per-surface inner
  * selectors are themselves memoized via `selectUnreadByMode`.
+ *
+ * A preview-gated surface is skipped while its flag is off, which is a
+ * user-visible correctness point rather than tidiness: the tab title is an
+ * ADVERTISEMENT too. A gated surface has no rail row and no Search Everywhere
+ * entry, so a count it contributes shows the user a `(1)` they cannot trace to
+ * anything or clear — and slots for a hidden surface really do exist, since
+ * gating removes the ingress and deliberately leaves earlier work running.
+ * `hiddenFromNav` is the deliberate opposite: it still contributes, because it
+ * IS advertised, just somewhere other than the rail (the topbar bell).
+ *
+ * The cost is one synchronous `localStorage` read per gated surface per
+ * dispatch, the same read `getAdvertisedSurfaces()` already performs on every
+ * render, and it is paid only by surfaces that carry a flag at all.
  */
 export function selectAllSurfacesAttention(state: RootState): number {
   let total = 0
   for (const s of _builtins) {
     if (s.appOnly && !state.dashboard.enabledAppIds.includes(s.navId)) continue
+    if (!surfacePreviewEnabled(s)) continue
     if (s.unreadSelector) total += s.unreadSelector(state)
     else if (s.slotMode !== undefined) total += selectUnreadByMode(s.slotMode)(state)
   }

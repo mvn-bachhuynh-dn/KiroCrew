@@ -5,13 +5,40 @@ const os = require("os");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
-const { postShutdown, stopGatewayGracefully, forceStopPort, classifyPortOwner, KIROCREW_PROC_RE } = require("../gateway-stop");
+const {
+  postShutdown,
+  stopGatewayGracefully,
+  forceStopPort,
+  classifyPortOwner,
+  isKirocrewCommand,
+} = require("../gateway-stop");
+const { listenerSecretPath } = require("../local-token");
+
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
 
 // Helper: temp KIROCREW_HOME containing a .local_secret file.
 function tmpHomeWithSecret(secret) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gw-stop-"));
   if (secret !== null) fs.writeFileSync(path.join(dir, ".local_secret"), secret);
   return dir;
+}
+
+// Helper: publish a listener entry the way a gateway does for `address`:`port`.
+function writeListenerSecret(home, port, address, secret) {
+  const file = listenerSecretPath(home, String(port), address, path);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, secret);
 }
 
 // Helper: a long-lived child. ignoreSigterm=true => only SIGKILL can stop it.
@@ -39,8 +66,10 @@ function waitReady(proc) {
 // Helper: local server implementing the /api/shutdown contract.
 // onShutdown(req) lets a test simulate the gateway exiting itself on 200.
 function startServer({ secret, status = 200, onShutdown }) {
+  const seen = [];
   const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/api/shutdown") {
+      seen.push(req.headers["x-local-secret"]);
       const ok = req.headers["x-local-secret"] === secret;
       if (!ok) { res.writeHead(403); return res.end('{"error":"invalid secret"}'); }
       res.writeHead(status); res.end(status === 200 ? '{"ok":true}' : "{}");
@@ -51,73 +80,141 @@ function startServer({ secret, status = 200, onShutdown }) {
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
-      resolve({ server, port: server.address().port });
+      resolve({ server, port: server.address().port, seen });
     });
   });
 }
 
-test("postShutdown returns true on 200 with correct secret", async () => {
-  const home = tmpHomeWithSecret("s3cr3t");
-  const { server, port } = await startServer({ secret: "s3cr3t", status: 200 });
+test("postShutdown sends the listener entry for the dialed address", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "listener", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "listener");
   try {
     const ok = await postShutdown({ backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home });
     assert.strictEqual(ok, true);
+    assert.deepStrictEqual(seen, ["listener"], "the home-wide secret must not be sent");
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("postShutdown returns false on 403 (wrong secret)", async () => {
-  const home = tmpHomeWithSecret("wrong");
-  const { server, port } = await startServer({ secret: "right", status: 200 });
+test("postShutdown never sends .local_secret when no listener entry is published", async () => {
+  // An older gateway publishes no entry. Nothing the app can observe proves the
+  // port reaches only its own child (an unprivileged lsof hides another user's
+  // sockets), so the home-wide secret stays home and the caller uses signals.
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
+  try {
+    for (const backendUrl of [`http://127.0.0.1:${port}`, `http://localhost:${port}`]) {
+      const ok = await postShutdown({ backendUrl, kirocrewHome: home });
+      assert.strictEqual(ok, false, backendUrl);
+    }
+    assert.deepStrictEqual(seen, [], "no request may carry a secret");
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("postShutdown does not reach for .local_secret when listener entries are refused", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "stale");
   try {
     const ok = await postShutdown({ backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home });
     assert.strictEqual(ok, false);
+    assert.deepStrictEqual(seen, ["stale"]);
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("postShutdown returns false when no secret file exists", async () => {
+test("postShutdown sends nothing to localhost when the entries cover one family only", async () => {
+  // v4 is published but not v6 (another process holds [::1]:<port>), so
+  // `localhost` may reach that other process.
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "v4-only");
+  try {
+    const ok = await postShutdown({ backendUrl: `http://localhost:${port}`, kirocrewHome: home });
+    assert.strictEqual(ok, false);
+    assert.deepStrictEqual(seen, []);
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("postShutdown refuses a target that is not an http loopback origin", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const requests = [];
+  const httpMod = { request: (opts) => { requests.push(opts); throw new Error("must not dial"); } };
+  try {
+    for (const backendUrl of ["http://192.0.2.1:5476", "https://127.0.0.1:5476", "not a url", ""]) {
+      const ok = await postShutdown({ backendUrl, kirocrewHome: home, httpMod });
+      assert.strictEqual(ok, false, backendUrl);
+    }
+    assert.deepStrictEqual(requests, []);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("postShutdown returns false when no secret is published at all", async () => {
   const home = tmpHomeWithSecret(null);
   const ok = await postShutdown({ backendUrl: "http://127.0.0.1:1", kirocrewHome: home });
   assert.strictEqual(ok, false);
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("postShutdown tries each candidate secret — a stale first secret does not block the live one", async () => {
-  // Migration edge: a partially-copied canonical secret is stale, but the
-  // gateway is authenticated by the legacy one. postShutdown must POST both.
-  const { server, port } = await startServer({ secret: "live-legacy", status: 200 });
+test("postShutdown tries each listener entry -- a stale exact entry does not block the live wildcard", async () => {
+  // A crashed generation leaves its entry behind, so a stale first candidate must
+  // not stop postShutdown from POSTing the live one beside it.
+  const home = tmpHomeWithSecret(null);
+  const { server, port, seen } = await startServer({ secret: "live-secret", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "stale-secret");
+  writeListenerSecret(home, port, "0.0.0.0", "live-secret");
   try {
-    const ok = await postShutdown({
-      backendUrl: `http://127.0.0.1:${port}`,
-      secrets: ["stale-canonical", "live-legacy"],
-    });
+    const ok = await postShutdown({ backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home });
     assert.strictEqual(ok, true);
-  } finally { server.close(); }
+    assert.deepStrictEqual(seen, ["stale-secret", "live-secret"]);
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("postShutdown returns false only after every candidate secret is rejected", async () => {
-  const { server, port } = await startServer({ secret: "the-real-one", status: 200 });
-  try {
-    const ok = await postShutdown({
-      backendUrl: `http://127.0.0.1:${port}`,
-      secrets: ["nope-1", "nope-2"],
-    });
-    assert.strictEqual(ok, false);
-  } finally { server.close(); }
-});
-
-test("stopGatewayGracefully: happy path — endpoint exits process, no signal needed", async () => {
-  const home = tmpHomeWithSecret("s3cr3t");
-  const proc = spawnDummy({ ignoreSigterm: true }); // proves SIGTERM was NOT used
+test("stopGatewayGracefully hands postShutdown no caller-supplied secret", async () => {
+  const proc = spawnDummy();
   await waitReady(proc);
-  // Server kills the child on 200, simulating the gateway exiting itself.
-  const { server, port } = await startServer({
-    secret: "s3cr3t", status: 200, onShutdown: () => proc.kill("SIGKILL"),
-  });
+  const calls = [];
+  try {
+    await stopGatewayGracefully(proc, {
+      backendUrl: "http://127.0.0.1:1",
+      kirocrewHome: "/unused",
+      timeoutMs: 5000,
+      postShutdownFn: async (opts) => { calls.push(opts); return false; },
+    });
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual("secrets" in calls[0], false, "no caller-supplied secret list");
+  } finally { if (proc.exitCode === null) proc.kill("SIGKILL"); }
+});
+
+test("stopGatewayGracefully: a gateway with no listener entry is stopped by signal, never sent .local_secret", async () => {
+  // The GPT 6.1 case on #20026: a listener the lsof probe cannot see answers the
+  // port. The home-wide secret must not reach it; SIGTERM stops our child.
+  const home = tmpHomeWithSecret("home-wide");
+  const proc = spawnDummy();
+  await waitReady(proc);
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
   try {
     await stopGatewayGracefully(proc, {
       backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 10000,
     });
     assert.notStrictEqual(proc.exitCode === null && proc.signalCode === null, true, "process should be gone");
+    assert.deepStrictEqual(seen, [], "the home-wide secret must not be sent");
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("stopGatewayGracefully: happy path through the child's own listener entry", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const proc = spawnDummy({ ignoreSigterm: true }); // proves SIGTERM was NOT used
+  await waitReady(proc);
+  const { server, port, seen } = await startServer({
+    secret: "listener", status: 200, onShutdown: () => proc.kill("SIGKILL"),
+  });
+  writeListenerSecret(home, port, "127.0.0.1", "listener");
+  try {
+    await stopGatewayGracefully(proc, {
+      backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 10000,
+    });
+    assert.notStrictEqual(proc.exitCode === null && proc.signalCode === null, true, "process should be gone");
+    assert.deepStrictEqual(seen, ["listener"]);
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -134,7 +231,19 @@ test("stopGatewayGracefully: SIGTERM fallback when endpoint fails", async () => 
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("stopGatewayGracefully: SIGKILL fallback when SIGTERM ignored", async () => {
+// The SIGKILL escalation exists for a child that IGNORES SIGTERM, which is a
+// POSIX-only state: on Windows there are no real signals, and
+// ChildProcess.kill("SIGTERM") maps onto TerminateProcess -- an unconditional
+// kill the target cannot install a handler for (verified: the child's SIGTERM
+// handler never runs and it dies with signalCode "SIGTERM"). So the premise
+// "SIGTERM was ignored" is unreachable there, and the escalation cannot be
+// exercised rather than merely being unnecessary.
+//
+// Split per platform instead of relaxed to `signalCode != null`, which would
+// pass on POSIX even if the SIGKILL fallback regressed into a plain SIGTERM --
+// the exact bug this test exists to catch. Each platform asserts the strongest
+// true statement about its own semantics.
+test("stopGatewayGracefully: SIGKILL fallback when SIGTERM ignored", { skip: process.platform === "win32" ? "no real signals on Windows: kill(SIGTERM) is TerminateProcess, which cannot be ignored" : false }, async () => {
   const home = tmpHomeWithSecret("s3cr3t");
   const proc = spawnDummy({ ignoreSigterm: true }); // ignores SIGTERM
   await waitReady(proc);
@@ -145,6 +254,314 @@ test("stopGatewayGracefully: SIGKILL fallback when SIGTERM ignored", async () =>
     });
     assert.strictEqual(proc.signalCode, "SIGKILL");
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("stopGatewayGracefully: a SIGTERM-ignoring child still dies on Windows", { skip: process.platform === "win32" ? false : "covered by the SIGKILL-escalation test on POSIX" }, async () => {
+  // The guarantee callers actually depend on -- stopGatewayGracefully resolves
+  // only once the process is GONE, so the auto-update bundle swap never races a
+  // live gateway child. Windows reaches that end state through the first kill
+  // rather than through the escalation, so assert the end state, not the route.
+  const home = tmpHomeWithSecret("s3cr3t");
+  const proc = spawnDummy({ ignoreSigterm: true });
+  await waitReady(proc);
+  const { server, port } = await startServer({ secret: "s3cr3t", status: 500 });
+  try {
+    await stopGatewayGracefully(proc, {
+      backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 800,
+    });
+    assert.notStrictEqual(
+      proc.exitCode === null && proc.signalCode === null,
+      true,
+      "process should be gone once stopGatewayGracefully resolves",
+    );
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("stopGatewayGracefully: the Windows fallback reaps the TREE, not just the gateway pid", async () => {
+  // THE ORPHAN BUG. The happy path is fine on every platform: POST
+  // /api/shutdown sets shutdown_event, and the gateway's own shutdown reaps its
+  // kiro-cli / MCP / app-server children before exiting. This test is about the
+  // FALLBACK -- an unreadable .local_secret, a 403, a timeout, or a wedged loop
+  // -- where the endpoint never takes and the shell resorts to killing.
+  //
+  // On POSIX, kill(SIGTERM) still lets the gateway run its handler and clean up.
+  // On Windows there is no such thing: Node maps both SIGTERM and SIGKILL onto
+  // TerminateProcess, so no handler runs, nothing is flushed, and every
+  // descendant is orphaned and reparented -- still holding the data home's locks
+  // and the same .local_secret. Worse, the port frees, so the caller's
+  // verification reports success while the orphans race the replacement gateway.
+  //
+  // So on Windows the kill must be TREE-scoped. Injected rather than spawning a
+  // real tree: the point is WHICH call the fallback makes, and a test cannot
+  // portably assert on grandchildren it did not create.
+  const treeKills = [];
+  // Collect EVERY 'exit' listener: stopGatewayGracefully registers more than one
+  // (the resolver plus the timer-clearing cleanup), so a mock that keeps only the
+  // last one never resolves and the test hangs instead of failing.
+  const proc = {
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    _onExit: [],
+    kill() { /* single-pid kill: must NOT be the Windows fallback */ },
+    once(event, fn) { if (event === "exit") this._onExit.push(fn); },
+    _finish() { this.exitCode = 1; for (const fn of this._onExit) fn(); },
+  };
+  await stopGatewayGracefully(proc, {
+    backendUrl: "http://127.0.0.1:1",
+    kirocrewHome: "/nope",
+    timeoutMs: 50,
+    // The endpoint fails -- this is the fallback path, by construction.
+    postShutdownFn: async () => false,
+    platform: "win32",
+    killTreeFn: async (pid) => { treeKills.push(pid); proc._finish(); },
+  });
+  assert.deepStrictEqual(
+    treeKills,
+    [4242],
+    "on Windows a failed /api/shutdown must escalate to a TREE kill; a single-pid " +
+      "kill frees the port but orphans every kiro-cli and MCP child"
+  );
+});
+
+test("stopGatewayGracefully: a REJECTED tree kill still falls back to killing the pid", async () => {
+  // A tree kill can legitimately refuse: windowsTaskkill fails closed when the
+  // identity probe cannot run or reports a recycled pid. Swallowing that leaves
+  // NO kill attempted at all -- strictly worse than the single-pid kill it
+  // replaced -- and the hard timer then resolves anyway, so the auto-update
+  // caller proceeds to swap the app's files while the gateway is still running.
+  // Losing the tree is bad; losing the parent too is data loss.
+  const signals = [];
+  const proc = {
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    _onExit: [],
+    kill(sig) { signals.push(sig); this.exitCode = 1; for (const fn of this._onExit) fn(); },
+    once(event, fn) { if (event === "exit") this._onExit.push(fn); },
+  };
+  await stopGatewayGracefully(proc, {
+    backendUrl: "http://127.0.0.1:1",
+    kirocrewHome: "/nope",
+    timeoutMs: 50,
+    postShutdownFn: async () => false,
+    platform: "win32",
+    killTreeFn: async () => { throw new Error("process identity changed"); },
+  });
+  assert.deepStrictEqual(
+    signals,
+    ["SIGTERM"],
+    "a refused tree kill must degrade to the single-pid kill, not to no kill at all"
+  );
+});
+
+test("stopGatewayGracefully: does not resolve while the tree kill is still reaping", async () => {
+  // The parent dies FIRST -- taskkill /T terminates it and then walks the rest of
+  // the tree -- so the process 'exit' event fires while descendants are still being
+  // reaped. Resolving on that event alone hands control back to the auto-update
+  // caller mid-sweep, which then swaps the app's files with kiro-cli / MCP children
+  // still live and holding the data home's locks: exactly the state the tree kill
+  // was added to prevent, reintroduced by resolving too early.
+  let releaseTree;
+  const treeDone = new Promise((r) => { releaseTree = r; });
+  let resolvedBeforeTreeSettled = false;
+  let treeSettled = false;
+  const proc = {
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    _onExit: [],
+    kill() {},
+    once(event, fn) { if (event === "exit") this._onExit.push(fn); },
+  };
+  const stopping = stopGatewayGracefully(proc, {
+    backendUrl: "http://127.0.0.1:1",
+    kirocrewHome: "/nope",
+    timeoutMs: 5000,
+    postShutdownFn: async () => false,
+    platform: "win32",
+    killTreeFn: async () => {
+      // The parent goes down immediately; the rest of the tree lags.
+      proc.exitCode = 1;
+      for (const fn of proc._onExit) fn();
+      await treeDone;
+      treeSettled = true;
+    },
+  }).then(() => { resolvedBeforeTreeSettled = !treeSettled; });
+
+  // Give the parent-exit path every chance to resolve early.
+  await new Promise((r) => setTimeout(r, 150));
+  releaseTree();
+  await stopping;
+  assert.strictEqual(
+    resolvedBeforeTreeSettled,
+    false,
+    "resolved on the parent's exit while the tree kill was still reaping descendants"
+  );
+});
+
+test("stopGatewayGracefully: a HUNG tree kill still resolves, and never pre-empts itself", async () => {
+  // A tree kill is AWAITED, not raced against a timer. Pre-empting it would kill
+  // the parent alone and orphan exactly the descendants it exists to reap -- the
+  // bug, dressed up as a mitigation. So the contract is: the caller sizes the tree
+  // kill's own timeouts to fit this deadline (pinned by the
+  // gateway-supervisor.js source test below),
+  // and this function must not resolve a moment later than it otherwise would.
+  //
+  // Asserted with a kill that NEVER settles, the pathological case: the hard timer
+  // must still resolve, and no single-pid kill may have fired behind the tree
+  // kill's back.
+  const signals = [];
+  const proc = {
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    _onExit: [],
+    kill(sig) { signals.push(sig); this.exitCode = 1; for (const fn of this._onExit) fn(); },
+    once(event, fn) { if (event === "exit") this._onExit.push(fn); },
+  };
+  const started = Date.now();
+  await stopGatewayGracefully(proc, {
+    backendUrl: "http://127.0.0.1:1",
+    kirocrewHome: "/nope",
+    timeoutMs: 60,
+    postShutdownFn: async () => false,
+    platform: "win32",
+    killTreeFn: () => new Promise(() => {}),
+  });
+  assert.deepStrictEqual(
+    signals,
+    [],
+    "the tree kill must not be pre-empted by a single-pid kill; that would orphan " +
+      "the descendants it exists to reap"
+  );
+  // Bounded by the hard safety net (timeoutMs + 3000), not by the hung kill.
+  assert.ok(
+    Date.now() - started < 60 + 3000 + 2000,
+    "a hung tree kill must not delay the caller past the hard deadline"
+  );
+});
+
+test("wedge recovery kills the gateway TREE, not just the wedged pid", () => {
+  // The wedge path deliberately SKIPS /api/shutdown -- that endpoint runs on the
+  // very loop that is frozen -- so it is the one trigger where Windows always
+  // reached a bare single-pid kill. And the port sweep that follows cannot cover
+  // for it: the bare kill frees the LISTEN port, so forceStopGatewayPort then
+  // finds no owner and the /T taskkill inside it is never reached. The detached
+  // kiro-cli / MCP children survive holding the data home's locks and race the
+  // gateway that is about to be respawned.
+  //
+  // Source-asserted at the supervisor ownership boundary. The requirement is
+  // that the wedge kill go through a tree-scoped path on win32, not that it use
+  // any particular helper name.
+  const supervisor = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
+  const marker = "liveness: backend unresponsive — force-killing wedged gateway";
+  const at = supervisor.indexOf(marker);
+  assert.notStrictEqual(
+    at,
+    -1,
+    "expected the wedge-recovery force-kill path in gateway-supervisor.js",
+  );
+  // The kill happens within the next few dozen lines of that log line.
+  const region = supervisor.slice(at, at + 2000);
+  assert.match(
+    region,
+    /killGatewayProcessTree|windowsTaskkill|IS_WIN/,
+    "wedge recovery must tree-kill on Windows; a bare pid kill frees the port, so " +
+      "the port sweep that follows finds no owner and never reaps the descendants"
+  );
+  // ...and the helper it goes through must NOT borrow the shutdown path's
+  // shortened timeouts. Those exist only because stopGatewayGracefully has a hard
+  // deadline to fit inside. Wedge recovery has none, so inheriting them would time
+  // the identity probe out early on a slow box, fall back to the parent-only kill,
+  // and respawn beside the very orphans this path exists to reap.
+  const helper = supervisor.indexOf("async function killGatewayProcessTree");
+  assert.notStrictEqual(
+    helper,
+    -1,
+    "expected the shared tree-kill helper in gateway-supervisor.js",
+  );
+  assert.doesNotMatch(
+    supervisor.slice(helper, helper + 1200),
+    /killGatewayTreeOnWindowsBounded/,
+    "the wedge-recovery tree kill must not reuse the shutdown-BOUNDED helper: it " +
+      "has no deadline to fit, so the shortened probe timeouts only make an early " +
+      "fallback to the parent-only kill more likely"
+  );
+});
+
+test("the gateway supervisor bounds the shutdown tree kill to the hard deadline", () => {
+  // windowsTaskkill's DEFAULTS are sized for the interactive port sweep: identity
+  // revalidation via PowerShell (8s) then WMIC (5s), then taskkill itself (10s) --
+  // 23s worst case, which is longer than stopGatewayGracefully's whole deadline of
+  // timeoutMs + 3000. On the shutdown path that ordering is what matters: the hard
+  // timer resolves on schedule regardless, so an unbounded kill would still be in
+  // flight when the auto-update caller starts swapping the app's files.
+  //
+  // Rather than pre-empting the kill (which would defeat its purpose by killing
+  // the parent alone and orphaning the tree it exists to reap), the call site
+  // passes TIGHTER timeouts so the whole tree kill provably completes first.
+  const supervisor = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
+  const start = supervisor.indexOf("function killGatewayTreeOnWindowsBounded");
+  assert.notStrictEqual(
+    start,
+    -1,
+    "gateway-supervisor.js must define the bounded Windows tree kill",
+  );
+  // Brace-match to the end of the function rather than regex-scanning to the first
+  // "})," -- the call nests one options object inside another, so a lazy pattern
+  // stops early and silently misses the outer timeout.
+  let depth = 0;
+  let end = start;
+  for (; end < supervisor.length; end += 1) {
+    if (supervisor[end] === "{") depth += 1;
+    else if (supervisor[end] === "}") { depth -= 1; if (depth === 0) break; }
+  }
+  const call = supervisor.slice(start, end + 1);
+  const budget = ["powershellTimeoutMs", "wmicTimeoutMs", "timeoutMs"]
+    .map((k) => Number((new RegExp(`${k}:\\s*(\\d+)`).exec(call) || [])[1]));
+  assert.ok(
+    budget.every((n) => Number.isFinite(n) && n > 0),
+    "the shutdown tree kill must pin all three of windowsTaskkill's timeouts " +
+      "(powershell, wmic, taskkill); an unpinned one inherits a default too long " +
+      "for the shutdown deadline"
+  );
+  const worstCase = budget.reduce((a, b) => a + b, 0);
+  assert.ok(
+    worstCase < 15000 + 3000,
+    `the tree kill's worst case (${worstCase}ms) must fit inside the hard deadline, `
+      + "or the caller is told the gateway is gone while the kill is still running"
+  );
+});
+
+test("stopGatewayGracefully: POSIX keeps signalling the child, not a tree kill", async () => {
+  // The Windows branch must not change POSIX behaviour: there, SIGTERM genuinely
+  // reaches the gateway's handler, which is strictly better than a tree kill
+  // because it still flushes sessions/memory/cron before exiting.
+  const signals = [];
+  const treeKills = [];
+  const proc = {
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    _onExit: [],
+    kill(sig) { signals.push(sig); this.exitCode = 1; for (const fn of this._onExit) fn(); },
+    once(event, fn) { if (event === "exit") this._onExit.push(fn); },
+  };
+  await stopGatewayGracefully(proc, {
+    backendUrl: "http://127.0.0.1:1",
+    kirocrewHome: "/nope",
+    timeoutMs: 50,
+    postShutdownFn: async () => false,
+    platform: "linux",
+    killTreeFn: async (pid) => { treeKills.push(pid); },
+  });
+  assert.deepStrictEqual(signals, ["SIGTERM"]);
+  assert.deepStrictEqual(treeKills, [], "POSIX must keep the graceful SIGTERM path");
 });
 
 test("stopGatewayGracefully: no-op on already-dead process", async () => {
@@ -243,6 +660,59 @@ test("forceStopPort: freed reflects real port state even after killing our targe
   assert.strictEqual(r.killed, 1);
   assert.deepStrictEqual(r.survivors, []); // OUR pid is gone
   assert.strictEqual(r.freed, false); // but the port is still held by 777
+});
+
+test("forceStopPort: awaits an asynchronous Windows kill before verifying", async () => {
+  let killFinished = false;
+  let probes = 0;
+  const r = await forceStopPort(7788, {
+    getListenPids: async () => {
+      probes += 1;
+      if (probes === 1) return [4242];
+      assert.strictEqual(killFinished, true, "verification raced taskkill completion");
+      return [];
+    },
+    getCommand: async () => "C:\\bundle\\kirocrew.exe gateway",
+    kill: async () => { killFinished = true; },
+    sleep: async () => {},
+    isKirocrew: (command) => command.includes("kirocrew.exe"),
+  });
+  assert.strictEqual(r.killed, 1);
+  assert.strictEqual(r.freed, true);
+});
+
+test("forceStopPort: a failed initial Windows probe is not a free port", async () => {
+  const probeError = new Error("netstat timed out");
+  const r = await forceStopPort(7788, {
+    getListenPids: async () => { throw probeError; },
+    getCommand: async () => "",
+    kill: async () => {},
+    sleep: async () => {},
+    failClosedOnProbeError: true,
+  });
+  assert.deepStrictEqual(r, {
+    killed: 0, freed: false, survivors: [], foreignHolder: false,
+    serviceHolder: false, probeFailed: true,
+  });
+});
+
+test("forceStopPort: a failed Windows verification never claims recovery", async () => {
+  let probes = 0;
+  const r = await forceStopPort(7788, {
+    getListenPids: async () => {
+      if (probes++ === 0) return [4242];
+      throw new Error("netstat verify timed out");
+    },
+    getCommand: async () => "C:\\bundle\\kirocrew.exe gateway",
+    kill: async () => {},
+    sleep: async () => {},
+    isKirocrew: (command) => command.includes("kirocrew.exe"),
+    failClosedOnProbeError: true,
+  });
+  assert.deepStrictEqual(r, {
+    killed: 1, freed: false, survivors: [], foreignHolder: false,
+    serviceHolder: false, probeFailed: true,
+  });
 });
 
 // ── classifyPortOwner ───────────────────────────────────────────────────────
@@ -369,18 +839,91 @@ test("classifyPortOwner: ours wins when a mixed set holds the port", async () =>
   assert.strictEqual(owner, "kirocrew");
 });
 
+test("classifyPortOwner: a composed edition's gateway classifies as ours, not foreign", async () => {
+  const owner = await classifyPortOwner(5476, {
+    getListenPids: async () => [4242],
+    getCommand: async () => "/opt/edition/bin/python3.12 -s -P -m kirocrew_enterprise gateway --port 5476",
+  });
+  assert.strictEqual(owner, "kirocrew");
+});
+
 test("classifyPortOwner and forceStopPort share one KiroCrew matcher", async () => {
   // Drift between the two would let one mis-target a stranger's process.
-  assert.ok(KIROCREW_PROC_RE.test("python -m kiro_crew gateway"));
-  assert.ok(KIROCREW_PROC_RE.test("/Applications/KiroCrew.app/.../kirocrew"));
-  assert.ok(!KIROCREW_PROC_RE.test("ssh -NL 5476:localhost:5476 host"));
+  assert.ok(isKirocrewCommand("python -m kiro_crew gateway"));
+  assert.ok(isKirocrewCommand("/Applications/KiroCrew.app/.../kirocrew"));
+  assert.ok(!isKirocrewCommand("ssh -NL 5476:localhost:5476 host"));
+  assert.ok(!isKirocrewCommand("ssh -NL 5476:localhost:5476 kirocrew"));
   // The matcher keys on the executable/module TOKEN, not a path substring:
   // an unrelated process merely living under a `kirocrew` home dir is foreign.
-  assert.ok(!KIROCREW_PROC_RE.test("C:\\Users\\kirocrew\\OtherApp\\server.exe --port 5476"));
-  assert.ok(!KIROCREW_PROC_RE.test("/home/kirocrew/some-other-server --port 5476"));
-  assert.ok(!KIROCREW_PROC_RE.test("C:\\Users\\kirocrew\\python.exe -m http.server 5476"));
-  // …but the real Windows executable / backend / module invocation still match.
-  assert.ok(KIROCREW_PROC_RE.test("C:\\Program Files\\KiroCrew\\kirocrew.exe"));
-  assert.ok(KIROCREW_PROC_RE.test("C:\\Program Files\\KiroCrew\\kirocrew-backend.exe --gateway"));
-  assert.ok(KIROCREW_PROC_RE.test("C:\\Python\\python.exe -m kiro_crew gateway"));
+  assert.ok(!isKirocrewCommand("C:\\Users\\kirocrew\\OtherApp\\server.exe --port 5476"));
+  assert.ok(!isKirocrewCommand("/home/kirocrew/some-other-server --port 5476"));
+  assert.ok(!isKirocrewCommand("C:\\Users\\kirocrew\\python.exe -m http.server 5476"));
+  assert.ok(!isKirocrewCommand("python app.py C:\\tmp\\kirocrew"));
+  assert.ok(!isKirocrewCommand("python app.py -m kiro_crew"));
+  // A POSIX `ps` line is unquoted, so an install path with a space arrives
+  // split across tokens. Our own gateway must still be identified there, and a
+  // later argument must still never pose as the executable.
+  assert.ok(isKirocrewCommand("/Users/Jane Doe/Apps/KiroCrew.app/Contents/Resources/bin/kirocrew gateway --port 5476"));
+  assert.ok(isKirocrewCommand("/Users/Jane Doe/venv/bin/python -m kiro_crew gateway"));
+  assert.ok(!isKirocrewCommand("/tmp/evil --spoof /usr/local/bin/kirocrew"));
+  assert.ok(!isKirocrewCommand("/tmp/evil /usr/local/bin/kirocrew"));
+  assert.ok(!isKirocrewCommand("/tmp/dir with space/evil kirocrew --port 5476"));
+  // Windows identity is path-bound: a matching basename at any other location
+  // remains foreign and can never authorize taskkill.
+  const trustedCli = "C:\\Program Files\\KiroCrew\\kirocrew.exe";
+  const trustedBackend = "C:\\Program Files\\KiroCrew\\kirocrew-backend.exe";
+  const trustedPython = "C:\\Program Files\\KiroCrew\\python.exe";
+  assert.ok(isKirocrewCommand(`"${trustedCli}"`, {
+    trustedExecutablePaths: [trustedCli],
+  }));
+  assert.ok(isKirocrewCommand(`"${trustedBackend}" --gateway`, {
+    trustedExecutablePaths: [trustedBackend],
+  }));
+  assert.ok(isKirocrewCommand(`"${trustedPython}" -m kiro_crew gateway`, {
+    trustedExecutablePaths: [trustedPython],
+  }));
+  assert.ok(!isKirocrewCommand("C:\\Temp\\kirocrew.exe gateway", {
+    trustedExecutablePaths: [trustedCli],
+  }));
+});
+
+test("isKirocrewCommand: a composed edition's `-m kirocrew_<edition>` gateway is ours", () => {
+  // A companion package boots the gateway from its own top-level module so its
+  // composition root runs instead of the core CLI. Hardcoding `kiro_crew` made
+  // every such gateway a "foreign holder" the launcher refused to reuse. The
+  // core must not learn any edition's name, so the match is the naming
+  // convention `kirocrew_<edition>`, mirroring the Python side's
+  // `_gateway_module_roots()`.
+  assert.ok(isKirocrewCommand("python -m kirocrew_enterprise gateway"));
+  assert.ok(isKirocrewCommand("/opt/edition/bin/python3.12 -s -P -m kirocrew_acme2 gateway --port 5476"));
+  assert.ok(isKirocrewCommand("/Users/Jane Doe/venv/bin/python -m kirocrew_enterprise gateway"));
+  const trustedPython = "C:\\Program Files\\KiroCrew\\python.exe";
+  assert.ok(isKirocrewCommand(`"${trustedPython}" -m kirocrew_enterprise gateway`, {
+    trustedExecutablePaths: [trustedPython],
+  }));
+  // Still only the FIRST execution selector: `-m` later in argv is an argument.
+  assert.ok(!isKirocrewCommand("python app.py -m kirocrew_enterprise"));
+  assert.ok(!isKirocrewCommand("python -c 'import x' -m kirocrew_enterprise"));
+  // Exact top-level module only. A dotted submodule, a bare prefix, a
+  // look-alike, mixed case or a hyphen never authorize a kill.
+  assert.ok(!isKirocrewCommand("python -m kirocrew_enterprise.tools gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_ gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew-enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m Kirocrew_Enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew_enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m mykirocrew_enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew.dashboard gateway"));
+  assert.ok(!isKirocrewCommand("python -m"));
+  // The module alone never authorizes a kill: the first positional after it
+  // must be a server subcommand, mirroring `_KIROCREW_SERVER_SUBCOMMANDS`. A
+  // process that merely imports a `kirocrew_*` module on our port stays foreign.
+  assert.ok(isKirocrewCommand("python -m kirocrew_enterprise dashboard --port 5476"));
+  assert.ok(isKirocrewCommand("python -m kirocrew_enterprise start"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_backup"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_backup serve --port 5476"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_enterprise run gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_enterprise --port 5476 gateway"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew run /tmp/spec.md"));
 });

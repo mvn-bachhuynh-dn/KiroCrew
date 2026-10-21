@@ -33,6 +33,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from kiro_crew.platform.context import redact_via_context
+from kiro_crew.platform_compat import rmtree_force
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
 from .bug_gate import BugGate
 from .contracts import (
     BUG_ERROR,
@@ -42,7 +46,7 @@ from .contracts import (
     Proposal,
     TargetProfile,
 )
-from .git_safety import GIT_SAFE_CONFIG, require_pinned
+from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 
 # Module logger — the gate is Phase C, where candidates are mechanically rejected before
 # they ever reach measurement. The two highest-value signals for run analysis are the
@@ -64,18 +68,18 @@ def _git_argv(worktree: Path, *args: str) -> list[str]:
     can forget the hook/fsmonitor overrides, and the attributes pin that unbinds
     repository-controlled filter/diff drivers is refreshed here too."""
     require_pinned(worktree)
-    return ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, *args]
+    return ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, *hook_off_args(worktree), *args]
 
 
 def _changed_paths(worktree: Path, base_sha: str) -> list[str]:
     # Stage first so NEW (untracked) files count — a bug fix's reproducing test is a new
     # file, and a bare ``git diff --name-only base`` omits untracked paths. We diff the
     # index (``--cached``) against base after ``git add -A`` so adds are included.
-    subprocess.run(_git_argv(worktree, "add", "-A"), capture_output=True, text=True)
+    subprocess.run(_git_argv(worktree, "add", "-A"), capture_output=True, **UTF8_TEXT)
     r = subprocess.run(
         _git_argv(worktree, "diff", "--cached", "--name-only", base_sha),
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
     )
     return [p for p in r.stdout.splitlines() if p.strip()]
 
@@ -86,11 +90,11 @@ def _changed_status_paths(worktree: Path, base_sha: str) -> list[tuple[str, str]
     Lets the allowlist distinguish an ADDED reproducing test (allowed on the bug track)
     from a MODIFIED existing test (gate-gaming, always forbidden). ``--diff-filter`` is
     not used; we parse ``--name-status`` so all change kinds are visible."""
-    subprocess.run(_git_argv(worktree, "add", "-A"), capture_output=True, text=True)
+    subprocess.run(_git_argv(worktree, "add", "-A"), capture_output=True, **UTF8_TEXT)
     r = subprocess.run(
         _git_argv(worktree, "diff", "--cached", "--name-status", base_sha),
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
     )
     if r.returncode != 0:
         # A git failure (bad/nonexistent base_sha, detached/corrupt repo) writes its
@@ -100,7 +104,7 @@ def _changed_status_paths(worktree: Path, base_sha: str) -> list[tuple[str, str]
         # the error so the caller rejects the candidate instead of admitting it.
         raise RuntimeError(
             f"git diff failed (rc={r.returncode}) for base {base_sha!r}: "
-            f"{(r.stderr or '').strip()[:200]}"
+            f"{redact_via_context((r.stderr or '').strip())[:200]}"
         )
     out: list[tuple[str, str]] = []
     for line in r.stdout.splitlines():
@@ -126,16 +130,16 @@ def _head_sha(worktree: Path) -> str:
     # The candidate's edit lives uncommitted in the worktree; for the same-sha
     # contract we record the base/HEAD sha the gate built against. We commit the
     # worktree edit so the measured artifact has a stable sha.
-    subprocess.run(_git_argv(worktree, "add", "-A"), capture_output=True, text=True)
+    subprocess.run(_git_argv(worktree, "add", "-A"), capture_output=True, **UTF8_TEXT)
     c = subprocess.run(
         _git_argv(worktree, "commit", "-q", "-m", "candidate gate snapshot", "--allow-empty"),
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
     )
     if c.returncode != 0:
         return ""
     return subprocess.run(
-        _git_argv(worktree, "rev-parse", "HEAD"), capture_output=True, text=True
+        _git_argv(worktree, "rev-parse", "HEAD"), capture_output=True, **UTF8_TEXT
     ).stdout.strip()
 
 
@@ -294,7 +298,7 @@ class Gate:
             # worktree's own src (base_src == cand_src) — never delete that.
             if base_src != cand_src:
 
-                shutil.rmtree(base_src.parent, ignore_errors=True)
+                rmtree_force(base_src.parent)
 
     def _stage_test_only_base(self, proposal: Proposal, base_sha: str) -> Path:
         """Build the RED base tree: the base source (bug still present) + ONLY the
@@ -345,7 +349,7 @@ class Gate:
             # fix files to base inside that snapshot so only the test is "new".
             base_tree = wt.parent / f"{wt.name}__redbase"
             if base_tree.exists():
-                shutil.rmtree(base_tree, ignore_errors=True)
+                rmtree_force(base_tree)
             # symlinks=True: copy each symlink AS A LINK, never dereferenced. The worktree is
             # agent-editable and a candidate may (within the edit allowlist) plant a test
             # symlink pointing OUT of the tree — e.g. at `$HOME/.aws/credentials`. The default
@@ -360,7 +364,7 @@ class Gate:
             # for pytest; it needs no git at all.
             gitlink = base_tree / ".git"
             if gitlink.is_dir():
-                shutil.rmtree(gitlink, ignore_errors=True)
+                rmtree_force(gitlink)
             else:
                 gitlink.unlink(missing_ok=True)
             for p in non_test:

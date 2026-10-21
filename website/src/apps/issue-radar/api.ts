@@ -4,869 +4,99 @@
 // convention, NOT the /apps/{name}/api reverse-proxy prefix used by apps like
 // file-explorer that run as a separate child process).
 import { i18nT } from '../../i18n/t'
+import {
+  accountQuery, AssigneesConflictError, DEFAULT_REPO_SETTINGS, gitlabGroupError, parseErrorBody,
+  repoBody, repoQuery, SettingsConflictError,
+} from './apiTypes'
+import type {
+  AccountScope, ApplyLabelsResponse, BulkApplyResponse, BulkPrAction, BulkPrResponse,
+  CiRunsResponse, ConnectResponse, CreateLabelResponse, DepsResponse, GenerateTaggingResponse,
+  GitLabGroup, GitLabGroupReviewsResponse, GitLabGroupsResponse, InvestigationPatch,
+  InvestigationResponse, IssueAiResponse, IssueAssigneesResponse, IssueDetailResponse,
+  IssuesResponse, IssueStateResponse, ItemKind, LabelsResponse, MembersResponse, MeResponse,
+  PrAiResponse, PrAutoMergeResponse, PrCommentResponse, PrMergeResponse, PrReviewResponse,
+  PrRunActionResponse, PrRunsResponse, PrStateResponse, PullDetailResponse, PullsResponse,
+  RecentReposResponse, RecommendationsResponse, RefSummaryResponse, RepoRef, RepoSettings,
+  ReposResponse, SettingsResponse, TaggingResponse,
+} from './apiTypes'
+import type {
+  CrewDetailResponse, CrewNamesResponse, CrewPatch, CrewResponse, CrewSettingsPatch,
+  CrewSettingsResponse, CrewSpec, CrewsResponse, CrewWorkResponse, WorkItemPatch,
+} from './apiCrewTypes'
 
 const API = '/api/apps/issue-radar'
 
-export interface ConnectResponse {
-  owner: string
-  repo: string
-  /** Resolved by the SERVER from the URL — the client cannot nominate it. This is
-   * the identity every later request for this repo must carry. */
-  provider: SourceProvider
-  host: string
-  full_name: string
-  private: boolean
-  open_issues_count: number
-}
-
-export interface Issue {
-  number: number
-  title: string
-  url: string
-  labels: string[]
-  comments: number
-  /** Total reaction count across all emoji (populated on next refresh). */
-  reactions?: number
-  /** +1 (thumbs-up) reactions — the community-demand signal used by the Overview. */
-  thumbs_up?: number
-  /** GitHub author association, e.g. "FIRST_TIME_CONTRIBUTOR", "MEMBER". */
-  author_association?: string | null
-  updated_at: string
-  created_at?: string
-  state?: string
-  author?: string | null
-  assignees?: string[]
-  body?: string
-}
-
-export interface IssuesResponse {
-  owner: string
-  repo: string
-  state?: string
-  issues: Issue[]
-  from_cache: boolean
-  /** Set by the `first_page=1` fast path: `true` when these are only the newest
-   * page (a cold-cache first paint, the full set still loading), `false`/absent
-   * when they are the complete list (served from a warm cache). */
-  partial?: boolean
-}
-
-/** One pull-request list row. A PR-native shape (from the `pulls` endpoint, not
- * `issues`): it carries `draft`, base/head refs, requested reviewers, and
- * `merged_at` (the signal that a closed PR was merged vs closed-unmerged). */
-export interface PullRequest {
-  number: number
-  title: string
-  url: string
-  /** GitHub state — "open" | "closed". Merged PRs are "closed" with merged_at set. */
-  state: string
-  draft: boolean
-  labels: string[]
-  author?: string | null
-  author_association?: string | null
-  updated_at: string
-  created_at?: string
-  closed_at?: string | null
-  /** ISO timestamp when merged, or null. The only reliable merged/closed split. */
-  merged_at?: string | null
-  assignees?: string[]
-  requested_reviewers?: string[]
-  base?: string | null
-  head?: string | null
-  /** Head COMMIT sha (not the branch name). Carried on the list row so a bulk
-   * review can pin each verdict to the revision its row was rendered at; `null`
-   * when the provider did not report one, in which case that row is not
-   * approvable in bulk. */
-  head_sha?: string | null
-  /** Lines added — from the GraphQL list enrichment. `null` means UNKNOWN (the
-   * enrichment call failed); it is deliberately not 0, which would claim the PR
-   * changes nothing. */
-  additions?: number | null
-  /** Lines removed — same enrichment, same null-means-unknown rule. */
-  deletions?: number | null
-  /** Files touched — same enrichment, same null-means-unknown rule. */
-  changed_files?: number | null
-  /** Aggregate status-check rollup, bucketed exactly like `PrCheck.bucket`;
-   * null when the PR has no checks or the enrichment call failed. */
-  checks_state?: 'failure' | 'running' | 'success' | 'other' | null
-  /** Per-bucket tally of the individual checks, using the same buckets as
-   * `PrCheck.bucket`. All four keys are present when it is there at all; `null`
-   * means the enrichment did not run. */
-  checks_counts?: Record<'failure' | 'running' | 'success' | 'other', number> | null
-  /** True when the PR has more checks than one API page, so `checks_counts` is
-   * incomplete and the card must show the aggregate rollup instead. */
-  checks_truncated?: boolean
-  /**
-   * Merge READINESS, in the same vocabulary as the detail pane's `mergeable_state`
-   * (GitHub's `mergeable_state` / GraphQL's lowercased `mergeStateStatus`).
-   *
-   * On the LIST row because a bulk action cannot otherwise tell the two merge verbs
-   * apart: `clean` means mergeable NOW (GitHub *refuses* to arm auto-merge — "Pull
-   * request is in clean status"), while `blocked`/`behind`/`unstable` mean not yet,
-   * which is what auto-merge is for. Without it the bulk bar offered auto-merge for
-   * every ticked row and GitHub rejected each ready one individually.
-   *
-   * `null` / absent means UNKNOWN — GitHub computes mergeability asynchronously, so a
-   * cold read answers `unknown`. Treat it as "cannot tell", never as "not ready": a
-   * gate that cannot tell must refuse rather than guess.
-   */
-  mergeable_state?: string | null
-  /** Whether the PR has no merge CONFLICTS. Deliberately NOT "ready to merge" —
-   * a PR with unsatisfied required reviews is `mergeable: true` with
-   * `mergeable_state: 'blocked'`. `null` means unknown. */
-  mergeable?: boolean | null
-  body?: string
-}
-
-export interface PullsResponse {
-  owner: string
-  repo: string
-  /** The server's own bulk-action cap. Read from the response rather than
-   * hardcoded: a client-side copy silently turns every large selection into a 400
-   * the day the backend cap changes (same reasoning as `/tagging`'s `bulk_max`). */
-  bulk_max?: number
-  state?: string
-  pulls: PullRequest[]
-  from_cache: boolean
-  /** Set by the `first_page=1` fast path: `true` when these are only the newest
-   * page (un-enriched) while the full enriched list loads behind them; absent or
-   * `false` when the set is complete. Mirrors `IssuesResponse.partial`. */
-  partial?: boolean
-  /** Set by /pulls/search when the result hit the server's cap, so the UI can say
-   * "newest N" instead of implying it listed every match. */
-  truncated?: boolean
-  /** The cap that produced `truncated`. */
-  limit?: number
-}
-
-/** The full single-PR payload the detail pane renders — a superset of the list
- * `PullRequest` (adds diff stats, review/comment counts, mergeability, full
- * label objects, milestone). */
-export interface PrDetailData {
-  number: number
-  title: string
-  body: string
-  state: string
-  draft: boolean
-  merged: boolean
-  url: string
-  author: string | null
-  author_association: string | null
-  created_at: string
-  updated_at: string
-  closed_at: string | null
-  merged_at: string | null
-  merged_by: string | null
-  comments: number
-  review_comments: number
-  commits: number
-  additions: number
-  deletions: number
-  changed_files: number
-  /** GitHub mergeability: true/false, or null while GitHub is still computing. */
-  mergeable: boolean | null
-  mergeable_state: string | null
-  base: string | null
-  head: string | null
-  /** Head commit sha — the commit the automated checks hang off. */
-  head_sha: string | null
-  labels: DetailLabel[]
-  assignees: string[]
-  requested_reviewers: string[]
-  milestone: Milestone | null
-  /** Set when the PROVIDER's own auto-merge is already armed (GitHub auto-merge /
-   * GitLab "merge when pipeline succeeds"), null when it is off. The actions bar
-   * reads this to decide whether it offers "enable" or "cancel", so it cannot
-   * offer to arm a PR that is already armed. */
-  auto_merge?: { method: string | null; enabled_by: string | null } | null
-}
-
-/** One automated check on a PR's head commit — a CI job, a Checks-API review
- * bot, or a legacy commit status, all normalized to one shape. `bucket` is the
- * coarse server-computed grouping the UI acts on, so it never has to re-derive
- * GitHub's ~10 conclusion values. */
-export interface PrCheck {
-  name: string
-  /** failure | running | success | other (neutral/skipped/cancelled). */
-  bucket: 'failure' | 'running' | 'success' | 'other'
-  /** Raw GitHub status (queued/in_progress/completed), for the tooltip. */
-  status: string | null
-  /** Raw GitHub conclusion (success/failure/timed_out/…), shown on the row. */
-  conclusion: string | null
-  /** Link to the run's details page, when the provider gave one. */
-  url: string | null
-  /** Short one-line summary/description from the check output. */
-  summary: string
-  /** The GitHub App that reported it (null for legacy commit statuses). */
-  app: string | null
-  started_at: string | null
-  completed_at: string | null
-}
-
-export interface PullDetailResponse {
-  owner: string
-  repo: string
-  number: number
-  detail: PrDetailData
-  timeline: TimelineEvent[]
-  checks: PrCheck[]
-  /** The card-level tally + rollup derived from `checks` by the same code the
-   * list enrichment uses, so the client can patch its cached list row instead of
-   * refetching the whole list. */
-  checks_summary?: {
-    checks_counts: Record<'failure' | 'running' | 'success' | 'other', number>
-    checks_state: 'failure' | 'running' | 'success' | 'other' | null
-    /** Always false here: a detail read is fully paginated, so its tally is
-     * complete by construction. */
-    checks_truncated?: boolean
-  }
-  from_cache: boolean
-}
-
-/** Per-reaction counts on an issue or comment (`total` is the sum). */
-export interface Reactions {
-  total: number
-  plus1: number
-  minus1: number
-  laugh: number
-  hooray: number
-  confused: number
-  heart: number
-  rocket: number
-  eyes: number
-}
-
-export interface DetailLabel {
-  name: string
-  color: string
-  description: string
-}
-
-export interface Milestone {
-  title: string
-  state: string
-  due_on: string | null
-}
-
-/** The full single-issue payload the detail pane renders — a superset of the
- * list `Issue` (adds body/state_reason/association/milestone/reactions/etc.). */
-export interface IssueDetailData {
-  number: number
-  title: string
-  body: string
-  state: string
-  state_reason: string | null
-  url: string
-  author: string | null
-  author_association: string | null
-  created_at: string
-  updated_at: string
-  closed_at: string | null
-  closed_by: string | null
-  comments: number
-  locked: boolean
-  labels: DetailLabel[]
-  assignees: string[]
-  milestone: Milestone | null
-  reactions: Reactions | null
-}
-
-/** One normalized timeline entry. `kind` selects which optional fields apply
- * (see backend `_normalize_timeline_event`). */
-export interface TimelineEvent {
-  kind:
-    | 'comment' | 'labeled' | 'unlabeled' | 'assigned' | 'unassigned'
-    | 'closed' | 'reopened' | 'renamed' | 'milestoned' | 'demilestoned'
-    | 'cross-referenced' | 'referenced'
-    | 'reviewed' | 'committed' | 'review_comment'
-  actor: string | null
-  created_at: string
-  // comment
-  body?: string
-  author_association?: string | null
-  reactions?: Reactions | null
-  // labeled / unlabeled
-  label?: { name: string; color: string }
-  // assigned / unassigned
-  assignee?: string | null
-  // closed
-  state_reason?: string | null
-  commit_id?: string | null
-  // renamed
-  rename?: { from: string; to: string }
-  // milestoned / demilestoned
-  milestone?: string | null
-  // cross-referenced
-  source?: { number: number; title: string; url: string; state: string; is_pr: boolean }
-  // reviewed (PR only) — "approved" | "changes_requested" | "commented" | "dismissed"
-  review_state?: string | null
-  // committed (PR only) — first line of the commit message
-  message?: string
-  // review_comment (PR only) — an INLINE comment anchored to a file + line. These
-  // come from /pulls/{n}/comments, which the issues timeline does not carry.
-  path?: string | null
-  line?: number | null
-  url?: string | null
-}
-
-export interface IssueDetailResponse {
-  owner: string
-  repo: string
-  number: number
-  detail: IssueDetailData
-  timeline: TimelineEvent[]
-  from_cache: boolean
-}
-
-/** The compact summary of one REFERENCED issue/PR (`GET /ref`). Backs the hover
- * preview on a cross-reference and the issue-vs-PR resolution a bare `#123`
- * needs — GitHub's `/issues/<n>` redirects to `/pull/<n>`, so the path alone
- * cannot say which it is. Deliberately no body/timeline: it is paid on hover. */
-export interface RefSummary {
-  number: number
-  title: string
-  state: string
-  state_reason: string | null
-  url: string
-  author: string | null
-  author_association: string | null
-  created_at: string
-  updated_at: string
-  closed_at: string | null
-  comments: number
-  /** True when this number is a pull request rather than an issue. */
-  is_pr: boolean
-  draft: boolean
-  /** ISO timestamp when merged, else null — the merged-vs-closed split. */
-  merged_at: string | null
-  labels: Array<{ name: string; color: string }>
-}
-
-export interface RefSummaryResponse {
-  owner: string
-  repo: string
-  number: number
-  summary: RefSummary
-  from_cache: boolean
-}
-
-/** One AI-proposed label: an exact repo label name + a short justification. */
-export interface SuggestedLabel {
-  name: string
-  reason: string
-}
-
-/** The AI triage result for one issue (summary shown at the top of the detail
- * pane; suggested_labels surfaced in the Labels sidebar as accept-able chips). */
-export interface IssueAiResponse {
-  owner: string
-  repo: string
-  number: number
-  summary: string
-  suggested_labels: SuggestedLabel[]
-  /** ISO timestamp the summary was produced. Null for caches written before it
-   * was stamped — the UI then omits the age. */
-  generated_at?: string | null
-  from_cache: boolean
-}
-
-/** GET /pull-ai — a PR's AI summary. No label suggestions: a PR's actionable
- * output is the review itself (see the Review button), not a taxonomy edit. */
-export interface PrAiResponse {
-  owner: string
-  repo: string
-  number: number
-  summary: string
-  /** ISO timestamp the summary was produced (null for pre-stamp caches). */
-  generated_at?: string | null
-  from_cache: boolean
-}
-
-/** Response to a label edit — the issue's authoritative label set after the
- * add/remove was applied (full objects, so chips re-render with real colours). */
-export interface ApplyLabelsResponse {
-  owner: string
-  repo: string
-  number: number
-  labels: DetailLabel[]
-}
-
-/** Response to a close/reopen — the issue's state after the change. */
-export interface IssueStateResponse {
-  owner: string
-  repo: string
-  number: number
-  state: string
-  state_reason: string | null
-}
-
-/** The pull-request actions the UI can invoke on ONE PR.
+/** The per-request UI-language hint for the backend's AI-prose calls.
  *
- * Merging comes in two forms and neither can land code the repo's rules have not
- * cleared: `merge` is for a PR the provider already reports ready (and the server
- * re-checks its merge state and pins it to the reviewed `head_sha` before issuing
- * it), while `auto_merge` hands one that is NOT ready yet to the provider to land by
- * itself once its checks pass. */
-export type PrAction =
-  | 'close' | 'reopen' | 'approve' | 'request_changes' | 'comment'
-  | 'merge' | 'auto_merge' | 'cancel_auto_merge'
-
-/** The subset of {@link PrAction} the BULK endpoint accepts. Mirrors the server's
- * `_BULK_PR_ACTIONS` allowlist. `request_changes` is per-PR only (a mass
- * change-request needs per-PR reasoning to be worth anything), and so is `merge`
- * (irreversible — 50 from one click is a blast radius no confirmation makes
- * reasonable; arming auto-merge is the bulk-safe equivalent). */
-export type BulkPrAction = Exclude<PrAction, 'request_changes' | 'merge'>
-
-export interface PrMergeResponse {
-  owner: string
-  repo: string
-  number: number
-  merged: boolean
-  sha: string | null
-  message: string
-}
-
-export interface PrStateResponse {
-  owner: string
-  repo: string
-  number: number
-  state: string
-  merged: boolean
-  draft: boolean
-}
-
-export interface PrReviewResponse {
-  owner: string
-  repo: string
-  number: number
-  id: number | null
-  state: string | null
-  submitted_at: string | null
-}
-
-export interface PrCommentResponse {
-  owner: string
-  repo: string
-  number: number
-  id: number | null
-  url: string | null
-  created_at: string | null
-}
-
-export interface PrAutoMergeResponse {
-  owner: string
-  repo: string
-  number: number
-  auto_merge: boolean
-  method: string | null
-  enabled_at: string | null
-}
-
-/** One CI run on a PR's head commit. Distinct from {@link PrCheck}: a check is a
- * per-job RESULT, while cancel/re-run acts on the parent RUN and needs its id.
- * `cancellable`/`rerunnable` are server-computed so the UI never offers an action
- * the provider will refuse. */
-export interface PrWorkflowRun {
-  id: number
-  name: string
-  status: string
-  conclusion: string | null
-  url: string | null
-  event: string | null
-  created_at: string | null
-  cancellable: boolean
-  rerunnable: boolean
-}
-
-export interface PrRunsResponse {
-  owner: string
-  repo: string
-  number: number
-  runs: PrWorkflowRun[]
-}
-
-export interface PrRunActionResponse {
-  owner: string
-  repo: string
-  number: number
-  run_id: number
-  cancelled?: boolean
-  rerun?: boolean
-  failed_only?: boolean
-}
-
-/** A bulk action's per-PR outcome. Partial failure is EXPECTED (a locked or
- * already-merged PR fails on its own), so the response reports both lists rather
- * than one status code — the caller is never told about a write that did not
- * happen, and the rows that succeeded stay applied. */
-export interface BulkPrResponse {
-  owner: string
-  repo: string
-  action: string
-  applied: Array<{ number: number } & Record<string, unknown>>
-  failed: Array<{ number: number; error: string }>
-}
-
-export interface RepoLabel {
-  name: string
-  color: string
-  description: string
-}
-
-export interface LabelsResponse {
-  owner: string
-  repo: string
-  labels: RepoLabel[]
-  from_cache: boolean
-}
-
-/** A repo member: someone with access to the repo. From the authoritative
- * collaborators roster (with a GitHub role) when available, else inferred from
- * issue authors on a read-only repo (see MembersResponse.source). */
-export interface RepoMember {
-  login: string
-  /** collaborators roster: "admin" | "maintain" | "write" | "triage" | "read".
-   * Derived fallback: "OWNER" | "MEMBER" | "COLLABORATOR". */
-  role: string
-}
-
-export interface MembersResponse {
-  owner: string
-  repo: string
-  members: RepoMember[]
-  /** "collaborators" = authoritative roster; "derived" = read-only fallback
-   * inferred from issue authors (needs no push access, but incomplete). */
-  source?: 'collaborators' | 'derived' | null
-  from_cache: boolean
-}
-
-export interface RepoPermissions {
-  admin?: boolean
-  maintain?: boolean
-  push?: boolean
-  pull?: boolean
-  triage?: boolean
-}
-
-/** Per-repo, local-only triage preferences (never written back to GitHub).
- * Teaches Issue Radar how THIS repo labels its work. */
-export interface RepoSettings {
-  /** Label names that mean "still needs triage" on this repo. */
-  triage_labels: string[]
-  /** Also treat issues that carry no labels at all as needing triage. */
-  unlabeled_is_untriaged: boolean
-  /** Label names that mark newcomer / first-issue-friendly work. */
-  good_first_issue_labels: string[]
-  /** Watch this repo in the background and push a KiroCrew notification when a
-   * new issue is opened. Opt-in (default false). */
-  notify_on_new_issue: boolean
-  /** Monotonic counter bumped by every write. A PUT replaces the whole document,
-   * so it must echo the revision it read — the server refuses (409) a write built
-   * on a snapshot that has since moved, which is what stops one tab from erasing
-   * a label another tab appended. */
-  revision: number
-}
-
-/** Backwards-compatible defaults: no configured labels + "unlabeled == untriaged"
- * (exactly the heuristic the dashboards used before settings existed). */
-export const DEFAULT_REPO_SETTINGS: RepoSettings = {
-  triage_labels: [],
-  unlabeled_is_untriaged: true,
-  good_first_issue_labels: [],
-  notify_on_new_issue: false,
-  revision: 0,
-}
-
-export interface SettingsResponse {
-  owner: string
-  repo: string
-  settings: RepoSettings
-}
-
-export type RecommendationCategory = 'priority' | 'area' | 'type' | 'triage' | 'first-issue'
-
-/** An AI-proposed NEW label for a repo (does not yet exist on GitHub). */
-export interface LabelRecommendation {
-  name: string
-  category: RecommendationCategory
-  color: string
-  description: string
-  rationale: string
-  examples: number[]
-}
-
-export interface RecommendationsResponse {
-  owner: string
-  repo: string
-  /** null when none have been generated yet. */
-  recommendations: LabelRecommendation[] | null
-  generated_at: string | null
-  from_cache: boolean
-}
-
-export interface CreateLabelResponse {
-  owner: string
-  repo: string
-  label: RepoLabel
-  created: boolean
-}
-
-/** Cached label proposals for the untagged queue, keyed by issue number (as a
- * string, because it comes straight off a JSON object). Each entry is the labels
- * the model proposed for that issue; an EMPTY array means "analysed, nothing
- * clearly applies" — which is why it is kept rather than omitted. */
-export type TaggingSuggestions = Record<string, SuggestedLabel[]>
-
-/** One row of the untagged queue. Carried in the response rather than resolved
- * client-side against the shared issue list, which follows the user's
- * open/closed filter — resolving it client-side would show an empty queue when
- * entering Tagging from a Closed filter even with untagged issues waiting. */
-export interface UntaggedIssue {
-  number: number
-  title: string
-  url: string
-  author?: string | null
-  created_at?: string
-  updated_at?: string
-}
-
-/** GET /tagging — the untagged queue for a repo plus any cached suggestions.
- * Read-only: opening the Tagging dashboard never runs the model. */
-export interface TaggingResponse {
-  owner: string
-  repo: string
-  /** Open issues carrying NO labels, newest first. */
-  issues: UntaggedIssue[]
-  /** Their numbers, in the same order — the key the suggestion map uses. */
-  untagged: number[]
-  /** OPEN-issue count per label name. Served here rather than derived from the
-   * shared issue list, which follows the user's open/closed filter. */
-  label_counts: Record<string, number>
-  /** Open-issue titles by number, for rendering example links. Same reason.
-   * Bounded to the slice a recommendation's examples can cite, not every open
-   * issue. */
-  titles: Record<string, string>
-  /** How many issues ONE bulk-apply request accepts. Served rather than
-   * hardcoded: a copy in the client silently 400s if the backend cap changes. */
-  bulk_max: number
-  /** Total open issues, so the dashboard can show untagged as a share. */
-  open_count: number
-  suggestions: TaggingSuggestions
-  generated_at: string | null
-  /** How many issues one generate call covers — drives the button's label. */
-  batch_size: number
-}
-
-/** POST /tagging — result of one batched generate. */
-export interface GenerateTaggingResponse {
-  owner: string
-  repo: string
-  /** The merged cache (this batch plus everything generated before). */
-  suggestions: TaggingSuggestions
-  /** Issue numbers this call analysed (including ones it declined to label). */
-  analyzed: number[]
-  /** Untagged issues still awaiting a first analysis after this call. */
-  remaining: number
-  generated_at: string | null
-}
-
-/** POST /labels/apply-bulk — per-issue outcome of a bulk apply. Partial failure
- * is normal (GitHub can reject one issue), so successes and failures both come
- * back and the caller reports rather than retries blindly. */
-export interface BulkApplyResponse {
-  owner: string
-  repo: string
-  applied: { number: number; labels: DetailLabel[] }[]
-  failed: { number: number; error: string }[]
-}
-
-export interface ConnectedRepo {
-  owner: string
-  repo: string
-  /** Absent on records written before GitLab support — treat as 'github'. */
-  provider?: SourceProvider
-  /** Absent on legacy records — treat as 'github.com'. */
-  host?: string
-  enabled?: boolean
-  permissions?: RepoPermissions | null
-  settings?: RepoSettings
-}
-
-export interface ReposResponse {
-  repos: ConnectedRepo[]
-}
-
-/** One row of the connect dialog's picker — a repo the `gh` user personally
- * contributed to inside the requested window. `last_contributed_at` is that
- * user's OWN latest contribution (push / PR / review / issue / comment), not
- * the repo's last push, and is what the row renders. `connected` is
- * server-computed against the config, so the picker can disable repos already
- * wired up. */
-export interface RecentRepo {
-  owner: string
-  repo: string
-  full_name: string
-  /** ISO-8601 UTC timestamp of the user's most recent contribution. */
-  last_contributed_at: string
-  /** How many contribution events the user made in the window. */
-  contribution_count: number
-  connected: boolean
-  /** Echoed by the server so the picker can build a ref without re-deriving
-   * which provider the list came from. */
-  provider?: SourceProvider
-  host?: string
-}
-
-/** Why the host can't talk to GitHub yet, when it can't. The picker turns this
- * into install / `gh auth login` instructions rather than an error string. */
-export type GhSetupReason = 'not_installed' | 'not_authenticated'
-
-export interface RecentReposResponse {
-  repos: RecentRepo[]
-  /** True when the event page came back full, so repos contributed to earlier
-   * in the window may be missing. The picker must not claim completeness. */
-  truncated?: boolean
-  /** Present only when `gh` is unusable; `repos` is then empty. */
-  setup_required?: GhSetupReason | null
-  /** The server's diagnostic detail (e.g. which dirs were searched). */
-  error?: string
-}
-
-export interface MeResponse {
-  /** The login on THIS provider. Not portable: the same person may be `alice` on
-   * GitHub and `alice.smith` on a company GitLab, so a login fetched for the
-   * wrong provider makes the "assigned to me" filters match nobody. */
-  login: string | null
-  provider?: SourceProvider
-  host?: string
-}
-
-/** Agent-written conclusions for an investigation (all optional; populated when
- * the investigating session — or the user — PUTs a summary back). */
-export interface InvestigationFindings {
-  verdict: string | null
-  root_cause: string | null
-  suggested_labels: string[]
-  next_action: string | null
-  summary: string | null
-}
-
-/** The local record linking an issue to its investigation chat session. There
- * is no shared ledger — one small per-issue file, used to RESUME the session,
- * badge its status, and retain findings. */
-export interface InvestigationRecord {
-  owner: string
-  repo: string
-  number: number
-  /** Chat slot (session) key opened for this investigation — drives resume. */
-  slot_key: string | null
-  /** The "Issue Radar - <repo>" chat folder the session was filed into. */
-  folder_id: string | null
-  status: 'investigating' | 'resolved' | 'archived'
-  started_at: string
-  last_opened_at: string
-  findings: InvestigationFindings | null
-}
-
-/** Which sequence a number belongs to. Only load-bearing on GitLab, where issues
- * and merge requests are numbered independently, so `#5` and `!5` are different
- * items that must not share one investigation record. */
-export type ItemKind = 'issue' | 'pull'
-
-export interface InvestigationResponse {
-  owner: string
-  repo: string
-  number: number
-  kind?: ItemKind
-  /** null when the issue has never been investigated. */
-  investigation: InvestigationRecord | null
-}
-
-/** Fields the Investigate flow (or the agent) may patch onto a record. Partial
- * — even `{}` is valid (bumps the last-opened stamp on resume). */
-export interface InvestigationPatch {
-  slot_key?: string
-  folder_id?: string
-  status?: 'investigating' | 'resolved' | 'archived'
-  findings?: Partial<InvestigationFindings> | null
-}
-
-export interface ApiError {
-  error: string
-}
-
-/** Thrown by `putSettings` on a 409. Carries the settings the server currently
- * holds, so the caller can re-apply its edit on top instead of losing it. */
-export class SettingsConflictError extends Error {
-  current: RepoSettings
-  constructor(message: string, current: RepoSettings) {
-    super(message)
-    this.name = 'SettingsConflictError'
-    this.current = current
-  }
-}
-
-async function parseErrorBody(r: Response): Promise<string> {
-  try {
-    const body = (await r.json()) as ApiError
-    return body.error || `HTTP ${r.status}`
-  } catch {
-    return `HTTP ${r.status}`
-  }
-}
-
-/** The full identity of a connected repository.
+ * `aiLanguage` must ALREADY be resolved through the app's own
+ * `resolveAiLanguage()` (`lib/format.ts`) by the calling component, which is the
+ * single place Issue Radar decides what language its AI output should be in --
+ * the same resolver `investigate.ts` and `review.ts` use. Deriving it here from
+ * a raw `activeLocale()` instead would give the app two disagreeing resolvers
+ * and ignore the user's explicit "Agent output language" pick, so a `ja` picker
+ * would produce Japanese investigations beside English summaries.
  *
- * A ref is `owner`/`repo` plus the provider and — for self-managed instances —
- * the HOST, because `group/project` names an entirely different project on
- * gitlab.com than on a private instance. Every API call takes a ref rather than
- * two loose strings, so a call cannot be made without saying WHICH repo it means.
+ * Why a hint has to exist at all: the dashboard's default language is "follow
+ * the browser", resolved entirely client-side, and the gateway reads
+ * `Accept-Language` nowhere -- so without this the backend cannot know the
+ * language of any install that never set `dashboard.language`, and every AI card
+ * comes back English inside a fully localized UI. Sending the already-resolved
+ * tag also keeps the catalog matcher in one place (`detect.ts`) instead of
+ * growing a second copy in Python.
  *
- * `provider`/`host` are optional and default to public GitHub server-side, so a
- * legacy `ConnectedRepo` record (written before GitLab support) is a valid ref.
- */
-export interface RepoRef {
-  owner: string
-  repo: string
-  provider?: SourceProvider
-  host?: string
-}
-
-/** Which forge a repo lives on. */
-export type SourceProvider = 'github' | 'gitlab'
-
-/** Which provider account an account-scoped endpoint should ask about.
+ * Deliberately per-request and never written to config: "Auto" is
+ * browser-relative, so persisting what this browser resolved would tell a
+ * different browser to discard its own pick -- see the `adoptedServerValue`
+ * rationale in `LanguageProvider.tsx`. An explicitly configured
+ * `dashboard.language` still outranks it server-side.
  *
- * Separate from `RepoRef` because `/me` and `/recent-repos` are about the USER on
- * a provider, not about a repo — there is no owner/repo to supply, and pretending
- * there is would invite passing a half-built ref. */
-export interface AccountScope {
-  provider?: SourceProvider
-  host?: string
+ * An empty tag sends NO field. `resolveAiLanguage` returns `''` both for "follow
+ * an English browser" and for an explicit English pick, and the directive-free
+ * prompt already produces English -- so omitting it leaves an English user's
+ * request byte-identical to what it has always been, caches included.
+ *
+ * Spread into the query for GETs and into the body for POSTs. */
+function langHint(aiLanguage: string): Record<string, string> {
+  return aiLanguage ? { lang: aiLanguage } : {}
 }
 
-/** Query params naming an account scope. Omitted fields default to public GitHub
- * server-side, so an absent scope is the pre-GitLab behaviour. */
-export function accountQuery(scope?: AccountScope): Record<string, string> {
-  const params: Record<string, string> = {}
-  if (scope?.provider) params.provider = scope.provider
-  if (scope?.host) params.host = scope.host
-  return params
-}
-
-/** Identity query params for a ref, for a GET request. */
-export function repoQuery(ref: RepoRef): Record<string, string> {
-  const params: Record<string, string> = { owner: ref.owner, repo: ref.repo }
-  if (ref.provider) params.provider = ref.provider
-  if (ref.host) params.host = ref.host
-  return params
-}
-
-/** Identity body fields for a ref, for a POST/PUT/DELETE request. */
-export function repoBody(ref: RepoRef): Record<string, string> {
-  return repoQuery(ref)
-}
+// The shapes these calls send and return live in two owners, and every public name
+// of both is re-exported here except the two error decoders (`parseErrorBody`,
+// `gitlabGroupError`) that only the calls below use. So this file stays the one
+// import path the app's modules use and the one module id their specs mock, and
+// neither owner imports it. `apiTypes.ts` holds the repo, issue and pull-request
+// shapes, the error classes the calls throw, the repo-settings defaults and how a
+// request names its repo; `apiCrewTypes.ts` holds the crew records, phase
+// classifications and event kinds that mirror the backend crew store.
+export {
+  GitLabGroupError, AssigneesConflictError, DEFAULT_REPO_SETTINGS, SettingsConflictError,
+  accountQuery, repoQuery, repoBody,
+} from './apiTypes'
+export type {
+  ConnectResponse, Issue, IssuesResponse, PullRequest, PullsResponse, GitLabGroup,
+  GitLabGroupsResponse, GitLabGroupReview, GitLabGroupReviewsResponse, PrDetailData, PrCheck,
+  PullDetailResponse, Reactions, DetailLabel, Milestone, IssueDetailData, TimelineEvent,
+  IssueDetailResponse, RefSummary, RefSummaryResponse, SuggestedLabel, IssueAiResponse,
+  PrAiResponse, ApplyLabelsResponse, IssueStateResponse, IssueAssigneesResponse, PrAction,
+  BulkPrAction, PrMergeResponse, PrStateResponse, PrReviewResponse, PrCommentResponse,
+  PrAutoMergeResponse, PrWorkflowRun, PrRunsResponse, CiRun, CiRepoRuns, CiRunsResponse,
+  PrRunActionResponse, BulkPrResponse, RepoLabel, LabelsResponse, RepoMember, MembersResponse,
+  RepoPermissions, RepoSettings, SettingsResponse, RecommendationCategory, LabelRecommendation,
+  RecommendationsResponse, CreateLabelResponse, TaggingSuggestions, UntaggedIssue, TaggingResponse,
+  GenerateTaggingResponse, BulkApplyResponse, ConnectedRepo, ReposResponse, RecentRepo,
+  GhSetupReason, RecentReposResponse, MeResponse, InvestigationFindings, InvestigationRecord,
+  ItemKind, InvestigationResponse, InvestigationPatch, ApiError, DepEdge, DepNode, DepsResponse,
+  RepoRef, SourceProvider, AccountScope,
+} from './apiTypes'
+export {
+  CREW_PHASES, CREW_EVENT_KINDS, TERMINAL_PHASES, TTL_ACTIVE_PHASES, EDITING_PHASES,
+  countsTowardOpen,
+} from './apiCrewTypes'
+export type {
+  CrewPhase, CrewEventKind, CrewTriedEntry, CrewCiState, Crew, WorkItem, CrewEvent, CrewSettings,
+  CrewCounts, CrewPatch, CrewSpec, WorkItemPatch, CrewSettingsPatch, CrewsResponse, CrewResponse,
+  CrewNamesResponse, CrewDetailResponse, CrewWorkResponse, CrewSettingsResponse,
+} from './apiCrewTypes'
 
 export const issueRadarApi = {
   connect: async (url: string): Promise<ConnectResponse> => {
@@ -981,9 +211,10 @@ export const issueRadarApi = {
   },
 
   /** AI triage (summary + suggested labels), cache-first server-side; pass
-   * refresh to force a regenerate. */
-  issueAi: async (ref: RepoRef, number: number, opts?: { refresh?: boolean }): Promise<IssueAiResponse> => {
-    const q = new URLSearchParams({ ...repoQuery(ref), number: String(number) })
+   * refresh to force a regenerate. `aiLanguage` is the tag from
+   * `resolveAiLanguage()` -- see `langHint`. */
+  issueAi: async (ref: RepoRef, number: number, aiLanguage: string, opts?: { refresh?: boolean }): Promise<IssueAiResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), ...langHint(aiLanguage), number: String(number) })
     if (opts?.refresh) q.set('refresh', '1')
     const r = await fetch(`${API}/issue-ai?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
@@ -993,9 +224,10 @@ export const issueRadarApi = {
   /** AI summary of a pull request — its description, whole conversation, and
    * check state. Cache-first server-side, and the cache self-invalidates when
    * the PR moves (new comment / push / flipped check), so no manual refresh is
-   * needed to pick up changes; pass refresh to force a regenerate anyway. */
-  pullAi: async (ref: RepoRef, number: number, opts?: { refresh?: boolean }): Promise<PrAiResponse> => {
-    const q = new URLSearchParams({ ...repoQuery(ref), number: String(number) })
+   * needed to pick up changes; pass refresh to force a regenerate anyway.
+   * `aiLanguage` is the tag from `resolveAiLanguage()` -- see `langHint`. */
+  pullAi: async (ref: RepoRef, number: number, aiLanguage: string, opts?: { refresh?: boolean }): Promise<PrAiResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), ...langHint(aiLanguage), number: String(number) })
     if (opts?.refresh) q.set('refresh', '1')
     const r = await fetch(`${API}/pull-ai?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
@@ -1029,6 +261,46 @@ export const issueRadarApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...repoBody(ref), number, state, state_reason: stateReason }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** REPLACE an issue's assignees with `assignees` (the FINAL set of logins, not
+   * an add/remove delta). Requires triage/push access (403 otherwise). An empty
+   * array clears all assignees; a junk entry is a 400, never a silent clear.
+   *
+   * `expected` is the set you last READ and is REQUIRED: the write only lands if
+   * the forge still holds it. That is what stops replace semantics from silently
+   * erasing a concurrent edit — two people who each add one name would otherwise
+   * have the later write overwrite the earlier addition. A stale `expected` throws
+   * {@link AssigneesConflictError} carrying the current set; re-render from it and
+   * let the user redo the edit rather than retrying the same body.
+   *
+   * A login the forge will not assign is a 400 whose `error` sentence names the
+   * refused logins (the body also carries `invalid_assignees`), and NOTHING is
+   * applied — GitHub answers 422 for the whole request and GitLab is pre-checked
+   * against the project roster. Rendering the thrown message is therefore already
+   * actionable; it is not an upstream failure to retry.
+   *
+   * On success the returned `assignees` is read back from the write rather than
+   * echoed from the request, because a success is not required to be an exact echo
+   * (GitLab Free keeps only the first assignee) — render THAT. */
+  setIssueAssignees: async (
+    ref: RepoRef, number: number, assignees: string[], expected: string[],
+  ): Promise<IssueAssigneesResponse> => {
+    const r = await fetch(`${API}/issue/assignees`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), number, assignees, expected }),
+    })
+    if (r.status === 409) {
+      const body = (await r.json().catch(() => ({}))) as { error?: string; assignees?: string[] }
+      throw new AssigneesConflictError(
+        body.error || i18nT('apps.issueRadar.api.assignees_changed_elsewhere'),
+        body.assignees ?? [],
+      )
+    }
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
@@ -1150,6 +422,14 @@ export const issueRadarApi = {
   ): Promise<PrRunsResponse> => {
     const q = new URLSearchParams({ ...repoQuery(ref), number: String(number), sha })
     const r = await fetch(`${API}/pull/runs?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Recent GitHub Actions runs across every connected GitHub repo, for the CI
+   * runs dashboard. Read on demand only. */
+  ciRuns: async (): Promise<CiRunsResponse> => {
+    const r = await fetch(`${API}/ci-runs`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
@@ -1281,6 +561,44 @@ export const issueRadarApi = {
     return r.json()
   },
 
+  /** The GitLab groups the user follows for review requests. A local read: the
+   * server answers from its config without calling GitLab. */
+  gitlabGroups: async (): Promise<GitLabGroupsResponse> => {
+    const r = await fetch(`${API}/gitlab-groups`, { credentials: 'same-origin' })
+    if (!r.ok) throw await gitlabGroupError(r)
+    return r.json()
+  },
+
+  /** Follow a GitLab group. `group` is a bare path such as `acme/platform` (a
+   * gitlab.com group) or a pasted group link, which names its own instance. */
+  addGitlabGroup: async (group: string): Promise<GitLabGroup> => {
+    const r = await fetch(`${API}/gitlab-groups`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ group }),
+    })
+    if (!r.ok) throw await gitlabGroupError(r)
+    return r.json()
+  },
+
+  /** Stop following a GitLab group. Local only: nothing on GitLab changes. */
+  removeGitlabGroup: async (group: GitLabGroup): Promise<GitLabGroup> => {
+    const q = new URLSearchParams({ host: group.host, path: group.path })
+    const r = await fetch(`${API}/gitlab-groups?${q.toString()}`, { method: 'DELETE', credentials: 'same-origin' })
+    if (!r.ok) throw await gitlabGroupError(r)
+    return r.json()
+  },
+
+  /** Open merge requests across the group and every subgroup where the signed-in
+   * `glab` user is a requested reviewer. Capped like `searchPulls`. */
+  gitlabGroupReviews: async (group: GitLabGroup): Promise<GitLabGroupReviewsResponse> => {
+    const q = new URLSearchParams({ host: group.host, path: group.path })
+    const r = await fetch(`${API}/gitlab-groups/review-requests?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw await gitlabGroupError(r)
+    return r.json()
+  },
+
   /** Read an issue's investigation record (`investigation` is null if the issue
    * has never been investigated). */
   getInvestigation: async (
@@ -1310,22 +628,25 @@ export const issueRadarApi = {
   },
 
   /** Read the repo's cached AI label recommendations (`recommendations` is null
-   * if none generated yet). Never runs the model. */
-  getRecommendations: async (ref: RepoRef): Promise<RecommendationsResponse> => {
-    const q = new URLSearchParams(repoQuery(ref))
+   * if none generated yet). Never runs the model. `aiLanguage` must match what
+   * the generate call used: the server refuses to serve a set written in another
+   * language, so a mismatch reads as "none generated yet". */
+  getRecommendations: async (ref: RepoRef, aiLanguage: string): Promise<RecommendationsResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), ...langHint(aiLanguage) })
     const r = await fetch(`${API}/recommendations?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
 
   /** Generate (and cache) label recommendations via one model call over the
-   * repo's labels + a sample of its open issues. */
-  generateRecommendations: async (ref: RepoRef): Promise<RecommendationsResponse> => {
+   * repo's labels + a sample of its open issues. `aiLanguage` is the tag from
+   * `resolveAiLanguage()` -- see `langHint`. */
+  generateRecommendations: async (ref: RepoRef, aiLanguage: string): Promise<RecommendationsResponse> => {
     const r = await fetch(`${API}/recommendations`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(repoBody(ref)),
+      body: JSON.stringify({ ...repoBody(ref), ...langHint(aiLanguage) }),
     })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
@@ -1349,7 +670,9 @@ export const issueRadarApi = {
   /** Read the untagged queue + any cached label suggestions for it. Never runs
    * the model, so it is safe to call whenever the Tagging dashboard mounts.
    * Pass refresh to re-read the issues from GitHub rather than the local cache
-   * (needed to notice labels added on GitHub itself). */
+   * (needed to notice labels added on GitHub itself).
+   *
+   * Sends NO language hint, deliberately -- see `generateTagging`. */
   tagging: async (
     ref: RepoRef, opts?: { refresh?: boolean },
   ): Promise<TaggingResponse> => {
@@ -1362,7 +685,16 @@ export const issueRadarApi = {
 
   /** Generate label suggestions with ONE batched model call. Omit `numbers` to
    * take the next un-analysed slice of the queue (repeat to walk a long backlog);
-   * pass `numbers` to (re)analyse specific issues. */
+   * pass `numbers` to (re)analyse specific issues.
+   *
+   * Sends NO language hint, deliberately. The tagging cache is ONE document per
+   * repo that ACCUMULATES across many batched calls, and the store drops every
+   * accumulated entry when the language it was written in changes -- safe while
+   * the language is install-wide (a deliberate operator switch, once), but a
+   * per-browser hint would make two browsers on different languages alternate
+   * forever, each wiping the queue the other just paid a model to build. This
+   * surface needs its cache partitioned by language first; until then it follows
+   * `dashboard.language` only. */
   generateTagging: async (
     ref: RepoRef, numbers?: number[],
   ): Promise<GenerateTaggingResponse> => {
@@ -1411,6 +743,186 @@ export const issueRadarApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...repoBody(ref), changes }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  // ── crews ──────────────────────────────────────────────────────────────────
+  //
+  // Record shapes and the phase classifications mirror `crew_store.py` — see the
+  // interface block in `apiCrewTypes.ts` for which module owns each list.
+  //
+  // The request ENVELOPES are not uniform, and the differences are load-bearing
+  // because a wrong key is a 400 rather than a type error. Checked against
+  // `crew_routes.py` handler by handler:
+  //
+  //   GET  /crews, /crews/names, /crews/settings   ?owner&repo
+  //   GET  /crew                     ?owner&repo&id
+  //   POST /crews                    owner/repo + the crew fields at the ROOT
+  //   PUT  /crew                     owner/repo + `id` + the patch at the ROOT
+  //   DELETE /crew                   owner/repo + `id`
+  //   POST /crew/pause               owner/repo + `id` + `paused` (bool) + `reason`
+  //   PUT  /crew/work                owner/repo + `crew_id` + `number` + patch
+  //   PUT  /crews/settings           owner/repo + a NESTED `settings` object
+  //
+  // The last two are the exceptions; every other write names the crew `id` and
+  // carries its payload flat.
+
+  /** Every non-retired crew in the repo, plus the repo-wide protocol settings and
+   * the header tallies. One request, because the crew list cannot be rendered
+   * without all three. */
+  crews: async (ref: RepoRef): Promise<CrewsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Create a crew. A duplicate name is refused server-side (the name field is
+   * free text, so uniqueness cannot live in the suggestion chips). */
+  createCrew: async (ref: RepoRef, spec: CrewSpec): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crews`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), ...spec }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Unused names for the create dialog's chips. Server-side, because taken names
+   * include RETIRED crews' — which the crew list does not return. */
+  suggestCrewNames: async (ref: RepoRef): Promise<CrewNamesResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews/names?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** One crew's page payload: the record, its work items, its recent ledger
+   * lines, and its slot usage. */
+  crew: async (ref: RepoRef, id: string): Promise<CrewDetailResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), id })
+    const r = await fetch(`${API}/crew?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Merge a patch into one crew. A rename re-checks uniqueness but leaves
+   * `avatar_seed` alone, so the crew keeps its face. */
+  updateCrew: async (ref: RepoRef, id: string, patch: CrewPatch): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, ...patch }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Retire a crew — it stops working, but its record, its NAME RESERVATION and
+   * its work log all survive. Deliberately not "delete": reusing the name would
+   * make the retired crew's old claim comments read as live claims. */
+  retireCrew: async (ref: RepoRef, id: string): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew`, {
+      method: 'DELETE',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Upsert one work item AND append at most one ledger line, in one request —
+   * see `WorkItemPatch`. Refused (409) when a second item tries to enter an
+   * editing phase while another still holds the crew's worktree. */
+  recordCrewWork: async (
+    ref: RepoRef, id: string, number: number, patch: WorkItemPatch,
+  ): Promise<CrewWorkResponse> => {
+    const r = await fetch(`${API}/crew/work`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      // `crew_id`, NOT `id`: this route is the odd one out — `_handle_crew_work`
+      // reads `crew_id`, while /crew and /crew/pause read `id` — and it answers
+      // 400 `missing_crew_id` for the wrong spelling.
+      //
+      // The envelope keys go LAST so no field of a future `WorkItemPatch` can
+      // shadow one. The server has the mirror of this rule (`_WORK_PATCH_FIELDS`
+      // is an allowlist, so the envelope cannot land in the patch either).
+      body: JSON.stringify({ ...repoBody(ref), ...patch, crew_id: id, number }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Pause or resume a crew. `reason` is stored on the record as
+   * `paused_reason`; pass it only when pausing. */
+  setCrewPaused: async (
+    ref: RepoRef, id: string, paused: boolean, reason?: string,
+  ): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew/pause`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, paused, reason: reason ?? '' }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** "Switch back to triage model": release a model picked in the crew's chat, so
+   * the crew switches between its triage and work models again. The one
+   * `model_held` value a patch may carry; only the runtime sets the hold. */
+  resumeCrewModelSwitching: async (ref: RepoRef, id: string): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, model_held: false }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  getCrewSettings: async (ref: RepoRef): Promise<CrewSettingsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews/settings?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Merge a patch into the repo's protocol settings. A PATCH-style merge, not a
+   * whole-document replace, so this needs no revision guard: two tabs editing
+   * different fields cannot erase each other. */
+  putCrewSettings: async (
+    ref: RepoRef, patch: CrewSettingsPatch,
+  ): Promise<CrewSettingsResponse> => {
+    const r = await fetch(`${API}/crews/settings`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      // NESTED under `settings`, matching this app's own `PUT /settings` so the
+      // two configuration surfaces share one client shape. Spreading the patch at
+      // the root is a 400 `invalid_settings`: the handler requires the key to be
+      // an object and never falls back to reading loose fields.
+      body: JSON.stringify({ ...repoBody(ref), settings: patch }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** The repo's dependency edges (blocked-by / blocking) + a node map, for the
+   * Graph tab and the detail-pane "Blocked by / Blocking" section. Cache-first,
+   * like `/issues`. The backend route lands in a SEPARATE PR (M1), so callers
+   * must treat a 404/500/empty answer as "no dependency data yet" and render a
+   * designed empty state rather than an error — see GraphView / DepsSection. */
+  deps: async (ref: RepoRef): Promise<DepsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/deps?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },

@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from body_stream_helpers import attach_json_body
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew import artifacts as art_mod
@@ -277,13 +278,20 @@ class TestPushArtifactUpdate:
         the send itself is stubbed here."""
         state = _make_state(tmp_path)
         state._ws_clients = [MagicMock()]
-        sent: list[str] = []
-        state._send_ws_all = lambda msg: sent.append(msg)  # type: ignore[method-assign]
+        sent: list[tuple[str, object, str]] = []
+        # New chokepoint signature (msg_type, data, msg): the payload is passed
+        # alongside the serialized envelope so per-app WS scope filtering can
+        # inspect it.
+        state._send_ws_all = (  # type: ignore[method-assign]
+            lambda msg_type, data, msg: sent.append((msg_type, data, msg))
+        )
 
         state.push_artifact_update("cr-queue", 3)
 
         assert len(sent) == 1
-        env = json.loads(sent[0])
+        assert sent[0][0] == "artifact_update"
+        assert sent[0][1] == {"slug": "cr-queue", "version": 3, "deleted": False}
+        env = json.loads(sent[0][2])
         assert env == {
             "type": "artifact_update",
             "data": {"slug": "cr-queue", "version": 3, "deleted": False},
@@ -315,6 +323,9 @@ def _stub_restricted(monkeypatch):
     monkeypatch.setattr(art_handlers, "_is_restricted_session", _stub)
 
 
+_OWNER = "U_OWNER"
+
+
 def _request(
     *,
     body: dict | None = None,
@@ -326,10 +337,16 @@ def _request(
     req.match_info = match or {}
     req.query = {}
     encoded = json.dumps(body).encode() if body is not None else b""
-    req.read = AsyncMock(return_value=encoded)
-    req.app = {"state": state if state is not None else MagicMock(), "_restricted_session": False}
-    # request.get("app", "") — dashboard-origin (no app token)
-    req.get = MagicMock(return_value="")
+    attach_json_body(req, encoded)
+    state = state if state is not None else MagicMock()
+    # The dashboard owner: the artifact write routes refuse any other subject.
+    state.owner_id = _OWNER
+    req.app = {"state": state, "_restricted_session": False}
+    # Dashboard-origin claims (no app token) for the signed-in owner.
+    claims = {"user": _OWNER, "app": ""}
+    req.get = MagicMock(side_effect=lambda key, default=None: claims.get(key, default))
+    req.__contains__ = MagicMock(side_effect=claims.__contains__)
+    req.__getitem__ = MagicMock(side_effect=claims.__getitem__)
     return req
 
 

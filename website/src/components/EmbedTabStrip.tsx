@@ -1,9 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { matchPath, useLocation, useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { useAppSelector, useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
 import { X, Plus } from 'lucide-react'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
+import { safeSetSessionItem } from '../utils/safeStorage'
+import { useScrollEdges } from '../hooks/useScrollEdges'
+import {
+  TAB_STATUS_COLOR,
+  removeTabAt,
+  tabStatus,
+  tabStatusPulses,
+  truncateTabTitle,
+  type TabStatus,
+} from '../lib/sessionTabs'
 import type { ChatSlot } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -17,6 +29,23 @@ interface EmbedTabsWindow extends Window {
 
 const STORAGE_KEY = 'kirocrew-embed-tabs'
 const STORAGE_INDEX_KEY = 'kirocrew-embed-active-index'
+
+/**
+ * The tabs to open with. A chat the page was opened on (`/embed/chat/:slug`)
+ * is always the active tab: an open tab holding it is selected, a Sessions tab
+ * becomes it, and otherwise it is added. Without this the mount navigation
+ * below would replace the deep link with the restored tab's URL.
+ */
+function initialTabs(activeSlot: string | null, linkedSlug: string | null): { tabs: Tab[]; index: number } {
+  const restored = loadTabs(activeSlot)
+  if (!linkedSlug) return restored
+  const open = restored.tabs.findIndex(t => t.slug === linkedSlug)
+  if (open !== -1) return { tabs: restored.tabs, index: open }
+  if (restored.tabs[restored.index]?.slug === '') {
+    return { tabs: restored.tabs.map((t, i) => i === restored.index ? { slug: linkedSlug } : t), index: restored.index }
+  }
+  return { tabs: [...restored.tabs, { slug: linkedSlug }], index: restored.tabs.length }
+}
 
 function loadTabs(activeSlot: string | null): { tabs: Tab[]; index: number } {
   // Priority: sessionStorage > window.__kirocrewTabs > activeSlot > empty
@@ -41,8 +70,13 @@ export default function EmbedTabStrip() {
   const slots = useAppSelector(s => s.dashboard.slots)
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
 
-  const [tabs, setTabs] = useState<Tab[]>(() => loadTabs(activeSlot).tabs)
-  const [activeIndex, setActiveIndex] = useState(() => loadTabs(activeSlot).index)
+  const { pathname } = useLocation()
+  const [initial] = useState(() => {
+    const linkedSlug = matchPath('/embed/chat/:slug', pathname)?.params.slug || null
+    return { ...initialTabs(activeSlot, linkedSlug), linked: !!linkedSlug }
+  })
+  const [tabs, setTabs] = useState<Tab[]>(initial.tabs)
+  const [activeIndex, setActiveIndex] = useState(initial.index)
 
   const tabsRef = useRef(tabs)
   tabsRef.current = tabs
@@ -56,6 +90,8 @@ export default function EmbedTabStrip() {
     didMountNav.current = true
     const tab = tabs[activeIndex]
     if (!tab) return
+    // A deep link may have changed the restored tabs: store what is shown.
+    if (initial.linked) persist(tabs, activeIndex)
     if (tab.slug) navigate(`/embed/chat/${tab.slug}?sid=${tab.slug}`, { replace: true })
     else navigate('/embed/sessions', { replace: true })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -77,8 +113,10 @@ export default function EmbedTabStrip() {
   // Persist to sessionStorage + notify plugin on every change
   const persist = useCallback((newTabs: Tab[], newIndex: number) => {
     const slugs = newTabs.map(t => t.slug)
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(slugs))
-    sessionStorage.setItem(STORAGE_INDEX_KEY, String(newIndex))
+    // Storage can be full or denied in a host iframe; the host event and the
+    // navigation that follow must still happen.
+    safeSetSessionItem(STORAGE_KEY, JSON.stringify(slugs))
+    safeSetSessionItem(STORAGE_INDEX_KEY, String(newIndex))
     window.dispatchEvent(new CustomEvent('kirocrew-tab-update', {
       detail: { tabs: slugs, activeIndex: newIndex }
     }))
@@ -167,12 +205,9 @@ export default function EmbedTabStrip() {
   }
 
   const closeTab = (index: number) => {
-    const newTabs = [...tabs]
-    newTabs.splice(index, 1)
-    if (newTabs.length === 0) newTabs.push({ slug: '' })
-    let newIndex = activeIndex
-    if (activeIndex > index) newIndex--
-    else if (activeIndex >= newTabs.length) newIndex = newTabs.length - 1
+    const removed = removeTabAt(tabs, index, activeIndex)
+    const newTabs = removed.tabs.length ? removed.tabs : [{ slug: '' }]
+    const newIndex = removed.activeIndex
     setTabs(newTabs)
     setActiveIndex(newIndex)
     if (activeIndex === index) {
@@ -195,23 +230,87 @@ export default function EmbedTabStrip() {
 
   // --- Drag reorder: tab follows cursor, reorder on drop ---
   const dragRef = useRef<{ index: number; slug: string; startX: number; active: boolean } | null>(null)
+  // Armed only when setPointerCapture THROWS on pointer-down (see
+  // onPointerDown below). An uncaptured drag gets no retargeting and no
+  // lostpointercapture, so a release outside the strip never reaches it and
+  // the reorder state strands mid-drag. Window-level up/cancel listeners for
+  // that specific pointerId are the one place the terminal event can still
+  // be heard — the same acquisition-side fallback the shared usePointerDrag
+  // hook arms.
+  const fallbackRef = useRef<{ pointerId: number; dispose: () => void } | null>(null)
+  const disarmFallback = useCallback(() => {
+    fallbackRef.current?.dispose()
+    fallbackRef.current = null
+  }, [])
+  // Latest-ref routing for the window fallback armed in onPointerDown: the
+  // end handlers below are defined after it, so the fallback calls through
+  // here instead of naming them (same latest-ref pattern as tabsRef).
+  const dragEndRef = useRef({
+    up: (_e: React.PointerEvent | PointerEvent) => {},
+    cancel: () => {},
+  })
+  // If the component unmounts mid-uncaptured-drag, the window listeners must
+  // not outlive it.
+  useEffect(() => disarmFallback, [disarmFallback])
   const [dragSlug, setDragSlug] = useState<string | null>(null)
   const [dragOffset, setDragOffset] = useState(0)
   const tabRefs = useRef<(HTMLDivElement | null)[]>([])
   const stripRef = useRef<HTMLDivElement | null>(null)
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+
+  // The hook owns the node's edge measurement; this keeps a plain handle to
+  // the same node for the drag auto-scroll, pointer capture, and the wheel
+  // translation, which all read stripRef directly.
+  const setStrip = useCallback((node: HTMLDivElement | null) => {
+    stripRef.current = node
+    attachEdges(node)
+  }, [attachEdges])
+
+  // Tabs opening, closing, or renaming keep the strip's own box, so neither
+  // the ResizeObserver nor a scroll event reports the changed content width —
+  // only this remeasure can refresh the cue. `slots` is in the deps because
+  // the rendered label comes from redux, not from `tabs`: a session retitled
+  // after its first turn (auto-titling) widens the strip while `tabs` stays
+  // identity-stable. remeasure drops same-value writes, so the extra churn
+  // from unrelated slot updates costs no re-render.
+  useEffect(() => { remeasure() }, [tabs, slots, remeasure])
 
   const onPointerDown = (e: React.PointerEvent, index: number) => {
     if ((e.target as HTMLElement).closest('button')) return
     const strip = stripRef.current
     if (!strip) return
 
+    // A new press replaces whatever drag dragRef held, so a fallback armed
+    // for the outgoing pointer goes with it.
+    disarmFallback()
     dragRef.current = {
       index,
       slug: tabs[index].slug || `new-${index}`,
       startX: e.clientX,
       active: false,
     }
-    strip.setPointerCapture(e.pointerId)
+    let captured = true
+    try { strip.setPointerCapture(e.pointerId) } catch { captured = false }
+    if (!captured) {
+      // The drag still starts (tab activation below still runs), but the
+      // gesture must remain terminable: without retargeting, a release
+      // outside the strip never reaches it.
+      const pointerId = e.pointerId
+      const onWindowEnd = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        if (ev.type === 'pointercancel') dragEndRef.current.cancel()
+        else dragEndRef.current.up(ev)
+      }
+      window.addEventListener('pointerup', onWindowEnd)
+      window.addEventListener('pointercancel', onWindowEnd)
+      fallbackRef.current = {
+        pointerId,
+        dispose: () => {
+          window.removeEventListener('pointerup', onWindowEnd)
+          window.removeEventListener('pointercancel', onWindowEnd)
+        },
+      }
+    }
 
     // Activate the tab being dragged
     if (index !== activeIndex) {
@@ -252,12 +351,14 @@ export default function EmbedTabStrip() {
   }
 
   const onPointerCancel = () => {
+    disarmFallback()
     dragRef.current = null
     setDragSlug(null)
     setDragOffset(0)
   }
 
-  const onPointerUp = (e: React.PointerEvent) => {
+  const onPointerUp = (e: React.PointerEvent | PointerEvent) => {
+    disarmFallback()
     const d = dragRef.current
     dragRef.current = null
     if (!d?.active) {
@@ -309,6 +410,9 @@ export default function EmbedTabStrip() {
     }, 0)
   }
 
+  // Publish the end handlers for the window fallback armed in onPointerDown.
+  dragEndRef.current = { up: onPointerUp, cancel: onPointerCancel }
+
   const getTitle = (slug: string, _index: number) => {
     if (!slug) return i18nT('components.embedTabStrip.sessions')
     return slots.find(s => s.key === slug)?.title || slug
@@ -317,34 +421,35 @@ export default function EmbedTabStrip() {
   // Status dot color per tab
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
 
-  const getStatus = (slug: string): 'idle' | 'running' | 'unread' | 'permission' => {
+  // Status precedence, its colour vocabulary and the close-index arithmetic are
+  // shared with the dashboard's own session strip (lib/sessionTabs) so the two
+  // shells cannot drift on what a dot means or where a close lands.
+  const getStatus = (slug: string): TabStatus => {
     if (!slug) return 'idle'
-    const slot = slots.find(s => s.key === slug)
-    if (!slot) return 'idle'
-    if (slot.pending_approval) return 'permission'
-    if (slot.running) return 'running'
-    if (unreadSlots.includes(slug)) return 'unread'
-    return 'idle'
+    return tabStatus(slots.find(s => s.key === slug), unreadSlots, slug)
   }
 
   return (
-    <div
-      className="flex items-center shrink-0 border-b border-border px-1.5 py-1.5"
-      style={{ background: 'var(--bg)' }}
-    >
-      <div
-        ref={stripRef}
-        className="flex items-center gap-1 overflow-x-auto min-w-0 flex-1 relative"
-        style={{ scrollbarWidth: 'none' }}
-        onWheel={e => { if (stripRef.current) stripRef.current.scrollLeft += e.deltaY }}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerCancel}
-      >
+    <div className="shrink-0 border-b border-border" style={{ background: 'var(--bg)' }}>
+    <div className="flex items-center px-1.5 py-1.5">
+      {/* The wrapper exists for the edge cues: absolutely-positioned children
+          of the scroller itself would travel with the scrolled content, so the
+          fades anchor to this non-scrolling parent. It also owns the flex
+          sizing so the scroller keeps filling the row. */}
+      <div className="relative min-w-0 flex-1">
+        <div
+          ref={setStrip}
+          className="flex items-center gap-1 overflow-x-auto relative"
+          style={{ scrollbarWidth: 'none' }}
+          onWheel={e => { if (stripRef.current) stripRef.current.scrollLeft += e.deltaY }}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerCancel}
+        >
         {tabs.map((tab, i) => {
           const active = i === activeIndex
           const title = getTitle(tab.slug, i)
-          const truncated = title.length > 24 ? title.slice(0, 24) + '…' : title
+          const truncated = truncateTabTitle(title)
           const isDragged = dragSlug != null && (tab.slug || `new-${i}`) === dragSlug
           return (
             <div
@@ -373,11 +478,10 @@ export default function EmbedTabStrip() {
             >
               {tab.slug && (() => {
                 const status = getStatus(tab.slug)
-                const colors = { idle: 'var(--muted)', running: 'var(--accent)', unread: 'var(--ok)', permission: 'var(--warn)' }
                 return (
                   <span
-                    className={`shrink-0 w-1.5 h-1.5 rounded-full self-center mr-0.5 ${status === 'running' || status === 'permission' ? 'animate-pulse' : ''}`}
-                    style={{ background: colors[status] }}
+                    className={`shrink-0 w-1.5 h-1.5 rounded-full self-center mr-0.5 ${tabStatusPulses(status) ? 'animate-pulse' : ''}`}
+                    style={{ background: TAB_STATUS_COLOR[status] }}
                   />
                 )
               })()}
@@ -386,7 +490,7 @@ export default function EmbedTabStrip() {
                 onPointerDown={e => e.stopPropagation()}
                 onClick={e => { e.stopPropagation(); closeTab(i) }}
                 className={`transition-opacity ${
-                  active ? 'opacity-60 hover:opacity-100 hover:text-text' : 'opacity-0 group-hover/tab:opacity-60 group-focus-within/tab:opacity-60 hover:!opacity-100 hover:text-text'
+                  active ? 'opacity-60 hover:opacity-100 hover:text-text' : 'opacity-0 group-hover/tab:opacity-60 [@media(hover:none)]:opacity-60 group-focus-within/tab:opacity-60 hover:!opacity-100 hover:text-text'
                 }`}
                 aria-label={i18nT('components.embedTabStrip.close_tab')}
               >
@@ -395,6 +499,19 @@ export default function EmbedTabStrip() {
             </div>
           )
         })}
+        </div>
+        {/* Edge cues, same treatment as the sibling strips: this scroller hides
+            its scrollbar entirely (scrollbarWidth: none), so a gradient is the
+            only signal that tabs continue past the clipped edge. from-bg
+            matches the bar's var(--bg) surface. The dragged tab's z-50 stays
+            above the cue on purpose — mid-drag the tab is the content being
+            placed, not the content being hinted at. */}
+        {edges.left && (
+          <div aria-hidden="true" data-testid="embed-tab-strip-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
+        )}
+        {edges.right && (
+          <div aria-hidden="true" data-testid="embed-tab-strip-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
+        )}
       </div>
       <button
         onClick={e => {
@@ -411,6 +528,24 @@ export default function EmbedTabStrip() {
       >
         <Plus size={14} />
       </button>
+    </div>
+      {createSlotMutation.isError && (
+        // A rejected createSlot otherwise leaves the "+" looking dead. Its own
+        // wrapping row beneath the strip: the tab row is a non-shrinking
+        // horizontal scroller, so a notice inside it would add a third action to
+        // that row and overflow a 320px viewport. The strip holds no draft (tabs
+        // are persisted to sessionStorage on every change), so the hand-off is on.
+        <div className="px-2 pb-1.5">
+          <ErrorNotice
+            variant="inline"
+            askAgent
+            testId="embed-tab-strip-create-error"
+            className="flex-wrap"
+            message={errMessage(createSlotMutation.error) || i18nT('components.embedTabStrip.new_chat_failed')}
+            onDismiss={() => createSlotMutation.reset()}
+          />
+        </div>
+      )}
     </div>
   )
 }

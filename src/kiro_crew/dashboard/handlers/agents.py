@@ -1,99 +1,400 @@
-"""Agent configuration, themes, AIM integration, and agent CRUD handlers."""
+"""Agent administration HTTP handlers: the facade over :mod:`kiro_crew.dashboard.agent_admin`.
+
+Routes, the handlers package, sibling handlers and tests import and patch every
+agents handler through this module. The handler families live in the
+``agent_admin`` owners -- ``app_mcp_ownership``, ``agent_config``,
+``default_agent``, ``capabilities``, ``template_lineage``, ``fork_publish``,
+``agent_detail``, ``roster``, ``installed_agents``, ``crew_records``,
+``crew_update``, ``crew_removal`` and ``avatars`` -- and ``_facade_compose.compose``
+runs them on this module's globals, so a patch of ``agents.<name>`` reaches them.
+
+This module keeps the imports, constants and seams the owners read (``_err500``,
+``_sel``, ``_require_owner``, the ``_get_config_lock`` every config writer in the
+dashboard takes), the config schema route, the model and picker reads
+(``GET /api/models`` with its catalog cache and entitlement narrowing, effort
+levels, slash commands) with the crew model-pin checks, and the two routes
+repository guards read here by path: ``GET /api/agents`` and the avatar ``GET``.
+New work goes to the owner of its family;
+``docs/system-specs/modules/learn-cron-dashboard.md`` records the map.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib  # noqa: F401
+import copy  # noqa: F401
 import dataclasses
+import functools
+import hashlib  # noqa: F401
 import json
 import logging
 import os
 import re
+import stat  # noqa: F401
 import subprocess
+import time
 import uuid
-from pathlib import Path
-from typing import Any
+from collections.abc import Sequence  # noqa: F401
+from pathlib import Path  # noqa: F401
+from typing import Any, cast  # noqa: F401  (cast: crew_records reads it)
 
-from aiohttp import web
+from aiohttp import BodyPartReader, web  # noqa: F401
 
-from kiro_crew import agent_state, model_registry
+from kiro_crew import agent_state  # noqa: F401
+from kiro_crew import crew_teams as teams_mod  # noqa: F401
+from kiro_crew import model_registry, model_scope
+from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.agent_discovery import (
+from kiro_crew.acp_backends import (  # noqa: F401 - selectable_backend_values is a facade name
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KIRO,
+    model_registry_namespace,
+    selectable_backend_values,
+    selectable_stored_backend_values,
+)
+from kiro_crew.agent import (  # noqa: F401
+    AGENT_FILENAME,
+    OWNED_KIRO_AGENT_FILES,
+    SharedAgentHomeRefused,
+    _atomic_json_write,
+    _declined_foreign_spec_write,
+    _is_confirmed_managed_dashboard_author,
+    _refresh_forked_templates,
+    _spec_path_is_safe,
+    agents_spec_lock,
+    clear_model_pin,
+    emission_eligible_mcp_servers,
+    get_shipped_tools,
+    install_agent,
+    kiro_agents_dir_path,
+)
+from kiro_crew.agent_capabilities import CapabilityError, require_unmanaged_template  # noqa: F401
+from kiro_crew.agent_discovery import (  # noqa: F401
+    SCOPE_GLOBAL,
+    AgentInfo,
+    _read_agent_spec,
     clear_list_agents_cache,
     list_agents,
     project_agent_names,
     spec_model,
     spec_str,
 )
-from kiro_crew.config.loader import (
+from kiro_crew.agent_files import (  # noqa: F401
+    DASHBOARD_AUTHOR_AGENT_FILENAME,
+    KAS_RESERVED_AGENT_IDS,
+)
+from kiro_crew.agent_sdk import host_auth
+from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
+from kiro_crew.agent_sdk.drivers.acp import (
+    EntitlementRevalidating,
+    catalog_row_would_drop,
+    is_auth_failure_output,
+    resolve_kiro_bin_for_spawn,
+    resolve_pin_spelling,
+    resolve_ssh_auth_sock,
+)
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import (  # noqa: F401
+    agent_spec_candidates,
+    is_markdown_spec,
+    iter_agent_spec_files,
+)
+from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock  # noqa: F401
+from kiro_crew.apps.bridges import _registration_source  # noqa: F401
+from kiro_crew.apps.manager import (  # noqa: F401
+    INSTALLED_META_FILENAME,
+    app_dir,
+    app_enabled_state,
+    apps_dir,
+)
+from kiro_crew.atomic_write import replace_with_retry  # noqa: F401
+from kiro_crew.config.loader import (  # noqa: F401
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
+    _overlay_kiro_agent,
+    _safe_color,
+    coerce_dict_section,
+    coerce_effort,
+    config_local_path,
+    config_path,
+    default_template,
+    dispatch_kiro_agent,
+    inject_kiro_cli_api_key,
     normalize_agent_model,
-    read_config_for_update,
-    resolve_agent_bindings,
+    read_config_text,
     resolve_agent_config_path,
+    resolve_agent_identity,
     resolve_effective_model,
+    update_config_locked,
     write_config_atomically,
 )
+from kiro_crew.config.paths import data_home  # noqa: F401
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
+from kiro_crew.config.sections import (  # noqa: F401
+    _AVATAR_FILE_PIN_RE,
+    _AVATAR_GHOST_BOOL_TRAITS,
+    _AVATAR_GHOST_STR_TRAITS,
+)
+from kiro_crew.config.sections import _AVATAR_IMAGE_EXTS as _LOADER_AVATAR_IMAGE_EXTS
+from kiro_crew.config.sections import (  # noqa: F401
+    _safe_avatar,
+)
+from kiro_crew.dashboard.agent_admin import agent_config as _owner_agent_config
+from kiro_crew.dashboard.agent_admin import agent_detail as _owner_agent_detail
+from kiro_crew.dashboard.agent_admin import app_mcp_ownership as _owner_app_mcp_ownership
+from kiro_crew.dashboard.agent_admin import avatars as _owner_avatars
+from kiro_crew.dashboard.agent_admin import capabilities as _owner_capabilities
+from kiro_crew.dashboard.agent_admin import crew_records as _owner_crew_records
+from kiro_crew.dashboard.agent_admin import crew_removal as _owner_crew_removal
+from kiro_crew.dashboard.agent_admin import crew_update as _owner_crew_update
+from kiro_crew.dashboard.agent_admin import default_agent as _owner_default_agent
+from kiro_crew.dashboard.agent_admin import fork_publish as _owner_fork_publish
+from kiro_crew.dashboard.agent_admin import installed_agents as _owner_installed_agents
+from kiro_crew.dashboard.agent_admin import roster as _owner_roster
+from kiro_crew.dashboard.agent_admin import template_lineage as _owner_template_lineage
+from kiro_crew.dashboard.agent_admin.agent_config import (  # noqa: F401
+    _commit_agent_config,
+    _commit_agent_config_locked,
+    _find_agent_config,
+    _installed_agent_config,
+    _write_installed_config,
+    api_agent_config,
+)
+from kiro_crew.dashboard.agent_admin.agent_detail import (  # noqa: F401
+    _agent_detail_candidates,
+    _merge_resources_delta,
+    _reorder_named,
+    api_agent_detail,
+)
+from kiro_crew.dashboard.agent_admin.app_mcp_ownership import (  # noqa: F401
+    AppOwnershipUnreadable,
+    _app_declared_server_names,
+    _app_or_host_owned,
+    _drop_unbacked_app_entries,
+    _merge_unowned_servers,
+    _on_disk_mcp_servers,
+    _require_present_shape,
+)
+from kiro_crew.dashboard.agent_admin.avatars import (  # noqa: F401
+    _avatar_stem,
+    _avatar_variant_paths,
+    _avatars_dir,
+    _carry_motions_through_motionless_save,
+    _commit_promoted_avatar,
+    _discard_pending_avatar,
+    _image_body_complete,
+    _is_ghost_shaped,
+    _live_avatar_file,
+    _pending_avatar_path,
+    _promote_pending_avatar,
+    _read_avatar_file,
+    _remove_avatar_files,
+    _rollback_promoted_avatar,
+    _sniff_image_ext,
+    _staging_token,
+    api_kirocrew_agent_avatar_upload,
+)
+from kiro_crew.dashboard.agent_admin.capabilities import (  # noqa: F401
+    _audit_capability,
+    _is_valid_capability_package,
+    _mutate_agent_package,
+    api_capability_agents_install,
+    api_capability_agents_list,
+    api_capability_agents_uninstall,
+    api_capability_mcp_install,
+    api_capability_mcp_list,
+    api_capability_mcp_registry,
+    api_capability_mcp_uninstall,
+    api_capability_plugins_list,
+    api_capability_plugins_sync,
+    api_capability_skills_install,
+    api_capability_skills_list,
+    api_capability_skills_uninstall,
+)
+from kiro_crew.dashboard.agent_admin.crew_records import (  # noqa: F401
+    _api_kirocrew_agents_create,
+    _crew_effort_rejected,
+    _crew_memory_store_rejected,
+    _mark_first_greeting_owed,
+    _refresh_session_defaults,
+    api_kirocrew_agent_resolved_model,
+    api_kirocrew_agents_create,
+)
+from kiro_crew.dashboard.agent_admin.crew_removal import (  # noqa: F401
+    _member_slug_is_claimed,
+    _prune_private_copy_of_deleted_crew,
+    _reclaim_deleted_member_crew_log,
+    _reclaim_deleted_member_dashboard_lock,
+    _remove_goal_check_ins,
+    api_kirocrew_agent_delete,
+)
+from kiro_crew.dashboard.agent_admin.crew_update import (  # noqa: F401
+    _apply_member_approval_to_live_thread,
+    _effort_inputs,
+    api_kirocrew_agent_update,
+)
+from kiro_crew.dashboard.agent_admin.default_agent import (  # noqa: F401
+    _AppRegisteredTemplate,
+    _BackgroundOnlyTemplate,
+    _default_template_ineligible_reason,
+    _installed_template_alias,
+    _is_app_registered,
+    _set_default_template,
+    _spec_lock_or_unlocked_read,
+    api_default_agent,
+    default_template_eligible,
+)
+from kiro_crew.dashboard.agent_admin.fork_publish import (  # noqa: F401
+    api_agent_fork,
+    api_agent_publish,
+    api_agent_reset,
+)
+from kiro_crew.dashboard.agent_admin.installed_agents import (  # noqa: F401
+    _do_agents_sync,
+    _namespaced_agent_file_exists,
+    api_agents_installed,
+    api_kirocrew_agents_sync,
+)
+from kiro_crew.dashboard.agent_admin.roster import (  # noqa: F401
+    _agent_roster_row,
+    _carries_mask,
+    _name_would_be_masked,
+    _roster_avatar,
+    _roster_mask,
+)
+from kiro_crew.dashboard.agent_admin.template_lineage import (  # noqa: F401
+    _AmbiguousTemplateName,
+    _foreign_private_copy_owner,
+    _ForeignPrivateCopy,
+    _ForkBookkeepingFailed,
+    _is_reserved_basename,
+    _lineage_unverifiable_error,
+    _load_template_specs,
+    _PublishNameBound,
+    _rebind_crew_locked,
+    _reserved_binding_names,
+    _sidecar_unverifiable,
+    _spec_stem_on_disk,
+    _StaleBinding,
+    _unlink_copy_unless_referenced,
+    _UnverifiableLineage,
+    _write_spec_file,
+)
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_ordered
-from kiro_crew.dashboard.chat_utils import (
+from kiro_crew.dashboard.chat_utils import (  # noqa: F401
+    _BLOCKED_SLASH_COMMANDS,
     _SLASH_COMMANDS,
     SLASH_COMMAND_DESCRIPTIONS,
     _history_key_for,
+    drained_to_thread,
     is_deprecated_model,
+    run_config_write,
 )
-from kiro_crew.dashboard.handlers._shared import (
+from kiro_crew.dashboard.conditional_get import conditional_response, strong_content_etag
+from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
     MAX_AGENT_SKILLS,
+    SkillCatalogSnapshot,
     _capability_manager,
     _read_session_key,
     active_project_dir,
     agent_skill_keys,
     agent_skill_views,
     apply_skill_mapping,
+    enumerate_skill_catalog,
+    read_bounded_json,
+    rebuild_agent_spec,
 )
-from kiro_crew.dashboard.handlers.discover import _redact_external
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.handlers.agent_templates import (  # noqa: F401
+    TEMPLATE_DEFINITION_KEYS,
+    ControlPlaneNotDeclarable,
+    apply_definition_patch,
+    control_plane_declarations,
+    read_only_reason_for_path,
+    validate_definition_patch,
+)
+from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
+    owner_view_for_request,
+)
+from kiro_crew.dashboard.kiro_readiness import (
+    KIRO_PREREQUISITE_REQUIRED_CODE,
+    reject_if_kiro_unverified,
+)
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES  # noqa: F401
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
+from kiro_crew.external_text import redact_external_text as _redact_external  # noqa: F401
+from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
+from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.member_workspace import (  # noqa: F401
+    AUTO_WORKSPACE,
+    MemberWorkspaceUnavailable,
+    provision_member_workspace,
+    retire_unpublished_workspace,
+)
+from kiro_crew.members import MemberNameError, key_new_crew, validate_member_name  # noqa: F401
+from kiro_crew.memory_stores import (  # noqa: F401
+    DEFAULT_MEMORY_STORE,
+    MemberAlreadyExists,
+    UnknownMemoryStore,
+    memory_store_binding_defect,
+    memory_store_namespace_lock,
+    persist_member_config,
+    provision_member_memory,
+    retire_unpublished_allocation,
+)
+from kiro_crew.platform.governance import sanitize_agent_config_governance  # noqa: F401
+from kiro_crew.platform_compat import is_link_or_junction, kill_and_reap  # noqa: F401
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
     configured_sandbox_mode,
-    create_subprocess_limited,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
+from kiro_crew.user_json import loads_user_json  # noqa: F401
+from kiro_crew.validation import TEMPLATE_NAME_RE  # noqa: F401
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
+# How long one GET /api/models waits for a catalog before answering the degraded
+# 503. Unchanged: a remote hub still budgets its whole cold path against this
+# bound (see api_models), so raising it would move
+# DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS with it.
+_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS: float = 10.0
+# How long the SHARED background catalog fetch may run, decoupled from any one
+# request. On a host where a cold `kiro-cli --list-models` spawn always exceeds
+# the request bound, killing it at that bound meant no call ever finished, so
+# every 8s poll started another doomed cold spawn and the picker never left
+# `auto`. The fetch now outlives the request that started it: the request still
+# answers 503 after _LIST_MODELS_SUBPROCESS_TIMEOUT_SECS, but the spawn keeps
+# running under this ceiling and the next poll is served from its result.
+_LIST_MODELS_BACKGROUND_TIMEOUT_SECS: float = 90.0
+# A cached catalog younger than this is served straight away; an older one is
+# served straight away too and refreshed behind the reply (stale-while-
+# revalidate). The catalog changes rarely, so a few minutes stale costs nothing
+# the per-request entitlement narrowing does not already correct.
+_LIST_MODELS_CATALOG_TTL_SECS: float = 300.0
+# A fetch that spawned kiro-cli and failed (signed out, non-zero exit, timeout,
+# bad output) is remembered this long, and every poll inside the window gets the
+# same 503 without a new spawn or a new WARNING. The dashboard re-polls about
+# every 8s while the list is degraded, so a signed-out CLI cost one spawn and one
+# WARNING per poll (81 of each in 16 minutes on one gateway). 30s holds a failing
+# CLI to two spawns a minute, while a user who has just signed in waits at most
+# 30s for the picker to fill. A success clears the entry at once.
+_LIST_MODELS_FAILURE_BACKOFF_SECS: float = 30.0
+# The cache is the one place ``--list-models`` output is held past the request,
+# so retention is bounded before it is stored. Row count and identifying-field
+# length reuse the repo's ONE shared admission bound
+# (``model_registry.ADVERTISED_MODELS_MAX_IDS`` /
+# ``ADVERTISED_MODEL_ID_MAX_CHARS``) so the picker cannot serve an id the window
+# / advertised stores refused — an over-long id is REFUSED (the whole row
+# skipped), never truncated, matching ``admit_catalog_rows``. This cap bounds
+# only the non-identifying extra fields a row may carry (the shared admission
+# does not speak to those): each is clamped to the id-length bound and a row
+# keeps at most this many.
+_CATALOG_CACHE_MAX_FIELDS_PER_ROW = 64
 
 logger = logging.getLogger(__name__)
-
-
-def _namespaced_agent_file_exists(agent_name: str) -> bool:
-    """True when an app-registered agent file backs *agent_name*.
-
-    App agents are materialized as ``<app>--<agent>.json`` (namespaced file
-    names prevent two apps' same-named agents from clobbering each other), but
-    kiro-cli resolves agents by the JSON ``name`` field, not the file name. A
-    file-name-only existence check therefore reports a perfectly spawnable app
-    agent as missing on every boot.
-    """
-    # Resolved per call, not read from a module constant: the agents dir tracks
-    # the live data home (see config.md "Data Home"), and a frozen constant would
-    # glob the real ~/.kiro from an isolated run.
-    from kiro_crew.agent import kiro_agents_dir_path
-
-    try:
-        for path in kiro_agents_dir_path().glob(f"*--{agent_name}.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if isinstance(data, dict) and data.get("name") == agent_name:
-                return True
-    except OSError:
-        return False
-    return False
 
 
 def _err500(exc: BaseException) -> web.Response:
@@ -115,173 +416,44 @@ def _sel():
     return _pkg.sel()
 
 
-# ── Agent Config ──
+async def _require_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate shared by every mutating agents handler, here and in the owners.
 
-
-def _auto_install_agent() -> None:
-    """Re-install agent config to kiro-cli so changes take effect immediately."""
-    try:
-        from kiro_crew.agent import install_agent  # noqa: F811
-
-        install_agent()
-        logger.info("Auto-applied agent config via dashboard")
-    except Exception:
-        logger.debug("Auto-apply agent config failed", exc_info=True)
-
-
-def _find_agent_config() -> Path:
-    """Find agents/defaults.json — delegates to centralized resolver."""
-    return resolve_agent_config_path()
-
-
-def _installed_agent_config() -> Path:
-    """Return the installed agent config path (~/.kiro/agents/kirocrew.json).
-
-    This is the live config that kiro-cli reads.  Dashboard MCP toggle
-    and sync operations write here — NOT to agents/defaults.json.
+    ``~/.kiro/agents`` and ``cfg.agents`` are machine-global: a write there
+    installs tool grants and MCP server commands that later sessions execute,
+    so mutations are owner-only — the same server-side boundary
+    ``mcp_apps.api_mcp_apps_call`` enforces. The caller identity comes from
+    the token-auth middleware (``request["user"]`` / ``request["app"]``),
+    never from a client-set header. Returns the 403 to send, or ``None`` when
+    the caller is the owner.
     """
-    from kiro_crew.agent import AGENT_FILENAME, kiro_agents_dir_path  # noqa: F811
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
-    return kiro_agents_dir_path() / AGENT_FILENAME
-
-
-async def api_agent_config(request: web.Request) -> web.Response:
-    """GET/PUT /api/agent/config — read or write the installed agent config.
-
-    Reads/writes ``~/.kiro/agents/kirocrew.json`` — the live config that
-    kiro-cli actually uses at runtime.  Falls back to ``agents/defaults.json``
-    if the installed config doesn't exist yet.
-    """
-    import kiro_crew.dashboard.handlers as _h  # noqa: F811
-
-    installed_path = _h._installed_agent_config()
-    defaults_path = _h._find_agent_config()
-    # Prefer installed config (what kiro-cli reads); fall back to defaults
-    agent_config_path = installed_path if installed_path.is_file() else defaults_path
-
-    if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
-        config = body.get("config")
-        if not isinstance(config, dict):
-            return web.json_response({"error": "config must be an object"}, status=400)
-        try:
-            # Track tools the user intentionally removed from shipped defaults
-            # so they don't reappear on upgrade.  Stored in ~/.kiro/crew/config.json
-            # (NOT kirocrew.json — kiro-cli rejects unknown fields).
-            # Per-key dict so removing from allowedTools only doesn't affect tools.
-            from kiro_crew.agent import get_shipped_tools  # noqa: F811
-
-            shipped = get_shipped_tools()
-            removed_per_key: dict[str, list[str]] = {}
-            for key in ("tools", "allowedTools"):
-                diff = sorted(set(shipped.get(key, [])) - set(config.get(key, [])))
-                if diff:
-                    removed_per_key[key] = diff
-            mc_cfg_path = _h.config_path()  # type: ignore[operator]
-            # Fail closed: writing back a {} baseline would drop every other
-            # setting just to record removedTools. See read_config_for_update.
-            try:
-                mc_cfg = read_config_for_update(mc_cfg_path)
-            except ConfigReadError:
-                logger.exception("Refusing to record removedTools: config unreadable")
-                return web.json_response(
-                    {"error": "failed to read config file", "code": "config_unreadable"},
-                    status=500,
-                )
-            if removed_per_key:
-                mc_cfg["removedTools"] = removed_per_key
-            else:
-                mc_cfg.pop("removedTools", None)
-            write_config_atomically(mc_cfg_path, mc_cfg)
-            # Governance floor on the WHOLE-object write path: this handler
-            # persists the request's config verbatim, so a dashboard PUT could
-            # otherwise restore a ceiling-governed @denied grant or a governed
-            # server's autoApprove that the per-ref writers strip. Filter the map
-            # here too (no-op on an ungoverned host).
-            from kiro_crew.platform.governance import sanitize_agent_config_governance
-
-            # Offloaded: the filter resolves the ceiling AND scans the profile
-            # directory per ref, which is synchronous filesystem work — running it
-            # inline would stall the aiohttp event loop for the duration.
-            await asyncio.to_thread(sanitize_agent_config_governance, config)
-            installed_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-            # Restart kiro-cli sessions so new config takes effect
-            await _h._reset_all_sessions(request)
-            return web.json_response({"ok": True, "applied": True})
-        except Exception as exc:
-            return _err500(exc)
-    # GET
-    try:
-        data = json.loads(agent_config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        data = {}
-    return web.json_response(data)
-
-
-async def api_default_agent(request: web.Request) -> web.Response:
-    """GET/PUT /api/config/default-agent — read or set the default agent."""
-    import kiro_crew.dashboard.handlers as _h  # noqa: F811
-
-    if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
-        name = body.get("agent", "")
-        # Reject non-strings before any use: a JSON list/object here would make
-        # the membership check below raise (unhashable) into a 500, and a
-        # non-string must never reach the config write either.
-        if not isinstance(name, str):
-            return web.json_response(
-                {"error": "agent must be a string", "code": "invalid_agent_type"}, status=400
-            )
-        # Only a config alias may become the default: the default is resolved
-        # from cfg.agents on every dispatch, so persisting any other name (a
-        # project-scope discovery, an app agent, a typo) writes a default that
-        # silently resolves to something else. Guarded server-side so EVERY
-        # caller is covered, not just whichever picker currently hides the
-        # action — project-scope rows carry scope="project" in /api/agents
-        # precisely so UIs can disable this, but the config file is the last
-        # line of defense.
-        try:
-            # Config load is stat/read/validation filesystem work; off-loop so
-            # slow storage cannot freeze chat and the liveness heartbeat.
-            known = set((await asyncio.to_thread(KiroCrewConfig.load)).agents.keys())
-        except Exception:
-            known = set()
-        # Fail CLOSED: an unreadable config yields an empty `known`, and that is
-        # precisely when validation is impossible — a non-empty name must be
-        # rejected, not waved through. A valid config always has at least one
-        # agent (load() guarantees default_agent exists in agents), so an empty
-        # set never rejects a legitimate alias.
-        if name and name not in known:
-            return web.json_response(
-                {
-                    "error": f"agent {name!r} is not a configured agent alias",
-                    "code": "default_agent_not_alias",
-                },
-                status=400,
-            )
-        path = _h.config_path()
-        try:
-            data = read_config_for_update(path)
-        except ConfigReadError:
-            # Fail closed: writing back a {} baseline would drop every other setting.
-            logger.exception("Refusing to set default agent: config unreadable")
-            return web.json_response(
-                {"error": "failed to read config file", "code": "config_unreadable"}, status=500
-            )
-        data["default_agent"] = name
-        write_config_atomically(path, data)
-        return web.json_response({"ok": True, "default_agent": name})
-    cfg = KiroCrewConfig.load()
-    return web.json_response({"default_agent": cfg.default_agent})
+    return await require_owner_dashboard_request(request, operation)
 
 
 # ── Config Schema ──
+
+
+_CONFIG_SCHEMA_ACP_BACKEND = "agent.acp_backend"
+
+
+def _supply_live_enum(entry: dict) -> None:
+    """In place: give ``agent.acp_backend`` the values this build can actually serve.
+
+    The field carries no static ``enum`` on purpose (see ``AgentConfig``): an
+    edition registers its backends at boot, strictly after ``SCHEMA_REGISTRY`` is
+    built, so a frozen list could only be wrong — it would omit a registered
+    backend from the dashboard while the PATCH allowlist accepted it.
+
+    Resolved from the same owner as the PATCH allowlist and the config load path,
+    so the three cannot disagree, and in the config-file vocabulary the PATCH
+    stores (Kiro CLI is ``"kiro"``). One binding today, so it is spelled once rather
+    than made a registry; turn it into a path -> callable map when a second
+    dynamic enum appears.
+    """
+    if entry.get("path") == _CONFIG_SCHEMA_ACP_BACKEND:
+        entry["enumValues"] = selectable_stored_backend_values()
 
 
 async def api_config_schema(request: web.Request) -> web.Response:
@@ -306,6 +478,7 @@ async def api_config_schema(request: web.Request) -> web.Response:
         d = config_entry_to_dict(entry)
         if entry.sensitive or dataclasses.is_dataclass(d.get("defaultValue")):
             d["defaultValue"] = None
+        _supply_live_enum(d)
         result.append(d)
 
     return web.json_response({"entries": result})
@@ -327,378 +500,85 @@ _MAX_CAPABILITY_PACKAGE_LEN = 200
 _VALID_CAPABILITY_PACKAGE_RE = re.compile(r"^@?[A-Za-z0-9][A-Za-z0-9._@:/-]*$")
 
 
-def _is_valid_capability_package(name: str) -> bool:
-    """Return True if *name* is a well-formed, non-traversal package name.
-
-    The structural twin of ``mcp._is_valid_mcp_name``, for the package-shaped ids
-    the capability seam takes. Anchoring the first character to alphanumeric is
-    what makes flag injection (``--force``, ``-o``) impossible, and ``..`` is
-    rejected explicitly even though the charset would admit it.
-    """
-    if not name or len(name) > _MAX_CAPABILITY_PACKAGE_LEN:
-        return False
-    if ".." in name:  # reject path traversal even if it matches the charset
-        return False
-    return bool(_VALID_CAPABILITY_PACKAGE_RE.match(name))
-
-
-def _audit_capability(operation: str, outcome: str, resource: str) -> None:
-    """Emit a SEL line naming the package a capability mutation touched.
-
-    ``sel_audit_middleware`` already logs every mutating request, but only with
-    ``resources=request.path`` — it never reads the body. That records "an agent
-    package was installed" and not WHICH one. Installing an agent package
-    materializes new spawnable agent configs (persisted into ``config.json`` by
-    ``_do_agents_sync`` and treated as the spawn allowlist by
-    ``subagent._validate_agent``) plus new skills and prompt sources, so the
-    package name is the one fact an incident responder needs. Mirrors
-    ``mcp_discover``'s explicit per-outcome audit.
-    """
-    try:
-        _sel().log_api_access(
-            caller="dashboard",
-            operation=operation,
-            outcome=outcome,
-            source="dashboard",
-            resources=f"capability:{resource}",
-        )
-    except Exception:  # audit must never change the outcome
-        logger.debug("capability audit emit failed", exc_info=True)
-
-
-async def api_capability_mcp_list(request: web.Request) -> web.Response:
-    """GET /api/capability/mcp — list installed MCP servers (edition capability manager)."""
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        return web.json_response(await mgr.list_mcp())
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_mcp_install(request: web.Request) -> web.Response:
-    """POST /api/capability/mcp/install — install an MCP server via the capability manager."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    server_id = body.get("server_id", "").strip()
-    if not server_id:
-        return web.json_response({"error": "server_id required"}, status=400)
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        res = await mgr.install_mcp(server_id)
-        if not res.ok:
-            return web.json_response({"error": (res.message or "install failed")[:500]}, status=500)
-        from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402 circular: mcp imports agents
-            _sync_mcp_to_agent,
-        )
-
-        async with _get_config_lock():
-            # Off the loop: _sync_mcp_to_agent acquires bridges' synchronous
-            # _mcp_lock and does a full RMW of kirocrew.json. If a concurrent app
-            # registration holds that lock, a direct call would block the gateway
-            # loop until it releases. Every other caller offloads — match it.
-            await asyncio.to_thread(_sync_mcp_to_agent, server_id, True)
-        state: DashboardState = request.app["state"]
-        state.push_refresh("agents")
-        return web.json_response({"ok": True, "server_id": server_id})
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_mcp_uninstall(request: web.Request) -> web.Response:
-    """POST /api/capability/mcp/uninstall — uninstall an MCP server via the capability manager."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    server_id = body.get("server_id", "").strip()
-    if not server_id:
-        return web.json_response({"error": "server_id required"}, status=400)
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        res = await mgr.uninstall_mcp(server_id)
-        if not res.ok:
-            return web.json_response(
-                {"error": (res.message or "uninstall failed")[:500]}, status=500
-            )
-        from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402 circular: mcp imports agents
-            _sync_mcp_to_agent,
-        )
-
-        async with _get_config_lock():
-            # Off the loop for the same reason as install: the synchronous
-            # _mcp_lock RMW must not block the gateway if app registration holds it.
-            await asyncio.to_thread(lambda: _sync_mcp_to_agent(server_id, False, remove=True))
-        state: DashboardState = request.app["state"]
-        state.push_refresh("agents")
-        return web.json_response({"ok": True, "server_id": server_id})
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_skills_list(request: web.Request) -> web.Response:
-    """GET /api/capability/skills — list installed skill packages (edition capability manager)."""
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        return web.json_response(await mgr.list_skills())
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_skills_install(request: web.Request) -> web.Response:
-    """POST /api/capability/skills/install — install a skill package.
-
-    Takes only ``package``; any version/source resolution is owned by the
-    edition's capability manager (no Amazon-internal version-set field is
-    exposed on the public API).
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    package = body.get("package", "").strip()
-    if not package:
-        return web.json_response({"error": "package required"}, status=400)
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        res = await mgr.install_skill(package)
-        if not res.ok:
-            return web.json_response({"error": (res.message or "install failed")[:500]}, status=500)
-        # Regenerate agent config to pick up new skill paths. install_agent()
-        # does filesystem-heavy config rebuilding — offload it so it never
-        # blocks the asyncio event loop (chat/heartbeat) under a slow FS.
-        from kiro_crew.agent import install_agent  # noqa: F811
-
-        await asyncio.to_thread(install_agent)
-        state: DashboardState = request.app["state"]
-        state.push_refresh("agents")
-        return web.json_response({"ok": True, "package": package})
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_skills_uninstall(request: web.Request) -> web.Response:
-    """POST /api/capability/skills/uninstall — uninstall a skill package."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    package = body.get("package", "").strip()
-    if not package:
-        return web.json_response({"error": "package required"}, status=400)
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        res = await mgr.uninstall_skill(package)
-        if not res.ok:
-            return web.json_response(
-                {"error": (res.message or "uninstall failed")[:500]}, status=500
-            )
-        from kiro_crew.agent import install_agent  # noqa: F811
-
-        await asyncio.to_thread(install_agent)
-        state: DashboardState = request.app["state"]
-        state.push_refresh("agents")
-        return web.json_response({"ok": True, "package": package})
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def _mutate_agent_package(request: web.Request, *, install: bool) -> web.Response:
-    """Shared body for the agent-package install/uninstall handlers.
-
-    The two differ only in which seam op they call and the failure noun, and both
-    must rebuild the agent config afterwards: an agent package carries agents plus
-    its own skills and prompt sources, so the on-disk catalog and the generated
-    agent config are both stale until ``install_agent()`` re-runs.
-
-    Mirrors the guards ``mcp_discover.api_mcp_discover_install`` applies to the
-    same seam: an allowlist on the name BEFORE it leaves core, ``_redact_external``
-    on the manager's message, and an explicit SEL line naming the package.
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    # A body that is valid JSON but not an object (or carries a non-string
-    # ``package``) must be a 400, not an unhandled AttributeError -> 500.
-    if not isinstance(body, dict):
-        return web.json_response({"error": "body must be an object"}, status=400)
-    package = body.get("package")
-    if not isinstance(package, str):
-        return web.json_response({"error": "package required"}, status=400)
-    package = package.strip()
-    if not package:
-        return web.json_response({"error": "package required"}, status=400)
-    # The name crosses into the edition manager verbatim, and that manager owns
-    # its own invocation grammar — so bound it here rather than trusting every
-    # edition to reject a traversal or a shell metacharacter. Same allowlist the
-    # MCP mutation endpoints use.
-    if not _is_valid_capability_package(package):
-        return web.json_response({"error": f"Invalid package name '{package[:64]}'"}, status=400)
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    verb = "install" if install else "uninstall"
-    try:
-        res = await (mgr.install_agent(package) if install else mgr.uninstall_agent(package))
-        if not res.ok:
-            _audit_capability(f"capability_agent_{verb}", "error", package)
-            # The message is edition subprocess output in all but name: it can
-            # echo a registry URL with an embedded token, so it is redacted (both
-            # scans) and length-bounded before reaching the dashboard.
-            message = (res.message or f"{verb} failed")[:500]
-            return web.json_response({"error": _redact_external(message)}, status=500)
-        # Filesystem-heavy config rebuild — offload so it never blocks the asyncio
-        # event loop (chat turn + liveness heartbeat) on a slow FS.
-        from kiro_crew.agent import install_agent  # noqa: F811
-
-        await asyncio.to_thread(install_agent)
-        # list_agents() caches on a (count, newest-mtime-ns) signature, so a
-        # mutation landing inside one mtime tick would otherwise serve a stale
-        # catalog until some unrelated write bumped the signature.
-        clear_list_agents_cache()
-        state: DashboardState = request.app["state"]
-        state.push_refresh("agents")
-        _audit_capability(f"capability_agent_{verb}", "ok", package)
-        return web.json_response({"ok": True, "package": package})
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_agents_install(request: web.Request) -> web.Response:
-    """POST /api/capability/agents/install — install an agent package."""
-    return await _mutate_agent_package(request, install=True)
-
-
-async def api_capability_agents_uninstall(request: web.Request) -> web.Response:
-    """POST /api/capability/agents/uninstall — uninstall an agent package."""
-    return await _mutate_agent_package(request, install=False)
-
-
-async def api_capability_plugins_list(request: web.Request) -> web.Response:
-    """GET /api/capability/plugins — installed plugin packages + the drift set.
-
-    Returns the installed rows AND ``out_of_sync`` in one response: the dashboard
-    renders them together (a list plus a "reconcile N packages" affordance), and
-    splitting them would mean two polls that can disagree mid-install.
-
-    The two reads are independent, so they run CONCURRENTLY rather than in
-    sequence. Each carries its own ``CAPABILITY_READ_TIMEOUT`` bound, and that
-    bound is sized tight precisely because the dashboard POLLS the list endpoints
-    — awaiting them one after the other would let a single request pend for twice
-    the designed budget and accumulate pending gateway tasks per poll, which is
-    the wedge class the bound exists to prevent. Gathering caps the endpoint at
-    one read bound and halves its latency.
-    """
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        plugins, out_of_sync = await asyncio.gather(mgr.list_plugins(), mgr.plugins_out_of_sync())
-        return web.json_response({"plugins": plugins, "out_of_sync": out_of_sync})
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_plugins_sync(request: web.Request) -> web.Response:
-    """POST /api/capability/plugins/sync — reconcile plugins with agent packages."""
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        res = await mgr.sync_plugins()
-        if not res.ok:
-            _audit_capability("capability_plugins_sync", "error", "*")
-            message = (res.message or "sync failed")[:500]
-            return web.json_response({"error": _redact_external(message)}, status=500)
-        state: DashboardState = request.app["state"]
-        state.push_refresh("agents")
-        _audit_capability("capability_plugins_sync", "ok", "*")
-        # Redacted AND length-bounded on the success path too: this message names
-        # what was reconciled and can carry edition subprocess output, so it gets
-        # the same treatment as the failure path rather than passing through raw.
-        return web.json_response(
-            {"ok": True, "message": _redact_external((res.message or "")[:500])}
-        )
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_agents_installed(request: web.Request) -> web.Response:
-    """GET /api/agents/installed — list all installed kiro-cli agents.
-
-    kirocrew is always first; kirocrew-lite is excluded.
-
-    Deliberately GLOBAL-only (no project scope): every frontend consumer of this
-    endpoint is an agent CRUD/editor surface (Agents page, template editor) whose
-    actions persist into the global configuration — "Set as default" writes the
-    selected name into ``cfg.agents``. A project-scope row here would let that
-    action persist a name that exists only inside one checkout, producing a
-    default agent the config cannot resolve. Project-scope discovery instead
-    reaches the surfaces that DISPATCH agents: per-turn resolution
-    (``resolve_agent_bindings(..., project_dir=...)``), spawn validation, and
-    Slack — see ``agent_discovery.project_agent_names``.
-    """
-    # list_agents() does glob + per-file resolve(strict=True) + read_bytes +
-    # json.loads over ~/.kiro/agents — blocking filesystem work that, on a large
-    # agents dir (network home, many project-registry agents), can stall the
-    # event loop past the loop-stall watchdog when a browser loads the dashboard.
-    # Offload to the discovery pool, same as /api/skills.
-    def _collect() -> list[Any]:
-        agents = list(list_agents())
-        agents.sort(key=lambda a: (0 if a.name == "kirocrew" else 1, a.name))
-        return agents
-
-    agents = await asyncio.get_running_loop().run_in_executor(discovery_executor(), _collect)
-    return web.json_response([a.to_dict() for a in agents])
-
-
 def _normalize_model_key(name: str) -> str:
     """Canonical key for de-duping CC model ids across spelling variants.
 
-    The claude-agent-acp adapter advertises dashed ids (``claude-opus-4-7``)
-    while curated/config entries may use dotted versions (``claude-opus-4.7``);
-    case can also differ. Without normalization the same model surfaces twice in
-    the dropdown (one curated row + one advertised row). Lowercase and fold
-    ``.``→``-`` so equivalent ids collapse to one entry. ``default`` and ``auto``
-    both mean "let the backend pick", so they map to a single key too.
+    Mirrors ``normalizeModelKey`` in ``website/src/lib/model.ts``: both route a
+    model id through the shared canonical registry (``model_registry.json``) so
+    "same model?" has ONE definition across the dashboard (dropdown dedup, slot
+    display, and the subagent downgrade flag).
+
+    Resolution order:
+    1. ``auto``/``default``/unset -> the ``auto`` sentinel (both mean "let the
+       backend pick"); an empty id stays ``""`` (no pin, distinct from Auto).
+    2. Registry canonical key: a canonical key, a registry alias, or a
+       claude_code provider id -- with or without a region/vendor routing prefix
+       (``us.anthropic.…``, ``global.anthropic.…``) -- folds to its canonical
+       key. This makes an alias and its provider-prefixed canonical id equal
+       (``us.anthropic.claude-opus-4-8[1m]`` == ``claude-opus-4.8`` ->
+       ``opus-4.8-1m``) while keeping DISTINCT registry entries distinct -- the
+       advertised dashed ``claude-opus-4-8`` (200K, ``opus-4.8``) does NOT fold
+       onto dotted ``claude-opus-4.8`` (1M, ``opus-4.8-1m``); a bare
+       ``.``->``-`` fold conflates those two different-window models.
+    3. Fallback for an id the registry does not list (GPT/DeepSeek/Qwen, future
+       models, operator-typed ids): a lossless fold -- lowercase,
+       ``.``->``-`` -- so behavior is identity-preserving off the registered set,
+       matching ``from_provider_id``'s pass-through contract.
     """
-    key = (name or "").strip().lower().replace(".", "-")
-    if key in ("default", "auto"):
+    string_fold = (name or "").strip().lower().replace(".", "-")
+    if not string_fold:
+        return ""
+    if string_fold in ("default", "auto"):
         return "auto"
-    return key
+    # Registry lookups are exact and its keys/aliases/provider-ids are all
+    # lowercase, so resolve on the lowercased id. canonical_key resolves
+    # acp-first then claude_code AND peels a known routing prefix, so it covers
+    # both spelling halves above; a miss returns None.
+    resolved = model_registry.canonical_key((name or "").strip().lower())
+    if resolved is not None:
+        return resolved
+    return string_fold
 
 
-def _advertised_cc_models(request: web.Request) -> list[dict]:
-    """Map the first active CC provider's advertised models to the API shape.
+def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
+    """Map a live provider's advertised models to the API shape, per namespace.
 
-    claude-agent-acp captures its real versioned list at session init (see
-    AcpClient._capture_available_models). Backend provider ids are mapped back to
-    canonical registry keys (``from_provider_id``) so they dedup cleanly against
-    the registry rows in :func:`_cc_models` and the wire value stays canonical.
-    A provider id with no registry entry passes through unchanged (forward-compat
-    for models the registry doesn't list yet). Returns ``[]`` when no session has
-    initialized or the backend advertised nothing.
+    ``model_name`` is the advertised id verbatim: it is the wire value sent back
+    on selection, and the adapter only accepts ids it advertised.
+
+    A live session wins. With none live (a cold dashboard, a gateway restart, a
+    cold-start timeout) the list is the namespace's cross-session snapshot,
+    ``model_registry.advertised_models``, which every advertising session writes:
+    "no session is up" is not "nothing is advertised", and an id the catalog does
+    not list reaches a picker ONLY through this list. Returns ``[]`` only when the
+    snapshot is empty too (a genuine first run) or the backend advertised nothing.
+
+    Two filters, and both are load-bearing. The CAPABILITY gate
+    (``SessionCapabilities.resolves_model_from_advertised_list``) is the property
+    this list depends on: a backend whose served list is the only source of ids it
+    accepts back is exactly the backend whose advertised list has to be read. The
+    NAMESPACE gate (``model_id_namespace``) is whose ids these are. Harnesses
+    can advertise different served ids, so a retained claude session would
+    otherwise answer the codex picker with claude ids --
+    every one of which codex refuses.
+
+    Newest matching session first, like :func:`_entitled_kiro_models`: forward
+    order is creation order, so the most recently started session carries the most
+    recent snapshot of what the account is served.
     """
     try:
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
-        return []
-    for provider in providers:
+        providers = []
+    for provider in reversed(providers):
+        # Read each field straight off ``capabilities_of(provider)``: binding it to a
+        # local would be a second spelling of the question, which the one-spelling
+        # ratchet in test_agent_sdk_capabilities.py exists to keep greppable.
+        if not capabilities_of(provider).resolves_model_from_advertised_list:
+            continue
+        if capabilities_of(provider).model_id_namespace != namespace:
+            continue
         getter = getattr(provider, "available_models", None)
         if not callable(getter):
             continue
@@ -709,46 +589,60 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
         if advertised:
             return [
                 {
-                    "model_name": model_registry.from_provider_id(
-                        m.get("modelId", ""), "claude_code"
-                    ),
+                    "model_name": m.get("modelId", ""),
                     "display_name": m.get("name", "") or m.get("modelId", ""),
                     "description": m.get("description", ""),
                 }
                 for m in advertised
                 if m.get("modelId")
             ]
-    return []
+    return [
+        {"model_name": m, "display_name": m, "description": ""}
+        for m in model_registry.advertised_models(namespace)
+    ]
 
 
-def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
+async def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
     """Narrow the ``--list-models`` catalog to what a live session advertises.
 
     ``kiro chat --list-models`` is a CATALOG, not an entitlement: it returns the
-    same rows whatever the account's tier, so after a downgrade the picker kept
-    offering (and kept SHOWING as selected) a model no turn can run. The
-    per-session ``session/new`` ``availableModels`` list is the tier-aware one —
-    the same signal ``model_is_unusable`` pre-flights against before the wire —
-    so when a live session has one, it wins here too. Same rule #1549 applied to
-    the claude_code branch in :func:`_cc_models`: advertised is authoritative
-    when present.
+    same rows whatever the account's tier, so after a downgrade it still offers
+    (and still SHOWS as selected) a model no turn can run. The per-session
+    ``session/new`` ``availableModels`` list is the tier-aware one — the same
+    signal ``model_is_unusable`` pre-flights against before the wire — so when a
+    live session has one, it wins here too. Same rule as the claude_code branch
+    in :func:`_cc_models`: advertised is authoritative when present.
 
     The keep/drop decision delegates to ``model_is_unusable`` rather than
     comparing ids here, so the picker cannot disagree with the wire about what
     "this account can run" means. A local comparison would be a second spelling
     of that question — the exact drift that predicate exists to prevent — and any
     difference in how the two fold spelling variants shows up as a row the picker
-    offers and the wire then withholds.
+    offers and the wire then withholds. A literal miss is retried through
+    ``resolve_pin_spelling``, the same namespace fold the wire sites apply
+    before withholding — but the row is REWRITTEN to the advertised spelling
+    the fold answers with (and dropped when another row already offers that
+    spelling): the selection sinks (the agent/crew pin validator and
+    ``set_model``'s pre-flight) compare the picked value literally, so a row
+    must carry an id they accept verbatim, not the catalog's stale
+    ``<namespace>::<bare-id>`` qualifier it resolved from.
 
     The ``auto`` sentinel is never filtered: it means "inherit whatever the
     session already resolved", so it stays selectable even on a backend that does
     not advertise it by name.
 
-    Fails open in every unknowable case — no live session, a backend that
-    advertises nothing, or an advertised set that does not intersect the catalog
-    at all (a namespace mismatch rather than an entitlement, e.g. the claude
-    backend's bare ids). Filtering on any of those would empty the picker, which
-    is worse than listing one model too many.
+    Only a session whose ids live in the catalog's own namespace can narrow it
+    (``capabilities_of(provider).model_id_namespace``, the same gate
+    :func:`_advertised_cc_models` applies). A live claude session advertises
+    ``global.anthropic.…[1m]`` ids; ``resolve_pin_spelling`` folds those onto the
+    catalog's bare ids because they name the same models, so without the gate a
+    claude list would rewrite kiro's picker rows into claude's spelling and narrow
+    them to claude's entitlements. Namespace is the question here, not spelling.
+
+    Fails open in every unknowable case — no live session in this namespace, a
+    backend that advertises nothing, or an advertised set that does not intersect
+    the catalog at all under any spelling. Filtering on any of those would empty
+    the picker, which is worse than listing one model too many.
     """
     try:
         state: DashboardState = request.app["state"]
@@ -756,6 +650,7 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     except (KeyError, AttributeError):
         return models
     advertised: list[str] = []
+    catalog_ids = [m.get("model_name", "") for m in models]
     # Newest session first. `active_providers()` walks a dict of live sessions, so
     # forward order is creation order — and a session that started BEFORE a plan
     # change still holds the advertised list it captured at its own session/new.
@@ -763,6 +658,10 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     # entitlements, i.e. keep offering exactly the models this narrowing exists to
     # hide. The most recently started session carries the most recent snapshot.
     for provider in reversed(providers):
+        if capabilities_of(provider).model_id_namespace != model_registry_namespace(
+            ACP_BACKEND_KIRO
+        ):
+            continue
         getter = getattr(provider, "available_models", None)
         if not callable(getter):
             continue
@@ -770,25 +669,73 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
             ids = advertised_model_ids(getter())
         except Exception:
             continue
-        if ids:
-            advertised = ids
-            break
+        if not ids:
+            continue
+        # The snapshot for the session that will narrow the picker gets a chance
+        # to prove itself first. When it would drop a catalog model, the read
+        # path has no explicit-pick refusal to trigger the refresh-before-refuse
+        # heal, so an unconfirmed startup-race snapshot would silently hide
+        # entitled models here. ``maybe_refresh_available_models`` is declared on
+        # the provider ABC (default: return the current snapshot), owns the
+        # staleness heuristic and the single-flight, fail-open probe; a probe
+        # that fails or agrees leaves ``ids`` exactly as they were.
+        try:
+            refreshed = advertised_model_ids(
+                await provider.maybe_refresh_available_models(catalog_ids)
+            )
+            if refreshed:
+                ids = refreshed
+        except EntitlementRevalidating:
+            # The probe is in flight past the deadline. Propagate so the endpoint
+            # returns its degraded response and the frontend polls again rather
+            # than caching the un-revalidated snapshot; the next read serves the
+            # landed result. Never swallowed as a fail-open.
+            raise
+        except Exception:
+            pass
+        advertised = ids
+        break
     if not advertised:
         return models
     advertises_auto = any(_normalize_model_key(i) == "auto" for i in advertised)
-    kept = [
-        m
+    offered: set[str] = {
+        _normalize_model_key(m.get("model_name", ""))
         for m in models
         if _normalize_model_key(m.get("model_name", "")) == "auto"
         or not model_is_unusable(m.get("model_name", ""), advertised)
-    ]
+    }
+    kept: list[dict] = []
+    for m in models:
+        name = m.get("model_name", "")
+        # The per-row keep/drop verdict is shared with the read-path
+        # revalidation, so the probe decision and this filter agree on which
+        # rows a snapshot hides.
+        if catalog_row_would_drop(name, advertised):
+            continue
+        if _normalize_model_key(name) == "auto" or not model_is_unusable(name, advertised):
+            kept.append(m)
+            continue
+        resolved = resolve_pin_spelling(name, advertised)
+        if not resolved:
+            continue
+        key = _normalize_model_key(resolved)
+        # Another row (literal or already-rewritten) offers this advertised
+        # spelling: emitting a second one would show duplicate rows for one
+        # model, so the qualified duplicate drops.
+        if key in offered:
+            continue
+        offered.add(key)
+        kept.append({**m, "model_name": resolved})
     # Tell "not comparable" apart from "entitled to almost nothing". A backend
     # that advertises `auto` shares a namespace with the catalog by definition, so
     # `auto` alone is a real answer — the most restricted tier there is — and must
     # narrow the picker to it. Only when nothing at all lines up, `auto` included,
     # is this a namespace mismatch (bare vs prefixed provider ids) where showing
     # the whole catalog beats emptying the picker. `auto` is always kept, so it can
-    # never serve as the evidence that the two sides are comparable.
+    # never serve as the evidence that the two sides are comparable. A row
+    # rewritten through the ``resolve_pin_spelling`` retry IS such evidence: a
+    # peeled match proves the two vocabularies line up once the qualifier is
+    # removed.
     if not advertises_auto and not any(
         _normalize_model_key(m.get("model_name", "")) != "auto" for m in kept
     ):
@@ -803,26 +750,28 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     only source that reflects entitlement: claude-agent-acp captures it at session
     init from what the signed-in account is actually served. The registry is a
     static catalog of everything KiroCrew knows how to name, so a free-tier user
-    used to be offered the full flagship list and only discovered the truth when a
-    prompt failed.
+    shown it unfiltered is offered the full flagship list and discovers the truth
+    only when a prompt fails.
 
     So when anything is advertised, registry rows are FILTERED DOWN to it (keeping
     the registry's cleaner display names for the survivors), and advertised models
     the registry does not list are appended for forward-compat.
 
-    When NOTHING is advertised the registry is shown unfiltered. That is not a
-    fallback to the old behaviour by preference -- an empty advertised set means
-    "no session has initialized yet", which is indistinguishable from "this account
-    gets nothing", and showing an empty picker on a cold dashboard would be worse
-    than showing a superset.
+    With no session live the advertised set is the last snapshot any session
+    wrote (:func:`_advertised_cc_models`), so a cold dashboard filters the same
+    way. Only when NOTHING was ever advertised is the registry shown unfiltered.
+    That is not a preference for the unfiltered list -- an empty set then means
+    "no session has ever initialized", which is indistinguishable from "this
+    account gets nothing", and showing an empty picker on a first run would be
+    worse than showing a superset.
 
     ``auto`` is always present and always FIRST. It is the configured default
     (``config.agent.model``) and a sentinel rather than a real model, so it is
     never filtered by entitlement. It leads the list because the registry's own
-    ``default: true`` flag sorts the current flagship to the top, which presented
-    a specific paid model as the default in the picker.
+    ``default: true`` flag sorts the current flagship to the top, which would
+    present a specific paid model as the default in the picker.
     """
-    advertised = _advertised_cc_models(request)
+    advertised = _advertised_cc_models(request, "claude_code")
     registry_rows = model_registry.display_list("claude_code")
 
     if advertised:
@@ -841,13 +790,18 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
         ]
 
     merged: list[dict] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     for entry in (*registry_rows, *advertised):
         name = entry.get("model_name", "")
         key = _normalize_model_key(name)
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
+        if key in seen:
+            # Collision: registry keeps display, advertised id keeps the wire value.
+            if key != "auto":
+                merged[seen[key]] = {**merged[seen[key]], "model_name": name}
+            continue
+        seen[key] = len(merged)
         merged.append(entry)
     # "auto" leads. It may be absent entirely if a future registry drops the row,
     # so synthesize it rather than assuming the filter above preserved one.
@@ -856,7 +810,7 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     ]
     if not any(_normalize_model_key(e.get("model_name", "")) == "auto" for e in merged):
         merged.insert(0, {"model_name": "auto", "display_name": "Auto", "description": ""})
-        seen.add("auto")
+        seen = {_normalize_model_key(e.get("model_name", "")): i for i, e in enumerate(merged)}
     # Guarantee the configured default is present (e.g. a custom cc_model the
     # backend doesn't advertise) so the selected model never vanishes. Resolve it
     # to its canonical key first (it may be stored as a provider id or alias) so a
@@ -884,8 +838,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -904,6 +861,53 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     return merged
 
 
+def _advertised_backend_models(
+    request: web.Request, backend: str, configured_default: str = ""
+) -> list[dict]:
+    """Assemble model choices from one ACP backend's advertised namespace.
+
+    A live session wins over the cross-session cache. Both sources retain the
+    adapter's exact model ids, which may be provider/model pairs for Pi. A cold
+    cache offers ``auto`` and, when set, the configured default until the first
+    session advertises its choices.
+    """
+    namespace = model_registry_namespace(backend)
+    advertised = _advertised_cc_models(request, namespace)
+
+    rows: list[dict] = [
+        {"model_name": "auto", "display_name": "Auto", "description": "Backend default"}
+    ]
+    seen: set[str] = {"auto"}
+    for entry in advertised:
+        name = str(entry.get("model_name", "") or "").strip()
+        if not name or _normalize_model_key(name) == "auto" or name in seen:
+            continue
+        seen.add(name)
+        rows.append(
+            {
+                "model_name": name,
+                "display_name": entry.get("display_name") or name,
+                "description": entry.get("description", ""),
+            }
+        )
+    default = (configured_default or "").strip()
+    if (
+        default
+        and _normalize_model_key(default) != "auto"
+        and default not in seen
+        and not advertised
+    ):
+        rows.insert(
+            1, {"model_name": default, "display_name": default, "description": "Configured default"}
+        )
+    for entry in rows:
+        entry["context_window"] = (
+            model_registry.model_window(entry["model_name"])
+            or model_registry.REFERENCE_WINDOW_TOKENS
+        )
+    return rows
+
+
 def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
     """Sandbox-wrap the ``--list-models`` argv at the configured tier.
 
@@ -916,16 +920,493 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
     ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
     only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
     shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
-    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
-    misclassification skips the delegation branch — and with it the credential-env
-    scrub — so the child would inherit the sensitive environment. Both ACP spawn
-    paths pass this flag for the same reason.
+    read as "not kiro-cli". The positive classification is also the security gate
+    for default Windows delegation to Kiro's internal sandbox; basename inference
+    cannot grant it. Both ACP spawn paths pass this flag for the same reason.
     """
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
 
+def _scoped_default(cfg: Any, backend: str) -> str:
+    """The stored pin, but only when *backend*'s own harness can claim it.
+
+    A pin chosen in another harness is not a default here: marking it as one puts
+    an id the returned list does not even contain into the picker's selected slot,
+    while every turn runs the harness default. Same rule the provider factory
+    sends by, so the marker and the wire agree.
+
+    Called from the two branches that read the pin rather than once above them:
+    the kiro branch does not consult ``agent.model`` at all, and pulling the read
+    up would make it pay for a value it never uses (harness-parity H13 -- the
+    test is whether the kiro path changed, not whether it still works).
+    """
+    return model_scope.scoped_pin(
+        getattr(cfg.agent, "model", "") or "",
+        capabilities_for(backend).model_id_namespace,
+        source="api_models",
+        log_level=logging.DEBUG,
+    )
+
+
+#: The ``code`` on an ordinary degraded ``/api/models`` 503 (binary unresolved,
+#: timeout, non-zero exit, empty / invalid output). A machine tag the dashboard
+#: renders as its generic config-load notice; the expired-login path overrides it
+#: with :data:`KIRO_PREREQUISITE_REQUIRED_CODE`. Every ``/api/models`` 503 carries
+#: a code, matching the endpoint's other degraded answers.
+_CATALOG_UNAVAILABLE_CODE = "model_list_unavailable"
+
+
+class _CatalogUnavailable(Exception):
+    """A degraded catalog fetch outcome that maps to one 503 body.
+
+    The fetch runs in a shared background task that cannot return an HTTP
+    response, so each degraded outcome (binary unresolved, timeout, non-zero
+    exit, empty / invalid output) raises this carrying its error message, and
+    the request path renders a dict-literal 503 body from it — one 503 per
+    outcome. The message is carried, not a response dict, so the single render
+    site stays a dict literal the error-code ratchet can scan.
+
+    ``backoff`` says whether the outcome is held in the cache's negative entry
+    (see :data:`_LIST_MODELS_FAILURE_BACKOFF_SECS`). It is true for every outcome
+    of a spawn that ran. An unresolved binary spawns nothing and resolves on its
+    own shortly after start, so it is retried on the next poll.
+
+    ``code`` is the machine tag the 503 body carries beside ``error`` so a client
+    tells one degraded cause from another, the same contract the sibling 503s on
+    this endpoint already carry (``model_list_revalidating``,
+    ``model_list_sandbox_unavailable``). It defaults to
+    :data:`_CATALOG_UNAVAILABLE_CODE` for the ordinary degraded outcomes (binary
+    unresolved, timeout, non-zero exit, empty / invalid output), which the
+    dashboard renders as its generic config-load notice; the expired / signed-out
+    login path passes :data:`KIRO_PREREQUISITE_REQUIRED_CODE` instead, which the
+    dashboard renders as the one actionable "run ``kiro-cli login``" message.
+    """
+
+    def __init__(self, error: str, *, backoff: bool = True, code: str = _CATALOG_UNAVAILABLE_CODE):
+        super().__init__(error)
+        self.error = error
+        self.backoff = backoff
+        self.code = code
+
+
+def _bounded_catalog(models: list[dict]) -> list[dict]:
+    """Clamp a parsed catalog to what the cache may safely retain.
+
+    The retention point (:data:`_catalog_cache`) holds the list past the request,
+    so it is bounded here before it is stored, through the SAME admission the
+    window / advertised stores use — ``model_registry.ADVERTISED_MODELS_MAX_IDS``
+    rows, each identifying field (``model_name`` / ``model_id``) at most
+    ``ADVERTISED_MODEL_ID_MAX_CHARS`` — so the cache cannot serve an id those
+    stores refused. An over-long id is REFUSED (its whole row skipped), never
+    truncated, matching :func:`model_registry.admit_catalog_rows`'s own
+    invariant; the picker reads the name, so a sliced name would name a different
+    model or none.
+
+    Each remaining scalar field (str / int / float / bool / None) is kept, with
+    strings clamped to the id-length bound and a row holding at most
+    :data:`_CATALOG_CACHE_MAX_FIELDS_PER_ROW`; a non-scalar field (nested object
+    or array) is dropped — no reader of the cached list consumes one, and it is
+    the unbounded edge the retention bound exists to close. Row ORDER is
+    preserved (readers treat catalog order as meaningful). Rows and fields
+    discarded for any reason are counted and logged once per snapshot.
+    """
+    max_rows = model_registry.ADVERTISED_MODELS_MAX_IDS
+    max_chars = model_registry.ADVERTISED_MODEL_ID_MAX_CHARS
+    bounded: list[dict] = []
+    dropped_rows = 0
+    dropped_fields = 0
+    for row in models:
+        if len(bounded) >= max_rows:
+            dropped_rows += 1
+            continue
+        if not isinstance(row, dict):
+            dropped_rows += 1
+            continue
+        # Refuse (skip) a row whose identifying field is over-long, rather than
+        # slicing it into an id no store retained.
+        ident = row.get("model_name") or row.get("model_id")
+        if isinstance(ident, str) and len(ident) > max_chars:
+            dropped_rows += 1
+            continue
+        kept: dict = {}
+        for key, value in row.items():
+            if len(kept) >= _CATALOG_CACHE_MAX_FIELDS_PER_ROW:
+                dropped_fields += 1
+                continue
+            # The KEY is a retained string too: refuse (skip) an over-long one
+            # rather than cache it, so no retained string is unbounded.
+            if isinstance(key, str) and len(key) > max_chars:
+                dropped_fields += 1
+                continue
+            if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+                kept[key] = value
+            elif isinstance(value, str):
+                kept[key] = value[:max_chars]
+            else:
+                # Non-scalar (nested dict/list): dropped — unbounded and unread.
+                dropped_fields += 1
+        bounded.append(kept)
+    if dropped_rows or dropped_fields:
+        logger.warning(
+            "api_models: catalog cache dropped %d row(s) and %d field(s) over the "
+            "retention bound (max_rows=%d, max_id_chars=%d)",
+            dropped_rows,
+            dropped_fields,
+            max_rows,
+            max_chars,
+        )
+    return bounded
+
+
+@dataclasses.dataclass
+class _CatalogCache:
+    """The last good ``--list-models`` catalog, kept in memory only.
+
+    One slow success is enough: once ``models`` is set, every request is served
+    from it (after per-request entitlement narrowing) while a stale entry is
+    refreshed behind the reply. A gateway restart drops it, so the first request
+    after a restart pays the cold start again — the catalog is not persisted,
+    which keeps a downgraded account's stale rows from surviving a restart.
+
+    ``task`` single-flights the fetch: concurrent polls (and the 8s self-heal
+    loop) share one spawn rather than each starting its own cold start.
+
+    ``failure`` is the negative entry: the 503 message of the last failed fetch,
+    and ``failed_at`` when it ended. Inside :data:`_LIST_MODELS_FAILURE_BACKOFF_SECS`
+    the request path answers that 503 instead of spawning again. Only the message
+    is held, not the exception, so no traceback frame outlives the fetch. A
+    successful fetch clears it. ``failure_code`` rides alongside it so a held
+    auth-expiry 503 keeps its :data:`KIRO_PREREQUISITE_REQUIRED_CODE` tag through
+    the backoff window rather than decaying to a generic body on the next poll.
+    """
+
+    models: list[dict] | None = None
+    fetched_at: float = 0.0
+    task: "asyncio.Task[list[dict]] | None" = None
+    failure: str | None = None
+    failure_code: str = _CATALOG_UNAVAILABLE_CODE
+    failed_at: float = 0.0
+
+    def recent_failure(self) -> tuple[str, str] | None:
+        """A fetch that failed inside the backoff window: its 503 message and code.
+
+        Returns ``None`` once the window has elapsed (the next poll re-spawns), so
+        a non-``None`` answer is always within backoff. The code is the second
+        element -- the generic ``model_list_unavailable`` for an ordinary degraded
+        outcome, or ``kiro_prerequisite_required`` for an expired login -- so the
+        request path renders the same body the failing fetch would have.
+        """
+        if self.failure is None:
+            return None
+        if time.monotonic() - self.failed_at >= _LIST_MODELS_FAILURE_BACKOFF_SECS:
+            return None
+        return self.failure, self.failure_code
+
+
+_catalog_cache = _CatalogCache()
+
+
+async def _fetch_kiro_catalog() -> list[dict]:
+    """Spawn ``kiro-cli --list-models`` once and return the catalog rows.
+
+    Calls the module-level ``resolve_kiro_bin_for_spawn`` /
+    ``resolve_ssh_auth_sock`` wrappers directly. They are imported from
+    ``kiro_crew.agent_sdk.drivers.acp`` — the agent-SDK surface, not a forbidden
+    root — so this background worker reaches the spawn helpers without adding an
+    ACP-layer edge (see ``scripts/check_agent_sdk_boundary.py``).
+
+    Returns the deprecated-stripped list, each row under the ``model_id`` its
+    session advertises (see ``wire_row`` below), and seeds the window/advertised caches —
+    the UNFILTERED-then-deprecated-stripped list, i.e. the response body before
+    per-request entitlement narrowing. Raises :class:`_CatalogUnavailable` for a
+    degraded outcome (binary unresolved, timeout, non-zero exit, empty / invalid
+    output) and lets :class:`SandboxUnavailableError` propagate; the request path
+    renders each as its own 503.
+
+    Bounded by :data:`_LIST_MODELS_BACKGROUND_TIMEOUT_SECS`, NOT the request wait,
+    so a cold start that outlasts one poll still finishes and warms the cache for
+    the next one.
+    """
+    from kiro_crew.env import augmented_path  # noqa: F811
+
+    kiro_bin = await resolve_kiro_bin_for_spawn()
+    if not kiro_bin:
+        # Degraded (binary not resolved yet), NOT a genuine "zero models" result.
+        # 503 so the client retries instead of caching an empty list — a cached
+        # [] renders an empty picker that only a manual page refresh recovers from.
+        raise _CatalogUnavailable("kiro binary not resolved", backoff=False)
+    argv = [kiro_bin, "chat", "--list-models", "--format", "json", "--no-interactive"]
+    # Mirror AcpClient._spawn() sandbox: wrap_argv + env + process isolation.
+    # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
+    # pipes); this is a one-shot read-only command, so we replicate the
+    # sandbox setup directly.  See the security-controls rule.
+    #
+    # The configured tier is passed EXPLICITLY rather than left to
+    # wrap_argv's "auto" parameter default, so this endpoint can never ask
+    # for stricter isolation than the chat spawn of the same binary. It
+    # matters wherever the operator set agent.sandbox="off" (deferring
+    # isolation to kiro-cli's own internal sandbox): the one-shot and chat
+    # path must have one posture. The explicit Kiro classification also
+    # makes the shipped "auto" tier work on Windows via Kiro's built-in
+    # sandbox instead of answering 503 on every 8s poll.
+    #
+    # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
+    # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
+    # can cold-probe the backend with a synchronous
+    # `subprocess.run(..., timeout=5)`. This runs behind the request, but a
+    # blocking call on the event loop still stalls chat, cron and the liveness
+    # heartbeat on exactly the host where the probe is slowest. Both reads run
+    # in the worker, so the mode is resolved there too rather than passed in.
+    #
+    # A remote hub proxying this endpoint budgets its WHOLE cold path (the
+    # sandbox detection, the list-models subprocess, and the up to
+    # _READ_PATH_PROBE_DEADLINE_SECS the read-path entitlement revalidation
+    # waits in _entitled_kiro_models) via
+    # DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+    # kiro_crew/instances/constants.py — 5 + 10 + 3 < 20. The per-request wait
+    # (_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS) is what that budget sizes against,
+    # NOT the longer background ceiling; growing the request wait means moving
+    # that constant with it.
+    argv, cleanup = await asyncio.get_running_loop().run_in_executor(
+        subprocess_executor(), _wrap_list_models_argv, argv
+    )
+    argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
+    try:
+        env = {**os.environ}
+        env["PATH"] = augmented_path(env.get("PATH", ""))
+        # OFF the loop: the resolver globs /tmp/ssh-*/agent.* and stats
+        # every hit, so its latency scales with the /tmp entry count. Its
+        # sibling wrapper's contract states it must never run on the event loop.
+        await asyncio.to_thread(resolve_ssh_auth_sock, env)
+        # The Docker entrypoint removes credentials from the long-lived
+        # gateway environment.  This fixed-argv child is the official
+        # kiro-cli and KIRO_API_KEY is its own model credential, so settle
+        # the same single key the interactive ACP spawn receives.  Keep
+        # the protected .env read off the gateway loop.
+        await asyncio.to_thread(inject_kiro_cli_api_key, env)
+        env = scrub_agent_subprocess_env(env)
+        # Supervised so the call ends whatever it leaves behind. A kiro-cli
+        # launcher wrapper can start a ~140-thread credential helper for each
+        # call and leave it running; the self-heal loop re-polls every 8s while
+        # degraded, so on a gateway on that path every poll leaked one until
+        # the agent cgroup ran out of pids.
+        proc = await spawn_supervised_oneshot(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_LIST_MODELS_BACKGROUND_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            # The whole group, while the supervisor still leads it: killing
+            # only the leader would leave the command and its helpers running.
+            await kill_and_reap(proc)
+            # A cold CLI spawn exceeded even the background ceiling. 503 so the
+            # client keeps its last-good list and polls again rather than caching
+            # a successful empty result.
+            logger.warning("api_models: --list-models timed out; returning 503")
+            raise _CatalogUnavailable("model list timed out")
+    finally:
+        if cleanup and callable(cleanup):
+            cleanup()
+
+    if proc.returncode != 0:
+        from kiro_crew.platform import redact_via_context  # noqa: F811
+
+        stderr_tail = stderr.decode(errors="replace").strip()
+        stderr_tail = redact_via_context(stderr_tail)[-_MODEL_LIST_STDERR_TAIL_CHARS:]
+        logger.warning(
+            "api_models: --list-models exited %s: %s; returning 503",
+            proc.returncode,
+            stderr_tail or "<no stderr>",
+        )
+        # Classify the ONE non-zero exit that is not a degraded backend blip: an
+        # expired / signed-out kiro-cli login. ``--list-models`` fails that way
+        # mid-session once the token lapses, and the generic 503 below rendered as
+        # the dashboard's "Failed to load config." — pointing the user at retry /
+        # switch-model, neither of which can fix auth. The readiness gate above
+        # cannot catch an EXPIRED login: its latch was verified true at startup
+        # and is stale here. ``is_auth_failure_output`` is the SAME classifier the
+        # ACP error-frame and spawn-stderr paths already use (401 / 403, expiry
+        # wording, rejected bearer, the named service exceptions), so this adds no
+        # new auth vocabulary. The stderr is already redacted above, so no token
+        # reaches this branch or the error carried out of it.
+        if is_auth_failure_output(stderr_tail):
+            raise _CatalogUnavailable(
+                host_auth.signed_out_message(ACP_BACKEND_KIRO),
+                code=KIRO_PREREQUISITE_REQUIRED_CODE,
+            )
+        raise _CatalogUnavailable("model list command failed")
+
+    if not stdout.strip():
+        logger.warning("api_models: --list-models returned empty output; returning 503")
+        raise _CatalogUnavailable("model list returned empty output")
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "api_models: --list-models returned invalid JSON (%s); returning 503",
+            exc,
+        )
+        raise _CatalogUnavailable("model list returned invalid JSON")
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        logger.warning("api_models: --list-models returned an invalid payload; returning 503")
+        raise _CatalogUnavailable("model list returned an invalid payload")
+    models = data["models"]
+    # Seed the central window authority from kiro's authoritative structured
+    # 'context_window_tokens' field (keyed by model_id/model_name). This is
+    # the ONE place these rows enter the system; every other consumer (the
+    # ACP backfill, the context-budget scaler, the live meter) then resolves
+    # through model_registry.model_window() rather than re-reading kiro. The
+    # in-memory update is synchronous (cheap dict mutation); only the disk
+    # persist is offloaded to an executor so the event loop never blocks on
+    # filesystem I/O (no blocking call on the event loop).
+    #
+    # This fork keeps kiro's bare-dotted ids as the picker WIRE FORMAT
+    # (guarded by _model_rejected_reason / api_chat_slot_model, which rejects
+    # canonical registry keys the ACP CLI can't accept). The upstream
+    # registry-key canonicalization is deliberately NOT ported — it is
+    # incompatible with this fork's _model_rejected_reason guard. The window
+    # seeding above uses kiro's authoritative context_window_tokens to give
+    # the backfill real GPT/DeepSeek/Qwen windows, independent of the
+    # wire-format choice.
+    #
+    # The same rows also warm the ``acp`` advertised-model cache, kiro's
+    # VOCABULARY: which ids are kiro's own, so model_scope can tell a pin
+    # chosen for another harness from one chosen here before any session
+    # exists (the chip and the provider factory judge from the cache; the
+    # wire holds the live list). ONE admission feeds both caches
+    # (refresh_kiro_catalog), so an id the bound refuses gets no row in
+    # either. Fed from the UNFILTERED catalog on purpose: a deprecated or
+    # unentitled row is still a kiro id, and dropping it here would make
+    # model_scope call a native pin foreign. Entitlement stays with the
+    # live ``session/new`` list downstream (_entitled_kiro_models,
+    # model_is_unusable) -- ``--list-models`` is a catalog and no reader
+    # of this cache treats it as more. Sourced here rather than from any
+    # ``session/new`` payload because the registry attributes that payload
+    # to claude-agent-acp and a kiro session's list is scoped to the agent
+    # that session started. In-memory updates on the loop, disk persists
+    # off it.
+    windows_changed, advertised_changed = model_registry.refresh_kiro_catalog(
+        models, model_registry_namespace(ACP_BACKEND_KIRO)
+    )
+    if windows_changed:
+        await asyncio.get_running_loop().run_in_executor(
+            maintenance_executor(), model_registry.persist_kiro_windows
+        )
+    if advertised_changed:
+        await asyncio.get_running_loop().run_in_executor(
+            maintenance_executor(), model_registry.persist_advertised_models
+        )
+
+    def wire_row(row: dict) -> dict:
+        # Every reader downstream treats a row's ``model_name`` as the model id:
+        # the entitlement narrowing judges it against the live ``session/new``
+        # ``availableModels`` ids, the pin validators compare it literally, and
+        # the picker sends it to ``session/set_model``. kiro-cli prints a
+        # ``model_id`` beside the name, and a model can carry a display name that
+        # differs from its id. ``session/new`` advertises the ``model_id``, so a
+        # row left under its printed name is never found among the advertised ids
+        # and the picker hides a model the account can run. Such a row is served
+        # under the ``model_id``, with the printed name kept as ``display_name``;
+        # a row with no usable ``model_id`` is returned unchanged. Nested rather
+        # than module-level: the facade's definitions are pinned by
+        # ``test/test_dashboard_agents_composition_contract.py``.
+        model_id = row.get("model_id")
+        name = row.get("model_name")
+        if not isinstance(model_id, str) or not model_id.strip() or model_id == name:
+            return row
+        label = name if isinstance(name, str) and name.strip() else model_id
+        return {**row, "model_name": model_id, "display_name": row.get("display_name") or label}
+
+    return [wire_row(m) for m in models if not is_deprecated_model(m.get("model_name", ""))]
+
+
+def _shared_catalog_fetch() -> "asyncio.Task[list[dict]]":
+    """Return the in-flight catalog fetch, starting one if none is running.
+
+    Single-flight: concurrent polls share one spawn. The task caches its result
+    (and clears itself) when it finishes, so the next poll after a slow success
+    is served straight from the cache rather than starting another cold start.
+    """
+    existing = _catalog_cache.task
+    if existing is not None and not existing.done():
+        return existing
+
+    async def _run() -> list[dict]:
+        try:
+            models = await _fetch_kiro_catalog()
+        except _CatalogUnavailable as exc:
+            # Remember a failed spawn so the polls inside the backoff window
+            # answer its 503 without spawning again (see recent_failure). The
+            # code rides along so an expired-auth hold keeps its sign-in tag.
+            if exc.backoff:
+                _catalog_cache.failure = exc.error
+                _catalog_cache.failure_code = exc.code
+                _catalog_cache.failed_at = time.monotonic()
+            raise
+        finally:
+            # Release the single-flight slot the moment this attempt ends,
+            # win or lose, so a failed fetch does not wedge every later poll.
+            _catalog_cache.task = None
+        # Bound the retained list before it enters the one store that outlives
+        # the request (see _bounded_catalog).
+        bounded = _bounded_catalog(models)
+        _catalog_cache.models = bounded
+        _catalog_cache.fetched_at = time.monotonic()
+        _catalog_cache.failure = None
+        _catalog_cache.failure_code = _CATALOG_UNAVAILABLE_CODE
+        return bounded
+
+    task = asyncio.ensure_future(_run())
+    _catalog_cache.task = task
+    # A stale-while-revalidate refresh is fire-and-forget: the request path
+    # returns the cached list without awaiting this task, so a degraded refresh
+    # (expired auth, background-ceiling timeout, SandboxUnavailableError) would
+    # leave an unretrieved exception that crash_guard's asyncio handler logs as a
+    # full crash record at the 8s poll cadence. Consume it here: a failed refresh
+    # keeps the last-good cache and is a debug line, not a crash.
+    task.add_done_callback(_consume_refresh_exception)
+    return task
+
+
+def _consume_refresh_exception(task: "asyncio.Task[list[dict]]") -> None:
+    """Retrieve a finished refresh task's exception so it is never 'unhandled'.
+
+    A cached catalog means a degraded background refresh is non-fatal — the
+    request path already served the last-good list — so its exception is logged
+    at debug and swallowed rather than left for ``Task.__del__`` to escalate.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("api_models: background catalog refresh failed (serving cached)", exc_info=exc)
+
+
 async def api_models(request: web.Request) -> web.Response:
-    """GET /api/models — list available models from the live kiro-cli ACP session."""
+    """GET /api/models — the model list for the configured backend.
+
+    kiro-family backends read kiro-cli's ``--list-models`` catalog (narrowed to a
+    live session's entitlement); advertised-selection backends read their own
+    adapter's namespace, because they do not accept ids from that catalog.
+    """
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    backend = getattr(cfg.agent, "acp_backend", "")
+    if backend == ACP_BACKEND_CLAUDE:
+        return web.json_response(
+            _cc_models(request, configured_default=_scoped_default(cfg, backend))
+        )
+    if capabilities_for(backend).resolves_model_from_advertised_list:
+        return web.json_response(
+            _advertised_backend_models(
+                request, backend, configured_default=_scoped_default(cfg, backend)
+            )
+        )
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),
@@ -934,138 +1415,79 @@ async def api_models(request: web.Request) -> web.Response:
     # opened a browser window every 8s indefinitely. The 503 is the same
     # degraded response the timeout/unresolved branches already return, so the
     # client contract is unchanged; only the subprocess is skipped.
+    #
+    # Keep the tight destructive bound here: this endpoint polls only while the
+    # model list is a degraded fallback and stops the instant a live fetch wins
+    # (website/src/providers/modelListHealth.ts), so it is not polled at all when
+    # healthy and gains no latency from a wider window. Its only server-side
+    # cooldown is the short failure backoff below, so a wide stale-authorize window
+    # would still let a stale ready=True latch spawn a browser-opening login on
+    # most degraded ticks.
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked
-    kiro_bin: str | None = None
     try:
-        from kiro_crew.acp.client import (  # noqa: F811
-            _resolve_kiro_bin_for_spawn,
-            _resolve_ssh_auth_sock,
-        )
-        from kiro_crew.env import augmented_path  # noqa: F811
+        cached = _catalog_cache.models
+        if cached is not None:
+            # Serve the last good catalog straight away; a stale one is refreshed
+            # behind the reply (stale-while-revalidate). Entitlement narrowing
+            # still runs on every request, so a plan change is reflected now even
+            # when the catalog rows themselves are a few minutes old.
+            # A refresh that just failed is not retried until its backoff ends.
+            stale = time.monotonic() - _catalog_cache.fetched_at >= _LIST_MODELS_CATALOG_TTL_SECS
+            if stale and _catalog_cache.recent_failure() is None:
+                _shared_catalog_fetch()
+            models = await _entitled_kiro_models(request, list(cached))
+            return web.json_response(models)
 
-        kiro_bin = await _resolve_kiro_bin_for_spawn()
-        if not kiro_bin:
-            # Degraded (binary not resolved yet), NOT a genuine "zero models"
-            # result. Return 503 so the client retries instead of caching an
-            # empty list — a cached [] renders an empty picker that only a
-            # manual page refresh recovers from.
-            return web.json_response({"error": "kiro binary not resolved"}, status=503)
-        argv = [kiro_bin, "chat", "--list-models", "--format", "json", "--no-interactive"]
-        # Mirror AcpClient._spawn() sandbox: wrap_argv + env + process isolation.
-        # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
-        # pipes); this is a one-shot read-only command, so we replicate the
-        # sandbox setup directly.  See the security-controls rule.
+        # No catalog yet. Join (or start) the one shared background fetch and wait
+        # at most the per-request bound for it — the SAME 10s a request waited
+        # before. On timeout we answer the same degraded 503, but the fetch is NOT
+        # cancelled: it runs on under its own longer ceiling and warms the cache,
+        # so the next 8s poll is served from its result instead of starting
+        # another doomed cold start.
         #
-        # The configured tier is passed EXPLICITLY rather than left to
-        # wrap_argv's "auto" parameter default, so this endpoint can never ask
-        # for stricter isolation than the chat spawn of the same binary. It
-        # matters wherever the operator set agent.sandbox="off" (deferring
-        # isolation to kiro-cli's own internal sandbox) on a host with no backend
-        # — any Windows host, macOS >= 26: chat runs, while the default-mode wrap
-        # here fail-closed and answered 503 on every 8s poll. The frontend reads
-        # that as "degraded" and serves its auto-only fallback list, so the picker
-        # showed exactly one entry. Same fix, same reason as the `_bg` session in
-        # session.py.
-        #
-        # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
-        # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
-        # can cold-probe the backend with a synchronous
-        # `subprocess.run(..., timeout=5)`. This endpoint is polled every 8s while
-        # the model list is degraded, so leaving either on the loop stalls chat,
-        # cron and the liveness heartbeat on exactly the host where the probe is
-        # slowest. Both reads run in the worker, so the mode is resolved there
-        # too rather than passed in.
-        argv, cleanup = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _wrap_list_models_argv, argv
-        )
-        argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
+        # A fetch that failed inside the backoff window answers the same 503
+        # straight from the negative entry: no spawn, no new WARNING line.
+        failure = _catalog_cache.recent_failure()
+        if failure is not None:
+            message, code = failure
+            raise _CatalogUnavailable(message, code=code)
+        task = _shared_catalog_fetch()
         try:
-            env = {**os.environ}
-            env["PATH"] = augmented_path(env.get("PATH", ""))
-            _resolve_ssh_auth_sock(env)
-            proc = await create_subprocess_limited(
-                *argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-                env=env,
+            models = await asyncio.wait_for(
+                asyncio.shield(task), timeout=_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS
             )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.communicate()
-                # A cold CLI spawn exceeded the timeout. This is the common
-                # cause of the "picker is empty until I refresh" symptom: a
-                # slow first `--list-models` spawn returning [] (HTTP 200) would
-                # be cached by the client as a successful empty result. Return
-                # 503 instead so React Query retries with backoff and the
-                # picker self-heals without a manual refresh.
-                logger.warning("api_models: --list-models timed out; returning 503")
-                return web.json_response({"error": "model list timed out"}, status=503)
-        finally:
-            if cleanup and callable(cleanup):
-                cleanup()
-
-        if proc.returncode != 0:
-            from kiro_crew.platform import redact_via_context  # noqa: F811
-
-            stderr_tail = stderr.decode(errors="replace").strip()
-            stderr_tail = redact_via_context(stderr_tail)[-_MODEL_LIST_STDERR_TAIL_CHARS:]
-            logger.warning(
-                "api_models: --list-models exited %s: %s; returning 503",
-                proc.returncode,
-                stderr_tail or "<no stderr>",
-            )
-            return web.json_response({"error": "model list command failed"}, status=503)
-
-        if not stdout.strip():
-            logger.warning("api_models: --list-models returned empty output; returning 503")
-            return web.json_response({"error": "model list returned empty output"}, status=503)
-
-        try:
-            data = json.loads(stdout.decode(errors="replace"))
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "api_models: --list-models returned invalid JSON (%s); returning 503",
-                exc,
-            )
-            return web.json_response({"error": "model list returned invalid JSON"}, status=503)
-        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
-            logger.warning("api_models: --list-models returned an invalid payload; returning 503")
+        except asyncio.TimeoutError:
+            # The cold spawn outran one request. Keep the shared fetch running
+            # (shield already detached it from this await) so the next poll lands
+            # on the warmed cache rather than re-spawning.
+            logger.warning("api_models: --list-models slower than the request bound; returning 503")
             return web.json_response(
-                {"error": "model list returned an invalid payload"}, status=503
+                {"error": "model list timed out", "code": _CATALOG_UNAVAILABLE_CODE}, status=503
             )
-        models = data["models"]
-        # Seed the central window authority from kiro's authoritative structured
-        # 'context_window_tokens' field (keyed by model_id/model_name). This is
-        # the ONE place these rows enter the system; every other consumer (the
-        # ACP backfill, the context-budget scaler, the live meter) then resolves
-        # through model_registry.model_window() rather than re-reading kiro. The
-        # in-memory update is synchronous (cheap dict mutation); only the disk
-        # persist is offloaded to an executor so the event loop never blocks on
-        # filesystem I/O (no blocking call on the event loop).
-        #
-        # This fork keeps kiro's bare-dotted ids as the picker WIRE FORMAT
-        # (guarded by _model_rejected_reason / api_chat_slot_model, which rejects
-        # canonical registry keys the ACP CLI can't accept). The upstream
-        # registry-key canonicalization is deliberately NOT ported — it is
-        # incompatible with this fork's _model_rejected_reason guard. The window
-        # seeding above uses kiro's authoritative context_window_tokens to give
-        # the backfill real GPT/DeepSeek/Qwen windows, independent of the
-        # wire-format choice.
-        if model_registry.refresh_kiro_windows(models):
-            await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(), model_registry.persist_kiro_windows
-            )
-        models = [m for m in models if not is_deprecated_model(m.get("model_name", ""))]
-        models = _entitled_kiro_models(request, models)
+        models = await _entitled_kiro_models(request, list(models))
         return web.json_response(models)
+    except _CatalogUnavailable as exc:
+        # A degraded fetch outcome (binary unresolved, timeout, non-zero exit,
+        # empty / invalid output). The carried body is the 503 for that outcome,
+        # with a machine ``code`` the dashboard keys on: the generic
+        # ``model_list_unavailable`` renders the config-load notice, while an
+        # expired / signed-out login carries ``kiro_prerequisite_required`` and
+        # renders the one actionable "run kiro-cli login" message.
+        return web.json_response({"error": exc.error, "code": exc.code}, status=503)
+    except EntitlementRevalidating:
+        # An entitlement revalidation is in flight past the read deadline. The
+        # picker snapshot might narrow the catalog on an un-revalidated answer,
+        # and the frontend caches any non-empty 200 with no refetch — so serve
+        # the degraded 503 contract instead: the frontend keeps its last-good
+        # list and polls again in 8s, and the next read (once the probe has
+        # landed, whether it corrected the list or failed open) returns 200.
+        logger.info("api_models: entitlement revalidation in flight; returning 503 to re-poll")
+        return web.json_response(
+            {"error": "model list revalidating", "code": "model_list_revalidating"},
+            status=503,
+        )
     except SandboxUnavailableError as exc:
         # Narrower than the generic clause below, and BEFORE it: this is the one
         # degraded cause that no amount of retrying fixes, so it must not be
@@ -1095,7 +1517,9 @@ async def api_models(request: web.Request) -> web.Response:
         # Spawn failure, JSON parse error, etc. — degraded, not "zero models".
         # 503 so the client retries instead of caching an empty picker.
         logger.warning("api_models failed; returning 503 for client retry", exc_info=True)
-        return web.json_response({"error": "model list unavailable"}, status=503)
+        return web.json_response(
+            {"error": "model list unavailable", "code": _CATALOG_UNAVAILABLE_CODE}, status=503
+        )
 
 
 async def api_effort_levels(request: web.Request) -> web.Response:
@@ -1125,7 +1549,12 @@ async def api_effort_levels(request: web.Request) -> web.Response:
 async def api_slash_commands(request: web.Request) -> web.Response:
     """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
-    if cfg.agent.provider == "claude_code":
+    # This global endpoint has no session/member key; the configured default
+    # backend is its capability authority, independent of the provider label.
+    blocked_commands = _BLOCKED_SLASH_COMMANDS
+    if capabilities_for(cfg.agent.acp_backend).supports_native_todos:
+        blocked_commands = blocked_commands - {"/todos"}
+    if is_claude_code(cfg.agent.provider):
         state: DashboardState = request.app["state"]
         cc_commands: list[str] = []
         for provider in state.sessions.active_providers():
@@ -1147,256 +1576,39 @@ async def api_slash_commands(request: web.Request) -> web.Response:
         result = [
             {"name": f"/{c}", "description": SLASH_COMMAND_DESCRIPTIONS.get(f"/{c}", "")}
             for c in cc_commands
+            if f"/{c}" not in blocked_commands
         ]
-        result.append({"name": "/side", "description": SLASH_COMMAND_DESCRIPTIONS.get("/side", "")})
+        for command in ("/side", "/workflow"):
+            if not any(item["name"] == command for item in result):
+                result.append(
+                    {"name": command, "description": SLASH_COMMAND_DESCRIPTIONS.get(command, "")}
+                )
         return web.json_response(result)
 
+    # Blocked commands stay in _SLASH_COMMANDS (typing one still gets the
+    # explicit "not available in the dashboard" rejection in chat_runner), but
+    # the suggestion payload must not advertise them: a menu entry that only
+    # ever produces a warning is an inert affordance.
     return web.json_response(
         [
             {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")}
-            for c in sorted(_SLASH_COMMANDS)
+            for c in sorted(_SLASH_COMMANDS - blocked_commands)
         ]
     )
 
 
-async def api_agent_detail(request: web.Request) -> web.Response:
-    """GET/DELETE/PATCH /api/agents/detail/{name} — view, delete, or update agent config."""
-    name = request.match_info["name"]
-    from kiro_crew.agent import kiro_agents_dir_path  # noqa: F811
-
-    # Parse body early so JSONDecodeError returns 400, not 404 from the file loop.
-    patch_body = None
-    if request.method == "PATCH":
-        try:
-            patch_body = await request.json()
-        except (json.JSONDecodeError, ValueError):
-            return web.json_response({"error": "invalid JSON"}, status=400)
-        # Valid JSON is not necessarily an object. A top-level array makes
-        # ``"skills" in patch_body`` a LIST-membership test (true for
-        # ``["skills"]``), and the subscript that follows then raises TypeError
-        # -> HTTP 500. Reject the shape once, here, rather than per-field.
-        if not isinstance(patch_body, dict):
-            return web.json_response({"error": "body must be a JSON object"}, status=400)
-
-    state: DashboardState = request.app["state"]
-    for f in kiro_agents_dir_path().glob("*.json"):
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            if data.get("name") == name or f.stem == name:
-                if request.method == "DELETE":
-                    if f.name in (
-                        "kirocrew.json",
-                        "kirocrew-lite.json",
-                    ):
-                        return web.json_response({"error": "cannot delete kirocrew"}, status=400)
-                    # The dashboard withholds delete for a template that is the
-                    # kiro-cli fallback or is bound to a crew, but a client-side
-                    # check cannot be race-free: its view of the config is a
-                    # cached snapshot, so a crew bound (or the fallback moved)
-                    # between render and click still reaches this handler. Only
-                    # a check that reads config UNDER THE SAME LOCK the writers
-                    # take makes the invariant hold, so this is the authority
-                    # and the UI is now just the early, friendlier signal.
-                    async with _get_config_lock():
-                        # Off-thread: this runs while the config lock is HELD, so a
-                        # synchronous read stalls the event loop AND queues every
-                        # other config writer behind a disk read. `to_thread` is the
-                        # idiom already used for this in core.py / files.py.
-                        cfg = await asyncio.to_thread(KiroCrewConfig.load)
-                        # Every identifier this file answers to. The match above
-                        # accepts EITHER the JSON's own "name" or the filename
-                        # stem, so a request naming one leaves the other out of
-                        # `name` -- and config may well record the one omitted.
-                        #
-                        # `declared` goes through `spec_str`, the helper this file
-                        # already uses on the GET path: `~/.kiro/agents` is a
-                        # SHARED directory and a structured `name` (an ACP-style
-                        # `{"id": ...}`) is observed in the wild. It is reachable
-                        # here via the `f.stem == name` arm of the match, and an
-                        # unhashable set member turns this into a TypeError --
-                        # which the `except (JSONDecodeError, OSError)` below does
-                        # NOT catch, so it escapes as HTTP 500 on a delete that
-                        # should have succeeded or returned a 409.
-                        declared = spec_str(data, "name")
-                        aliases = {name, f.stem}
-                        if declared:
-                            aliases.add(declared)
-                        # Both fields are checked because the two readers disagree:
-                        # `agent.default_agent` is the kiro-cli fallback, while
-                        # top-level `default_agent` is what /api/config/default-agent
-                        # (the picker on this very page) writes. Guarding only one
-                        # leaves the other free to dangle.
-                        if aliases & {cfg.agent.default_agent, cfg.default_agent}:
-                            return web.json_response(
-                                {
-                                    "error": (
-                                        f"Cannot delete '{name}': it is the default agent used "
-                                        "when nothing names a template. Change the default first."
-                                    ),
-                                    "code": "agent_is_default",
-                                },
-                                status=409,
-                            )
-                        bound = sorted(
-                            crew
-                            for crew, crew_cfg in cfg.agents.items()
-                            if crew_cfg.kiro_agent in aliases
-                        )
-                        if bound:
-                            return web.json_response(
-                                {
-                                    "error": (
-                                        f"Cannot delete '{name}': still used by "
-                                        f"{', '.join(bound)}. Repoint or remove them first."
-                                    ),
-                                    "code": "agent_in_use",
-                                },
-                                status=409,
-                            )
-                        f.unlink()
-                    clear_list_agents_cache()
-                    # Same reason `declared` goes through `spec_str` above:
-                    # `prune` is typed `str` and a structured `name` would reach
-                    # it through the `or`.
-                    agent_state.prune(declared or name)
-                    state.push_refresh("agents")
-                    return web.json_response({"ok": True})
-                if request.method == "PATCH" and patch_body is not None:
-                    if "skills" in patch_body:
-                        raw_skills = patch_body["skills"]
-                        if not isinstance(raw_skills, list) or not all(
-                            isinstance(s, str) for s in raw_skills
-                        ):
-                            return web.json_response(
-                                {"error": "skills must be a list of strings"}, status=400
-                            )
-                        if len(raw_skills) > MAX_AGENT_SKILLS:
-                            return web.json_response(
-                                {"error": f"at most {MAX_AGENT_SKILLS} skills per agent"},
-                                status=400,
-                            )
-                    mapped: list[str] = []
-                    loop = asyncio.get_running_loop()
-                    async with _get_config_lock():
-                        # Re-read under the lock: the copy above was read before
-                        # the lock and a concurrent PATCH may have superseded it.
-                        data = json.loads(f.read_text(encoding="utf-8"))
-                        agent_name = data.get("name") or name
-                        # Skills FIRST, before any state mutation. The mapping can
-                        # reject the request (unknown key -> 400) and the model
-                        # branch below writes the agent_state sidecar; doing model
-                        # first meant a rejected combined PATCH still froze the
-                        # model against future shipped-default bumps.
-                        #
-                        # Offloaded to the discovery pool: the mapping enumerates
-                        # the skill roots (see enumerate_skill_catalog), which on a
-                        # large or network-backed catalog is enough filesystem work
-                        # to stall the event loop — the same reason /api/skills and
-                        # /api/agents/installed run off the loop.
-                        if "skills" in patch_body:
-                            mapped, unknown = await loop.run_in_executor(
-                                discovery_executor(),
-                                apply_skill_mapping,
-                                data,
-                                f,
-                                state,
-                                list(patch_body["skills"]),
-                            )
-                            if unknown:
-                                return web.json_response(
-                                    {"error": "unknown skills", "skills": unknown[:20]},
-                                    status=400,
-                                )
-                        else:
-                            mapped = await loop.run_in_executor(
-                                discovery_executor(), agent_skill_keys, data, f, state
-                            )
-                        if "model" in patch_body:
-                            # Stored verbatim (canonical key); translated to a
-                            # provider id at the config.loader factory boundary.
-                            data["model"] = patch_body["model"] or None
-                            if data["model"] is None:
-                                data.pop("model", None)
-                                # Cleared/auto: resume tracking the shipped
-                                # default (re-synced by _refresh_dynamic_fields).
-                                agent_state.set_model_managed(agent_name, True)
-                            else:
-                                # Explicit pick: freeze it against default bumps.
-                                agent_state.set_model_managed(agent_name, False)
-                        # Never persist KiroCrew bookkeeping into the kiro spec —
-                        # kiro-cli rejects unknown fields and drops the agent.
-                        data.pop("model_managed", None)
-                        data.pop("cc_model", None)
-                        f.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-                    # The list_agents() cache keys on a (count, newest-mtime-ns)
-                    # signature; two writes inside the same mtime granularity
-                    # would otherwise serve a stale skill list.
-                    clear_list_agents_cache()
-                    state.push_refresh("agents")
-                    return web.json_response(
-                        {"ok": True, "model": data.get("model", ""), "skills": mapped}
-                    )
-                # ``skills`` / ``unmanaged_skills`` are computed, response-only
-                # views of ``resources`` — never written back into the spec
-                # (kiro-cli rejects unknown fields and drops the agent). One
-                # catalog walk for both, off the event loop (filesystem-heavy).
-                keys, unmanaged_uris = await asyncio.get_running_loop().run_in_executor(
-                    discovery_executor(), agent_skill_views, data, f, state
-                )
-                return web.json_response(
-                    {
-                        **data,
-                        # The rest of the spec is passed through verbatim, but
-                        # these two are CONSUMED as display text by the detail
-                        # panel. A foreign spec's structured value rendered as a
-                        # React child throws error #31 and blanks the whole tab,
-                        # so both are coerced on the same "non-string means
-                        # absent" rule list_agents() uses.
-                        "description": spec_str(data, "description"),
-                        "model": spec_model(data),
-                        "skills": keys,
-                        "unmanaged_skills": unmanaged_uris,
-                    }
-                )
-        except (json.JSONDecodeError, OSError):
-            continue
-    # "default" is the built-in agent with no config file
-    if name == "default":
-        if request.method != "GET":
-            return web.json_response({"error": "cannot modify built-in default agent"}, status=400)
-        return web.json_response({"name": "default", "model": ""})
-
-    return web.json_response({"error": "not found"}, status=404)
+# Windows reserves these basenames (before the first dot, any extension) at the
+# filesystem level: creating CON.json raises, and some transports mangle them.
+# Checked wherever a template filename is chosen — user-supplied publish names
+# are refused, generated fork names are suffixed past them.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
-async def api_capability_agents_list(request: web.Request) -> web.Response:
-    """GET /api/capability/agents — list installed agent packages (edition capability manager)."""
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        return web.json_response(await mgr.list_agents())
-    except Exception as exc:
-        return _err500(exc)
-
-
-async def api_capability_mcp_registry(request: web.Request) -> web.Response:
-    """GET /api/capability/mcp/registry — browse available MCP servers from the registry.
-
-    The capability manager owns registry-output parsing and returns entries
-    directly (conventional keys: id, installed, title, tier, description); the
-    core passes them through verbatim.
-    """
-    mgr = _capability_manager()
-    if not mgr.available():
-        return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
-    try:
-        return web.json_response({"servers": await mgr.registry()})
-    except Exception as exc:
-        return _err500(exc)
-
-
-# ── KiroCrew Agent CRUD API ──
+# ── Kiro Crew Agent CRUD API ──
 
 
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
@@ -1405,13 +1617,33 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     Also surfaces the requesting session's project-scope agents
     (``<project>/.kiro/agents``, resolved via ``X-Session-Key``) tagged
     ``scope="project"`` — these dispatch from that slot because kiro-cli runs
-    with the slot's project as cwd, so the picker must offer them (#1684's
-    headline). A config alias of the same name is listed once, as the alias:
+    with the slot's project as cwd, so the picker must offer them. A config
+    alias of the same name is listed once, as the alias:
     dispatch resolves aliases first, so the alias is what would answer.
     """
     cfg = KiroCrewConfig.load()
+    # Caller class, resolved once for the whole response. It decides only VALUE
+    # treatment, never the key set -- see ``_roster_mask``.
+    #
+    # The OWNER predicate, not an app-token check. `request.get("app", "")` alone
+    # asks "is this an app?", and a non-owner DASHBOARD session answers no: an
+    # allow-listed messaging user running `!dashboard` holds a dashboard token
+    # with `app == ""` and would have sailed through, which is the same
+    # caller-class hole that keeps reappearing when this question is hand-rolled
+    # per class instead of delegated to the one predicate that already answers
+    # it. `is_owner_dashboard_request` is what `_require_owner` resolves to for
+    # the mutating agents routes, so the read and write sides now agree
+    # on who the owner is.
+    #
+    # Fails CLOSED -- treated as NOT the owner, so masked -- when the app carries
+    # no state to resolve an owner against. The predicate subscripts
+    # `app["state"]`, and for a disclosure control "unknown caller" must mean
+    # "mask", not "show".
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+    redact = request.app.get("state") is None or not is_owner_dashboard_request(request)
     agents = [
-        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        _agent_roster_row(name, "global", agent_cfg, redact=redact)
         for name, agent_cfg in cfg.agents.items()
     ]
 
@@ -1424,14 +1656,23 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     if project_dir:
         try:
             project_names = await asyncio.get_running_loop().run_in_executor(
-                discovery_executor(), project_agent_names, project_dir
+                discovery_executor(),
+                functools.partial(
+                    project_agent_names,
+                    project_dir,
+                    operation="api_kirocrew_agents",
+                    source="dashboard",
+                ),
             )
         except Exception:
             logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
             project_names = frozenset()
-        base = dataclasses.asdict(KiroCrewAgentConfig())
+        # One shared default record for every project row — they carry no
+        # per-agent config of their own (nothing on disk to read without a
+        # second scan), so the row is the default record under a project tag.
+        project_default = KiroCrewAgentConfig()
         agents.extend(
-            {"name": name, "scope": "project", **base}
+            _agent_roster_row(name, "project", project_default, redact=redact)
             for name in sorted(project_names - set(cfg.agents.keys()))
         )
 
@@ -1447,9 +1688,12 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
             # their config-insertion index and form a stable bottom block.
             sorted_agents = sorted(
                 enumerate(agents),
+                # ``str(...)`` because the row's value type widened to ``object``
+                # for ``avatar`` (the one structured field); ``name`` is always a
+                # ``str`` -- masked or verbatim, ``_roster_mask`` returns one.
                 key=lambda item: (
-                    -usage.get(item[1]["name"], (0, 0.0))[0],
-                    -usage.get(item[1]["name"], (0, 0.0))[1],
+                    -usage.get(str(item[1]["name"]), (0, 0.0))[0],
+                    -usage.get(str(item[1]["name"]), (0, 0.0))[1],
                     item[0],
                 ),
             )
@@ -1465,303 +1709,226 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     )
 
 
-_config_lock: asyncio.Lock | None = None
-_config_lock_loop: asyncio.AbstractEventLoop | None = None
+_config_lock = LoopBoundLock()
 
 
-def _get_config_lock() -> asyncio.Lock:
-    """Return a config lock bound to the current event loop (Python 3.10 compat)."""
-    global _config_lock, _config_lock_loop
-    loop = asyncio.get_running_loop()
-    if _config_lock is None or _config_lock_loop is not loop:
-        _config_lock = asyncio.Lock()
-        _config_lock_loop = loop
+def _get_config_lock() -> LoopBoundLock:
+    """Return the config lock (loop-bound; rebinds when the running loop changes)."""
     return _config_lock
 
 
-async def api_kirocrew_agents_sync(request: web.Request) -> web.Response:
-    """POST /api/agents/sync — auto-sync AIM-installed agents into config.json."""
-    async with _get_config_lock():
-        return await _do_agents_sync(request)
+def _pin_entitlement_backend(cfg: Any) -> str:
+    """The harness whose live catalog may judge a crew's model pin.
 
-
-async def _do_agents_sync(request: web.Request) -> web.Response:
-
-    cfg = KiroCrewConfig.load()
-    synced: list[str] = []
-    pruned: list[str] = []
-    try:
-        discovered_agents = await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), lambda: list(list_agents())
-        )
-        discovered_names = {a.name for a in discovered_agents}
-
-        # Add new agents
-        from kiro_crew.agent import kiro_agents_dir_path  # noqa: F811
-
-        mc_kiro_agents = {a.kiro_agent for a in cfg.agents.values()}
-        for disc in discovered_agents:
-            if (
-                disc.name not in mc_kiro_agents
-                and disc.name not in cfg.agents
-                and disc.source != "kirocrew"
-            ):
-                # EXECUTABLE INVARIANT enforcement (mirrors the seam-boundary
-                # LIVENESS bound in platform.capability_bound —
-                # BoundedCapabilityManager): a builtin_agents() row MUST be
-                # spawnable. The core can only verify the on-disk case
-                # (~/.kiro/agents/<name>.json); an edition may also make a
-                # row ACP-resolvable WITHOUT an on-disk file, so we WARN rather
-                # than hard-drop — dropping a legitimately ACP-resolvable agent
-                # would itself be a correctness bug. The warning turns an
-                # otherwise silent spawn-time (ACP session/set_mode) failure into
-                # an actionable log line pointing at the offending seam row.
-                # Upstream resolves the agents dir per call (data-home safety);
-                # the namespaced check is for app-provided agents, which live as
-                # `<app>--<agent>.json` and would otherwise look "missing".
-                # Off the loop: both the stat and the namespaced glob touch the
-                # filesystem, and on a populated agents directory this per-agent
-                # check (in a loop) would stall the gateway loop and heartbeat.
-                _dn = disc.name
-                _has_on_disk = await asyncio.to_thread(
-                    lambda: (kiro_agents_dir_path() / f"{_dn}.json").exists()
-                    or _namespaced_agent_file_exists(_dn)
-                )
-                if not _has_on_disk:
-                    logger.warning(
-                        "syncing agent %r (source=%s) with no on-disk config at "
-                        "%s — if it is not ACP-resolvable it will persist into "
-                        "config.json and fail at spawn (builtin_agents EXECUTABLE "
-                        "INVARIANT)",
-                        disc.name,
-                        disc.source,
-                        kiro_agents_dir_path() / f"{disc.name}.json",
-                    )
-                cfg.agents[disc.name] = KiroCrewAgentConfig(
-                    kiro_agent=disc.name,
-                    description=disc.description,
-                    source=disc.source,
-                )
-                synced.append(disc.name)
-
-        # Prune agents whose kiro_agent file no longer exists on disk.
-        # Only prune package-installed agents (never user-created or kirocrew-owned).
-        # Skip pruning if scan returned nothing -- likely a transient issue.
-        # Invariant: for package-sourced entries, kiro_agent == dict key == agent name.
-        # ("aim" is also accepted for backward-compat with older configs.)
-        if discovered_names:
-            for name, agent_cfg in list(cfg.agents.items()):
-                if agent_cfg.source in ("package", "aim") and (
-                    agent_cfg.kiro_agent not in discovered_names
-                ):
-                    del cfg.agents[name]
-                    pruned.append(name)
-    except Exception:
-        logger.warning("Failed to scan installed agents", exc_info=True)
-        try:
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="agent.auto_sync",
-                outcome="failure",
-                source="agent_sync",
-            )
-        except Exception:
-            logger.warning("SEL logging failed for agent sync failure", exc_info=True)
-        return web.json_response({"ok": False, "error": "sync failed", "synced": []}, status=500)
-
-    if synced or pruned:
-        try:
-            cfg.save()
-        except Exception:
-            logger.warning("Failed to save config after agent sync", exc_info=True)
-            try:
-                _sel().log_api_access(
-                    caller=request.get("user", "dashboard"),
-                    operation="agent.auto_sync",
-                    outcome="failure",
-                    source="agent_sync",
-                )
-            except Exception:
-                logger.warning("SEL logging failed for config save failure", exc_info=True)
-            return web.json_response(
-                {"ok": False, "error": "config save failed", "synced": []}, status=500
-            )
-        try:
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="agent.auto_sync",
-                outcome="success",
-                source="agent_sync",
-                resources=", ".join(synced + [f"-{p}" for p in pruned]),
-            )
-        except Exception:
-            logger.warning("SEL logging failed for agent sync success", exc_info=True)
-    else:
-        try:
-            _sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="agent.auto_sync",
-                outcome="noop",
-                source="agent_sync",
-            )
-        except Exception:
-            logger.warning("SEL logging failed for agent sync noop", exc_info=True)
-
-    if pruned:
-        logger.info("Pruned %d stale package agents: %s", len(pruned), ", ".join(pruned))
-
-    return web.json_response({"ok": True, "synced": synced, "pruned": pruned})
-
-
-async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Response:
-    """GET /api/agents/resolved-model?agent=NAME — the model a new session uses.
-
-    Serves the one backend resolver so the dashboard's model chip does not have
-    to re-derive the precedence client-side (and drift from it). ``agent`` is a
-    KiroCrew agent name; omitted falls back to the configured default agent.
-    ``model`` is "" when every tier defers to the backend's own choice.
+    Every agent the crew create and update handlers write is a Crew Member whose DM slot
+    (``member-<slug>``) routes through ``agent.member_acp_backend`` — not
+    through the configured default harness ``agent.acp_backend``. When the two
+    share a model-registry namespace, the default backend scopes the
+    entitlement evidence correctly (kiro, including the empty default backend,
+    and kas share ``acp``). When they do not, the default's catalog cannot
+    establish whether the pin the DM thread will actually run is usable — a
+    live kiro session's catalog would deterministically reject a
+    claude-advertised id — so the evidence must come from the harness the DM
+    thread will ACTUALLY run on, which is ``member_backend``. Returning it (not
+    ``None``) keeps the scope on the member's own namespace: a provider from an
+    unrelated harness can neither admit nor reject the pin, and when no member
+    -namespace provider is live the catalog is simply unknown (fail-open) rather
+    than judged by the wrong backend's advertised ids.
     """
-    agent_name = request.query.get("agent", "").strip()
+    default_backend = getattr(cfg.agent, "acp_backend", "")
+    member_backend = getattr(cfg.agent, "member_acp_backend", "")
+    if (
+        capabilities_for(member_backend).model_id_namespace
+        != capabilities_for(default_backend).model_id_namespace
+    ):
+        return member_backend
+    return default_backend
+
+
+async def _revalidate_crew_pin(
+    model: str, request: web.Request, *, for_workers: bool = False
+) -> str | None:
+    """Revalidate the snapshot a crew's model pin is about to be judged by.
+
+    Awaited BEFORE the handlers take the config lock: :func:`_model_pin_rejected`
+    runs synchronously inside it and cannot probe, and a probe must not hold the
+    lock for its read deadline. Resolves the same entitlement backend the locked
+    check will use and hands off to the role-pin revalidation, which heals the
+    live snapshot in place. Returns a denial reason only while that probe is still
+    in flight past its deadline; ``None`` otherwise.
+
+    Skips the cases the locked check answers without the live list -- inherit,
+    the retained claude_code seam and a known wrong-flavour spelling -- so no probe
+    is spent on a value the snapshot does not decide.
+
+    ``for_workers`` names the crew's ``worker_model``: the sessions a crewmate
+    dispatches run on ``agent.acp_backend`` (never a member DM), so that pin is
+    judged against the worker's harness rather than the member's.
+    """
+    if not model or model == "auto" or model_registry.acp_id_correction(model):
+        return None
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    # Globs ~/.kiro/agents and may read the installed agent file — keep the
-    # filesystem work off the event loop.
-    model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None)
-    bindings = resolve_agent_bindings(cfg, agent_name or None)
-    return web.json_response(
-        {
-            "model": model,
-            "agent": agent_name,
-            "kiro_agent": bindings.kiro_agent,
-            # Whether the agent itself pins the model, vs inheriting it.
-            "pinned": bool(bindings.model),
-        }
-    )
+    if is_claude_code(cfg.agent.provider):
+        return None
+    # circular import: see _model_pin_rejected.
+    from kiro_crew.dashboard.handlers.core import _revalidate_role_pin_evidence
+
+    backend = cfg.agent.acp_backend if for_workers else _pin_entitlement_backend(cfg)
+    return await _revalidate_role_pin_evidence(model, request, backend=backend)
 
 
-async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
-    """POST /api/agents — create a new KiroCrew agent."""
+def _model_pin_rejected(
+    model: str, request: web.Request, provider: str, *, backend: str | None = None
+) -> str | None:
+    """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    name = body.get("name", "").strip()
-    if not name:
-        return web.json_response({"error": "Agent name is required"}, status=400)
-    async with _get_config_lock():
-        cfg = KiroCrewConfig.load()
-        if name in cfg.agents:
-            return web.json_response({"error": f"Agent '{name}' already exists"}, status=409)
-        cfg.agents[name] = KiroCrewAgentConfig(
-            kiro_agent=body.get("kiro_agent", "kirocrew"),
-            workspace=body.get("workspace", "default"),
-            memory_store=body.get("memory_store", "default"),
-            # Passed RAW, not str()-coerced: normalize_agent_model is total and
-            # maps a non-string to "" (inherit). Wrapping in str() first would
-            # turn {"model": 123} into the literal "123", which normalizes to a
-            # string the backend then rejects as an unknown model id.
-            model=normalize_agent_model(body.get("model")),
-            description=body.get("description", ""),
-            triggers=body.get("triggers", ""),
-            source=body.get("source", "kirocrew"),
+    An agent's ``model`` is read by kiro-cli when the child starts, so a pin the
+    account cannot serve kills every session and subagent using that agent
+    seconds after spawn, before anything can inspect it. Rejecting it here — at
+    the one moment a human is looking at the value — turns that into a single
+    message on the surface that authored it.
+
+    *provider* is passed in rather than resolved here so this whole path adds no
+    config read of its own: every caller already holds a loaded config, and
+    ``KiroCrewConfig.load()`` deep-copies the validated dict even on a cache
+    hit — work that must not land on the event loop while the config lock is
+    held. It is forwarded to the validator for the same reason.
+
+    A known wrong-flavour registry spelling is reported before entitlement: a
+    live advertised set would otherwise replace the actionable ACP-id mapping
+    with a generic "not available" error. All other values delegate to the
+    per-role validator so the crew form, the role pins and the session-init
+    withhold apply one predicate. ``""``/``"auto"`` mean inherit and always
+    pass; an unknown advertised set means entitlement is unknowable, and the
+    validator accepts rather than accusing on no evidence.
+    """
+    # The retained claude_code seam accepts canonical and registered Bedrock
+    # wire ids that the ACP correction and advertised-id comparison below
+    # intentionally map away from. Its entitlement guard lives in its own
+    # provider path, where full configured ids and bare advertised ids can be
+    # canonicalized before comparison.
+    if is_claude_code(provider):
+        return None
+
+    # The registry knows each model under several spellings and only one is what
+    # kiro-cli serves; the others reach the child verbatim and kill it at startup.
+    # Check this before live entitlement because a wrong-flavour id is naturally
+    # absent from that set and would otherwise produce a less actionable error.
+    correction = model_registry.acp_id_correction(model)
+    if correction:
+        # Deliberately NOT prescriptive. Upstream naming does not line up across
+        # providers — Bedrock's ``claude-opus-4-8`` is the registry's
+        # ``claude-opus-4.5``, while ``claude-opus-4-8[1m]`` is ``claude-opus-4.8``
+        # — so a user who typed the Bedrock spelling meaning "Opus 4.8" may not
+        # want the id this maps to. Telling them to adopt it would steer a
+        # plausible-intent user into a quieter capability change than the one
+        # they asked for. Report the mapping, show what is actually served, and
+        # let them choose.
+        served = ", ".join(model_registry.available_models("acp")[:8]) or "auto"
+        return (
+            f"{model!r} is not a model kiro-cli serves. The registry maps that "
+            f"spelling to {correction!r} — confirm that is the model you want, or "
+            f"pick one of: {served}, or 'auto'."
         )
-        cfg.save()
+    # circular import: handlers.core resolves _get_config_lock from this module,
+    # so importing it at module scope would close the cycle.
+    from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+    return _validate_role_model(model, request, provider=provider, backend=backend)
+
+
+# ── Per-crew uploaded avatars ────────────────────────────────────────
+#
+# The "image" tier of per-crew custom avatars: the picture lives as a file
+# under the data home, the config field only records `{"kind": "image"}`
+# (see config.sections._safe_avatar). Serving goes through the authenticated API —
+# never a raw filesystem path — so remote dashboards work unchanged.
+
+#: Accepted image formats, sniffed from magic bytes — the client-sent
+#: Content-Type is attacker-controlled and is deliberately ignored. The set
+#: itself lives in the config loader, which validates the ``ext`` pin the
+#: committed config carries against the same vocabulary.
+_AVATAR_IMAGE_EXTS = _LOADER_AVATAR_IMAGE_EXTS
+_AVATAR_CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
+#: Upload ceiling. The client downscales to 512px before upload, so a
+#: compliant upload is tens of KB; 1 MB tolerates a generous margin while
+#: keeping a hostile body from ballooning memory (parts accumulate in RAM).
+_AVATAR_MAX_BYTES = 1024 * 1024
+
+
+# ``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation --
+# moved to chat_utils so the files handler's staging copy can share the one
+# implementation; the local name is kept for its callers.
+_drained_to_thread = drained_to_thread
+
+
+async def api_kirocrew_agent_avatar_get(request: web.Request) -> web.Response:
+    """GET /api/agents/{name}/avatar — serve the crew's uploaded picture.
+
+    Owner-gated and SEL-audited like its POST/DELETE peers. ``ETag`` derives
+    from the bytes served, so a replaced picture invalidates even when size
+    and second-granularity mtime coincide.
+    """
+    denied = await _require_owner(request, "agent.avatar_get")
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    # The file is served only while the crew's config actually selects it —
+    # a leftover file after an out-of-band config edit or a failed cleanup
+    # must not remain silently retrievable. The file pin narrows that further:
+    # only the exact committed file is served, so an uncommitted install left
+    # by a mid-save crash cannot impersonate the saved picture.
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    agent = cfg.agents.get(name)
+    if agent is None or agent.avatar.get("kind") != "image":
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    path = await asyncio.to_thread(_live_avatar_file, name, agent.avatar.get("file"))
+    if path is None:
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    data = await asyncio.to_thread(_read_avatar_file, path)
+    if data is None:
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
-        operation="agent.create",
+        operation="agent.avatar_get",
         outcome="success",
         source="dashboard",
         resources=name,
     )
-    return web.json_response({"ok": True, "name": name})
-
-
-async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
-    """PUT /api/agents/{name} — update a KiroCrew agent."""
-
-    name = request.match_info["name"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    async with _get_config_lock():
-        cfg = KiroCrewConfig.load()
-        if name not in cfg.agents:
-            return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
-        agent = cfg.agents[name]
-        changed: list[str] = []
-        if "kiro_agent" in body:
-            agent.kiro_agent = body["kiro_agent"]
-            changed.append("kiro_agent")
-        if "workspace" in body:
-            agent.workspace = body["workspace"]
-            changed.append("workspace")
-        if "memory_store" in body:
-            agent.memory_store = body["memory_store"]
-            changed.append("memory_store")
-        if "model" in body:
-            # "auto"/"" both mean inherit; store the single "" spelling so the
-            # agent keeps deferring to the kiro pin / global fallback. Raw, not
-            # str()-coerced — see the create path for why.
-            agent.model = normalize_agent_model(body["model"])
-            changed.append("model")
-        if "description" in body:
-            agent.description = body["description"]
-            changed.append("description")
-        if "triggers" in body:
-            agent.triggers = body["triggers"]
-            changed.append("triggers")
-        if "source" in body:
-            agent.source = body["source"]
-            changed.append("source")
-        cfg.save()
-    _sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="agent.update",
-        outcome="success",
-        source="dashboard",
-        resources=f"{name} ({','.join(changed)})",
+    return conditional_response(
+        request,
+        data,
+        _AVATAR_CONTENT_TYPES[path.suffix.lstrip(".")],
+        etag=strong_content_etag(data),
+        cache_control="private, max-age=0, must-revalidate",
     )
-    return web.json_response({"ok": True, "name": name})
 
 
-async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
-    """DELETE /api/agents/{name} — delete a KiroCrew agent."""
-
-    name = request.match_info["name"]
-    async with _get_config_lock():
-        cfg = KiroCrewConfig.load()
-        if name not in cfg.agents:
-            return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
-        if name == cfg.default_agent:
-            return web.json_response(
-                {"error": f"Cannot delete default agent '{name}'. Change default_agent first."},
-                status=409,
-            )
-        del cfg.agents[name]
-        cfg.save()
-    _sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="agent.delete",
-        outcome="success",
-        source="dashboard",
-        resources=name,
-    )
-    return web.json_response({"ok": True})
-
-
-# ── Conductor skill regeneration ────────────────────────────────────
-
-
-def _regen_conductor() -> None:
-    """Regenerate conductor skill after metadata or agent roster changes."""
-    try:
-        cfg = KiroCrewConfig.load()
-        if not cfg.agent.conductor_skill:
-            return
-        from kiro_crew.conductor_skill import generate_conductor_skill  # noqa: F811
-        from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-        generate_conductor_skill(SkillsLoader())
-    except Exception:
-        logger.exception("Failed to regenerate conductor skill")
+# Every function the owners define runs on this module's globals, so a patch of
+# ``kiro_crew.dashboard.handlers.agents.<name>`` reaches it wherever it lives;
+# see ``kiro_crew.dashboard.agent_admin``. Run once, after this body has bound every
+# name.
+_facade_compose(
+    globals(),
+    (
+        _owner_app_mcp_ownership,
+        _owner_agent_config,
+        _owner_default_agent,
+        _owner_capabilities,
+        _owner_template_lineage,
+        _owner_fork_publish,
+        _owner_agent_detail,
+        _owner_roster,
+        _owner_installed_agents,
+        _owner_crew_records,
+        _owner_crew_update,
+        _owner_crew_removal,
+        _owner_avatars,
+    ),
+)

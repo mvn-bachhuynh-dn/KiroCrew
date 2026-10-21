@@ -1,4 +1,8 @@
-"""Running an app's own lifecycle scripts (``onEnable`` / ``onDisable`` / ``onUpdate`` / ``onUninstall``).
+"""Running an app's own lifecycle scripts (``onEnable`` / ``onDisable`` / ``onUninstall``).
+
+``setup.onInstall`` is run by the install transaction in ``registry_pipeline/install.py``,
+not here, and ``setup.onUpdate`` is declared but dispatched by nothing (see the
+declared-not-wired paragraph in ``docs/system-specs/modules/app-kit-platform.md``).
 
 Extracted out of ``apps/routes.py`` so that ``apps/teardown.py`` can run
 ``setup.onDisable`` as part of the ONE shared teardown. ``routes.py`` imports
@@ -18,6 +22,7 @@ prevent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from typing import Any
@@ -26,9 +31,20 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.execution import app_execution_denied
 from kiro_crew.apps.manager import apps_dir
 from kiro_crew.apps.registry import minimal_env
-from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+from kiro_crew.sandbox import (
+    cgroup_scope_argv,
+    create_subprocess_limited,
+    wrap_argv,
+    wrap_argv_async,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Seconds a timed-out lifecycle script gets between the graceful SIGTERM and
+#: the SIGKILL escalation, so an install/uninstall hook's cleanup trap can run
+#: without the timeout path being able to hang on a trap that never exits.
+#: Mirrors the app-build grace in ``registry._KILL_GRACE_PERIOD``.
+_TERM_GRACE_SECS = 5
 
 
 async def run_lifecycle_script(
@@ -39,7 +55,7 @@ async def run_lifecycle_script(
     extra_env: dict[str, str] | None = None,
     action: str = "lifecycle_script",
 ) -> dict[str, Any]:
-    """Run a lifecycle script (onEnable/onDisable/onUpdate/onUninstall) in the app directory.
+    """Run a lifecycle script (onEnable/onDisable/onUninstall) in the app directory.
 
     Returns dict with ``output`` (str) and ``failed`` (bool).
     """
@@ -57,9 +73,35 @@ async def run_lifecycle_script(
     if not app_root.is_dir():
         return {"output": f"app directory not found: {app_root}", "failed": True}
 
+    # Native-Windows policy: these lifecycle hooks are a POSIX-only capability.
+    # ``run_lifecycle_script`` runs ``onEnable`` / ``onDisable`` / ``onUninstall``
+    # through ``/bin/bash -c`` (``set -euo pipefail`` prepended), and native
+    # Windows has no ``/bin/bash``. Refuse before any spawn with a clear reason —
+    # the same shape as ``backend.py`` refusing an exec (shell launcher) backend
+    # on native Windows — rather than letting the spawn fail opaquely and read as
+    # the app's own script breaking. The reason reaches the user through the
+    # enable response's existing ``script_output`` field; the enable route's
+    # rollback rule is unchanged. (``onInstall`` runs in the install transaction
+    # in ``registry_pipeline/install.py``, a separate spawn site this guard does
+    # not cover.) On Linux and macOS nothing changes.
+    if script and not platform_compat.IS_POSIX:
+        logger.warning(
+            "App %s lifecycle action %s not run: lifecycle hooks are not "
+            "supported on native Windows",
+            app_name,
+            action,
+        )
+        return {
+            "output": (
+                "app lifecycle hooks are not supported on native Windows "
+                "(they run through /bin/bash)"
+            ),
+            "failed": True,
+        }
+
     safe_script = f"set -euo pipefail\n{script}"
     base_cmd = ["/bin/bash", "-c", safe_script]
-    sandboxed_cmd, cleanup = wrap_argv(base_cmd, mode="standard")
+    sandboxed_cmd, cleanup = await wrap_argv_async(base_cmd, mode="standard", _prepare=wrap_argv)
     sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
     env = minimal_env(NONINTERACTIVE="1")
     if extra_env:
@@ -89,14 +131,19 @@ async def run_lifecycle_script(
                 # killpg on POSIX, taskkill /T on Windows — via platform_compat.
                 # Async variant offloads the Windows taskkill spawn to
                 # subprocess_executor so this lifecycle-script timeout path
-                # never blocks the event loop on taskkill.exe.
+                # never blocks the event loop on taskkill.exe. SIGTERM first so
+                # a script's cleanup trap can run.
                 await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGTERM)
             except OSError:
-                proc.kill()
-            try:
-                await proc.wait()
-            except Exception:
                 pass
+            # Bounded grace: drain pipes while the trap runs. communicate()
+            # returns once the child exits; a script that ignores the TERM
+            # outlives the grace and is escalated to a SIGKILL tree kill with
+            # a bounded, pipe-draining reap.
+            with contextlib.suppress(Exception, asyncio.TimeoutError):
+                await asyncio.wait_for(proc.communicate(), timeout=_TERM_GRACE_SECS)
+            if proc.returncode is None:
+                await platform_compat.kill_and_reap(proc)
             return {"output": f"script timed out after {timeout}s", "failed": True}
     finally:
         if cleanup:

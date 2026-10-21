@@ -1,5 +1,7 @@
 import { useContext, useEffect, useRef } from 'react'
 import { SendBtn } from './ui'
+import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useLocalCrewHidden } from './overlayRoot'
 import OnboardingChapterShell, { OnboardingShellContext } from './OnboardingChapterShell'
 import { setupChapterAside } from './AgentImportFlow'
 import {
@@ -23,7 +25,8 @@ import { i18nT } from '../i18n/t'
  *   - no Escape-to-dismiss (the Tab trap below deliberately omits it),
  *   - and the paths that abandon the flows on EITHER side still route through
  *     it: skipping Import setup lands here, and "Skip all" from Import setup
- *     shows this screen before the user reaches the product (see App.tsx).
+ *     shows this screen before the user reaches the product (see
+ *     shell/boot/firstRun.tsx).
  *
  * Mandatory is not the same as a consent gate. The screen discloses what is
  * sent and offers the opt-out; "Continue" is always enabled and never requires
@@ -47,6 +50,19 @@ export default function PrivacyChapter({
   const localDialogRef = useRef<HTMLDivElement>(null)
   const dialogRef = shellHost?.dialogRef ?? localDialogRef
   const headingRef = useRef<HTMLHeadingElement>(null)
+  // Shared IME latch for the Tab trap below: a Tab that lands during an IME
+  // composition (or its post-`compositionend` window) is choosing a candidate,
+  // not leaving the field, so the trap must decline it instead of yanking
+  // focus and aborting the composition (`useDialogFocusTrap` is the reference
+  // consumer of the same seam).
+  const imeLatch = useDocumentImeLatch(open)
+  // Hidden with the local Crew, this chapter still hears keys on the page
+  // (components/overlayRoot), and its Tab trap would swallow Tab on the Crew in
+  // front. Read through a ref so a switch does not re-run the effect, which
+  // would also move focus back to the heading.
+  const crewHidden = useLocalCrewHidden()
+  const crewHiddenRef = useRef(crewHidden)
+  crewHiddenRef.current = crewHidden
 
   // Move focus to the heading on open, then trap Tab inside the dialog
   // (website/AGENTS.md modal a11y). Escape is NOT wired: this chapter cannot be
@@ -56,6 +72,7 @@ export default function PrivacyChapter({
     if (!open) return
     headingRef.current?.focus()
     const onKeyDown = (event: KeyboardEvent) => {
+      if (crewHiddenRef.current) return
       if (event.key !== 'Tab') return
       const focusable = Array.from(
         dialogRef.current?.querySelectorAll<HTMLElement>(
@@ -66,19 +83,25 @@ export default function PrivacyChapter({
       const first = focusable[0]
       const last = focusable[focusable.length - 1]
       const activeIndex = focusable.indexOf(document.activeElement as HTMLElement)
-      if (event.shiftKey && activeIndex <= 0) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && (activeIndex < 0 || activeIndex === focusable.length - 1)) {
-        event.preventDefault()
-        first.focus()
-      }
+      const wrapsBackward = event.shiftKey && activeIndex <= 0
+      const wrapsForward = !event.shiftKey && (activeIndex < 0 || activeIndex === focusable.length - 1)
+      // A mid-dialog Tab is the browser's to move, so it is also not the
+      // trap's to claim — claiming it would consume legitimate navigation
+      // inside the post-composition latch window.
+      if (!wrapsBackward && !wrapsForward) return
+      // A Tab the IME owns must not cycle focus — the user is choosing a
+      // candidate, not leaving the field. `claimKey` owns the whole decline;
+      // it must run before the preventDefault() and focus move so the IME
+      // keeps the key (see its contract in useImeGuard.ts).
+      if (!imeLatch.claimKey(event)) return
+      event.preventDefault()
+      ;(wrapsBackward ? last : first).focus()
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
     // shellHost?.sectionSlot: in host mode the content is portaled a pass after
     // open, so re-run once the slot exists to install the trap + initial focus.
-  }, [open, dialogRef, shellHost?.sectionSlot])
+  }, [open, dialogRef, shellHost?.sectionSlot, imeLatch])
 
   if (!open) return null
 
@@ -92,7 +115,7 @@ export default function PrivacyChapter({
           <h1
             ref={headingRef}
             tabIndex={-1}
-            className="text-2xl font-semibold text-text-strong outline-none"
+            className="text-2xl font-semibold text-text-strong outline-hidden"
           >
             {i18nT('components.privacyChapter.title')}
           </h1>

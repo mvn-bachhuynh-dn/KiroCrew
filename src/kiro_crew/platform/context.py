@@ -17,7 +17,12 @@ See ``docs/system-specs/modules/platform-context.md``.
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import logging
+import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple, TypeVar
 
@@ -27,25 +32,35 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
     from kiro_crew.platform.interfaces import (
         AgentCatalogProvider,
         AgentExecutableResolver,
+        AgentIdentityProvider,
         AgentRuntime,
         AppRegistryPolicy,
         AppsLoader,
         CapabilityManager,
         CredentialPolicy,
         DashboardContributor,
+        DeniedRuleProvider,
         EmbeddingSource,
+        ExternalAccessPolicy,
         FeatureApp,
+        GatewayLifecycleProvider,
         IdentityProvider,
+        ImportSourceProvider,
         JailProvider,
         KnowledgeProvider,
         McpToolingProvider,
+        MemoryFilesProvider,
+        MobileConnectProvider,
         PackageManager,
         PromptSourceProvider,
         ProviderRegistry,
         PublishRegistry,
+        RemoteProvisionerProvider,
         SandboxPolicy,
+        SkillDiscoveryProvider,
         SlackEnterpriseGate,
         TelemetryProvider,
+        TipsProvider,
         TunnelProvider,
     )
     from kiro_crew.platform.security_authority import PolicyAuthority
@@ -61,7 +76,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
 # incrementing this only after the first public release, when a separately-built
 # companion can pin against a frozen contract.  (Every seam added pre-launch —
 # the ``governance`` carrier, then the ``knowledge``/``dashboard``/``jail``
-# extension points — landed under this same v1, no bump.)
+# extension points, then ``agent_identity`` — landed under this same v1, no bump.)
 CONTRACT_VERSION = 1
 
 _logger = logging.getLogger(__name__)
@@ -118,9 +133,9 @@ RESERVED_SLOTS: "dict[str, str]" = {
         "embeddings.register_embedding_backend() instead."
     ),
     "package_manager": (
-        "no core call site: install paths (ollama, ffmpeg, whisper) are inline "
-        "step-by-step brew/curl/pip logic in cli_doctor.py, not a single "
-        "plan-resolution point this seam could own."
+        "no core call site: external-tool install hints (ffmpeg, faiss, the voice-aws "
+        "extra) are inline brew/winget/pip text in doctor_checks/features.py, not a "
+        "single plan-resolution point this seam could own."
     ),
     "feature_apps": (
         "no core call site: bundled apps are discovered through "
@@ -270,33 +285,62 @@ class PlatformContext:
     # ── boot-layer extension points ──
     providers: "ProviderRegistry"
     publish: "PublishRegistry"
-    # ``run_first_run_setup`` is wired (slack/gateway.py); ``managed_mcp_servers``
+    # ``run_first_run_setup`` is wired (slack/gateway_runtime/service_boot.py); ``managed_mcp_servers``
     # is [RESERVED] — see RESERVED_METHODS.
     agent_runtime: "AgentRuntime"
     agent_executable: "AgentExecutableResolver"
+    gateway_lifecycle: "GatewayLifecycleProvider"
     sandbox: "SandboxPolicy"
     credentials: "CredentialPolicy"
     security: "PolicyAuthority"
     slack_gate: "SlackEnterpriseGate"
     # ``whoami``/``issuer`` are [RESERVED] — see RESERVED_METHODS.
     identity: "IdentityProvider"
+    # Agent workload identity / token vending. Distinct from ``identity``
+    # (operator SSO). v1 addition (no CONTRACT_VERSION bump).
+    agent_identity: "AgentIdentityProvider"
     embeddings: "EmbeddingSource"  # [RESERVED] — see RESERVED_SLOTS
     mcp_tooling: "McpToolingProvider"
     agent_catalog: "AgentCatalogProvider"
     prompt_sources: "PromptSourceProvider"
+    skill_discovery: "SkillDiscoveryProvider"
+    # The edition's feature-tip pool. The one REPLACE-capable seam in this
+    # contract: a supplied pool takes over from the public curated file AND the
+    # docs-scan catalog rather than being unioned into them, because a public tip
+    # advertises a capability an edition build may not have. v1 addition (no
+    # CONTRACT_VERSION bump).
+    tips: "TipsProvider"
+    # Edition-contributed denied-command rules the OPERATOR can switch off.
+    # Distinct from ``security`` (the un-weakenable overlay floor).
+    # v1 addition (no CONTRACT_VERSION bump).
+    denied_rules: "DeniedRuleProvider"
+    import_sources: "ImportSourceProvider"
     capability_manager: "CapabilityManager"
 
     # ── install / structural extension points ──
+    external_access: "ExternalAccessPolicy"
     registry: "AppRegistryPolicy"
     apps_loader: "AppsLoader"
     package_manager: "PackageManager"  # [RESERVED] — see RESERVED_SLOTS
     knowledge: "KnowledgeProvider"
+    # Where memory's markdown SOURCE text is read and written. Consumed by
+    # ``MemoryStore`` and by the vector store's document ingestion; memory's
+    # DERIVED state (the FTS index, the SQLite stores, the FAISS vectors) stays on
+    # local disk and does not travel through this seam, because it is rebuilt from
+    # the source text and a cache behind a possibly-remote boundary would cost a
+    # round trip per row to reconstruct something reconstructible by definition.
+    memory_files: "MemoryFilesProvider"
 
     # ── runtime-service / frontend extension points ──
     tunnel: "TunnelProvider"
     telemetry: "TelemetryProvider"
     dashboard: "DashboardContributor"
     jail: "JailProvider"
+    mobile_connect: "MobileConnectProvider"
+    # Remote-instance provisioners the Set-up tab offers (the built-in EC2 lane
+    # plus whatever the edition adds), each backed by a ``LaunchEngine`` the
+    # core's launch job drives. v1 addition (no CONTRACT_VERSION bump).
+    remote_provisioners: "RemoteProvisionerProvider"
 
     # ── bundled feature apps ──
     feature_apps: "Tuple[FeatureApp, ...]"  # [RESERVED] — see RESERVED_SLOTS
@@ -359,11 +403,267 @@ class PlatformContext:
 # and reset around the test (see the reset_platform_context fixture).
 _ACTIVE: Optional[PlatformContext] = None
 
+# Bumped on EVERY install of ``_ACTIVE``, so a consumer that caches something
+# derived from ``ctx.governance`` can tell that the ceiling underneath it moved.
+#
+# The ceiling was boot-frozen when this counter did not exist, so nothing needed
+# it: a cache built after boot was built against the final answer.  Central
+# policy distribution breaks that — ``policy_distribution`` installs a re-fetched
+# ceiling mid-session — and the one cache that matters,
+# ``governance_profiles.ProfileStore``, folds this into its freshness key.  A
+# boolean "is a fallback declared" cannot carry the fact on its own: swapping one
+# declared fallback for a different one leaves that boolean True on both sides, so
+# the store would keep serving profiles composed against the retired ceiling.
+#
+# Incremented by :func:`_install`, which is the ONLY writer of ``_ACTIVE`` —
+# including the lazy default and the test reset — so no future install site can
+# forget to bump it.
+_GOVERNANCE_GENERATION = 0
+_GENERATION_LOCK = threading.Lock()
+
+# Callbacks run on every DECLARED install of ``_ACTIVE`` (every one except the silent
+# lazy default -- see ``register_ceiling_install_hook``), so a consumer that must
+# re-derive something from the new ceiling is PUSHED the change instead of polling.
+#
+# The alternative — every consumer re-reading governance behind a TTL cache — was
+# tried for the ``approval_modes`` YOLO verdict and is what this registry replaces:
+# a cache needs a freshness key, a three-state "not resolved under this ceiling yet"
+# verdict, and an off-loop refresh, and each of those carries its own window in
+# which a stale answer is served. An install is a discrete event, so a consumer told
+# about it holds an answer that is either current or does not exist.
+#
+# A registry rather than a direct import because the consumers sit ABOVE this module
+# (``safety_override`` already imports from here), so calling into them by name would
+# be a cycle. Each registers itself at its own import.
+_CEILING_INSTALL_HOOKS: "list[Callable[[Optional[PlatformContext]], None]]" = []
+# Run BEFORE ``_ACTIVE`` is reassigned, so a consumer can invalidate what it derived
+# from the OUTGOING ceiling while the incoming one is not yet visible.
+#
+# Publishing first and invalidating after leaves a window whose width is a full
+# governance resolution: the new ceiling is live, the derived answer still belongs to
+# the retired one, and a concurrent authorization read is decided by the stale answer.
+# For an authorization consumer that window is a bypass, so invalidation cannot be the
+# second half of the install -- it has to be the first.
+_CEILING_INVALIDATE_HOOKS: "list[Callable[[], None]]" = []
+_HOOKS_LOCK = threading.Lock()
+
+
+def register_ceiling_install_hook(cb: "Callable[[Optional[PlatformContext]], None]") -> None:
+    """Call ``cb(ctx)`` after every DECLARED install of the active context.
+
+    ``ctx`` is the context just installed, or ``None`` for :func:`reset_context` —
+    a hook that caches something ceiling-derived should treat ``None`` as "there is
+    no ceiling to derive from" rather than as a ceiling that permits everything.
+
+    "Declared" excludes ONE install: the lazy default :func:`current_context` composes
+    when nothing was installed. That one is reached from inside a governance read (the
+    profile store resolves the active context to build its freshness key), so a hook
+    that reads governance would call back into a store that is mid-load and be handed
+    its fail-closed "not loaded" answer -- a verdict about nothing. It also needs no
+    hook: a consumer cannot be holding anything derived from a ceiling before the first
+    derivation happens, and that first derivation is what triggers the lazy install.
+
+    Idempotent per callable, so a module imported twice under different names does
+    not get its hook run twice. Registration does NOT replay the install that may
+    already have happened: a hook that needs to cope with being registered late must
+    say so itself (see ``safety_override.yolo_policy_permits``), because resolving
+    governance from inside an import is how import cycles are born.
+    """
+    with _HOOKS_LOCK:
+        if cb not in _CEILING_INSTALL_HOOKS:
+            _CEILING_INSTALL_HOOKS.append(cb)
+
+
+def register_ceiling_invalidate_hook(cb: "Callable[[], None]") -> None:
+    """Call ``cb()`` just BEFORE a declared install replaces the active context.
+
+    For a consumer whose derived value is an AUTHORIZATION answer. ``cb`` must make
+    that value fail closed and must do no I/O and take no lock a reader might hold:
+    it runs on the install path, ahead of the new ceiling becoming visible, and the
+    matching install hook writes the real answer immediately afterwards. It is told
+    nothing about the incoming ceiling on purpose -- its only job is to stop serving
+    the outgoing one.
+
+    Paired with :func:`register_ceiling_install_hook` and skipped on exactly the same
+    one install (the lazy default), so a consumer registering both is masked and
+    re-resolved as a unit.
+    """
+    with _HOOKS_LOCK:
+        if cb not in _CEILING_INVALIDATE_HOOKS:
+            _CEILING_INVALIDATE_HOOKS.append(cb)
+
+
+def _notify_ceiling_invalidating() -> None:
+    """Run the pre-publication invalidate hooks. Never raises.
+
+    A hook that raises must not stop the install, and it cannot leave a consumer
+    fail-OPEN either: the hooks here only ever withdraw a derived permission, so a
+    failure at worst leaves the previous answer in place -- which is the same state
+    publishing-then-invalidating had, and the install hook still corrects it.
+    """
+    with _HOOKS_LOCK:
+        hooks = list(_CEILING_INVALIDATE_HOOKS)
+    for cb in hooks:
+        try:
+            cb()
+        except Exception:
+            _logger.debug("ceiling invalidate hook %r failed", cb, exc_info=True)
+
+
+def _notify_ceiling_installed(ctx: Optional[PlatformContext]) -> None:
+    """Run the install hooks. Called with NO lock held, and never raises.
+
+    Outside ``_GENERATION_LOCK`` deliberately: a hook resolves governance, which
+    reads :func:`governance_generation` through ``ProfileStore``'s freshness key —
+    and that takes the same non-reentrant lock, so calling a hook while holding it
+    deadlocks the install. A hook that raises must not take the install down with
+    it either: the context IS installed by the time these run, so a failed hook
+    leaves a stale derived value, not a half-installed ceiling.
+    """
+    with _HOOKS_LOCK:
+        hooks = list(_CEILING_INSTALL_HOOKS)
+    for cb in hooks:
+        try:
+            cb(ctx)
+        except Exception:
+            _logger.debug("ceiling install hook %r failed", cb, exc_info=True)
+
+
+def _install(ctx: Optional[PlatformContext], *, notify: bool = True) -> None:
+    """Assign ``_ACTIVE``, bump the generation, then push to the hooks.
+
+    The single writer of ``_ACTIVE``, which is what makes the hooks complete: every
+    declared install -- boot, ``policy_distribution.apply_ceiling``, the test reset --
+    goes through here, so no install site can forget to announce itself.
+
+    Three phases, and the ORDER is the point. Invalidation runs first, so no consumer
+    serves an answer derived from the outgoing ceiling once the incoming one is live;
+    then the context is published; then the install hooks resolve the real answer
+    against it. Publishing before invalidating leaves a governance-resolution-wide
+    window in which the new ceiling is in force and the old answer is still being
+    handed out -- for an authorization answer, a bypass.
+
+    ``notify=False`` is for the lazy default alone; see
+    :func:`register_ceiling_install_hook` for why that one install is silent.
+    """
+    global _ACTIVE, _GOVERNANCE_GENERATION
+    if notify:
+        _notify_ceiling_invalidating()
+    with _GENERATION_LOCK:
+        _ACTIVE = ctx
+        _GOVERNANCE_GENERATION += 1
+    if notify:
+        _notify_ceiling_installed(ctx)
+
+
+def governance_generation() -> int:
+    """Monotonic counter of how many contexts have been installed this process.
+
+    Read by caches keyed on the active ceiling (see ``_GOVERNANCE_GENERATION``).
+    Opaque and comparison-only: callers may test it for equality with a value they
+    stored, never interpret its magnitude.
+    """
+    with _GENERATION_LOCK:
+        return _GOVERNANCE_GENERATION
+
 
 def set_context(ctx: PlatformContext) -> None:
-    """Install the process-global active context (called once at boot)."""
-    global _ACTIVE
-    _ACTIVE = ctx
+    """Install the process-global active context (called once at boot).
+
+    Also called by ``policy_distribution.apply_ceiling`` when a centrally-fetched
+    policy replaces the ceiling mid-session — the one supported post-boot install.
+    """
+    _install(ctx)
+
+
+# ── Declared no-I/O peek callers ──
+#
+# ``installed_context()`` is the one context accessor that does NOT take the
+# fail-closed path: where ``current_context()`` refuses to compose open-source
+# defaults on a non-standalone host, the peek simply answers ``None``.  That is
+# safe only where the no-context answer is already the conservative one — and
+# that is a property of the CALLER, not of this function, so the function cannot
+# check it.
+#
+# For a while nothing did.  The contract lived in the docstring below and in
+# ``docs/system-specs/modules/platform-context.md``, and the caller set grew from
+# one to three with nothing objecting — the spec sentence naming "the one such
+# caller" was still describing a set of three.
+#
+# So the caller set is declared HERE and gated by
+# ``test_platform_cpp_seam_coverage.py``, the same declared-map-plus-AST-scan
+# shape :data:`RESERVED_SLOTS` uses, rot-proof in both directions:
+#
+#   1. Every call site of ``installed_context()`` in the package must appear in
+#      this map.  A new peek fails the build until its author writes down why ITS
+#      no-context answer is conservative — the review question the docstring
+#      could only ask politely.
+#   2. Every entry must still have a real call site.  A caller that is deleted or
+#      renamed takes its entry with it, so the map cannot decay into a list of
+#      permissions nobody exercises.
+#
+# The gate is a forcing function, not a proof: it cannot verify that a written
+# justification is TRUE.  What it removes is the silent path — adding a peek now
+# costs a diff to the very file whose fail-closed contract is being bypassed, and
+# every justification lands in front of a reviewer.
+#
+# Keys are ``"<path under src/kiro_crew>::<enclosing function>"``.  Each value
+# must contain the phrase ``no-context answer`` so the justification is greppable
+# and cannot dodge the question it exists to answer.
+PEEK_CALLERS: "dict[str, str]" = {
+    "security/redaction.py::_token_param_exempt_prefixes": (
+        "no-context answer is the empty prefix set, which means MORE redaction: "
+        "pass 4 redacts every `token=` URL value. The lookup can only skip a "
+        "value no earlier credential pass claimed, so an absent context cannot "
+        "be the reason a credential survives."
+    ),
+    "security/exfil.py::_exempt_exact_hosts": (
+        "no-context answer is the empty exempt-host set, which means MORE "
+        "redaction: every host runs the base64-blob / query-length heuristics. "
+        "The lookup can only ever RELAX those heuristics, never the hard-"
+        "credential floor, so an absent context cannot be the reason a "
+        "credential survives — it is stricter than any companion-supplied "
+        "exemption list could be."
+    ),
+    "platform/context.py::redact_log_via_context": (
+        "no-context answer is the full OSS baseline redaction pass, which is "
+        "byte-for-byte what each of these log sites did before adopting the "
+        "helper. Nothing in that state evidences a companion whose policy is "
+        "being skipped; the genuine downgrade case — a context IS installed and "
+        "its policy failed to compose — is handled separately by withholding "
+        "the line's text (LOG_WITHHELD_PLACEHOLDER)."
+    ),
+    "platform/governance_parts/carriers.py::active_policy_distribution": (
+        "no-context answer is an unconfigured PolicyDistribution, i.e. no "
+        "central fetch. It is reached only when boot never installed a context, "
+        "and then this process holds no ceiling to refresh and runs no refresher "
+        "against one; it is also exactly what this function's own except-branch "
+        "returns, so the peek cannot produce an answer its error path would not."
+    ),
+}
+
+
+def installed_context() -> Optional[PlatformContext]:
+    """The INSTALLED context, or ``None``. Never resolves, never raises, no I/O.
+
+    Unlike :func:`current_context` this is a bare attribute read: it does NOT
+    load config, does NOT discover plugin entry points, and does NOT compose the
+    standalone default. For a caller on a hot path whose answer for "no context"
+    is the same as its answer for "the default context", that resolution is pure
+    cost -- and on a NON-standalone profile it is unmemoized cost, because
+    ``current_context()`` deliberately never caches its fail-closed verdict, so
+    every call re-pays the config load before raising.
+
+    Use this ONLY where the no-context answer is already the conservative one.
+    A caller that must honour a companion's policy has to go through
+    ``current_context()`` and take the fail-closed error.
+
+    Every call site must be declared in :data:`PEEK_CALLERS` with the reason its
+    no-context answer is conservative; ``test_platform_cpp_seam_coverage.py``
+    fails the build on an undeclared peek, and on a declaration whose call site
+    is gone.
+    """
+    return _ACTIVE
 
 
 def current_context() -> PlatformContext:
@@ -392,7 +692,6 @@ def current_context() -> PlatformContext:
     raise :class:`PlatformCompositionError`.  Defense-in-depth so a future
     swallowing caller cannot reintroduce the silent fail-open.
     """
-    global _ACTIVE
     if _ACTIVE is None:
         # deferred (not a cycle): keep config import off the module-load path so
         # importing kiro_crew.platform stays cheap; only the lazy-default path needs it.
@@ -416,14 +715,22 @@ def current_context() -> PlatformContext:
                 "open-source defaults (fail-closed). Boot did not run or failed "
                 "to compose the companion."
             )
-        _ACTIVE = build_default_context(cfg, profile=PROFILE_STANDALONE)
+        # Silent: this runs INSIDE a governance read (the profile store resolves the
+        # active context for its freshness key), so notifying here would re-enter a
+        # store that is mid-load. Nothing needs it -- see
+        # ``register_ceiling_install_hook``.
+        ctx = build_default_context(cfg, profile=PROFILE_STANDALONE)
+        _install(ctx, notify=False)
+        # Return the value just built rather than re-reading the global: the read
+        # would need a narrowing cast, and another thread could have installed a
+        # different context between the install and the read.
+        return ctx
     return _ACTIVE
 
 
 def reset_context() -> None:
     """Clear the active context (test helper)."""
-    global _ACTIVE
-    _ACTIVE = None
+    _install(None)
 
 
 _T = TypeVar("_T")
@@ -573,7 +880,9 @@ def redact_via_context(text: str) -> str:
 
     No logging on the degrade path: this shim runs inside stdio MCP servers
     (``mcp_core`` / ``mcp_cron``) whose stray writes would corrupt the JSON-RPC
-    stream.
+    stream. The degrade is COUNTED instead (:func:`_redact_degrades`), so the
+    content-scan verdict cache never keeps an answer the baseline gave in the
+    companion's place.
     """
     # Deferred import: keep ``security`` (which pulls the redaction regex stack)
     # off the platform module-load path; only the fallback path needs it, and
@@ -585,4 +894,382 @@ def redact_via_context(text: str) -> str:
     except Exception:
         from kiro_crew.security import redact as _security_redact
 
+        _REDACT_DEGRADES.count = _redact_degrades() + 1
         return _security_redact(text)
+
+
+#: Per-thread count of :func:`redact_via_context` falling back to the bare
+#: ``security.redact``. Per THREAD because a content scan runs on one thread and
+#: brackets only its own detector calls: another egress site degrading during a
+#: 12-second scan says nothing about that scan's verdict.
+_REDACT_DEGRADES = threading.local()
+
+
+def _redact_degrades() -> int:
+    """This thread's :data:`_REDACT_DEGRADES`; comparison-only, like
+    :func:`governance_generation`. A content scan reads it before and after, and a
+    change means the verdict may be the baseline's rather than the active
+    context's, so it is not cached."""
+    count: int = getattr(_REDACT_DEGRADES, "count", 0)
+    return count
+
+
+#: Wide-encoding projections :func:`binary_content_is_flagged` scans beside its
+#: ``latin-1`` pass, each as ``(pattern, offset, stride)``.
+#:
+#: A credential written as UTF-16 or UTF-32 inside an allow-listed container --
+#: an ID3v2 UTF-16 tag in ``audio/mpeg``, a UTF-16BE string in
+#: ``application/pdf`` -- carries NUL bytes between its characters, so a
+#: single-byte projection reads ``K\x00E\x00Y`` and no detector matches. Each
+#: pattern finds a run of printable ASCII at one encoding's spacing and the
+#: stride lifts those characters back out; both byte orders and both widths are
+#: covered, and a run at any alignment falls inside one of them.
+#:
+#: Matching a RUN, rather than striding the whole buffer, is what keeps this from
+#: handing the detectors a second stream of high-entropy bytes: random binary
+#: almost never holds a long alternating-NUL sequence, so a media file with no
+#: wide text in it contributes nothing to scan and pays only the search.
+_WIDE_PROJECTIONS: Tuple[Tuple["re.Pattern[bytes]", int, int], ...] = (
+    (re.compile(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00){8,}"), 0, 2),
+    (re.compile(rb"(?:\x00[\x09\x0a\x0d\x20-\x7e]){8,}"), 1, 2),
+    (re.compile(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00\x00\x00){8,}"), 0, 4),
+    (re.compile(rb"(?:\x00\x00\x00[\x09\x0a\x0d\x20-\x7e]){8,}"), 3, 4),
+)
+
+
+def _baseline_symbol_tables_masked(raw_text: str) -> str:
+    """*raw_text* with the standard container symbol tables blanked, for a scan.
+
+    Deferred import for the reason :func:`redact_via_context` states: keep the
+    redaction regex stack off the platform module-load path. Only the narrow binary
+    scan below reaches here, and a gate that is already scanning content pays that
+    import willingly.
+
+    Returns the argument ITSELF when nothing is masked -- both when the helper
+    masks no table and when it cannot be imported at all. The caller reads that
+    identity as "the unmasked answer stands", so a broken import weakens no
+    refusal and costs no second scan.
+    """
+    try:
+        from kiro_crew.security.redaction import mask_baseline_symbol_tables
+    except Exception:
+        return raw_text
+    return mask_baseline_symbol_tables(raw_text)
+
+
+#: Verdicts of the two content scans below, keyed on everything that decides one:
+#: which scan, the bytes (by SHA-256 digest), and the ceiling that scanned them
+#: (:func:`governance_generation`, so installing a context retires every verdict
+#: the old one gave). A bounded LRU holding a digest and a bool per entry.
+#:
+#: The same bytes reach these scans again and again: ``POST /api/outbox/notify``
+#: scans a file at send time, then ``GET /api/outbox/{filename}`` scans it on every
+#: render of its file card and on every Range request the card's ``<video>`` issues.
+#: Each pass is GIL-bound regex work over up to the 50 MB read cap -- a 44 MB MP4
+#: measures about 12 s -- and the answer cannot change while the bytes and the
+#: detectors do not, so every pass after the first is pure cost.
+_SCAN_VERDICTS: "OrderedDict[Tuple[str, bytes, int], bool]" = OrderedDict()
+_SCAN_VERDICTS_MAX = 256
+_SCAN_VERDICTS_LOCK = threading.Lock()
+
+#: Serializes the scans themselves. CPython's ``re`` holds the GIL for the whole of
+#: a match call, so scans in several ``asyncio.to_thread`` workers gain no
+#: parallelism: they pass the GIL between each other while the event loop waits
+#: behind all of them, and the loop's worst gap grows with every pass in flight.
+#: One at a time bounds it by the longest single pass. Measured over four outbox
+#: MP4s of 24-44 MB: worst loop gap 18.7 s concurrent, 7.7 s serialized, both
+#: done in about 38 s. Re-entrant because the binary scan's last leg IS the wide
+#: scan, on the same thread. Never acquired while :data:`_SCAN_VERDICTS_LOCK` is held.
+_SCAN_LOCK = threading.RLock()
+
+
+def _scan_verdict(kind: str, raw: bytes, scan: "Callable[[bytes], bool]") -> bool:
+    """``scan(raw)``, answered from :data:`_SCAN_VERDICTS` when it can be.
+
+    A miss runs the scan under :data:`_SCAN_LOCK` and re-checks the cache once the
+    lock is held, so concurrent callers holding the same bytes pay one scan between
+    them. A verdict is stored only when nothing it depended on moved while it ran:
+    neither the governance generation nor this thread's :func:`_redact_degrades`,
+    whose change means the bare baseline may have answered in the active context's
+    place. An exception -- a :class:`PlatformCompositionError` on a host that could
+    not compose -- propagates and stores nothing, so the scan still fails closed.
+
+    ``hashlib`` releases the GIL while it digests a large buffer, so computing the
+    key costs the event loop nothing even at the read cap.
+    """
+    generation = governance_generation()
+    # Content-addressed cache key, not a security digest: ``raw`` is hashed only to
+    # recognize the same bytes again, never stored or compared as a credential, so
+    # ``usedforsecurity=False`` states that intent and the strength of the hash
+    # guards nothing here -- a collision would at worst reuse a verdict, which the
+    # generation and degrade guards already retire. CodeQL's ``py/weak-sensitive-
+    # data-hashing`` flow heuristic flags the sink because a scanned buffer can
+    # carry credential bytes (that is what these functions exist to FIND); the same
+    # false-positive class is suppressed the repo-standard ``lgtm`` way elsewhere
+    # (see ``auto_improvement/spine/archive.py``).
+    digest = hashlib.sha256(  # noqa: S324 -- content key, not a security digest
+        raw, usedforsecurity=False
+    ).digest()  # lgtm[py/weak-sensitive-data-hashing]
+    key = (kind, digest, generation)
+    with _SCAN_VERDICTS_LOCK:
+        cached = _SCAN_VERDICTS.get(key)
+        if cached is not None:
+            _SCAN_VERDICTS.move_to_end(key)
+            return cached
+    with _SCAN_LOCK:
+        with _SCAN_VERDICTS_LOCK:
+            cached = _SCAN_VERDICTS.get(key)
+        if cached is not None:
+            return cached
+        degrades = _redact_degrades()
+        verdict = scan(raw)
+        if _redact_degrades() == degrades and governance_generation() == generation:
+            with _SCAN_VERDICTS_LOCK:
+                _SCAN_VERDICTS[key] = verdict
+                while len(_SCAN_VERDICTS) > _SCAN_VERDICTS_MAX:
+                    _SCAN_VERDICTS.popitem(last=False)
+    return verdict
+
+
+_Scan = Callable[[bytes], bool]
+
+
+def _kept_and_serialized(kind: str) -> "Callable[[_Scan], _Scan]":
+    """Route a content scan through :func:`_scan_verdict` under the name *kind*.
+
+    A decorator rather than a wrapper call inside each scan, so the scan's own body
+    -- the ``latin-1`` decode and the detector call that make it THE shared egress
+    scan -- stays in the one function every gate imports.
+    """
+
+    def decorate(scan: _Scan) -> _Scan:
+        @functools.wraps(scan)
+        def scan_once(raw: bytes) -> bool:
+            return _scan_verdict(kind, raw, scan)
+
+        return scan_once
+
+    return decorate
+
+
+@_kept_and_serialized("wide")
+def wide_content_is_flagged(raw: bytes) -> bool:
+    """Whether *raw* carries credential material written at UTF-16/UTF-32 spacing.
+
+    Every file-delivery gate runs this over every buffer it decides on, and it is
+    deliberately behind neither a UTF-8 decode failure nor a MIME check. Both
+    conditions are unsound gates for it: NUL-interleaved ASCII is itself valid
+    UTF-8, so a buffer holding ``K\\x00E\\x00Y`` decodes cleanly and takes the
+    text branch, where the detectors match contiguous ASCII and so match nothing;
+    and a file needs no media extension to hold wide text, so a MIME allow-list
+    does not bound which buffers can carry it.
+
+    Cheap on a buffer that holds no wide text: :data:`_WIDE_PROJECTIONS` searches
+    for a RUN of printable ASCII at each encoding's spacing, and with no run found
+    this returns before any detector runs. Ordinary text and ordinary media both
+    take that path. Searching for runs rather than striding the whole buffer is
+    also what keeps the detectors from being handed a second stream of
+    high-entropy bytes, which would widen the false-positive surface.
+
+    This leg does NOT ask the narrow pass's table-masked second question, because
+    no container reaches it carrying a table. A symbol table is written as
+    contiguous bytes at single-byte spacing, so it matches none of
+    :data:`_WIDE_PROJECTIONS`, whose patterns require printable ASCII alternating
+    with NUL; measured over baseline, grayscale, progressive and optimised JPEGs
+    from 692 bytes to 1.6 MB, and over palette and truecolour PNGs, every one of
+    them yields zero projections here. What does reach this leg is wide-encoded
+    TEXT -- an ID3v2 UTF-16 title, a UTF-16BE PDF string -- and a credential is
+    exactly what this leg exists to find in it.
+
+    Synchronous, like :func:`binary_content_is_flagged`: an async gate calls it
+    through ``asyncio.to_thread`` rather than on the event loop, and the verdict is
+    serialized and kept the same way (:func:`_scan_verdict`).
+    """
+    lifted = [
+        match.group()[offset::stride]
+        for pattern, offset, stride in _WIDE_PROJECTIONS
+        for match in pattern.finditer(raw)
+    ]
+    if not lifted:
+        return False
+    wide = b"\n".join(lifted).decode("latin-1")
+    return redact_via_context(wide) != wide
+
+
+@_kept_and_serialized("binary")
+def binary_content_is_flagged(raw: bytes) -> bool:
+    """Whether non-UTF-8 *raw* carries credential material the scanner finds.
+
+    The ONE binary-content scan for every file-delivery gate. A credential can
+    sit inside an allow-listed media type -- base64 key material in a PDF, an
+    exported token in image metadata -- and a UTF-8 decode raises before the text
+    pass ever runs, so those bytes need a pass of their own. ``latin-1`` is the
+    decode used because it is total: every byte maps to a code point, so no input
+    can escape the scan by failing to decode.
+
+    Totality is not enough on its own, because a single-byte projection reads a
+    wide-encoded credential as characters separated by NUL and matches nothing.
+    :func:`wide_content_is_flagged` covers that, and every gate calls it on its
+    text branch too: a buffer whose bytes ARE valid UTF-8 never reaches here, and
+    NUL-interleaved ASCII is valid UTF-8, so the wide pass cannot live behind this
+    function's decode-failure entry condition alone.
+
+    Latin-1 also splits a UTF-8 multi-byte space after ``Bearer``, so the
+    ``errors="replace"`` UTF-8 projection is joined on and scanned in the same
+    pass, mask and all.
+
+    Four gates guard the ``file_send`` delivery path -- the MCP tool before any
+    byte is copied, ``POST /api/outbox/notify``, ``GET /api/outbox/{filename}``,
+    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. All
+    four must agree on what counts as flagged content, for two different reasons.
+    The three owner-facing gates each read the one durable grant
+    :mod:`kiro_crew.file_delivery_consent` records, so a disagreement among them
+    turns that grant into "delivered, card rendered, download refused". The upload
+    legs read no grant at all and refuse regardless, so a disagreement there
+    splits one file's verdict across two delivery legs instead. Agreement is why
+    this lives here as one function rather than as the same three lines written
+    out four times.
+
+    Routed through :func:`redact_via_context`, so a loaded companion's extra
+    credential regexes apply here exactly as they do on the text path. What a
+    gate DOES with a positive answer is the gate's own decision, and differs:
+    the owner-facing three honour the owner's recorded grant, the upload legs
+    refuse unconditionally.
+
+    A positive answer is re-asked with the standard container symbol tables
+    masked, for the reason ``mask_baseline_symbol_tables`` documents: the standard
+    baseline Huffman table's printable tail reads as an unlabelled bot token, so
+    without the second question essentially every JPEG written with the default
+    tables is refused here. Masking is pinned to that one fixed constant, so the
+    re-ask cannot clear anything else.
+
+    The order is what keeps the cost off the common path. A buffer the detectors do
+    not flag is answered by the same single scan as ever; and when the masker finds
+    no table it returns the buffer ITSELF, which the identity test below reads as
+    "the unmasked answer stands" rather than paying the credential alternation a
+    second time over up to the read cap.
+
+    Synchronous, and deliberately: the scan is CPU work over up to the 50 MB read
+    cap, so an async gate must call it through ``asyncio.to_thread`` rather than
+    on the event loop. A worker thread keeps the call off the loop's thread but not
+    off the GIL, which the regex engine holds for a whole match call; that is why
+    scans run one at a time and a verdict is kept (:func:`_scan_verdict`).
+    """
+    text = raw.decode("latin-1") + "\n" + raw.decode("utf-8", errors="replace")
+    if redact_via_context(text) != text:
+        masked = _baseline_symbol_tables_masked(text)
+        if masked is text or redact_via_context(masked) != masked:
+            return True
+    return wide_content_is_flagged(raw)
+
+
+def redact_owner_view_via_context(text: str) -> str:
+    """:func:`redact_via_context` for the DASHBOARD OWNER'S own view with the switch OFF.
+
+    Runs the same context-aware redaction -- a loaded companion's exfiltration
+    carve-outs and extra patterns apply -- inside a ``redaction_switch.owner_view``
+    scope, so the CORE credential pass stands down while everything else in the
+    chain is unchanged. The caller has already established both facts that
+    justify the scope (owner requester, switch read OFF the event loop and found
+    disabled -- ``handlers/files.py`` ``_owner_view_bypasses_credential_pass``);
+    when either is missing it calls :func:`redact_via_context` or ``redact``
+    instead, so there is no ``bypass`` flag to thread. Use it at the file
+    viewer's two handlers only; every other egress never consults the switch.
+    """
+    from kiro_crew.security.redaction_switch import owner_view
+
+    with owner_view():
+        return redact_via_context(text)
+
+
+def redact_code_via_context(text: str) -> str:
+    """:func:`redact_via_context` for text known to be CODE: it spares an alphabet and a data URI.
+
+    Runs the same context-aware redaction -- a loaded companion's extra patterns and
+    exfiltration carve-outs apply -- inside a ``redaction_switch.code_text`` scope, where pass 3
+    of the core credential pass leaves alone an ordered alphabet and a data URI payload of 64
+    characters or more, and judges every other run as it does anywhere. That pass reads a run
+    of letters and digits as a key by its entropy and shape: in prose it errs towards masking,
+    in code it rewrites an alphabet or a base64 data URI that the program reads back, which
+    breaks the program with no error. Every other rule still runs, so a key id, a PEM block,
+    a JWT or a prefixed token written into code is masked as anywhere else, and so is a key in
+    any shape a script holds it. Only text that is code may be served as this returns it.
+    ``member_dashboard._template_text_safe`` takes :func:`redact_via_context` over a whole
+    page as its baseline and puts this function's result in place of the baseline's for the
+    text of the page's ``<script>`` and ``<style>`` elements.
+    """
+    from kiro_crew.security.redaction_switch import code_text
+
+    with code_text():
+        return redact_via_context(text)
+
+
+#: Substituted for a log line's text when redaction could not be composed. Names
+#: the cause, because on the host where this fires the operator's real problem is
+#: the failed companion composition, not the missing line.
+LOG_WITHHELD_PLACEHOLDER = "<withheld: redaction unavailable>"
+
+
+def redact_log_via_context(text: str) -> str:
+    """Context-aware redaction for an operational LOG line, which must not raise.
+
+    Same redaction as :func:`redact_via_context` -- so a loaded companion's extra
+    credential/cookie regexes apply instead of the OSS baseline -- but it never
+    propagates :class:`PlatformCompositionError` to the caller.
+
+    Why a log site needs its own spelling. ``redact_via_context`` re-raises that
+    error deliberately: for an EGRESS sink, refusing to send is both safe and the
+    whole point. A gate-side log line is not an egress boundary, and there the
+    same raise buys nothing while costing availability -- several of these sites
+    log from a path whose failure is worse than a missing line (a background
+    drain, a boot-time install step, an audit write).
+
+    The two no-companion states are NOT the same, and conflating them is what
+    makes this helper subtle:
+
+    * **A context is installed but its policy could not be composed.** The host
+      is known to be non-standalone and its companion genuinely failed, so the
+      baseline would be a real downgrade -- exactly what
+      ``redact_via_context``'s fail-closed contract exists to forbid. The line's
+      TEXT is withheld (:data:`LOG_WITHHELD_PLACEHOLDER`): strictly safer than
+      either raising or downgrading, and the caller's own log call still records
+      that a line arrived and why its content is absent. Same shape as
+      ``auto_improvement.backend.mcp_server._redact_result``.
+    * **No context is installed at all.** Nothing here evidences a companion,
+      the full OSS pass still runs, and this is byte-for-byte what the site did
+      before it adopted this helper -- so withholding would DESTROY diagnostics
+      to protect against a companion that may not exist. Baseline it is. A
+      process that deliberately does not compose (``mcp_gateway.gatewayd`` is
+      one: see ``mcp_gateway/app_call.py``, "this daemon is not the composition
+      process") therefore keeps its logs, and closing that residual properly
+      means handing such a process a composed context -- a separate change, and
+      the same remedy that module already names for the security ceiling.
+
+    Transient (non-composition) adapter errors degrade to baseline, inherited
+    from ``redact_via_context``, so a merely flaky companion does not blank the
+    logs either.
+
+    Costs NO I/O per call. ``installed_context()`` is a bare attribute read, and
+    it is the right primitive here for the reason its own contract gives -- the
+    no-context answer is the SAME as the default-context answer, since
+    ``DefaultCredentialPolicy.redact`` delegates to ``security.redact``, so
+    resolving one would be pure cost. That matters because
+    ``current_context()`` never memoizes its fail-closed verdict on a
+    non-standalone profile, so a per-line caller reaching it would re-pay a
+    config load and an entry-point discovery for every line on the event loop
+    (``docs/system-specs/modules/platform-context.md`` calls this out). Once a
+    context IS installed the delegation below is also just an attribute read, so
+    no path resolves.
+
+    Callers keep their own truncation, and must apply it AFTER this returns:
+    slicing a redacted string is what keeps a credential from surviving as an
+    unmatchable fragment.
+    """
+    if installed_context() is None:
+        from kiro_crew.security import redact as _security_redact
+
+        return _security_redact(text)
+    try:
+        return redact_via_context(text)
+    except PlatformCompositionError:
+        return LOG_WITHHELD_PLACEHOLDER

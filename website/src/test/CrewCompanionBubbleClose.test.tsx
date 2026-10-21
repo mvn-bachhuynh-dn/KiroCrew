@@ -9,7 +9,7 @@
  * bubble still will not close on screen, the fault is in the hitbox, not here.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup } from '@testing-library/react'
 
 import { Bubble } from '../apps/crew-companion/Bubble'
 
@@ -25,6 +25,17 @@ afterEach(() => {
 /** The exit animation runs before onDismiss fires, so tests must step past it. */
 function flushExit() {
   vi.advanceTimersByTime(400)
+}
+
+/**
+ * Let a CTA whose handler reports asynchronously finish reporting.
+ *
+ * The verdict arrives in a microtask, and the state it drives has to be applied
+ * before the exit timer is stepped — otherwise the timer is advanced past a
+ * dismissal that has not been scheduled yet, and the test reads a pass as a fail.
+ */
+async function settleAction() {
+  await act(async () => {})
 }
 
 describe('closing a bubble', () => {
@@ -89,14 +100,24 @@ describe('closing a bubble', () => {
     expect(getComputedStyle(x as Element).position).not.toBe('absolute')
   })
 
-  it('the CTA sits below the box, outside the text row', () => {
-    // Inside the row it would line up beside the words; the box also clips overflow.
+  it('the CTA is a footer inside the card, not a pill floating under it', () => {
+    // Keeping it as the body row's sibling gives the action full width without joining the text row.
     const { container } = render(
       <Bubble text="needs your OK" kind="approval" onDismiss={() => {}} onAction={() => {}} />,
     )
-    const row = container.querySelector('.cc-bubble-cta-row')
-    expect(row).not.toBeNull()
-    expect(row!.parentElement?.className).toContain('cc-bubble-wrap')
+    const card = container.querySelector('.cc-bubble')
+    const foot = container.querySelector('.cc-bubble-foot')
+    expect(card, 'card not found').not.toBeNull()
+    expect(foot, 'footer not rendered for a kind that has a CTA').not.toBeNull()
+    // Inside the card…
+    expect(card!.contains(foot!)).toBe(true)
+    // …and a SIBLING of the message row, not nested in it (which would put the action
+    // beside the words — the reason it was originally kept outside the card at all).
+    const bodyRow = container.querySelector('.cc-bubble-body-row')
+    expect(bodyRow).not.toBeNull()
+    expect(bodyRow!.contains(foot!)).toBe(false)
+    // The old floating-pill container must be gone, not merely unused.
+    expect(container.querySelector('.cc-bubble-cta-row')).toBeNull()
   })
 
   it('unresolved work has NO ✕ and is cleared through its CTA instead', () => {
@@ -112,6 +133,54 @@ describe('closing a bubble', () => {
     fireEvent.click(cta!)
     flushExit()
     expect(onAction).toHaveBeenCalledWith('open-session')
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('a CTA whose action could not be carried out does NOT clear the bubble', async () => {
+    // The dismissal used to be unconditional, which is worst exactly where it
+    // matters: an approval has no ✕ and ignores body clicks, so clearing it on a
+    // failed open destroys the only pointer back to the blocked session.
+    const onDismiss = vi.fn()
+    const { container } = render(
+      <Bubble
+        text="needs your OK"
+        kind="approval"
+        onDismiss={onDismiss}
+        onAction={() => Promise.resolve(false)}
+      />,
+    )
+    fireEvent.click(container.querySelector('.cc-bubble-cta')!)
+    await settleAction()
+    flushExit()
+    expect(onDismiss).not.toHaveBeenCalled()
+    expect(container.querySelector('.cc-bubble-wrap')?.className).not.toContain('cc-bubble-out')
+  })
+
+  it('a CTA that reports success clears the bubble once the action lands', async () => {
+    const onDismiss = vi.fn()
+    const { container } = render(
+      <Bubble
+        text="needs your OK"
+        kind="approval"
+        onDismiss={onDismiss}
+        onAction={() => Promise.resolve(true)}
+      />,
+    )
+    fireEvent.click(container.querySelector('.cc-bubble-cta')!)
+    await settleAction()
+    flushExit()
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('a synchronous CTA still clears the bubble synchronously', () => {
+    // The breathing nudge's handler opens the panel and returns nothing; routing
+    // every CTA through a promise would delay an exit that cannot fail.
+    const onDismiss = vi.fn()
+    const { container } = render(
+      <Bubble text="Try a breath" kind="break-breathe" onDismiss={onDismiss} onAction={() => {}} />,
+    )
+    fireEvent.click(container.querySelector('.cc-bubble-cta')!)
+    flushExit()
     expect(onDismiss).toHaveBeenCalledTimes(1)
   })
 

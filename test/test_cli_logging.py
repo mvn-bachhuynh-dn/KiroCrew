@@ -13,23 +13,44 @@ Covers:
 - ``_fd_targets_file``  — the dev/ino detection primitive
 - ``_redirect_fds_to``  — the post-rotation fd re-point primitive
 - ``_setup_cli_logging`` — handler topology in detached vs foreground mode
+- the QueueHandler/QueueListener indirection — the file handler (rollover
+  included) runs on the listener thread, never the calling thread, and
+  ``_stop_log_queue_listener`` drains every queued record to disk
 """
 
+import ast
+import errno
+import io
 import logging
 import os
+import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+import kiro_crew.cli as cli_mod
 from kiro_crew.cli import (
+    _CliLogQueueHandler,
     _fd_targets_file,
     _FdTrackingRotatingFileHandler,
     _redirect_fds_to,
     _setup_cli_logging,
+    _stop_log_queue_listener,
+    drain_log_queue_before_hard_exit,
 )
+from kiro_crew.cli_logging import _fd_is_regular_file as _real_fd_is_regular_file
 from kiro_crew.config import config_dir
+
+
+@pytest.fixture(autouse=True)
+def _stderr_is_not_a_file(_floor_monkeypatch):
+    """pytest's fd capture points fd 2 at a temp FILE, which a gateway reads as
+    a service manager's error file. Tests model a console unless they opt in
+    (TestSetupCliLoggingServiceErrorFile)."""
+    _floor_monkeypatch.setattr("kiro_crew.cli._fd_is_regular_file", lambda fd: False)
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +64,8 @@ def _pristine_logging():
     empty handler lists, then restore the originals afterwards — closing
     any handler the test added so the tmp gateway.log file descriptor is
     released promptly (required on Windows, where an open fd blocks the
-    tmpdir cleanup).
+    tmpdir cleanup). Also stops the module's QueueListener so its drain
+    thread and the file handler's fd never leak across tests.
     """
     root = logging.getLogger()
     kc = logging.getLogger("kiro_crew")
@@ -52,6 +74,16 @@ def _pristine_logging():
     root.handlers[:] = []
     kc.handlers[:] = []
     yield
+    listener = cli_mod._LOG_QUEUE_LISTENER
+    _stop_log_queue_listener()
+    if listener is not None:
+        # The drain returns before closing the file handler when a test left
+        # the listener stopped (``QueueListener.stop`` raises on a listener
+        # whose thread is gone). Close the listener's handlers here regardless:
+        # ``Handler.close`` is idempotent, and the tmpdir cleanup on Windows
+        # needs the gateway.log fd released whether or not the drain got there.
+        for handler in listener.handlers:
+            handler.close()
     for logger, (handlers, _) in ((root, saved_root), (kc, saved_kc)):
         for handler in logger.handlers[:]:
             if handler not in handlers:
@@ -148,6 +180,114 @@ class TestRedirectFdsTo:
         assert self._read(old) == b"still-old\n"
 
 
+def _open_fds_on(path: Path) -> list[str]:
+    """Descriptors of THIS process whose target is *path* (Linux ``/proc``)."""
+    fd_dir = Path("/proc/self/fd")
+    held = []
+    for entry in fd_dir.iterdir():
+        try:
+            if os.readlink(entry) == str(path):
+                held.append(entry.name)
+        except OSError:
+            continue  # the fd closed while we listed it
+    return held
+
+
+class TestAppendOnlyLogFileHandler:
+    """A process that is not the gateway must not keep ``gateway.log`` open.
+
+    Windows refuses to rename a file another process holds open, so an MCP
+    server that kept its own handle made every gateway rollover fail and the
+    gateway's file log dropped every later record until restart.
+    """
+
+    def test_no_handle_held_after_construction_or_emit(self, tmp_path):
+        log = tmp_path / "gateway.log"
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        try:
+            assert handler.stream is None
+            record = logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "one", None, None)
+            handler.handle(record)
+            handler.handle(record)
+            assert handler.stream is None
+            assert log.read_text(encoding="utf-8") == "one\none\n"
+        finally:
+            handler.close()
+
+    def test_never_rotates(self, tmp_path):
+        log = tmp_path / "gateway.log"
+        log.write_text("x" * (3 * 1024 * 1024), encoding="utf-8")
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        try:
+            handler.handle(
+                logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "tail", None, None)
+            )
+        finally:
+            handler.close()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["gateway.log"]
+        assert log.read_text(encoding="utf-8").endswith("tail\n")
+
+    def test_unopenable_path_raises_at_construction(self, tmp_path):
+        # A sandbox deny must surface at setup, where the caller falls back to
+        # console-only logging, rather than as one traceback per record.
+        with pytest.raises(OSError):
+            cli_mod._AppendOnlyLogFileHandler(tmp_path / "missing-dir" / "gateway.log")
+
+    def test_failed_open_on_emit_is_reported_not_raised(self, tmp_path, monkeypatch):
+        log = tmp_path / "gateway.log"
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        reported = []
+        monkeypatch.setattr(handler, "handleError", reported.append)
+
+        def _deny():
+            raise PermissionError(errno.EACCES, "denied")
+
+        monkeypatch.setattr(handler, "_open", _deny)
+        record = logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "lost", None, None)
+        handler.handle(record)  # must not raise into the caller
+        assert reported == [record]
+        handler.close()
+
+    @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc fd listing")
+    @pytest.mark.parametrize("command", ["mcp-core", "mcp-cron", "chat", "status"])
+    def test_non_gateway_command_holds_no_handle_on_gateway_log(self, command, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        log_file = config_dir() / "gateway.log"
+        _setup_cli_logging(command, 1)
+        logging.getLogger("kiro_crew.holder").warning("from-%s", command)
+        _stop_log_queue_listener()  # chat writes through the listener thread
+        assert f"from-{command}" in log_file.read_text(encoding="utf-8")
+        assert _open_fds_on(log_file) == []
+
+    @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc fd listing")
+    def test_gateway_is_the_only_holder(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.holder").warning("gateway-record")
+        listener = cli_mod._LOG_QUEUE_LISTENER
+        assert listener is not None
+        (fh,) = listener.handlers
+        assert isinstance(fh, RotatingFileHandler)
+        assert fh.maxBytes == 2 * 1024 * 1024
+
+
+class TestBootRotationFailureIsReported:
+    def test_failed_boot_rotation_logs_a_warning(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        log_file = config_dir() / "gateway.log"
+        log_file.write_text("previous run\n", encoding="utf-8")
+
+        def _held(self, target):
+            raise PermissionError(errno.EACCES, "held by another process")
+
+        monkeypatch.setattr(Path, "replace", _held)
+        _setup_cli_logging("gateway", 1)
+        _stop_log_queue_listener()
+        text = log_file.read_text(encoding="utf-8")
+        assert text.startswith("previous run\n")
+        assert "could not move" in text and "held by another process" in text
+
+
 class TestFdTrackingRotatingFileHandler:
     @pytest.mark.skipif(
         os.name == "nt",
@@ -216,6 +356,151 @@ class TestFdTrackingRotatingFileHandler:
         assert all(c == Path(handler.baseFilename) for c in calls)
 
 
+def _big_record(msg: str = "x" * 100) -> logging.LogRecord:
+    return logging.LogRecord("t", logging.WARNING, __file__, 1, msg, None, None)
+
+
+class TestRolloverFailureStopsFileLogging:
+    """When the reopen inside a rollover fails, fds 1/2 stay on the RENAMED
+    file. A traceback per record there escapes the 2 MB cap and fills the
+    disk, so an OSError streak prints one traceback and, for a non-retryable
+    errno or a long streak, file logging stops."""
+
+    @pytest.fixture
+    def redirects(self, monkeypatch):
+        # Record fd re-points instead of performing them: a real dup2 onto
+        # fd 2 would swallow pytest's own output.
+        calls: list[Path] = []
+        monkeypatch.setattr(
+            cli_mod, "_redirect_fds_to", lambda path, fds=(1, 2): calls.append(Path(path))
+        )
+        return calls
+
+    @staticmethod
+    def _deny_reopen(handler, monkeypatch, err: int) -> None:
+        def _open():
+            raise OSError(err, os.strerror(err), handler.baseFilename)
+
+        monkeypatch.setattr(handler, "_open", _open)
+
+    def test_eacces_on_reopen_stops_file_logging(self, tmp_path, monkeypatch, redirects):
+        err = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err)
+        handler = _FdTrackingRotatingFileHandler(
+            tmp_path / "gateway.log", maxBytes=64, backupCount=2, encoding="utf-8"
+        )
+        handler.emit(_big_record())  # fills past maxBytes: the next emit rolls
+        self._deny_reopen(handler, monkeypatch, errno.EACCES)
+        for _ in range(20):
+            handler.emit(_big_record())
+        handler.close()
+        out = err.getvalue()
+        assert out.count("--- Logging error ---") == 1
+        assert len([ln for ln in out.splitlines() if "file logging to" in ln]) == 1
+        assert redirects == [Path(os.devnull)]
+
+    def test_retryable_errno_stops_at_streak_limit(self, tmp_path, monkeypatch, redirects):
+        err = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err)
+        handler = _FdTrackingRotatingFileHandler(
+            tmp_path / "gateway.log", maxBytes=64, backupCount=2, encoding="utf-8"
+        )
+        handler.emit(_big_record())
+        self._deny_reopen(handler, monkeypatch, errno.ENOSPC)
+        for _ in range(20):
+            handler.emit(_big_record())
+        handler.close()
+        out = err.getvalue()
+        assert out.count("--- Logging error ---") == 1
+        assert len([ln for ln in out.splitlines() if "file logging to" in ln]) == 1
+        assert redirects == [Path(os.devnull)]
+
+    def test_transient_error_below_limit_keeps_logging(self, tmp_path, monkeypatch, redirects):
+        err = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err)
+        log = tmp_path / "gateway.log"
+        handler = _FdTrackingRotatingFileHandler(log, maxBytes=0, backupCount=2, encoding="utf-8")
+        failing = {"on": False}
+        real = handler.shouldRollover
+
+        def _maybe_fail(record):
+            if failing["on"]:
+                raise OSError(errno.ENOENT, "transient", handler.baseFilename)
+            return real(record)
+
+        monkeypatch.setattr(handler, "shouldRollover", _maybe_fail)
+        # Two bursts of two failures each: four in all, past the limit of 3
+        # unless the success between the bursts resets the streak.
+        for burst in range(2):
+            failing["on"] = True
+            for _ in range(2):
+                handler.emit(_big_record("fail"))
+            failing["on"] = False
+            handler.emit(_big_record(f"ok-{burst}"))
+        handler.close()
+        text = log.read_text(encoding="utf-8")
+        assert "ok-0" in text and "ok-1" in text
+        assert err.getvalue().count("--- Logging error ---") == 2  # one per streak
+        assert redirects == []
+
+    def test_write_error_on_open_file_never_stops(self, tmp_path, monkeypatch, redirects):
+        # A disk-full write to the live, still-rotated file may clear by
+        # itself: suppress the repeat tracebacks but keep the handler alive.
+        err = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err)
+        log = tmp_path / "gateway.log"
+        handler = _FdTrackingRotatingFileHandler(log, maxBytes=0, backupCount=2, encoding="utf-8")
+        real = handler.stream
+        failing = {"on": True}
+
+        class _FullDisk:
+            def write(self, text):
+                if failing["on"]:
+                    raise OSError(errno.ENOSPC, "full", handler.baseFilename)
+                return real.write(text)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        handler.stream = _FullDisk()
+        for _ in range(10):
+            handler.emit(_big_record("fail"))
+        failing["on"] = False
+        handler.emit(_big_record("back"))
+        handler.close()
+        assert "back" in log.read_text(encoding="utf-8")
+        assert err.getvalue().count("--- Logging error ---") == 1
+        assert redirects == []
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Windows cannot rename a file another handle holds open, so "
+        "stderr cannot follow the renamed inode there.",
+    )
+    def test_renamed_backup_does_not_grow_after_failure(self, tmp_path, monkeypatch, redirects):
+        log = tmp_path / "gateway.log"
+        handler = _FdTrackingRotatingFileHandler(log, maxBytes=64, backupCount=2, encoding="utf-8")
+        # Stands in for fd 2 after the detached redirect: it follows the inode
+        # through the rename, exactly as raw stderr does.
+        stderr_file = open(log, "a", encoding="utf-8")
+        try:
+            monkeypatch.setattr(sys, "stderr", stderr_file)
+            handler.emit(_big_record())
+            self._deny_reopen(handler, monkeypatch, errno.EACCES)
+            handler.emit(_big_record())  # renames gateway.log -> .1, reopen fails
+            stderr_file.flush()
+            backup = tmp_path / "gateway.log.1"
+            size_after_failure = backup.stat().st_size
+            for _ in range(50):
+                handler.emit(_big_record())
+            stderr_file.flush()
+            assert backup.stat().st_size == size_after_failure
+        finally:
+            monkeypatch.undo()
+            stderr_file.close()
+            handler.close()
+
+
 class TestSetupCliLoggingDetached:
     """Handler topology when stderr IS gateway.log (detach-spawned)."""
 
@@ -235,23 +520,30 @@ class TestSetupCliLoggingDetached:
         ]
         assert stream_handlers == []
 
-    def test_file_handler_on_root_not_kiro_crew(self):
+    def test_queue_handler_on_root_not_kiro_crew(self):
         _setup_cli_logging("gateway", 1)
-        root_fhs = [h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler)]
-        assert len(root_fhs) == 1
-        assert Path(root_fhs[0].baseFilename) == config_dir() / "gateway.log"
-        kc_fhs = [
-            h
-            for h in logging.getLogger("kiro_crew").handlers
-            if isinstance(h, RotatingFileHandler)
+        root_qhs = [h for h in logging.getLogger().handlers if isinstance(h, _CliLogQueueHandler)]
+        assert len(root_qhs) == 1
+        kc_qhs = [
+            h for h in logging.getLogger("kiro_crew").handlers if isinstance(h, _CliLogQueueHandler)
         ]
-        assert kc_fhs == []
+        assert kc_qhs == []
+        # The file handler must never sit on a logger directly — inline emit
+        # on the event-loop thread is the loop-stall bug this fix removes.
+        for logger in (logging.getLogger(), logging.getLogger("kiro_crew")):
+            assert not any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
+        listener = cli_mod._LOG_QUEUE_LISTENER
+        assert listener is not None
+        (fh,) = listener.handlers
+        # Detached mode needs the fd-tracking subclass so the WHOLE rollover
+        # (rename chain + dup2 fd re-point) rides the listener thread.
+        assert isinstance(fh, _FdTrackingRotatingFileHandler)
+        assert Path(fh.baseFilename) == config_dir() / "gateway.log"
 
     def test_kiro_crew_record_written_exactly_once(self):
         _setup_cli_logging("gateway", 1)
         logging.getLogger("kiro_crew.test_doublewrite").warning("sentinel-record")
-        for h in logging.getLogger().handlers:
-            h.flush()
+        _stop_log_queue_listener()  # deterministic drain to disk
         text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
         assert text.count("sentinel-record") == 1
         # And it is the PID-stamped file-handler copy, not the console format.
@@ -262,8 +554,7 @@ class TestSetupCliLoggingDetached:
         # stderr echo; the root-attached handler must keep them flowing.
         _setup_cli_logging("gateway", 1)
         logging.getLogger("somelib.test_doublewrite").warning("thirdparty-record")
-        for h in logging.getLogger().handlers:
-            h.flush()
+        _stop_log_queue_listener()  # deterministic drain to disk
         text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
         assert text.count("thirdparty-record") == 1
 
@@ -280,19 +571,107 @@ class TestSetupCliLoggingDetached:
         assert not (config_dir() / "gateway.log.prev").exists()
         self.redirect.assert_not_called()
 
-    def test_handler_level_capped_at_warning_for_third_party(self, monkeypatch):
-        """A stricter persisted kiro_crew level must not gag third-party
-        WARNINGs on the shared root handler (kiro_crew records stay filtered
-        at the kiro_crew logger itself)."""
+    def test_handlers_carry_no_level_third_party_warning_still_lands(self, monkeypatch):
+        """The ``kiro_crew`` logger is the SINGLE level gate. Neither the file
+        handler nor the queue handler carries a level of its own: a stricter
+        persisted kiro_crew level gates kiro_crew records at the kiro_crew
+        logger, third-party records are gated at the root logger's WARNING,
+        and nothing is re-judged on the way to the file. A level on either
+        handler would be a boot-time copy that a runtime ``agent.log_level``
+        change does not reach."""
         from kiro_crew.config import KiroCrewConfig
 
-        cfg = KiroCrewConfig.load()
+        cfg = KiroCrewConfig()
         cfg.agent.log_level = "ERROR"
         monkeypatch.setattr("kiro_crew.cli.KiroCrewConfig.load", staticmethod(lambda: cfg))
         _setup_cli_logging("gateway", 0)
-        fh = next(h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler))
-        assert fh.level == logging.WARNING
+        (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
+        (qh,) = [h for h in logging.getLogger().handlers if isinstance(h, _CliLogQueueHandler)]
+        assert fh.level == logging.NOTSET
+        assert qh.level == logging.NOTSET
+        assert cli_mod._LOG_QUEUE_LISTENER.respect_handler_level is False
         assert logging.getLogger("kiro_crew").level == logging.ERROR
+        logging.getLogger("somelib.test_single_gate").warning("thirdparty-still-flows")
+        logging.getLogger("kiro_crew.test_single_gate").warning("kiro-crew-gated")
+        _stop_log_queue_listener()  # deterministic drain to disk
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "thirdparty-still-flows" in text
+        assert "kiro-crew-gated" not in text
+
+    def test_unwritable_gateway_log_fails_loudly(self, monkeypatch):
+        """A DETACHED process must not soft-fail an unopenable ``gateway.log``.
+
+        Detached setup deliberately skips ``basicConfig`` (a console echo would
+        double-write into the log stderr already points at), so there is no
+        console handler. Swallowing the OSError here would boot a long-lived
+        gateway with no persistent log AND no destination for the warning
+        saying so. Only the console-backed foreground path soft-fails --
+        see ``TestSetupCliLoggingForeground.test_unwritable_gateway_log_soft_fails``.
+        """
+
+        def _deny(*_a, **_k):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
+        with pytest.raises(PermissionError):
+            _setup_cli_logging("gateway", 1)
+
+
+class TestFdIsRegularFile:
+    def test_true_for_a_regular_file(self, tmp_path):
+        with open(tmp_path / "gateway.err", "w") as fh:
+            assert _real_fd_is_regular_file(fh.fileno()) is True
+
+    def test_false_for_a_pipe(self):
+        r, w = os.pipe()
+        try:
+            assert _real_fd_is_regular_file(w) is False
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_false_for_a_closed_fd(self):
+        r, w = os.pipe()
+        os.close(r)
+        os.close(w)
+        assert _real_fd_is_regular_file(w) is False
+
+
+class TestSetupCliLoggingServiceErrorFile:
+    """A gateway whose stderr is a file nothing rotates (launchd's
+    ``gateway.err``, the Desktop launch log) echoes only warnings and errors
+    there; ``gateway.log`` keeps every record at the configured level."""
+
+    @pytest.fixture(autouse=True)
+    def _service_stderr(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        _floor_monkeypatch.setattr("kiro_crew.cli._fd_is_regular_file", lambda fd: True)
+        _floor_monkeypatch.setattr("kiro_crew.cli._redirect_fds_to", MagicMock())
+        # pytest's own capture handler on root turns the real basicConfig into
+        # a no-op, so stand in for it with the console handler it would add.
+        self.console = io.StringIO()
+
+        def _basic_config(**_kwargs):
+            logging.getLogger().addHandler(logging.StreamHandler(self.console))
+
+        _floor_monkeypatch.setattr(logging, "basicConfig", _basic_config)
+
+    def test_gateway_echoes_only_warnings_to_the_stderr_file(self):
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.test_service").info("kc-info-record")
+        logging.getLogger("kiro_crew.test_service").warning("kc-warn-record")
+        _stop_log_queue_listener()
+        assert "kc-info-record" not in self.console.getvalue()
+        assert "kc-warn-record" in self.console.getvalue()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert text.count("kc-info-record") == 1
+        assert text.count("kc-warn-record") == 1
+
+    def test_other_commands_keep_echoing_every_level(self):
+        _setup_cli_logging("status", 1)
+        logging.getLogger("kiro_crew.test_service").info("kc-info-record")
+        assert "kc-info-record" in self.console.getvalue()
 
 
 class TestSetupCliLoggingForeground:
@@ -304,23 +683,31 @@ class TestSetupCliLoggingForeground:
         self.redirect = MagicMock()
         monkeypatch.setattr("kiro_crew.cli._redirect_fds_to", self.redirect)
 
-    def test_file_handler_on_kiro_crew_logger(self):
+    def test_queue_handler_on_kiro_crew_logger(self):
         _setup_cli_logging("gateway", 1)
-        kc_fhs = [
-            h
-            for h in logging.getLogger("kiro_crew").handlers
-            if isinstance(h, RotatingFileHandler)
+        kc_qhs = [
+            h for h in logging.getLogger("kiro_crew").handlers if isinstance(h, _CliLogQueueHandler)
         ]
-        assert len(kc_fhs) == 1
-        assert kc_fhs[0].level == logging.INFO
-        root_fhs = [h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler)]
-        assert root_fhs == []
+        assert len(kc_qhs) == 1
+        # The level lives on the kiro_crew logger alone; the queue handler and
+        # the file handler carry none (a copy here is one a runtime change
+        # does not reach).
+        assert kc_qhs[0].level == logging.NOTSET
+        assert logging.getLogger("kiro_crew").level == logging.INFO
+        assert not any(isinstance(h, _CliLogQueueHandler) for h in logging.getLogger().handlers)
+        # No inline file handler on either logger.
+        for logger in (logging.getLogger(), logging.getLogger("kiro_crew")):
+            assert not any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
+        (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
+        # Foreground keeps the plain (owner-only) handler: no fds were redirected,
+        # so there is nothing to re-point on rollover.
+        assert type(fh) is cli_mod._OwnerOnlyRotatingFileHandler
+        assert fh.level == logging.NOTSET
 
     def test_record_written_once_to_file(self):
         _setup_cli_logging("gateway", 1)
         logging.getLogger("kiro_crew.test_foreground").warning("fg-sentinel")
-        for h in logging.getLogger("kiro_crew").handlers:
-            h.flush()
+        _stop_log_queue_listener()  # deterministic drain to disk
         text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
         assert text.count("fg-sentinel") == 1
 
@@ -331,3 +718,441 @@ class TestSetupCliLoggingForeground:
         assert (config_dir() / "gateway.log.prev").exists()
         # … but a foreground console must never be dup2'd into the log file.
         self.redirect.assert_not_called()
+
+    def test_unwritable_gateway_log_soft_fails(self, monkeypatch):
+        """Seatbelt may deny ``gateway.log``; a CONSOLE-backed setup must not raise.
+
+        Sandboxed MCP children (e.g. ``kirocrew mcp-core``) inherit a profile
+        that blocks the persistent log path. Foreground setup installed a
+        console handler, so the warning has somewhere to land and the MCP
+        handshake must still start. The detached counterpart is pinned by
+        ``TestSetupCliLoggingDetached.test_unwritable_gateway_log_fails_loudly``.
+        """
+
+        def _deny(*_a, **_k):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr("kiro_crew.cli._AppendOnlyLogFileHandler", _deny)
+        _setup_cli_logging("mcp-core", 0)  # must not raise
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+        assert not any(
+            isinstance(h, logging.FileHandler) for h in logging.getLogger("kiro_crew").handlers
+        )
+
+    def test_unwritable_gateway_log_still_redacts_for_long_lived(self, monkeypatch):
+        """OSError on gateway.log must not skip Bearer/JWT console redaction."""
+
+        def _deny(*_a, **_k):
+            raise PermissionError(1, "Operation not permitted")
+
+        redaction = MagicMock()
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli.install_log_redaction", redaction)
+        _setup_cli_logging("gateway", 1)  # must not raise
+        redaction.assert_called_once_with([])
+
+
+class TestRuntimeLevelReachesFileLog:
+    """A runtime ``agent.log_level`` change reaches ``gateway.log`` without a restart.
+
+    ``apply_log_level`` -- the Logs-page toggle and the ``agent.log_level``
+    config applier -- moves the ``kiro_crew`` logger, and that logger is the
+    single level gate: neither the file handler nor the producer-side queue
+    handler pins a boot-time level of its own. A gateway booted at WARNING and
+    raised to INFO writes its INFO records to the file ``kirocrew logs`` reads,
+    not only to the live Logs stream (its own handler on the logger). These
+    tests fail if either handler carries a level.
+    """
+
+    @staticmethod
+    def _boot(monkeypatch, *, detached: bool, persisted: str = "WARNING") -> None:
+        """Build the chain the way an installed gateway boots it: persisted
+        level from config (no ``--verbose``), foreground or detach-spawned.
+        The config handed to boot is a fresh default object, never the one a
+        real ``load()`` returned, so no cached document is mutated."""
+        from kiro_crew.config import KiroCrewConfig
+
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: detached)
+        monkeypatch.setattr("kiro_crew.cli._redirect_fds_to", MagicMock())
+        cfg = KiroCrewConfig()
+        cfg.agent.log_level = persisted
+        monkeypatch.setattr("kiro_crew.cli.KiroCrewConfig.load", staticmethod(lambda: cfg))
+        _setup_cli_logging("gateway", 0)
+
+    @staticmethod
+    def _sinks(detached: bool):
+        producer = logging.getLogger() if detached else logging.getLogger("kiro_crew")
+        (qh,) = [h for h in producer.handlers if isinstance(h, _CliLogQueueHandler)]
+        (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
+        return fh, qh
+
+    def test_raised_info_record_reaches_gateway_log(self, monkeypatch):
+        from kiro_crew.dashboard.handlers.updates import apply_log_level
+
+        self._boot(monkeypatch, detached=False)
+        fh, qh = self._sinks(detached=False)
+        assert logging.getLogger("kiro_crew").level == logging.WARNING
+
+        assert apply_log_level("INFO", source="dashboard") is True
+
+        assert logging.getLogger("kiro_crew").level == logging.INFO
+        logging.getLogger("kiro_crew.test_runtime_level").info("raised-info-record")
+        _stop_log_queue_listener()  # deterministic drain to disk
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "raised-info-record" in text, "raised INFO record never reached gateway.log"
+        # The applier's own confirmation is the first raised record; the
+        # reporter saw it on the desktop's stdout capture and never in the file.
+        assert "Log level changed to INFO via dashboard" in text
+        # The handlers never held a level to move: the logger was the whole gate.
+        assert fh.level == qh.level == logging.NOTSET
+
+    def test_detached_tightening_keeps_third_party_warnings_flowing(self, monkeypatch):
+        """A stricter kiro_crew level gates kiro_crew records at the kiro_crew
+        logger; third-party records on the shared root handler stay gated at
+        the root logger's WARNING. Neither handler holds a level to do it."""
+        from kiro_crew.dashboard.handlers.updates import apply_log_level
+
+        self._boot(monkeypatch, detached=True)
+        fh, qh = self._sinks(detached=True)
+
+        assert apply_log_level("ERROR", source="config") is True
+
+        assert logging.getLogger("kiro_crew").level == logging.ERROR
+        assert fh.level == qh.level == logging.NOTSET
+        logging.getLogger("somelib.test_runtime_level").warning("thirdparty-still-flows")
+        logging.getLogger("kiro_crew.test_runtime_level").warning("kiro-crew-gagged")
+        _stop_log_queue_listener()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "thirdparty-still-flows" in text
+        assert "kiro-crew-gagged" not in text
+
+    def test_detached_raise_does_not_open_the_root_to_third_party_info(self, monkeypatch):
+        """Raising kiro_crew to INFO admits kiro_crew INFO; third-party INFO
+        stays gated at the root logger's WARNING, exactly as a boot at INFO."""
+        from kiro_crew.dashboard.handlers.updates import apply_log_level
+
+        self._boot(monkeypatch, detached=True)
+
+        assert apply_log_level("INFO", source="dashboard") is True
+
+        logging.getLogger("kiro_crew.test_runtime_level").info("kiro-crew-info")
+        logging.getLogger("somelib.test_runtime_level").info("thirdparty-info")
+        _stop_log_queue_listener()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "kiro-crew-info" in text
+        assert "thirdparty-info" not in text
+
+    def test_tightening_keeps_records_already_queued(self, monkeypatch):
+        """A record logged while INFO was in force must still reach the file
+        after a runtime tightening: with no level on the handlers and no
+        handler-level re-check at dequeue, nothing judges a queued record by a
+        level set after it was logged -- a queue backed up behind a rollover
+        on a slow disk holds hundreds of them."""
+        from kiro_crew.dashboard.handlers.updates import apply_log_level
+
+        self._boot(monkeypatch, detached=False, persisted="INFO")
+        listener = cli_mod._LOG_QUEUE_LISTENER
+        assert listener is not None
+        listener.stop()  # park the consumer: records now sit in the queue
+        try:
+            logging.getLogger("kiro_crew.test_runtime_level").info("queued-before-tightening")
+
+            assert apply_log_level("ERROR", source="dashboard") is True
+        finally:
+            # Teardown drains through ``listener.stop()``, which raises on a
+            # listener whose thread is already gone and then skips the file
+            # handler's close -- a failed assertion inside this window must
+            # not hand it a stopped listener (an open gateway.log fd blocks
+            # the tmpdir cleanup on Windows).
+            listener.start()  # the consumer resumes with the new level in force
+        _stop_log_queue_listener()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "queued-before-tightening" in text, "tightening dropped a record already queued"
+
+
+class TestQueueOffLoop:
+    """The point of the queue: file-handler I/O never runs on the calling
+    thread (in the gateway that thread runs the asyncio event loop, and an
+    inline emit or rollover blocking >25s trips the loop-stall watchdog,
+    which hard-exits the process and orphans every in-flight subagent)."""
+
+    @pytest.fixture(autouse=True)
+    def _foreground(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        monkeypatch.setattr("kiro_crew.cli._redirect_fds_to", MagicMock())
+
+    def test_file_emit_runs_on_listener_thread(self):
+        _setup_cli_logging("gateway", 1)
+        (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
+        emit_threads: list[threading.Thread] = []
+        orig_emit = fh.emit
+
+        def recording_emit(record):
+            emit_threads.append(threading.current_thread())
+            orig_emit(record)
+
+        fh.emit = recording_emit  # type: ignore[method-assign]
+        logging.getLogger("kiro_crew.offloop").warning("off-loop-sentinel")
+        _stop_log_queue_listener()  # drains the queue through recording_emit
+        assert emit_threads, "record never reached the file handler"
+        caller = threading.current_thread()
+        assert all(t is not caller for t in emit_threads)
+
+    def test_stop_drains_pending_records(self):
+        _setup_cli_logging("gateway", 1)
+        log = logging.getLogger("kiro_crew.drain")
+        for i in range(50):
+            log.warning("drain-record-%d", i)
+        _stop_log_queue_listener()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert text.count("drain-record-") == 50
+
+    def test_reentrant_setup_leaves_single_queue_handler(self):
+        _setup_cli_logging("gateway", 1)
+        _setup_cli_logging("gateway", 1)
+        kc_qhs = [
+            h for h in logging.getLogger("kiro_crew").handlers if isinstance(h, _CliLogQueueHandler)
+        ]
+        assert len(kc_qhs) == 1
+        assert cli_mod._LOG_QUEUE_LISTENER is not None
+
+    def test_short_lived_command_keeps_sync_handler(self):
+        """Short-lived verbs get NO queue: several replace the process via
+        os.exec* (``logs -f``, ``config edit``), which skips atexit — a queued
+        tail there would be lost, while a sync handler has already written it.
+        They also run no event loop, so there is nothing for the queue to
+        protect."""
+        _setup_cli_logging("status", 1)
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+        kc = logging.getLogger("kiro_crew")
+        assert not any(isinstance(h, _CliLogQueueHandler) for h in kc.handlers)
+        sync_fhs = [h for h in kc.handlers if isinstance(h, logging.FileHandler)]
+        assert len(sync_fhs) == 1
+        logging.getLogger("kiro_crew.short").warning("short-lived-record")
+        for h in kc.handlers:
+            h.flush()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "short-lived-record" in text
+
+    def test_stop_is_idempotent(self):
+        _setup_cli_logging("gateway", 1)
+        _stop_log_queue_listener()
+        _stop_log_queue_listener()  # second stop must be a silent no-op
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+
+    def test_bounded_stop_still_drains_when_healthy(self):
+        """The force-exit path (timeout=) must still flush a healthy queue."""
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.bounded").warning("bounded-record")
+        _stop_log_queue_listener(timeout=5.0)
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "bounded-record" in text
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+
+    def test_bounded_stop_gives_up_on_wedged_handler(self):
+        """A wedged disk must not hang the force exit: the bounded stop
+        returns within the deadline and skips flush/close."""
+        import time
+
+        _setup_cli_logging("gateway", 1)
+        (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
+        release = threading.Event()
+        orig_emit = fh.emit
+
+        def wedged_emit(record):
+            release.wait(5.0)  # simulate blocking handler I/O
+            orig_emit(record)
+
+        fh.emit = wedged_emit  # type: ignore[method-assign]
+        logging.getLogger("kiro_crew.wedged").warning("wedged-record")
+        t0 = time.monotonic()
+        _stop_log_queue_listener(timeout=0.2)
+        elapsed = time.monotonic() - t0
+        release.set()  # unblock the daemon thread so teardown closes cleanly
+        assert elapsed < 2.0
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+
+
+class TestDrainBeforeHardExit:
+    """``os._exit`` runs no ``atexit`` handler, so every ``async`` path that
+    hard-exits the gateway must drain the log queue itself - bounded, and off
+    the event loop."""
+
+    @pytest.fixture(autouse=True)
+    def _foreground(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        monkeypatch.setattr("kiro_crew.cli._redirect_fds_to", MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_queued_tail_reaches_disk(self):
+        """The records logged immediately before a hard exit - the ones a
+        post-mortem actually needs - are on disk when the drain returns."""
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.shutdown").warning("shutdown-tail-record")
+        await drain_log_queue_before_hard_exit()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert "shutdown-tail-record" in text
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+
+    @pytest.mark.asyncio
+    async def test_join_runs_off_the_event_loop_thread(self):
+        """The synchronous listener join happens on an executor thread: doing
+        it inline would park the loop for up to the drain deadline."""
+        _setup_cli_logging("gateway", 1)
+        join_threads: list[threading.Thread] = []
+        real_stop = cli_mod._stop_log_queue_listener
+
+        def recording_stop(timeout=None):
+            join_threads.append(threading.current_thread())
+            real_stop(timeout)
+
+        cli_mod._stop_log_queue_listener = recording_stop  # type: ignore[assignment]
+        try:
+            await drain_log_queue_before_hard_exit()
+        finally:
+            cli_mod._stop_log_queue_listener = real_stop  # type: ignore[assignment]
+        assert join_threads, "drain never reached the listener stop"
+        assert all(t is not threading.current_thread() for t in join_threads)
+
+    @pytest.mark.asyncio
+    async def test_wedged_handler_does_not_delay_the_exit(self):
+        """A wedged disk must not hold the loop past the deadline: the drain
+        returns bounded, and the exit proceeds without it."""
+        import time
+
+        _setup_cli_logging("gateway", 1)
+        (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
+        release = threading.Event()
+        orig_emit = fh.emit
+
+        def wedged_emit(record):
+            release.wait(10.0)  # simulate blocking handler I/O
+            orig_emit(record)
+
+        fh.emit = wedged_emit  # type: ignore[method-assign]
+        logging.getLogger("kiro_crew.wedged").warning("wedged-shutdown-record")
+        t0 = time.monotonic()
+        await drain_log_queue_before_hard_exit(timeout=0.2)
+        elapsed = time.monotonic() - t0
+        release.set()  # unblock the daemon thread so teardown closes cleanly
+        assert elapsed < 3.0
+
+    @pytest.mark.asyncio
+    async def test_no_listener_is_a_silent_no_op(self):
+        """Short-lived verbs never start a listener; the drain must still be
+        safe to await, and must never raise into a hard-exit path."""
+        _setup_cli_logging("status", 1)
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+        await drain_log_queue_before_hard_exit()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_drain_never_blocks_the_exit(self):
+        """Logging must not be able to abort a shutdown: a stop that raises is
+        swallowed, not propagated to the caller about to ``os._exit``."""
+        _setup_cli_logging("gateway", 1)
+        real_stop = cli_mod._stop_log_queue_listener
+
+        def exploding_stop(timeout=None):
+            raise RuntimeError("interpreter teardown race")
+
+        cli_mod._stop_log_queue_listener = exploding_stop  # type: ignore[assignment]
+        try:
+            await drain_log_queue_before_hard_exit()
+        finally:
+            cli_mod._stop_log_queue_listener = real_stop  # type: ignore[assignment]
+
+
+class TestEveryGatewayHardExitDrainsTheQueue:
+    """Ratchet: the queue only helps if EVERY hard exit in the gateway process
+    drains it. ``src/kiro_crew/slack/gateway_runtime/exit_path.py`` and ``slack/events_slash.py`` are the
+    two modules that call ``os._exit`` from inside the long-lived gateway
+    process - the other ``os._exit`` sites in the tree (``sandbox.py``,
+    ``_process_group_supervisor.py``) run in forked/pre-exec children that
+    never install the CLI's queue listener.
+
+    The check is per-function and does NOT look inside nested functions, so a
+    drain in a sibling closure cannot vouch for its parent."""
+
+    _MODULES = (
+        Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/gateway.py",
+        *sorted(
+            (Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/gateway_runtime").glob(
+                "*.py"
+            )
+        ),
+        *sorted((Path(__file__).resolve().parents[1] / "src/kiro_crew/slack").glob("events*.py")),
+    )
+    _DRAINS = {"_stop_log_queue_listener", "drain_log_queue_before_hard_exit"}
+
+    @staticmethod
+    def _own_body_names(fn):
+        """Every Name/Attribute identifier in ``fn``'s own body, skipping the
+        bodies of functions nested inside it."""
+        names: set[str] = set()
+
+        class _Walk(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):  # nested def: not fn's own body
+                if node is fn:
+                    self.generic_visit(node)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Name(self, node):
+                names.add(node.id)
+
+            def visit_Attribute(self, node):
+                names.add(node.attr)
+                self.generic_visit(node)
+
+        _Walk().visit(fn)
+        return names
+
+    def _hard_exit_functions(self, tree):
+        """(function node, line) for each ``os._exit(...)`` or
+        ``platform_compat.hard_exit(...)`` call (the spelling that cancels an
+        update apply in flight first, then ``os._exit``), attributed to the nearest
+        enclosing function."""
+        parents: "dict[ast.AST, ast.AST]" = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        found = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and (
+                    (node.func.attr == "_exit" and node.func.value.id == "os")
+                    or (node.func.attr == "hard_exit" and node.func.value.id == "platform_compat")
+                )
+            ):
+                continue
+            cur = parents.get(node)
+            while cur is not None and not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cur = parents.get(cur)
+            if cur is not None:
+                found.append((cur, node.lineno))
+        return found
+
+    def test_the_ratchet_actually_finds_the_hard_exits(self):
+        """A scan that matches nothing would pass vacuously."""
+        total = 0
+        for path in self._MODULES:
+            total += len(self._hard_exit_functions(ast.parse(path.read_text(encoding="utf-8"))))
+        assert total >= 3, f"expected the known os._exit sites, found {total}"
+
+    def test_no_hard_exit_strands_the_queued_log_tail(self):
+        violations = []
+        for path in self._MODULES:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn, lineno in self._hard_exit_functions(tree):
+                if not (self._own_body_names(fn) & self._DRAINS):
+                    violations.append(f"{path.name}:{lineno} in {fn.name}()")
+        assert not violations, (
+            "os._exit skips atexit, so these hard exits drop the queued "
+            "gateway.log tail; await drain_log_queue_before_hard_exit() (or "
+            "call _stop_log_queue_listener(timeout=...) from a sync handler) "
+            "first: " + ", ".join(violations)
+        )

@@ -32,13 +32,15 @@ sign      (ubuntu)  flatten artifacts, attest wheel/sdist/AppImage provenance,
                     extract the .app, run packaging/signing/sign.sh
                     -> signed/<channel>/<version>/<AppSlug>.zip
   |
-notarize  (macOS)   notarytool submit --wait, stapler staple, spctl gate,
-                    build a DMG from the STAPLED app, sign the DMG via a second
+notarize  (macOS)   notarize.sh submit + bounded polling with transient-error
+                    retries, stapler staple, spctl gate, build a DMG from the
+                    STAPLED app, sign the DMG via a second
                     CDSigner task, notarize + staple + gate the DMG, attest the
                     DMG, attach the gated artifact to the run
   |
 publish   (ubuntu)  copy the gated artifact to the public distribution bucket,
                     then write feed/<channel>/latest-mac.yml
+                    (feed/<channel>/<arch>/latest-mac.yml on a single-arch leg)
 ```
 
 Key properties, each load-bearing:
@@ -67,7 +69,7 @@ Key properties, each load-bearing:
 
 `publish` is a separate ubuntu job on purpose: a transient publish failure retries
 as a roughly-two-minute job rather than repeating two Apple submissions with
-30-minute budgets each, and the expensive macOS runner never burns minutes on S3
+60-minute budgets each, and the expensive macOS runner never burns minutes on S3
 uploads. Linux publishing takes no part in this trust chain; the AppImage ships
 from `publish-linux.yml`.
 
@@ -81,8 +83,10 @@ be stapled at all (`stapler` Error 73), so first-install verification would need
 network access.
 
 So the DMG is built **from the already-stapled app**, then signed by a second
-CDSigner task with a `type: dmg` manifest
-(`packaging/signing/sign-dmg.sh`), then notarized and stapled itself. The script
+CDSigner task (`packaging/signing/sign-dmg.sh`), then notarized and stapled
+itself. That task submits a `type: "app"` manifest with the DMG as the output
+path: the live API enumerates the valid types and `dmg` is not one of them, so a
+`type: dmg` submission comes back as a 400. The script
 fails closed: it runs `codesign --verify --strict` and requires an
 `Authority=Developer ID Application` line on the result. The `spctl --type install`
 gate in the workflow is exactly the check that catches an adhoc regression.
@@ -98,6 +102,18 @@ even though the nightly bundle is `KiroCrew Nightly.app`. CDN keys and the
 latest-DMG permalink (`desktop/<channel>/latest/KiroCrew.dmg`) are a public
 contract, so deriving filenames from the bundle name would silently rename keys
 and break the permalink. The DMG's **volume** name does follow the bundle.
+
+The single-arch legs (`mac_variant: arm64 | x64`, on nightly and on both release
+channels) run the same three jobs once more per DMG and append the arch to every
+name the legs would otherwise share: the signing-bucket keys (`SIGN_KEY_SUFFIX`, read by
+`sign.sh`), `notarized/…/KiroCrew-<arch>.zip`, the gated artifact
+`KiroCrew-notarized-<channel>-<version>-<arch>`, the public
+`desktop/<channel>/<version>/KiroCrew-<arch>.{zip,dmg}` and alias
+`desktop/<channel>/latest/KiroCrew-<arch>.dmg`, and the channel file directory
+`feed/<channel>/<arch>/`. Three legs of one channel+version therefore never
+touch each other's keys, and with the variant empty the universal leg's names
+are unchanged. A single-arch app follows its directory because
+`packaging/build-desktop.sh` stamps `desktopDistArch` into its `package.json`.
 
 ## The signing manifest is generated, never hand-maintained
 
@@ -146,7 +162,7 @@ be verified through a real notarization.
 `packaging/signing/Entitlements.entitlements` is the release-lane entitlements
 file. `website/electron/build/entitlements.mac.plist` is the electron-builder-lane
 twin. **The two signing paths read their OWN file**, so a key present in only one
-of them means that lane ships a broken bundle. `website/electron/packaging.test.js`
+of them means that lane ships a broken bundle. `website/electron/test/packaging.test.js`
 pins both.
 
 Under the hardened runtime an entitlement, not the `Info.plist` usage string, is
@@ -154,6 +170,16 @@ what grants a device capability. `com.apple.security.device.audio-input` is what
 makes the microphone work for voice input and streaming STT; without it the mic is
 refused with **no prompt at all** and no System Settings toggle to fix it. Camera
 is deliberately absent, because `permission-handler.js` denies video.
+
+Not every protected resource works that way, so do not generalize the mic rule.
+**Local network access has no entitlement** — on macOS 15 it is gated by TCC alone
+and declared solely by `NSLocalNetworkUsageDescription` in
+`website/electron/package.json`'s `build.mac.extendInfo`, which both lanes inherit
+from the same built bundle. Requesting
+`com.apple.developer.networking.multicast` to "fix" LAN access breaks signing
+unless Apple has provisioned it, and `com.apple.security.network.client` is an
+App-Sandbox key this bundle has no use for. `packaging.test.js` asserts both stay
+out of both files.
 
 ## Supply-chain ordering inside the jobs
 
@@ -253,7 +279,15 @@ generic scan rejection. The known trigger is macOS tar metadata: `bsdtar` embeds
 probe matrix (vary the manifest and the input tarball independently) before
 blaming the manifest.
 
-**Signing times out.** `sign.sh` polls for 15 minutes (`MAX_WAIT`, 30s interval)
+**Submission answers `{"message":"Too Many Requests"}`.** The service throttles a
+burst, and the universal, arm64 and x64 legs of one release submit together.
+`sign.sh` and `sign-dmg.sh` submit through `cdsigner-submit.sh`, which resubmits a
+throttled request up to five times with jittered doubling backoff (at most 300s
+of waiting) and fails at once on any other answer. A throttled request created no
+task, so the resubmission is safe. Exit code 4 with "still throttled after 5
+attempts" means the service stayed saturated; rerun the failed job.
+
+**Signing times out.** `sign.sh` polls for 45 minutes (`MAX_WAIT`, 30s interval)
 and gates on the explicit `success` status flag rather than elapsed time, so a
 success arriving on the final tick is not misread as a timeout. Exit code 5 is a
 genuine timeout and carries the sign-task id.

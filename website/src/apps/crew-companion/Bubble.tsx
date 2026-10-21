@@ -11,23 +11,40 @@
  * Hovering pauses both the dismissal and the bar — reading a bubble must not be the
  * thing that loses it.
  */
-import { X } from 'lucide-react'
+import { ArrowRight, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import './bubble.css'
 import { i18nT } from '../../i18n/t'
-import { policyFor, isSticky, type NotifKind } from './notificationPolicy'
+import { policyFor, isSticky, type BubbleAction, type NotifKind } from './notificationPolicy'
 
 export interface BubbleProps {
   text: string
   kind: NotifKind
   /** Dismiss it. Called by the ✕, by a click on the body, and by the timer. */
   onDismiss: () => void
-  /** Run the bubble's call to action, when its policy offers one. */
-  onAction?: (action: 'breathe' | 'open-session') => void
+  /**
+   * Run the bubble's call to action, when its policy offers one.
+   *
+   * The RESULT decides whether the bubble then leaves. Returning nothing means
+   * "done" — the handler acted locally and there is nothing to fail — while
+   * `false`, or a promise resolving to `false`, says the action could not be
+   * carried out and the notification must stay.
+   *
+   * That distinction is the whole point of the contract: a sticky bubble has no ✕
+   * and ignores body clicks, so its CTA is the only exit. Clearing it regardless
+   * of what the handler managed to do destroys the user's only pointer back to
+   * work that is still blocked on them.
+   */
+  onAction?: (action: BubbleAction) => boolean | void | Promise<boolean | void>
 }
 
 /** Exit animation duration; the unmount waits exactly this long. */
 const EXIT_MS = 300
+
+/** True for a value that reports its outcome later. */
+function isThenable(v: unknown): v is Promise<boolean | void> {
+  return typeof (v as Promise<unknown> | undefined)?.then === 'function'
+}
 
 export function Bubble({ text, kind, onDismiss, onAction }: BubbleProps) {
   const policy = policyFor(kind)
@@ -97,6 +114,8 @@ export function Bubble({ text, kind, onDismiss, onAction }: BubbleProps) {
         role="status"
         data-kind={kind}
       >
+        {/* The countdown anchors to this row so it cannot overlap the footer. */}
+        <div className="cc-bubble-body-row">
         {/*
           Text and ✕ are FLEX SIBLINGS, so the ✕ takes its own space and the text
           shrinks to make room. Absolutely positioning it over the corner instead —
@@ -170,30 +189,45 @@ export function Bubble({ text, kind, onDismiss, onAction }: BubbleProps) {
           />
         ) : null}
 
-      </div>
+        </div>
 
-      {/*
-        The CTA sits BELOW the bubble box, not inside it — a sibling, as in the source.
-        Two reasons it cannot live in the box: the box is a flex ROW carrying the text
-        and the ✕, so a block child would line up beside the words; and the box clips
-        its overflow for the countdown bar. Stopping propagation still matters, since
-        the whole bubble above is a dismiss target.
-      */}
+      {/* Keep the action inside the same card as the notification it resolves. */}
       {policy.ctaKey ? (
-        <div className="cc-bubble-cta-row">
+        <div className="cc-bubble-foot">
           <button
             type="button"
             className="cc-bubble-cta"
             onClick={(e) => {
               e.stopPropagation()
-              if (policy.action) onAction?.(policy.action)
-              setLeaving(true)
+              if (!policy.action) {
+                setLeaving(true)
+                return
+              }
+              const outcome = onAction?.(policy.action)
+              // A handler that answers synchronously keeps the exit synchronous —
+              // deferring every CTA through a microtask would change the timing of
+              // the ones that never fail (the breathing nudge opens the panel and
+              // is done). Only a handler that reports asynchronously waits.
+              if (isThenable(outcome)) {
+                void outcome.then(
+                  (ok) => { if (ok !== false) setLeaving(true) },
+                  // A handler that threw did not act, so the bubble stays for the
+                  // same reason an explicit `false` keeps it. Handled here rather
+                  // than left to reject: an unhandled rejection in a window with
+                  // no console open is a failure nobody ever sees.
+                  () => {},
+                )
+                return
+              }
+              if (outcome !== false) setLeaving(true)
             }}
           >
-            {i18nT(policy.ctaKey as Parameters<typeof i18nT>[0])}
+            <span>{i18nT(policy.ctaKey as Parameters<typeof i18nT>[0])}</span>
+            <ArrowRight className="lucide-inline" aria-hidden="true" />
           </button>
         </div>
       ) : null}
+      </div>
 
     </div>
   )

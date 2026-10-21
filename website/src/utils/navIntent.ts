@@ -12,9 +12,36 @@ import { safeSetSessionItem } from './safeStorage'
  */
 export const PREFILL_STORAGE_KEY = 'kirocrew_prefill'
 
-/** Seed the composer prefill for a slot (consumed by ChatPage when that slot activates). */
-export function writePrefill(slotKey: string, prompt: string): void {
-  safeSetSessionItem(PREFILL_STORAGE_KEY, JSON.stringify({ slotKey, prompt, ts: Date.now() }))
+/** Seed the composer prefill for a slot. Returns whether sessionStorage accepted it. */
+export function writePrefill(slotKey: string, prompt: string): boolean {
+  return safeSetSessionItem(PREFILL_STORAGE_KEY, JSON.stringify({ slotKey, prompt, ts: Date.now() }))
+}
+
+/**
+ * The chat session a dashboard path names, or `''` when it names none.
+ *
+ * `/chat?sid=<slotKey>` is the dashboard's session deep link — the System page's
+ * session rows, Telemetry's conversation links and the app SDK all build it — and
+ * `?slot=` is the legacy spelling ChatPage still reads. A `/chat/<slug>` prefix is
+ * decorative (ChatPage writes it from the session title), so it is accepted too.
+ *
+ * Used to tell a session deep link apart from an ordinary route, because the two
+ * cannot be honoured the same way: `navigate()` alone only selects a session while
+ * ChatPage is MOUNTING, so a link followed while /chat is already open lands on
+ * the page with the previous session still selected.
+ */
+export function chatDeepLinkSlot(path: string): string {
+  let url: URL
+  try {
+    // A relative path needs some base to parse against; only the path and query
+    // are ever read back off it.
+    url = new URL(path, 'http://dashboard.invalid')
+  } catch {
+    return ''
+  }
+  const onChat = url.pathname === '/chat' || url.pathname.startsWith('/chat/')
+  if (!onChat) return ''
+  return url.searchParams.get('sid') || url.searchParams.get('slot') || ''
 }
 
 /**
@@ -22,17 +49,43 @@ export function writePrefill(slotKey: string, prompt: string): void {
  * dashboard window. Order matters: the prefill must be in sessionStorage
  * before the slot switch + route change so ChatPage's slot-restore effect
  * finds it when the target slot activates.
+ *
+ * `mayLeave` is the page-on-screen leave check (`useMayLeaveForNavigation`).
+ * An intent that leaves the page asks it first, like every wired in-app exit,
+ * and a veto drops the whole intent: no prefill is staged and no slot switches
+ * for a navigation the user refused.
  */
 export function applyNavIntentInMain(
   intent: NavIntent,
-  deps: { navigate: (path: string) => void; switchSlot: (slotKey: string) => void },
+  deps: {
+    navigate: (path: string) => void
+    switchSlot: (slotKey: string) => void
+    // Required, so every caller decides whether its exit asks the page first.
+    mayLeave: () => boolean
+    /**
+     * Append `text` to the chat composer this window already shows for
+     * `slotKey`, returning false when no such composer is on screen. A hand-off
+     * to the slot already shown cannot go through the sessionStorage prefill:
+     * activating an already-active slot does not re-run the slot-restore effect,
+     * so the seed would sit unread for its 30s TTL and then overwrite whatever
+     * the user typed on their next switch back.
+     */
+    appendToOpenComposer?: (slotKey: string, text: string) => boolean
+  },
 ): void {
-  if (intent.prefill) writePrefill(intent.prefill.slotKey, intent.prefill.prompt)
-  if (intent.slotKey) deps.switchSlot(intent.slotKey)
-  deps.navigate(intent.path)
   // Best-effort raise — a channel-delivered intent has no user activation, so
   // browsers may veto this; the opener-focus on the popout side is the
   // reliable path and this is just the assist for the claimed-but-not-opener
-  // main.
+  // main. Raised before the leave check so its confirm shows on a window the
+  // user can see.
   try { window.focus() } catch { /* vetoed — non-fatal */ }
+  const prefill = intent.prefill
+  if (prefill?.append !== undefined && intent.path === '/chat'
+    && intent.slotKey === prefill.slotKey && deps.appendToOpenComposer?.(prefill.slotKey, prefill.append)) {
+    return
+  }
+  if (!deps.mayLeave()) return
+  if (prefill) writePrefill(prefill.slotKey, prefill.prompt)
+  if (intent.slotKey) deps.switchSlot(intent.slotKey)
+  deps.navigate(intent.path)
 }

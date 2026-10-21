@@ -10,8 +10,8 @@ like Slack, Discord, and Telegram.
 
 | Requirement | Needed for | Floor |
 |-------------|------------|-------|
-| **Python** + pip | Backend | `>= 3.10` |
-| **Node.js** + npm | Building the dashboard from source | `>= 22` (24 LTS recommended) |
+| **Python** + pip | Backend | `>= 3.12` |
+| **Node.js** + npm | Building the dashboard from source | `>= 22.12` (24 LTS recommended) |
 | **`kiro-cli`** | Driving the LLM | Required, on your `PATH` |
 
 Node is only needed to *build* the dashboard. The prebuilt wheel, the macOS DMG,
@@ -55,7 +55,7 @@ carries only `kirocrew` and pip still needs PyPI to resolve its dependencies.
 
 ```bash
 git clone https://github.com/kirodotdev/KiroCrew.git
-cd Kiro Crew
+cd KiroCrew
 cd website && npm install && npm run build && cd ..
 pip install -e ".[voice]"       # [voice] adds the optional speech-to-text extras
 ```
@@ -84,25 +84,49 @@ kirocrew setup
 
 This interactive wizard detects `kiro-cli` on your PATH, saves the project
 directory so Kiro Crew works from any working directory, installs the agent
-config to `~/.kiro/agents/kirocrew.json`, registers the browser MCP proxy, and
-walks through the workspace directory, timezone, dashboard URL, and the
-`http://kirocrew.localhost:5476` custom domain. It configures no messaging
-channels: connect them after setup from the dashboard, or run `kirocrew setup
---slack` for the guided Slack setup.
+config to `~/.kiro/agents/kirocrew.json`, and walks through the workspace
+directory, timezone, dashboard URL, and the `http://kirocrew.localhost:5476`
+custom domain. It configures no messaging channels: connect them after setup
+from the dashboard, or run `kirocrew setup --slack` for the guided Slack setup.
 
-To actually browse, turn on **Browser Mode** in Settings → Browser. Enabling it
-downloads and sets up Playwright (`@playwright/mcp` plus the selected engine's
-browser binary, bootstrapping Node if needed); browsing is then default-on
-whenever Browser Mode stays enabled.
+To browse, install the Playwright agent CLI (needs Node.js 20 or newer):
+
+```bash
+npm install -g @playwright/cli@latest
+playwright-cli install-browser chromium
+playwright-cli install --skills agents --global
+```
+
+`install-browser` downloads a separate Chromium build into your user cache and
+needs no root. It does not install Google Chrome, and it does not install OS
+libraries. If the download reports missing libraries, install them with your own
+package manager; on Debian or Ubuntu `sudo npx playwright install-deps chromium`
+does it. The Settings → Browser page runs the same download on the machine the
+gateway runs on. On a Debian or Ubuntu (apt) host it first tries the download
+with Playwright's `--with-deps`, which also installs the libraries, and retries
+without it if that step is refused. It prints the library command for that
+machine when one is still needed.
+
+Having `playwright-cli` on your `PATH` is what makes browsing available, so
+uninstalling it is how you take the capability away. Note that it covers
+`playwright-cli attach --extension`, which drives your own running Chrome with
+the sessions you are logged into. The dashboard's **Browser** panel shows the
+live session and lets you take over with real mouse and keyboard, which is how
+you complete a CAPTCHA or a 2FA prompt.
 
 Use `kirocrew setup --agent-only` to reinstall just the agent config and skip
-the other wizard steps.
+the other wizard steps. `--electron-only` installs only the desktop app (macOS),
+and `--clean` treats the run as a fresh install rather than merging MCP servers
+and tools from an existing config.
 
 ### Messaging channels (optional)
 
 The default wizard configures no messaging channels — the dashboard and CLI need
-none. To connect Slack from the terminal, run `kirocrew setup --slack`, which
-prompts for:
+none. Two channels have a guided terminal setup: `kirocrew setup --slack`, and
+`kirocrew setup --whatsapp`, which reports the optional `whatsapp` extra and the
+pairing state before enabling the channel. Both are ignored with `--agent-only`.
+
+`--slack` prompts for:
 
 - `SLACK_APP_TOKEN` starts with `xapp-`
 - `SLACK_BOT_TOKEN` starts with `xoxb-`
@@ -114,8 +138,9 @@ over Slack.
 
 These are stored in `~/.kiro/crew/.env`.
 
-Other channels (Discord, Telegram, Teams, Webex, WeCom, WeChat) are connected
-from the dashboard — see each channel's doc.
+Every other messaging channel is connected from the dashboard — the roster is in
+[the documentation index](index.md#chat-channels), and each channel has its own
+doc there.
 
 ## Starting Kiro Crew
 
@@ -145,10 +170,12 @@ conversation.
 kirocrew doctor
 ```
 
-Reports the resolved platform edition, the `kiro-cli` binary and login state,
-the project directory, the agent config and its MCP entries, Slack credentials,
-gateway status, and the embedding runtime and model. It repairs missing MCP
-entries where it can, and prints a specific fix hint for anything it cannot.
+Reports, among other checks, the resolved platform edition, the `kiro-cli` binary
+and login state, the project directory, the agent config and its MCP entries,
+confinement and the sandbox, services, channels and access, workload, Slack
+credentials, gateway status, and the embedding runtime and model. It repairs
+missing MCP entries where it can, and prints a specific fix hint for anything it
+cannot. `kirocrew doctor --help` lists its options.
 
 ## Updating
 
@@ -156,9 +183,7 @@ entries where it can, and prints a specific fix hint for anything it cannot.
 kirocrew update
 ```
 
-For a source checkout this pulls, rebuilds the frontend, reinstalls the package,
-and restarts in place. Clicking "Update Available" in the dashboard topbar runs
-the same path.
+For a source checkout this updates the checkout and rebuilds it. Restart the gateway with `kirocrew restart` to use the new version. Clicking "Update Available" in the dashboard topbar runs the same path.
 
 ## Running in the Background
 

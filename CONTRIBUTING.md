@@ -27,51 +27,79 @@ carry an `area:` label naming the subsystem they land in — `area: dashboard`,
 codebase you want to work in, and a type label (`bug`, `enhancement`,
 `documentation`) telling you what kind of change it is.
 
-Before starting anything substantial, check whether someone is already on it and
-comment on the issue saying you are picking it up. For a large change, open an
-issue first and get a reaction to the approach. Nobody enjoys declining a
-finished pull request that went the wrong direction, and a maintainer can usually
-tell you in a paragraph.
+Before starting anything substantial, check whether someone is already on it. For a
+large change, open an issue first and get a reaction to the approach. Nobody
+enjoys declining a finished pull request that went the wrong direction, and a
+maintainer can usually tell you in a paragraph.
+
+### Claiming an issue
+
+To tell us you are working on a `tier:T1` or `tier:T2` issue, comment `/claim` on it
+as the first line of your comment. If nobody holds it, the maintainers' automation
+assigns it to you and labels it `claimed`, and our own fix pipelines leave it
+alone while your claim lasts.
+
+| Comment | What it does |
+|---|---|
+| `/claim` | claims an open, unassigned `tier:T1` or `tier:T2` issue for 7 days |
+| `/claim extend` | adds 7 more days, once per claim |
+| `/unclaim` | hands the issue back |
+
+- An open pull request that links the issue (`Closes #N`, a draft is fine) keeps
+  the claim for as long as it stays open, so you can push a draft and keep
+  reviewing your own work before you mark it ready.
+- With no linked pull request, you get a reminder after 7 days, and the claim ends
+  3 days later. A linked pull request closed without merging ends it 3 days after
+  the close. The issue is then open for anyone again.
+- You can hold 2 claims at a time.
+- `tier:T3` and `tier:T4` issues are design work and cannot be claimed; comment on
+  them instead. Security reports go through [SECURITY.md](SECURITY.md), never an
+  issue.
+- The reply to your `/claim` comes from the daily triage run, so allow up to a day.
 
 ## Prerequisites
 
-- macOS or Linux (Windows is not supported by the `kiro-cli` backend)
-- Python ≥ 3.9
-- Node.js ≥ 22 (24 LTS recommended) and npm (for the frontend)
-- The `kiro-cli` agent on your `PATH`, logged in (`kiro-cli login`) — it is the
-  only LLM backend (`agent.provider = acp`)
-- [Ollama](https://ollama.com) for memory and knowledge-library embeddings
+- macOS, Linux, or Windows — Windows builds and runs natively from source, with
+  the documented feature limits in the [Windows guide](docs/guides/windows-install.md)
+- Python ≥ 3.12
+- Node.js ≥ 22.12.0 (24 LTS recommended) and npm (for the frontend); the
+  [install guide](docs/guides/install.md#prerequisites) owns the floors
+- An authenticated ACP backend. Fresh setups use `kiro-cli` on `PATH` after
+  `kiro-cli login`; other verified harnesses are selected with `agent.acp_backend`
+  and have backend-specific prerequisites in the [install guide](docs/guides/install.md)
+- Nothing extra for embeddings — memory and the knowledge library embed in-process, so no daemon to install
 
 ## First-Time Setup
 
+The root build target owns frontend dependency installation, SPA staging,
+virtualenv creation, and the editable backend install. Do not duplicate those
+steps manually:
+
 ```bash
-# 1. Fork the repo on GitHub, then clone your fork
-git clone https://github.com/kirodotdev/KiroCrew.git
-cd kirocrew
+# Fork the repo on GitHub, then clone your fork
+git clone https://github.com/<your-username>/KiroCrew.git
+cd KiroCrew
+git remote add upstream https://github.com/kirodotdev/KiroCrew.git
 
-# 2. Build the frontend and bundle it into the package
-cd website
-npm install
-npm run build
-cp -r dist ../src/kiro_crew/static/dist
-cd ..
-
-# 3. Editable backend install (with optional voice extras)
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[voice]"
-
-# 4. Configure and verify
-kirocrew setup               # data dir, agent backend (channels connect later)
-kirocrew doctor              # verify everything works
-kirocrew gateway             # start server (dashboard + messaging channels)
+make build
+source .venv/bin/activate
+kirocrew setup               # configure the data home and default agent
+kirocrew doctor              # verify the install and backend
+kirocrew gateway             # start the dashboard and messaging gateway
 ```
 
-The dashboard is at `http://localhost:5476`.
+The dashboard is at `http://localhost:5476`. The [install guide](docs/guides/install.md)
+owns the build targets, optional extras, and failure recovery.
+
+On Windows, `.\make.ps1 build` builds the frontend and backend; activate
+`.venv\Scripts\Activate.ps1` instead. Read the
+[Windows guide](docs/guides/windows-install.md) first because some execution
+paths require an explicit opt-in.
 
 **Messaging channels are optional**: the default `kirocrew setup` configures
-none, and the dashboard + CLI work without any channel credentials. Connect
-Slack, Discord, Telegram, Teams, Webex, WeCom, or WeChat later, or run
-`kirocrew setup --slack` for the guided Slack path.
+none, and the dashboard + CLI work without channel credentials. Connect a
+channel later from the dashboard, or run `kirocrew setup --slack` for the guided
+Slack path.
 
 ## Development Skills (agents and humans)
 
@@ -81,47 +109,38 @@ The contributor workflow is codified as agent-loadable skills in
 
 - **`kirocrew-worktree-dev`** — the HARD RULE workflow: every change in a git
   worktree, the blocking build gates, the built-dist gotcha, preview paths.
-- **`prepare-pr`** — drives working-tree changes to a review-ready PR
+- **`kirocrew-prepare-pr`** — drives working-tree changes to a review-ready PR
   (commit → sync → squash → open → poll CI/review bots → fix findings).
 - **`babysit`** — same-session monitoring loop that keeps a PR moving through
   CI and review rounds.
+- **`writing-tests`** — writing and fixing backend tests that are side-effect
+  free and not flaky.
+- **`dashboard-template`** — adding a dashboard page with its contract,
+  provider, and parity test.
 
 An agent contributing to Kiro Crew loads this suite and follows the same
-worktree → build gate → prepare-pr → review loop human contributors use, so
+worktree → build gate → kirocrew-prepare-pr → review loop human contributors use, so
 the PR process stays consistent regardless of who is writing the code. If you
-change the workflow, change it THERE — those files are the single source of
-truth (with `.github/workflows/ci.yml` canonical for the gate list).
+change the workflow, change it THERE. The checked-in workflows and
+[CI and review guide](docs/ci/ci-and-reviews.md) are canonical for the gate list;
+do not copy a gate count into another document.
 
 ## Building
 
-### Backend
-
-```bash
-pip install -e ".[voice]"    # installs deps + console scripts
-pytest                       # run the test suite
-```
-
-### Frontend
-
-The React SPA lives in `website/`. Production builds are bundled into
-`src/kiro_crew/static/dist/` and served by the backend.
-
-```bash
-cd website
-npm install
-npm run build                # tsc + vite build → website/dist
-```
-
-After building, copy `website/dist` into `src/kiro_crew/static/dist/` so the
-backend serves the latest assets (the `pip` build step copies this directory
-into the wheel).
+Use `make build` for the reproducible frontend + backend build. The
+[install guide](docs/guides/install.md#build-targets) owns each target, dependency
+choice, optional extra, and platform-specific command; use the narrower target
+listed there only when you intentionally need one surface.
 
 ## Dev Mode (Isolated Data Directory)
 
-Run a dev gateway alongside production without data or port conflicts:
+Run a dev gateway alongside production without data or port conflicts.
+`./dev-fullstack.sh` starts the dev backend, the Vite dev server, and a dashboard
+token in one terminal; `./dev-backend.sh` starts the dev backend alone from live
+source. The manual steps:
 
 ```bash
-# Seed dev data from your real config (optional, safe to re-run)
+# Copy your whole data home into .kirocrew-dev/ (optional; re-running replaces it)
 ./dev-seed.sh
 
 # Start the dev backend (port 6777, isolated data)
@@ -129,6 +148,11 @@ KIROCREW_HOME=.kirocrew-dev KIROCREW_PORT=6777 kirocrew gateway
 ```
 
 Browse at `http://localhost:6777`. The backend serves the built frontend assets directly.
+When `src/kiro_crew/static/dist` links to `website/dist` (what `make build` and the
+gateway set up for a stock checkout), a hand-run `npm run build` is live as soon as it
+finishes, on a running gateway too; under an edition `static/dist` links to a private
+copy, which only the next stage replaces. See the runtime dist resolution notes in
+[learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md).
 
 | Env var | Purpose | Default |
 |---------|---------|---------|
@@ -164,114 +188,21 @@ KIROCREW_HOME=.kirocrew-dev KIROCREW_PORT=6777 kirocrew token
 
 **Key points:**
 
-- The backend must be reinstalled or restarted after Python source changes
+- The editable backend must be restarted after Python source changes
 - The frontend hot-reloads automatically — no rebuild for `.tsx`/`.ts`/`.css` changes
 - Always access via `localhost:3000` (Vite) during frontend dev, not `localhost:6777` directly
 - If the backend restarts, you may need a new token (sessions expire with the process)
 
 ## Releasing New Versions
 
-### The model
+The release-branch, candidate, stable, hot-patch, version-stamping, artifact,
+and recovery procedures are maintained in the
+[release runbook](docs/build/release.md). Follow that runbook rather than copying
+commands from this guide; these details are coupled to the current workflows.
 
-`main` is always the latest code, and deliberately not stable. Feature releases
-are cut as a **release branch** off `main` on 0.1 increments (`0.1.0` → `0.2.0`
-→ `0.3.0`).
-
-Once a branch is cut, **bug fixes for that release go on the release branch, not
-on `main`.** Each one produces a new release candidate — `0.2.0-rc.1`,
-`-rc.2`, … — published to the insider channel. **Stable is the last RC we judge
-stable enough, promoted by tagging that RC's commit — never rebuilt.** So
-`0.2.0-rc.5` becomes stable `0.2.0`: same commit, same bytes, a new tag.
-
-Hot patches bump the patch digit (`0.2.0` → `0.2.1`) and are also cut from the
-release branch.
-
-After each stable cut, do two things: **bump `main` by 0.1** (to `0.3.0`) so
-nightlies sort above what just shipped, and **merge the branch's fixes back into
-`main`** so they aren't stranded on the branch.
-
-### Channels
-
-| Channel | Built from | Who it's for |
-|---------|-----------|--------------|
-| nightly | `main` | us and contributors |
-| insider | release branch, RC tags | power users testing ahead |
-| stable | the promoted insider | everyone (client default) |
-
-Nightly installs **side by side** as its own app. Insider and stable are two
-update lanes of **one** production app, switchable in Settings.
-
-The user-facing version of this table — same audiences, more detail on
-switching — is [Release channels](README.md#release-channels) in the README.
-Keep the two in step.
-
-### Cutting a release
-
-```bash
-# 1. Branch off main
-git switch -c release/0.2.0 origin/main
-git push -u origin release/0.2.0
-
-# 2. Tag RCs on the branch as fixes land → each publishes to insider
-git tag -a v0.2.0-rc.1 -m "0.2.0 rc1" && git push origin v0.2.0-rc.1
-#    ... fixes land on release/0.2.0 ... then v0.2.0-rc.2, -rc.3, …
-
-# 3. Promote: tag the good RC's COMMIT with a bare version → stable
-git tag -a v0.2.0 -m "release 0.2.0" <rc-commit-sha>
-git push origin v0.2.0
-
-# 4. Bump main to 0.3.0 (PR), and merge the branch's fixes back into main
-
-# Hot patch: fix on the release branch, then
-git tag -a v0.2.1 -m "release 0.2.1" && git push origin v0.2.1
-```
-
-Update `CHANGELOG.md` with a `## [X.Y.Z] — YYYY-MM-DD` section as part of the
-release (see AGENTS.md → "Release Changelog" for the format), and land the
-changelog and any version bump through a normal PR — never push to `main` or a
-release branch directly.
-
-### How builds are triggered
-
-**Nightly** runs on a schedule every night and can be kicked off on demand at any
-time. **Insider and stable are triggered by pushing a version tag** — an RC tag
-publishes to insider, a plain version tag publishes to stable.
-
-The release branch, the RC numbering, the promote decision, and the back-merge
-are all **human process**. The pipeline only reacts to the tag.
-
-Each build ships a signed and notarized macOS app, a Linux AppImage, a pip
-wheel, and a Docker image. A channel's update feed is repointed **last**, after
-its artifacts are verified downloadable, and clients only install with the
-user's consent. Windows builds but is not yet signed or published.
-
-**There is no rollback — we roll forward by cutting a new version.** Published
-CDN keys are immutable and are never overwritten.
-
-### Bumping the in-code version
-
-The in-code version governs **non-tag** builds — nightly and local/source
-installs. A tagged release overrides all three manifests at build time, so this
-is what makes nightlies read as previews of the *next* release:
-
-| File | Field |
-|------|-------|
-| `src/kiro_crew/__init__.py` | `__version__` — the source of truth |
-| `pyproject.toml` | `[project] version` — what the wheel carries |
-| `website/electron/package.json` | `version` — the updater's version compare |
-
-Keep it a bare `X.Y.Z`: `nightly.yml` builds both a semver and a PEP 440 stamp
-from it, and a suffixed base (`.dev0`) produces invalid versions.
-
-### One trap worth knowing
-
-Any two prerelease tags sharing a base and a trailing number collapse onto the
-same PEP 440 wheel version — `v0.2.0-rc.1` and `v0.2.0-insider.1` both map to
-`0.2.0rc1`. The second publish then fails as a republish of an immutable key, so
-**stick to one prerelease convention (`-rc.N`) per base version.**
-
-Full detail, including the branch, channel, and RC model behind these steps and the
-platform-lane contract: **[docs/build/release.md](docs/build/release.md)**.
+Release changes land through normal pull requests—never push directly to
+`main` or a release branch. The release PR updates `CHANGELOG.md` according to
+the [changelog format](docs/build/changelog.md).
 
 ## Project Structure
 
@@ -281,12 +212,13 @@ Key entry points:
 |------|---------|
 | `src/kiro_crew/cli.py` | CLI entrypoint (argparse) |
 | `src/kiro_crew/session.py` | Conversation session management |
-| `src/kiro_crew/providers/` | LLM provider layer (claude_code, acp, bedrock) |
+| `src/kiro_crew/providers/` | LLM provider layer. ACP only — `agent.provider` is fixed to `acp` |
 | `src/kiro_crew/acp/client.py` | ACP JSON-RPC client (stdio) |
 | `src/kiro_crew/slack/gateway.py` | Slack Socket Mode gateway |
 | `src/kiro_crew/slack/handler.py` | Message handling, tool approval |
 | `src/kiro_crew/dashboard/` | Web dashboard (aiohttp backend) |
-| `src/kiro_crew/mcp_core.py` | MCP tools: spawn, learn, task, wait, hook, send_message, file_send |
+| `src/kiro_crew/mcp_core.py` | `kirocrew-core` MCP server: answers `tools/list` and dispatches calls |
+| `src/kiro_crew/mcp_tools/` | `kirocrew-core` tools, one module per domain (`schemas()` + `HANDLERS`) |
 | `src/kiro_crew/mcp_cron.py` | MCP tools: cron scheduling |
 | `src/kiro_crew/context.py` | Context builder (memory, skills, history) |
 | `src/kiro_crew/subagent.py` | Subagent lifecycle and timeout |
@@ -294,26 +226,15 @@ Key entry points:
 | `src/kiro_crew/snapshot.py` | Portable snapshot and restore |
 | `src/kiro_crew/apps/` | App Kit platform (manifest, manager, registry, routes) |
 | `src/kiro_crew/eval/` | Multi-session eval harness |
-| `agents/` | Agent config and system prompt |
-| `agents/prompt.md` | Default system prompt — edit to change the agent's base personality and rules |
+| `src/kiro_crew/config/` | Shipped agent config (`defaults.json`) and default system prompt (`prompt.md`); overrides are in [Agent Config Files](src/kiro_crew/docs/agents.md#agent-config-files) |
 | `skills/` | On-demand skill definitions (see [skills/README.md](skills/README.md)) |
 | `website/` | React + Vite frontend SPA |
 
 ## Code Style
 
-| Rule | Standard |
-|------|----------|
-| Line length | 100 chars (black) |
-| Python | ≥ 3.10, `from __future__ import annotations` |
-| Logging | `import logging` + `logger = logging.getLogger(__name__)` |
-| Async | `asyncio` throughout, `async def` for all I/O |
-| Data | `@dataclass` for containers |
-| Imports | All at top of file, no in-method imports |
-| Naming | Module constants: `UPPER_SNAKE`. Private: `_UPPER_SNAKE` |
-| Lint | flake8 (F401 unused imports, N806 lowercase vars, W504); isort + black |
-| Types | mypy, `# type: ignore[...]` sparingly |
-
-Full reference: [AGENTS.md](AGENTS.md)
+The canonical Python, TypeScript, naming, comment, formatting, and lint rules are
+in [Code style](docs/system-specs/common/code-style.md). `AGENTS.md` routes each
+subsystem to any additional spec that must be read before editing it.
 
 ## Documentation (required with every behavior change)
 
@@ -321,61 +242,33 @@ Full reference: [AGENTS.md](AGENTS.md)
 commit.** A PR that changes behavior and leaves its doc stale will be sent back:
 a doc nobody updated is worse than no doc, because readers still trust it.
 
-1. **Find the one owning doc.** Every subsystem has exactly one, usually under
-   `docs/system-specs/modules/`. [AGENTS.md](AGENTS.md)'s routing table maps
-   subsystem to doc.
-2. **Edit that doc; don't add a second one.** Two docs on one subject diverge,
-   and then nobody can tell which is true.
-3. **Update the indexes** when you add, move, rename, or delete a doc: the
-   directory's own `README.md`, [docs/README.md](docs/README.md), and anything
-   linking to it.
-4. **No changelogs inside docs.** No `Last Updated:` line, no
-   "previously/used to/we now", no PR numbers or SHAs. Git holds history; the doc
-   states current behavior in present tense.
-5. **Run the gate:** `./scripts/docs-lint.sh` (also a blocking CI job). It catches
-   broken internal links, docs no index reaches, directories missing an index, code
-   comments citing a doc that does not exist, and a renamed doc whose filename is
-   hardcoded in code.
-
-Note that `src/kiro_crew/docs/` is **packaged and read at runtime**: its filenames
-are an API (see [its README](src/kiro_crew/docs/README.md)), so renaming a file
-there is a code change, and an internal engineering note placed there ships to every
-user.
+The five steps — find the one owning doc, edit rather than add, update every
+index, no changelog narration, run `./scripts/docs-lint.sh` — plus the
+`src/kiro_crew/docs/` filenames-are-an-API caveat are in
+[The rule for changing docs](docs/README.md#the-rule-for-changing-docs).
 
 ## Extending Kiro Crew
 
-- **Skills** — drop markdown files in `skills/` or `~/.kiro/crew/skills/`. See [skills/README.md](skills/README.md) for the full format reference
-- **MCP tools** — add to `mcp_core.py` or `mcp_cron.py`. Every LLM-facing command must have an MCP tool
-- **Hooks** — configure in `~/.kiro/crew/config.json`
-- **Lessons** — self-learned from corrections, stored in `~/.kiro/crew/lessons.jsonl`
+- **Skills** — a skill is a directory holding a `SKILL.md`. See [skills/README.md](skills/README.md) for the format and where skills are installed
+- **MCP tools** — a `kirocrew-core` tool is a `schemas()` descriptor plus a `HANDLERS` entry in `src/kiro_crew/mcp_tools/<domain>.py`; cron tools live in `mcp_cron.py` (their bodies) and `mcp_cron_tool_list.py` (their schemas). See [MCP](docs/architecture/mcp.md#a-kirocrew-core-tool-has-two-halves). Every LLM-facing command must have an MCP tool
+- **Hooks** — see [Steering files, prompts and hooks](src/kiro_crew/docs/steering-and-hooks.md)
+- **Lessons** — self-learned from corrections and stored in the memory store (`lessons.jsonl` is a legacy fallback); see [Memory & Learning](src/kiro_crew/docs/memory-and-learning.md#lessons)
 
 ## Tests
 
-### Backend Tests
+Use targeted tests while iterating, then run the change-scoped local test gate
+before a commit:
 
 ```bash
-pytest                       # full suite (pytest-asyncio, pytest-xdist)
-pytest -k test_name          # single test
+python3 scripts/local-gate.py
 ```
 
-| Pattern | Example |
-|---------|---------|
-| File naming | `test/test_<module>.py` |
-| Async tests | `@pytest.mark.asyncio` required |
-| Filesystem | `tmp_path` fixture |
-| Config | `monkeypatch` for overrides |
-| External processes | Always mock the agent backend, never spawn real processes |
-| Grouping | `class TestFeatureName:` |
-
-### Frontend Tests
-
-```bash
-cd website
-npm test                     # vitest (unit/component) + electron tests
-npm run check                # typecheck + lint + tests
-npm run test:integration     # MSW-based integration tests
-npm run test:playwright      # E2E (requires a running backend)
-```
+This is the test portion of the [gate before you commit](AGENTS.md#the-gate-before-you-commit),
+not a replacement for its static checks. The full test suite is CI's job unless
+a human explicitly requests `python3 scripts/local-gate.py --full`. Test
+structure, isolation, worker limits, frontend commands, and platform traps are
+canonical in [Testing conventions](docs/system-specs/common/testing-conventions.md)
+and [Frontend testing](website/docs/testing.md).
 
 ## Using AI Tools
 
@@ -404,32 +297,58 @@ get it merged.
 
 When your change is ready, the workflow is already codified rather than left to
 taste. See Development Skills above: `kirocrew-worktree-dev` covers building and
-verifying in a worktree, and `prepare-pr` takes it from there, driving the change
+verifying in a worktree, and `kirocrew-prepare-pr` takes it from there, driving the change
 to a review-ready pull request by committing, syncing onto the base, squashing to
-the single commit this repo requires, opening or updating the PR, then polling CI
+the one or two commits this repo allows, opening or updating the PR, then polling CI
 and the review bots and fixing what they find. An agent that loads it follows the
 same route a maintainer would, which is why the process holds regardless of who or
 what wrote the code. If you are contributing with an agent, point it at that skill
 instead of describing the steps yourself.
 
+One thing the GitHub UI will get wrong for you: if your branch falls behind the
+base while the PR is open, **rebase it, do not merge**. Plain-clicking
+**Update branch**, like a local `git merge main`, adds a merge commit, which counts
+toward the one-or-two-commit limit above and fails `PR Hygiene` on a PR that was
+green a moment earlier. That button's dropdown does carry an **Update with rebase**
+option, which is safe; the default click is the trap. Pick that option, or run:
+
+```
+git fetch upstream
+git rebase upstream/<base branch>
+git push --force-with-lease origin <feature-branch>
+```
+
 ## Pull Request Workflow
 
 1. **Fork** the repository on GitHub.
-2. **Branch** from `main`:
+2. **Branch** from `main` in a git worktree, never in the main clone (the
+   `kirocrew-worktree-dev` skill owns this rule):
    ```bash
-   git fetch origin
-   git checkout -b feat/my-feature origin/main
+   git fetch upstream main
+   git worktree add ../kirocrew-wt-my-feature -b feat/my-feature upstream/main
    ```
-3. **Make your change** and add tests (new functions/components should be tested).
-4. **Run the checks locally** before opening a PR:
+3. **Start from an issue.** Every PR must name an issue of this repository
+   that has been given a tier, on a line of its own in the description: `Closes #N`
+   closes the issue when the PR merges; `Part of #N` leaves it open for the
+   rest of the work. The `Issue Gate` check enforces it once the Captain's
+   triage scan is running (it is paused until then). No issue yet? Open one
+   and let it be tiered first -- see
+   [Reporting Bugs and Requesting Features](#reporting-bugs-and-requesting-features).
+4. **Make your change** and add tests (new functions/components should be tested).
+5. **Run the [gate before you commit](AGENTS.md#the-gate-before-you-commit)**
+   before opening a PR; its test step is:
    ```bash
-   pytest                                   # backend
-   cd website && npm run check && cd ..     # frontend: typecheck + lint + tests
+   python3 scripts/local-gate.py
    ```
-5. **Commit** using [Conventional Commits](https://www.conventionalcommits.org/)
+6. **Commit** using [Conventional Commits](https://www.conventionalcommits.org/)
    (see below), push to your fork, and open a **Pull Request against `main`**.
-6. A maintainer will review. Address feedback by pushing additional commits to
-   your branch.
+7. **Fill the PR template.** Keep every heading of
+   [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) and fill the
+   **Goal:** line under Problem / Motivation. The `pr-hygiene` check fails a body
+   that is missing them, and a PR with more than two commits; see the
+   [pre-gate rules](docs/ci/ci-and-reviews.md#code-reviewyml-the-deterministic-pre-gate).
+8. A maintainer will review. Address feedback by amending or squashing so the
+   branch stays within two commits, then force-push with `--force-with-lease`.
 
 Two things are worth knowing before you start something large.
 [GOVERNANCE.md](GOVERNANCE.md) covers who decides what lands and how a
@@ -444,37 +363,13 @@ anything that would be expensive to reverse. Everything else skips it, and a bug
 fix should never wait on a design document. If you are unsure which side of the
 line your change falls on, open an issue and ask.
 
-### CI checks on your PR (forks vs. direct branches)
+### CI checks on your PR
 
-GitHub deliberately withholds repository secrets and OIDC credentials from
-workflows triggered by **pull requests opened from a fork**. Three of our
-checks need those credentials to reach Amazon Bedrock, so their behaviour
-depends on *where your branch lives*:
-
-| Check | Fork PR | Branch pushed to `kirodotdev/KiroCrew` |
-| --- | --- | --- |
-| **Opus 4.8 Review** | Skipped (neutral — not a failure) | Runs |
-| **GPT 5.6 Review** | Skipped | Runs |
-| **Design Review** | Skipped | Runs |
-| Tests, lint, typecheck, CodeQL, coverage, build | Run normally | Run normally |
-
-- **Opening from a fork (the default for most contributors):** the three AI
-  reviews are **skipped, not failed** — and this is identical for *everyone*,
-  regardless of permission level. A maintainer who opens a PR from their own
-  personal fork gets exactly the same skip; write access does not change it.
-  A skipped review does **not** block your PR and there is nothing for you to
-  fix: just make sure the credential-free checks (tests, lint, typecheck,
-  CodeQL, coverage, build) are green. A maintainer runs the AI review on their
-  side (or re-pushes your branch to the upstream repo) and reviews manually.
-- **Getting the AI reviews to run** depends only on *where the branch lives*,
-  never on who you are: the branch has to be on `kirodotdev/KiroCrew` itself,
-  not on a fork. Pushing a branch directly to the upstream repo requires write
-  access — so if you have it, push there and open the PR from that branch to
-  get the full suite. Without write access, the fork path above is the correct
-  and only route, by design.
-
-If your only red checks are the AI reviews on a fork PR, there is nothing for
-you to fix — flag it to a maintainer.
+The workflow graph, fork approval path, required and advisory review lanes,
+ratchet behavior, and inherited-red guidance are canonical in
+[CI and reviews](docs/ci/ci-and-reviews.md). Read that guide before changing a
+workflow or reacting to a red baseline gate; do not widen a ceiling or baseline
+to hide drift from `main`.
 
 ## Commit Messages
 
@@ -486,9 +381,50 @@ you to fix — flag it to a maintainer.
 <body — what and why, not how>
 ```
 
-Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
+Types the PR-title gate accepts: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
+`test`, `chore`, `ci`, `build`, `revert`.
 
-Rules: imperative mood, lowercase summary, no trailing period, wrap body at 72 chars.
+Rules: imperative mood, lowercase summary of at most 72 chars, no trailing period,
+wrap the body at 72 chars, and one logical change per commit.
+
+## Recognizing Contributions
+
+There is one contributor list, the Contributors block in [README.md](README.md).
+Deliberately one: a second table for "other" contributions would rank one kind of
+help above another, and split recognition across two places nobody reads twice.
+
+Two things are credited automatically by a daily job: authoring a merged pull
+request, and reporting an issue that a merged pull request closed. The job also
+credits the linked authors and co-authors of a merged PR's commits, so work that
+lands under someone else's PR still reaches its real author. You do not need to
+ask for any of these.
+
+Superseding another contributor's PR: when you open a replacement PR that takes
+over someone else's work, keep their commits authored as-is (cherry-pick, do not
+re-author) and add `Co-authored-by: <login> <id+login@users.noreply.github.com>`
+to every commit you write. The daily job reads those trailers, so the original
+author is credited even though the replacement PR is authored by you.
+
+The second rule is deliberately about outcome, not volume. Credit follows a report
+that changed the product, which is why the job reads each merged PR's closing
+references rather than listing every issue — that keeps duplicates, invalid
+reports, and issues opened to farm a credit out of the list. It undercounts on
+purpose: if a pull request fixed your report without writing a closing keyword,
+the link does not exist and the job cannot see it. Ask, and it gets added by hand.
+
+Everything else is credited in the same block on request: a code review, a
+translation, an idea, a design, a private security report. Open an issue naming
+the person (yourself is fine), and a maintainer records it:
+
+```sh
+python3 scripts/update_contributors.py --login <github-login> --name "Display Name"
+```
+
+The daily job re-derives the full contributor set and rebuilds its branch
+from scratch, but it never rewrites or drops an existing line, so a
+manually-added entry survives every later run. A login listed in
+`.github/contributors-optout.txt` is never added by the job, which is how a
+removal request stays honored.
 
 ## Questions?
 
@@ -503,7 +439,7 @@ discussion in the repository.
 ## Code of Conduct
 
 This project has adopted a [Code of Conduct](CODE_OF_CONDUCT.md). Participating
-means following it, and the file names where to report a concern.
+means following it and the open source code of conduct and FAQ it links.
 
 ## Licensing
 

@@ -15,12 +15,33 @@ git, the project directory, the agent config and its managed MCP entries,
 credentials, gateway status, and the embedding runtime and model file. Where a
 check fails it prints a specific fix command.
 
+## Diagnostics bundle
+
+To report a problem, collect a bundle instead of pasting logs by hand:
+
+```bash
+kirocrew doctor --bundle
+```
+
+This writes a zip to `~/.kiro/crew/diagnostics/` holding the gateway logs and
+crash reports, `versions.txt` and `manifest.json`. Every text file in it passes
+through the credential redaction first, and the command prints how many secrets it
+removed. It then prints a GitHub new-issue link on the bug-report form; drag the
+zip into that issue. The link fills in the version and the release channel from
+the build's own release record. When the build cannot prove its channel, the
+channel field reads `Not sure` and no `channel:` label is attached, so a human
+sets it. The link printed in the terminal leaves out the free-text fields; the
+dashboard's **Report problem** button uses the same collector and fills those in
+too.
+
 ## Common Issues
 
-### "kiro-cli not found in PATH"
+### The default kiro-cli backend is not on PATH
 
-`kiro-cli` is the agent backend and is required: `agent.provider` is fixed to
-`acp`, and the gateway spawns `kiro-cli acp --agent <name>` for every session.
+`agent.provider` is fixed to ACP, while `agent.acp_backend` selects the ACP
+harness. With the default blank backend, `kiro-cli` is required and the gateway
+spawns `kiro-cli acp --agent <name>`. If you selected another ACP backend,
+`kirocrew doctor` reports that backend's executable and setup instead.
 
 ```bash
 which kiro-cli   # should print a path; empty means it is not on PATH
@@ -36,6 +57,48 @@ kiro-cli login
 `kirocrew doctor` reports the binary and the login state on separate lines, so
 check both.
 
+**macOS desktop app:** if a command resolves in Terminal but not inside the
+app, the cause is usually launchd's minimal `PATH`, which a shell rc file
+never changes. The fix is `launchctl setenv PATH "$PATH"` plus a full quit and
+relaunch — see the
+[macOS troubleshooting guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/macos-troubleshooting.md)
+for the recipe and how to persist it across reboots.
+To add only a few directories, a `PATH=` line in `~/.kiro/crew/.env` does it
+without touching launchd; see [Credentials](configuration.md#credentials).
+
+### Dashboard asks for sign-in but `kiro-cli` is already authenticated
+
+Typical on a headless host that authenticates `kiro-cli` with an API key rather
+than `kiro-cli login`. `kirocrew doctor` prints a signed-in state while the
+dashboard's setup gate still asks for a device login, and `/api/models` plus
+usage polling answer 503.
+
+The readiness probe forwards `KIRO_API_KEY` to `kiro-cli whoami`, but only from
+the **gateway's own** environment. Exporting it in a shell after the gateway is
+running does not reach it, and neither launchd nor systemd passes the installing
+shell's environment to the service. Put it where the gateway reads it at boot:
+
+```bash
+P=~/.kiro/crew/.env
+touch "$P" && chmod 600 "$P"
+printf '%s\n' "KIRO_API_KEY=$KIRO_API_KEY" >> "$P"
+kirocrew restart           # or restart however you run the gateway
+```
+
+The `chmod` comes first on purpose: under a standard `022` umask a file created
+by the append alone is `0644`, and the gateway only forces `0600` the next time
+it reads it — so the key would be readable by other local users until then. The
+quoting matters for the same reason if your crew home contains a space. Every
+key in `~/.kiro/crew/.env` is loaded into the gateway's environment at startup;
+a bare `KIRO_API_KEY=` with no value does not count, because falsy values are
+skipped. Do not put the key in the systemd unit or in
+`/etc/kirocrew/kirocrew.env` — both are readable by any local user.
+`kirocrew service install` warns when it sees a key in your shell that the
+service will not inherit.
+
+Releases before 0.3.0 filtered `KIRO_API_KEY` out of the probe entirely, so no
+placement works on those; use `kiro-cli login` or upgrade.
+
 ### Agent config missing or stale
 
 ```bash
@@ -45,14 +108,69 @@ kirocrew setup --agent-only
 This regenerates `~/.kiro/agents/kirocrew.json` while preserving your own
 customizations in it.
 
+### Pod commands report Permission denied on the user bus
+
+`kirocrew pod` uses per-user service-manager units. On Linux it must connect to
+`$XDG_RUNTIME_DIR/bus`. Pod verb entry and the Pods row in `kirocrew doctor` run
+`systemctl --user is-system-running` once to test that connection. Low-level unit
+queries do not repeat the probe before each command.
+
+If doctor reports the bus as `sandboxed away`, the socket exists but an outer
+sandbox, such as a container or launcher shim, blocks the current process:
+
+```text
+Failed to connect to bus: Permission denied
+```
+
+Run pod commands from a host shell instead of that sandboxed process:
+
+```bash
+kirocrew doctor
+kirocrew pod status <worktree>
+kirocrew pod up <worktree>
+```
+
+If doctor reports `no user session bus`, or reports the address as stale because
+the socket it names holds nothing, no per-user systemd instance is running for
+this uid, and pods are `systemd --user` units. Start it with the
+`loginctl enable-linger <user>` command doctor prints. That command talks to the
+**system** bus, so it is not self-service on a host that cannot reach a bus at
+all: if it answers `Failed to create bus connection: Permission denied`, run it
+from a host shell, or have an administrator run
+`sudo loginctl enable-linger <uid>` — the numeric uid resolves where a name
+lookup answers `Failed to look up user <user>: No such process`. A Cloud Dev
+Desktop reaches the stale case by exporting `DBUS_SESSION_BUS_ADDRESS` from a
+login session whose manager has since stopped. To preview a worktree with no
+systemd at all, use `./dev-backend.sh` from the root of a Kiro Crew source
+checkout; it is a repository script and is not installed with the package.
+
+If doctor reports `session bus: not applicable (no systemd per-user manager on
+this host)`, the host's systemd ships without `user@.service` — Enterprise Linux
+7 derivatives such as RHEL 7, CentOS 7 and Amazon Linux 2 do. There is no
+per-user manager for linger to start, so `loginctl enable-linger` cannot help.
+Run a worktree gateway with `./dev-backend.sh` from a source checkout, or have an
+administrator hand-install a `user@$(id -u).service` unit as described under
+"Hosts without a working `systemd --user`" in the
+[remote and mobile guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/remote-and-mobile.md#hosts-without-a-working-systemd---user).
+
+Probe and unit operations resolve
+`systemctl` only from trusted system directories and ignore same-named PATH entries. A
+missing trusted executable, missing interpreter, or other failure while executing the
+resolved command is reported as an operational error, not as an absent backend.
+Destructive Dev Fleet cleanup then refuses to remove the worktree. Other Kiro Crew
+features do not depend on the pod service manager.
+
 ### MCP tools not working
 
-`kirocrew doctor` auto-appends missing `tools` / `allowedTools` entries for the
-managed servers and rewrites the file. It cannot auto-add a missing `mcpServers`
-entry, because the command path is install-specific. If tools still fail:
+`kirocrew doctor` auto-appends missing `tools` entries for managed servers and
+rewrites the file. It may also repair `allowedTools` for always-on servers, but
+it deliberately does not blanket-auto-approve `kirocrew-computer` or other
+opt-in servers. It cannot auto-add a missing `mcpServers` entry, because the
+command path is install-specific. If tools still fail:
 
-1. Check `~/.kiro/agents/kirocrew.json` for `kirocrew-core`, `kirocrew-cron`,
-   and `kirocrew-computer` under `mcpServers`, and for the matching `@`-prefixed
+1. Check `~/.kiro/agents/kirocrew.json` for `kirocrew-core` and
+   `kirocrew-cron` under `mcpServers`, plus `kirocrew-computer` only when
+   Computer Use is enabled and supported; check for matching `@`-prefixed
    entries under `tools`
 2. Check `~/.kiro/settings/mcp.json` for globally configured servers
 3. Re-run `kirocrew setup --agent-only`
@@ -61,10 +179,78 @@ The doctor also runs a live handshake probe against each managed server and
 prints the child's stderr tail on failure, which is usually where the real cause
 (an import error, a bad path) shows up.
 
+If a session is refused with `kirocrew-core is withheld by <source>:
+<restriction>; <remedy> ...`, a declaration of `kirocrew-core` carries a setting
+that a per-session copy of the server cannot keep — `disabled: true`, a
+`disabledTools` list, a `type` other than stdio, or another key only kiro-cli
+reads. `<source>` names where it lives:
+the agent spec, the global MCP settings (`~/.kiro/settings/mcp.json`), or the
+project's MCP settings. Session-scoped tools such as skill search need that
+per-session copy, so the session is refused instead of silently losing them.
+Remove the restriction the way the message names, then start a new session.
+
+### MCP tools missing on an enterprise (work) account
+
+If the probe above reports every server healthy but the tools are still absent in
+sessions — no `spawn_run`, no `cron_add`, no `learn_add` — and your Kiro account
+is a work account signed in through IAM Identity Center, your administrator has
+almost certainly allow-listed MCP servers through an MCP registry. In that mode
+kiro-cli connects only to servers marked `"type": "registry"`, and it drops the
+rest without an error. The local probe cannot see this because it spawns the
+servers directly.
+
+```bash
+kirocrew config set agent.mcp_registry_mode true
+kirocrew restart
+```
+
+Your administrator also has to add `kirocrew-core`, `kirocrew-cron` and
+`kirocrew-computer` to the registry under those exact names. `kirocrew doctor`
+prints an `MCP Governance (enterprise)` section on Identity Center hosts with the
+current state. Full walkthrough, including the registry JSON your administrator
+needs: `docs/guides/enterprise-mcp-governance.md`.
+
+### A server from your organization's MCP registry shows "Not verified"
+
+A server you installed from your organization's MCP registry (through Kiro IDE or
+the Kiro CLI) shows **Not verified** under Connections → MCP Servers, with no
+command. That is expected. The Kiro CLI wrote it into `~/.kiro/settings/mcp.json`
+as a pointer, `{"type": "registry"}`, and loads the real server from the registry
+when a session starts. Kiro Crew cannot read the registry, so the dashboard does
+not start or check that server itself.
+
+Kiro Crew passes the pointer on to every Kiro CLI session unchanged. To see
+whether it connected, run `kiro-cli mcp list`, or ask an agent to use one of its
+tools. Sessions on the Claude or KAS backends do not load registry servers.
+
+### A remote MCP server shows "Not verified"
+
+Remote MCP servers that authenticate with OAuth — Atlassian, for example — can
+show **Not verified** under Connections → MCP Servers while working perfectly in
+chat. Nothing is wrong with the server. The badge describes what the dashboard
+can see, not what the server can do.
+
+The Kiro CLI runs the OAuth flow and keeps the token in its own credential store;
+Kiro Crew never holds it. The dashboard's status probe therefore connects without a
+token, and the server answers `401`. That single answer covers two situations the
+dashboard cannot tell apart: a server nobody has authorized, and a server already
+authorized through the Kiro CLI. So it reports only what it knows.
+
+To find out which one you have:
+
+- If an agent can call that server's tools in chat, it is authorized and working.
+- If tool calls fail, use the server in chat once. The Kiro CLI starts the OAuth
+  flow on the `401` and Kiro Crew shows the consent link as a banner; approve it
+  there and the calls succeed.
+
+A server that is genuinely broken reads **Error** with the reason next to it, not
+**Not verified**.
+
 ### Dashboard not loading
 
 ```bash
 kirocrew status                          # is the gateway running?
+kirocrew logs -n 200                     # what did it log before it stopped?
 curl http://localhost:5476/api/status    # is it answering on the expected port?
 ```
 
@@ -83,22 +269,29 @@ on another port with `KIROCREW_PORT`.
 
 ### Context window filling up
 
-Kiro Crew auto-compacts at `session.autocompact_pct` context usage (90% by
-default). If compaction fires often:
+Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
+default for a new install — an existing `config.json` keeps whatever value it
+already stores, which for installs created before this default changed is
+`90.0`; check with `kirocrew config get session.autocompact_pct`). The KAS
+backend is the exception: it decides when to compact on its own, and this
+setting does not change that. If compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
-- Enable `skills.lazy_load` so a large skills set injects only a ranked top-K
+- Keep `skills.lazy_load` on (the default) so a large skills set injects only a ranked top-K
   instead of the whole catalog
 - Lower `session.timeout_secs` to recycle sessions more often
 
 ### Build failures
 
-Backend:
-
-```bash
-pip install -e . && python -m pytest 2>&1 | tail -20
-```
+Building and testing apply to a Kiro Crew source checkout, not to an installed
+package. The backend's test tools live in the `dev` extra, so a plain
+`pip install -e .` has no `pytest`. Install with `pip install -e ".[dev]"` and run
+the change-scoped gate with `python3 scripts/local-gate.py`; the
+[install guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/install.md#b-from-source-development)
+and
+[CONTRIBUTING.md](https://github.com/kirodotdev/KiroCrew/blob/main/CONTRIBUTING.md#tests)
+have the full recipe.
 
 Frontend:
 
@@ -106,8 +299,9 @@ Frontend:
 cd website && npm install && npm run build 2>&1 | tail -20
 ```
 
-Node must be `20` or `>= 22`; an older Node fails the Vite build. Python must be
-`>= 3.10`.
+Node must be `>= 22.12`, the floor Vite and Rolldown declare in
+`website/package-lock.json`; an older Node fails the Vite build. Python must be
+`>= 3.12`.
 
 ### Embedding model download failed
 
@@ -184,20 +378,101 @@ Common problems:
   model: doing so would silently swap your vector space and re-embed your whole
   corpus because of a typo. Embeddings stay unavailable (keyword search still
   works) until the path is fixed.
-- **A log line says the model produces N-dim vectors but `embedding_dim` is M,
-  and refuses to load.** Set `memory.embedding_dim` to the number in the message.
-  The width is checked at load precisely so a mismatch is a loud refusal rather
-  than an unexplained loss of semantic search.
-- **You swapped models but nothing re-embedded.** The default vector-space
-  identity is derived from the file's name and size, so two different models of
-  identical byte size look the same. Set `memory.embed_model_id` explicitly to
-  distinguish them.
+- **Embedding-model dimension mismatch.** Set `memory.embedding_dim` to the output width named in the error. The width is checked at load so a mismatch is a loud refusal rather than an unexplained loss of semantic search.
+- **You swapped models but nothing re-embedded.** The vector-space identity
+  is `<label>:sha256:<digest>` of the model file's bytes, so a different model
+  under the same name and size is detected on its own; `memory.embed_model_id`
+  is only the label and cannot pin the old space. Applying the model from the
+  dashboard (Memory → Embedding Model) records the new digest together with
+  `memory.embed_model_stamp`, and an unchanged file reuses that digest at
+  startup without re-reading the weights. A file replaced behind a stale stamp
+  is re-hashed off the event loop. Status reports the model as unverified while
+  that check runs and recovers automatically after it succeeds; applying the
+  model again is not required.
+- **Status warns about inherited legacy vectors.** Older model identities used
+  the file name and size, so they cannot prove which weights produced the
+  vectors. If you changed weights before upgrading, reapply the same file in
+  Memory settings to rebuild inherited vectors while keeping memory text.
 
 ### High memory usage with embeddings
 
 About 700 MB of RSS is expected while the embedding model is loaded. One copy is
 shared by vector memory and the Knowledge Library. The model loads lazily on
 first use and stays resident afterwards.
+
+### `~/.kiro/crew/scratch/` is using a lot of disk
+
+Every agent process gets a directory under `~/.kiro/crew/scratch/` for its
+temp files and its `$KIROCREW_SCRATCH` work products (clones, build logs,
+screenshots). A directory is reclaimed automatically once every process
+recorded in its `.owner` file has exited and nothing in it has been touched for
+an hour, so short-lived sessions clean up on their own.
+
+A directory that holds a git repository (a clone, a workspace of checkouts, a
+bare repository) is never deleted this way, because nothing outside the agent
+can prove the work in it is saved. It is moved into the `.quarantine`
+directory beside the others instead, named `<UTC time of the move>-<its own
+name>`, and deleted from there 14 days after the move (later, if something was
+written into it in the last hour). The gateway log names every move in one
+INFO line: `agent-scratch: moved <name> to <path in .quarantine> instead of
+deleting it`, with the date it will be deleted.
+
+The quarantine keeps the work, not what tools rebuild from it. Each kept
+directory loses its `node_modules`, `__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.ruff_cache`, `.tox` and `.nox` directories, its Python
+virtual environments (any directory holding a `pyvenv.cfg` file and no git
+repository) and its pytest temp directories (`pytest-of-*` at its top), on
+every hourly sweep, so edits under `node_modules` are not kept and a
+dependency installed inside `.quarantine` is removed again. Nothing inside a
+`.git` directory is touched. A repository that sits only inside one of those, such as
+the throwaway ones a test suite creates, does not count, so a directory whose
+only repositories are there is deleted at once. Run `npm ci` or recreate the
+venv after restoring one. To keep the work, move the
+directory out of `.quarantine` before that date (copying files out of it does
+not delay the delete), or commit and push it from there; to restore it for its
+session, move it back beside the others under its original name.
+
+One directory does not: the background runtime's tree is shared by every
+dashboard session and is handed on from one runtime to its replacement, so it
+lives as long as the gateway does and is never pruned while a session might
+still need it. It is one of the `runtime-*` directories — usually the oldest
+and largest. Other `runtime-*` directories belong to ordinary agent processes
+and are reclaimed by the normal rule above. If the shared tree grows large, the
+fix is a gateway restart (a fresh tree is
+started and the old one is reclaimed by the hourly sweep once its processes are
+gone), or deleting large work products inside it that you know are finished.
+Do not delete a directory whose `.owner` names a live process.
+
+```bash
+du -sh ~/.kiro/crew/scratch/*/ | sort -h | tail
+```
+
+#### Moving scratch off the system drive
+
+On Windows the scratch tree lives on `C:` by default and can hold bulky,
+disposable data (staged self-update installers, clones, build logs) that fills
+the system drive. To relocate the whole managed scratch root to a data drive,
+set `KIROCREW_SCRATCH_ROOT` to a real directory and restart the gateway:
+
+```bash
+# Windows (PowerShell), persisted for the user:
+setx KIROCREW_SCRATCH_ROOT "D:\kirocrew-scratch"
+```
+
+The path is used as the scratch root itself. A value naming a drive/filesystem
+root or a known system directory is refused and logged
+(`KIROCREW_SCRATCH_ROOT=… is a system directory, ignoring`), falling back to the
+default `~/.kiro/crew/scratch`. Redirecting the directory with an NTFS junction
+or symlink is refused for safety, so this env var is the supported way to move
+it. The target must be on a drive with access control (NTFS); a FAT/exFAT volume
+is refused (`KIROCREW_SCRATCH_ROOT=… volume has no access control (FAT/exFAT)`)
+because it cannot be locked to your account. `KIROCREW_SCRATCH_ROOT` is honoured on Windows only; it is ignored on Linux
+and macOS, where scratch stays at the default `~/.kiro/crew/scratch`. Note
+`KIROCREW_SCRATCH` (no `_ROOT`) is unrelated — it is an output written
+for child processes, and setting it yourself does nothing.
+
+Setting `KIROCREW_HOME` to a data drive relocates the whole data home,
+scratch included, if you want everything off `C:` rather than scratch alone.
 
 ### Subagent completion event seems cut off
 
@@ -228,6 +503,54 @@ kirocrew config set agent.subagent_result_ttl_secs 21600   # 6 hours
 
 See [Subagents](subagents.md#completion-event-truncation) for the full
 reference.
+
+### "This conversation hit its turn limit and is paused"
+
+A chat-channel conversation that drives too many turns inside one window is
+latched, and every later message in it is refused with this text. It stops a
+channel that has started answering its own replies. The default is 90 turns per
+hour per conversation; dashboard, cron and subagent turns are not counted.
+
+To continue, reset that conversation from the dashboard. Every reset verb
+releases the latch, and so does a gateway restart. To change the limit, set
+`KIROCREW_CHANNEL_TURN_CEILING` (turns; `0` turns the limit off) or
+`KIROCREW_CHANNEL_TURN_WINDOW_SECS` (seconds) in `~/.kiro/crew/.env` and restart
+the gateway.
+
+### `kirocrew restart`: "Replacement gateway ... did not become ready within"
+
+The replacement gateway is still running but did not pass its readiness check in
+time, so nothing serves the dashboard yet. A slow host
+can need longer than the default 60 seconds; set `KIROCREW_RESTART_READY_TIMEOUT`
+to a number of seconds (clamped to 15–180) for the shell running
+`kirocrew restart`. A replacement that dies early is reported at once and is not
+helped by a longer wait: run `kirocrew logs -f` to see its startup.
+
+### "Refusing to start: the Python standard library is shadowed."
+
+Kiro Crew exits with status 2 when a file or directory on the import path has
+the name of a standard-library module (an `asyncio/` folder or a `queue.py` in
+the directory you launched from, for example). The message names the module,
+where it resolved and which `sys.path` entry provided it. Move or rename that
+module, or launch from another directory. The `import path:` row of
+`kirocrew doctor` reports the same check.
+
+### Voice input stays off after a crash
+
+If the gateway died while loading the speech-to-text model, the next start does
+not try again with the same speech runtime: voice input stays refused and the
+reason names a marker file, `.load-in-progress.json` in the models directory
+(`~/.kiro/crew/models/whisper/`). It clears when the speech runtime changes (a
+reinstall). To try once more with the same runtime, remove that file. To stop
+the attempts, turn `stt.enabled` off.
+
+### Doctor warns about run directories without a marker
+
+`run dirs: ... carry no .kirocrew-run-dir marker` counts run directories under
+the workspace root that an older build left without a marker. The gateway only
+reclaims marked directories, so these stay; above 1000 the row becomes a warning
+and prints the manual move to do with the gateway stopped. Doctor itself deletes
+nothing.
 
 ## Log Levels
 

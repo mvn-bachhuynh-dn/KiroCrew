@@ -64,6 +64,7 @@ class FakeLoader:
         base_version=None,
         scripts=None,
         source="consolidation",
+        refusal=None,
     ):
         self.staged.append(
             {
@@ -368,7 +369,7 @@ def test_process_no_candidate_emits_skipped_audit(monkeypatch):
     """When the model returns no new_skill, emit a 'skipped' audit event.
 
     Regression test for the observability gap: an eligible session that ran the
-    skill-gen prompt but got no candidate previously left NO SEL event, making
+    skill-gen prompt but got no candidate would leave NO SEL event, making
     'asked, model declined' indistinguishable from 'never asked' in the audit
     log. The else-branch in _process_auto_skills now records it.
     """
@@ -595,7 +596,7 @@ async def test_process_auto_skills_update_route_forwards_scripts():
 async def test_stage_update_skips_non_live_target():
     """The judge sees PENDING candidates in `existing`, so it can answer
     `UPDATE auto/<pending-slug>` — a target that is not live. Staging that would
-    queue a candidate approve_pending_update rejects forever, so drop it."""
+    queue a candidate approve_pending_update_checked rejects forever, so drop it."""
     loader = FakeLoader(live_body=None)
     c = _mk(loader)
     c._event_loop = asyncio.get_running_loop()
@@ -800,6 +801,35 @@ def test_frontmatter_value_reads_fields_and_tolerates_missing():
     assert H._frontmatter_value(None, "description") == ""
 
 
+def test_frontmatter_value_resolves_block_scalars():
+    # A live skill authored with block-scalar frontmatter must round-trip
+    # through the update path: the staged candidate overwrites the live skill
+    # on approval, so reading the indicator verbatim would collapse the
+    # description to ">" (resolved to "" by the loader) and inject a bogus
+    # ">" entry into the merged trigger list.
+    body = (
+        "---\n"
+        "name: auto/x\n"
+        "description: >\n"
+        "  Retry a deploy\n"
+        "  after checking the logs.\n"
+        "triggers: |-\n"
+        "  a, b\n"
+        "---\n\n## Steps\n"
+    )
+    assert (
+        H._frontmatter_value(body, "description") == "Retry a deploy after checking the logs.\n"
+    )
+    # `triggers` uses `|-`, whose strip chomping drops the trailing break, so it is
+    # unaffected by the strip chomping -- the pair keeps the two modes visibly distinct here.
+    assert H._frontmatter_value(body, "triggers") == "a, b"
+    # An empty block resolves to "" rather than the indicator character.
+    assert H._frontmatter_value("---\ndescription: >\nname: x\n---\nbody", "description") == ""
+    # An indented occurrence of the key is prose inside a block, not a field.
+    nested = "---\ndescription: >\n  triggers: not real\ntriggers: real\n---\nbody"
+    assert H._frontmatter_value(nested, "triggers") == "real"
+
+
 @pytest.mark.asyncio
 async def test_stage_update_merges_live_triggers_not_replaces_them():
     """Approval writes the candidate's frontmatter over live, so the candidate
@@ -879,7 +909,7 @@ async def test_base_version_is_captured_before_the_body_it_describes():
 
     If live advances while the (up to 90s) merge turn runs, sampling the version
     afterwards records the NEW version against a body merged from the OLD one —
-    and approve_pending_update's staleness guard, seeing base == current, would
+    and approve_pending_update_checked's staleness guard, seeing base == current, would
     let that stale body overwrite the intervening update. The guard is only as
     good as the version it is handed.
     """

@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from kiro_crew.cron import (
     _MAX_SKIP_DATE_HORIZON_SECS,
     CronJob,
@@ -16,6 +18,16 @@ from kiro_crew.cron import (
     CronService,
     compute_next_run_ts,
 )
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 class TestIsDueSkipDates:
@@ -78,7 +90,7 @@ class TestIsDueSkipDates:
 
     def test_skip_dates_uses_now_parameter_not_wall_clock(self) -> None:
         """skip_dates check should use the now parameter, not datetime.now()."""
-        # Synthetic now: 2026-04-06 12:00 UTC
+        # Synthetic now, fixed by the timegm tuple below.
         synthetic_now = timegm((2026, 4, 6, 12, 0, 0, 0, 0, 0))
         job = self._make_cron_job(
             skip_dates=["2026-04-06"], timezone="UTC",
@@ -136,7 +148,7 @@ class TestMcpCronSkipDates:
     """Integration tests for skip_dates via MCP tool layer."""
 
     def test_cron_add_with_skip_dates(self, monkeypatch, tmp_path) -> None:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         # Isolate the cron store to tmp_path so parallel (xdist) cron tests don't
         # race on the shared default jobs file. _call_tool builds its service from
@@ -163,7 +175,7 @@ class TestMcpCronSkipDates:
         assert jobs[0].timezone == "Europe/Luxembourg"
 
     def test_cron_update_skip_dates(self, monkeypatch, tmp_path) -> None:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         monkeypatch.setattr("kiro_crew.mcp_cron.config_dir", lambda: tmp_path)
         monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
@@ -192,6 +204,82 @@ class TestMcpCronSkipDates:
         assert jobs[0].skip_dates == ["2026-05-01"]
         assert jobs[0].timezone == "Europe/Luxembourg"
 
+    @staticmethod
+    def _job_skipping_two_dates(monkeypatch, tmp_path):
+        """A job that skips two dates, created through the tool's own dispatch."""
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
+
+        monkeypatch.setattr("kiro_crew.mcp_cron.config_dir", lambda: tmp_path)
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        name = f"clear-skip-{uuid.uuid4().hex[:8]}"
+        result = _call_tool(
+            "cron_add",
+            {
+                "name": name,
+                "message": "hello",
+                "cron_expr": "0 9 * * *",
+                "skip_dates": ["2026-12-25", "2026-12-26"],
+            },
+        )
+        assert "Added job" in result, result
+        (job,) = [j for j in CronService(base_dir=tmp_path).list_jobs() if j.name == name]
+        return _call_tool, job.id
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            # What a client that drops empty lists delivers for ``skip_dates: []``
+            # beside the flag: the flag alone.
+            {"clear_skip_dates": True},
+            # ``skip_dates: []`` and the flag together, from a client that keeps both.
+            {"clear_skip_dates": True, "skip_dates": []},
+            # Beside another field, the case where a dropped ``[]`` was silently lost.
+            {"clear_skip_dates": True, "name": "renamed"},
+        ],
+    )
+    def test_clear_skip_dates_empties_the_list(self, monkeypatch, tmp_path, args) -> None:
+        call, job_id = self._job_skipping_two_dates(monkeypatch, tmp_path)
+
+        result = call("cron_update", {"job_id": job_id, **args})
+
+        assert result.startswith("Updated job"), result
+        job = CronService(base_dir=tmp_path).get_job(job_id)
+        assert job is not None
+        assert job.skip_dates == []
+        if "name" in args:
+            assert job.name == "renamed"
+
+    @pytest.mark.parametrize("flag", [{}, {"clear_skip_dates": False}])
+    def test_a_list_of_dates_still_replaces_the_list(self, monkeypatch, tmp_path, flag) -> None:
+        call, job_id = self._job_skipping_two_dates(monkeypatch, tmp_path)
+
+        result = call("cron_update", {"job_id": job_id, "skip_dates": ["2027-01-01"], **flag})
+
+        assert result.startswith("Updated job"), result
+        job = CronService(base_dir=tmp_path).get_job(job_id)
+        assert job is not None and job.skip_dates == ["2027-01-01"]
+
+    def test_clear_skip_dates_beside_dates_is_refused_and_changes_nothing(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        call, job_id = self._job_skipping_two_dates(monkeypatch, tmp_path)
+
+        result = call(
+            "cron_update",
+            {
+                "job_id": job_id,
+                "name": "renamed",
+                "skip_dates": ["2027-01-01"],
+                "clear_skip_dates": True,
+            },
+        )
+
+        assert result.startswith("Error: clear_skip_dates"), result
+        job = CronService(base_dir=tmp_path).get_job(job_id)
+        assert job is not None
+        assert job.skip_dates == ["2026-12-25", "2026-12-26"]
+        assert job.name != "renamed", "a refused call writes no field at all"
+
 
 class TestComputeNextRunTsSkipDates:
     """Unit tests for compute_next_run_ts advancing past skip_dates."""
@@ -216,7 +304,7 @@ class TestComputeNextRunTsSkipDates:
 
     def test_skip_dates_advances_past_skipped_friday(self) -> None:
 
-        # Fix "now" to Thursday 2026-05-28 12:00 UTC so next Friday = 2026-05-29
+        # Fix "now" to a Thursday so the immediate next Friday is the skipped one.
         synthetic_now = timegm((2026, 5, 28, 12, 0, 0, 0, 0, 0))
         job = self._make_cron_job(
             skip_dates=["2026-05-29"],  # skip the immediate next Friday

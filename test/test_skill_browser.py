@@ -8,6 +8,11 @@ Covers:
 - ``GET /api/skills/<name>/tree`` and ``GET /api/skills/<name>/file`` end-to-end
 
 Tests use a tmp_path fake $HOME so we never touch the real filesystem.
+
+The package-skill detail read through the descriptor gate, and the containment of every
+read inside the admitted skill root (symlinked leaves, the pinned descriptor, a redefined
+root), are pinned in ``test_skill_browser_containment.py``; the shared helpers live in
+``skill_browser_helpers.py``.
 """
 from __future__ import annotations
 
@@ -18,6 +23,11 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from skill_browser_helpers import (  # noqa: F401 -- the fixture is requested by name
+    _make_app,
+    _write_skill,
+    fake_home_fixture,
+)
 
 from kiro_crew.dashboard.handlers._shared import (
     SKILL_FILE_MAX_BYTES,
@@ -26,44 +36,17 @@ from kiro_crew.dashboard.handlers._shared import (
     _expand_agent_globs,
     _expand_resource_uri,
     _load_parsed_agents,
+    _one_row_per_skill_file,
     _parse_skill_description,
     _resolve_loaded_by_agents,
     _resolve_skill_root,
     annotate_skills_with_agents,
     collect_skills_blocking,
+    enumerate_skill_catalog,
     list_kiro_skills,
     list_skill_tree,
     read_skill_file,
 )
-
-# ── Fixtures ──
-
-
-@pytest.fixture
-def fake_home(tmp_path, monkeypatch):
-    """Pin $HOME to tmp_path so Path.home() returns a writable sandbox.
-
-    Also clears KIROCREW_HOME so ``skills_dir()`` resolves to
-    ``<tmp>/.kiro/crew/skills`` rather than any value leaked from the
-    surrounding build environment.
-    """
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("KIROCREW_HOME", raising=False)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    return tmp_path
-
-
-def _write_skill(root: Path, name: str, *, description: str = "", body: str = "body") -> Path:
-    """Materialize a SKILL.md under root/<name>/SKILL.md."""
-    skill_dir = root / name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    fm = ["---", f"name: {name}"]
-    if description:
-        fm.append(f"description: {description}")
-    fm.append("---")
-    skill_dir.joinpath("SKILL.md").write_text("\n".join(fm) + f"\n{body}\n")
-    return skill_dir
-
 
 # ── _parse_skill_description ──
 
@@ -90,6 +73,14 @@ class TestParseSkillDescription:
         desc, always = _parse_skill_description(f)
         assert desc == ""
         assert always is False
+
+    def test_nested_description_does_not_replace_top_level(self, tmp_path):
+        f = tmp_path / "SKILL.md"
+        f.write_text(
+            "---\nname: x\ndescription: the skill\ninputs:\n"
+            "  - name: a\n    description: one input\n\tdescription: tabbed\n---\n"
+        )
+        assert _parse_skill_description(f) == ("the skill", False)
 
     def test_strips_quotes_from_description(self, tmp_path):
         f = tmp_path / "SKILL.md"
@@ -502,6 +493,148 @@ class TestCollectSkillsBlocking:
         assert collect_skills_blocking(loader, [], project_dir=None) == []
 
 
+class TestOneRowPerSkillFile:
+    """Two sources reaching ONE SKILL.md list it once, and only a row from the
+    user-writable skills folder stays editable."""
+
+    def test_extra_paths_over_kiro_user_lists_once(self, fake_home, close_skills_loaders):
+        """Real loader: ``skills.extra_paths`` naming ``~/.kiro/skills`` reaches
+        the file as a Kiro Crew row AND as a ``kiro-user`` row; one is listed."""
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.skills import SkillsLoader
+
+        user_root = fake_home / ".kiro" / "skills"
+        skill_dir = user_root / "tracker"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: tracker\ndescription: top level\n"
+            "inputs:\n  - name: x\n    description: nested input\n---\nbody\n"
+        )
+        cfg = KiroCrewConfig()
+        cfg.skills.extra_paths = [str(user_root)]
+        loader = SkillsLoader(
+            skills_path=fake_home / ".kiro" / "crew" / "skills",
+            install_builtins=False,
+            config=cfg,
+        )
+
+        rows = [r for r in collect_skills_blocking(loader, [], project_dir=None)
+                if r["name"] == "tracker"]
+
+        assert len(rows) == 1
+        # Neither row is editable, so the row keyed by the file's own folder
+        # stays: its key is the one an agent-skill mapping saves.
+        assert rows[0]["key"] == "kiro-user/tracker"
+        assert rows[0]["description"] == "top level"
+        assert rows[0]["aliases"] == ["tracker"]
+
+    def test_editable_row_wins_and_agents_merge(self, tmp_path):
+        md = tmp_path / "s" / "SKILL.md"
+        md.parent.mkdir()
+        md.write_text("---\nname: s\n---\n")
+        alias = tmp_path / "alias"
+        alias.symlink_to(md.parent)  # a second spelling of the same file
+        rows = [
+            {"key": "s", "source": "kirocrew", "owned": False,
+             "path": str(alias / "SKILL.md"), "loaded_by_agents": ["a"]},
+            {"key": "s2", "source": "kirocrew", "owned": True,
+             "path": str(md), "loaded_by_agents": ["b"]},
+            {"key": "kiro-user/s", "source": "kiro-user",
+             "path": str(md), "loaded_by_agents": ["a", "c"]},
+        ]
+
+        out = _one_row_per_skill_file(rows)
+
+        assert [r["key"] for r in out] == ["s2"]
+        assert out[0]["loaded_by_agents"] == ["b", "a", "c"]
+        # The dropped keys stay resolvable for key lookups.
+        assert out[0]["aliases"] == ["s", "kiro-user/s"]
+
+    def test_inode_zero_never_merges(self, tmp_path, monkeypatch):
+        """A filesystem that reports inode 0 for every file gives no identity."""
+        import os as _os
+
+        a = tmp_path / "a" / "SKILL.md"
+        b = tmp_path / "b" / "SKILL.md"
+        for p in (a, b):
+            p.parent.mkdir()
+            p.write_text("---\nname: s\n---\n")
+        real_stat = _os.stat
+
+        def zero_ino(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            return _os.stat_result((st.st_mode, 0, st.st_dev, *st[3:]))
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared.os.stat", zero_ino
+        )
+        rows = [
+            {"key": "a", "source": "kirocrew", "path": str(a)},
+            {"key": "kiro-user/b", "source": "kiro-user", "path": str(b)},
+        ]
+        assert [r["key"] for r in _one_row_per_skill_file(rows)] == ["a", "kiro-user/b"]
+
+    def test_kept_row_carries_the_dropped_rows_usage(self, tmp_path):
+        md = tmp_path / "s" / "SKILL.md"
+        md.parent.mkdir()
+        md.write_text("---\nname: s\n---\n")
+        rows = [
+            {"key": "s", "source": "kirocrew", "owned": False, "path": str(md),
+             "deliveries": 7, "last_used_at": 1700000000.0,
+             "size_bytes": 42, "inject_on_trigger": False},
+            {"key": "kiro-user/s", "source": "kiro-user", "path": str(md)},
+        ]
+        out = _one_row_per_skill_file(rows)
+        assert [r["key"] for r in out] == ["kiro-user/s"]
+        assert out[0]["deliveries"] == 7
+        assert out[0]["last_used_at"] == 1700000000.0
+        assert out[0]["size_bytes"] == 42
+        # A pointer-only skill stays pointer-only on the kept row.
+        assert out[0]["inject_on_trigger"] is False
+
+    def test_unowned_crew_row_yields_to_the_folder_owner(self, tmp_path):
+        """An edition root is walked by the loader too; its ``package/`` row stays."""
+        md = tmp_path / "s" / "SKILL.md"
+        md.parent.mkdir()
+        md.write_text("---\nname: s\n---\n")
+        rows = [
+            {"key": "s", "source": "kirocrew", "owned": False, "path": str(md)},
+            {"key": "package/s", "source": "package", "path": str(md)},
+        ]
+        out = _one_row_per_skill_file(rows)
+        assert [r["key"] for r in out] == ["package/s"]
+        assert out[0]["aliases"] == ["s"]
+
+    def test_directory_path_compares_by_its_skill_md(self, tmp_path):
+        md = tmp_path / "s" / "SKILL.md"
+        md.parent.mkdir()
+        md.write_text("---\nname: s\n---\n")
+        rows = [
+            {"key": "package/s", "source": "package", "path": str(md.parent)},
+            {"key": "kiro-user/s", "source": "kiro-user", "path": str(md)},
+        ]
+        assert [r["key"] for r in _one_row_per_skill_file(rows)] == ["package/s"]
+
+    def test_distinct_files_and_workspace_rows_are_kept(self, tmp_path):
+        a = tmp_path / "a" / "SKILL.md"
+        b = tmp_path / "b" / "SKILL.md"
+        for p in (a, b):
+            p.parent.mkdir()
+            p.write_text("---\nname: s\n---\n")
+        rows = [
+            {"key": "s", "source": "kirocrew", "path": str(a)},
+            {"key": "kiro-user/s", "source": "kiro-user", "path": str(b)},
+            # A workspace row is consent-gated, so it never merges, even
+            # when it names a file another row lists.
+            {"key": "kiro-workspace/s", "source": "kiro-workspace", "path": str(a)},
+            {"key": "no-path", "source": "kirocrew", "path": ""},
+            {"key": "gone", "source": "kirocrew", "path": str(tmp_path / "missing")},
+        ]
+        assert [r["key"] for r in _one_row_per_skill_file(rows)] == [
+            "s", "kiro-user/s", "kiro-workspace/s", "no-path", "gone",
+        ]
+
+
 # ── _expand_agent_globs (annotation O(n²) reduction) ──
 
 
@@ -579,6 +712,19 @@ class TestReadSkillFile:
         content, err = read_skill_file(skill, "SKILL.md")
         assert err is None
         assert content == "hello\n"
+
+    def test_crlf_and_cr_are_served_as_newlines(self, fake_home):
+        """The read is binary; the contract is text.
+
+        A skill file written on Windows carries CRLF, and the viewer must get
+        the same content it gets for the same file on any other host.
+        """
+        skill = fake_home / ".kiro" / "crew" / "skills" / "demo"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"first\r\nsecond\rthird\n")
+        content, err = read_skill_file(skill, "SKILL.md")
+        assert err is None
+        assert content == "first\nsecond\nthird\n"
 
     def test_rejects_path_traversal(self, fake_home):
         skill = fake_home / ".kiro" / "crew" / "skills" / "demo"
@@ -743,19 +889,6 @@ class TestResolveSkillRoot:
 # ── GET endpoints (integration) ──
 
 
-def _make_app(state):
-    from kiro_crew.dashboard.handlers import api_skill_file, api_skill_tree, api_skills
-
-    app = web.Application()
-    app["state"] = state
-    app.router.add_get("/api/skills", api_skills)
-    # Route order matters — specific routes must come before {name:.+}.
-    # ``/-/`` separator avoids collision with skills named ``.../tree``.
-    app.router.add_get("/api/skills/{name:.+}/-/tree", api_skill_tree)
-    app.router.add_get("/api/skills/{name:.+}/-/file", api_skill_file)
-    return app
-
-
 class TestEndpoints:
     @pytest.mark.asyncio
     async def test_tree_endpoint_returns_entries(self, fake_home):
@@ -883,3 +1016,352 @@ class TestEndpoints:
             resp2 = await client.get("/api/skills/utils/tree/-/tree")
             assert resp2.status == 200
             assert "entries" in (await resp2.json())
+
+
+class TestApiSkillsAgentScoping:
+    """GET /api/skills?agent=<name> scopes the listing to that
+    agent's own skill:// mapping, instead of the chat `$` picker always
+    showing the unfiltered global catalog regardless of the active agent
+    template."""
+
+    @pytest.fixture(autouse=True)
+    def _redirect_agents_dir(self, fake_home, monkeypatch):
+        """Point agent discovery at the fixture home's agents dir.
+
+        ``_KIRO_AGENTS_DIR`` is computed at import time from the real home, so
+        this module's ``fake_home`` (which patches only ``HOME`` and
+        ``Path.home``) does not redirect the default-argument lookup that
+        ``agent_skill_globs`` performs — leaving it to read the operator's real
+        ``~/.kiro/agents``, return ``[]``, and skip the filter entirely. Mirrors
+        the same override in ``test_agent_template_skills.py``'s fixture.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.agent_discovery._KIRO_AGENTS_DIR",
+            fake_home / ".kiro" / "agents",
+        )
+
+    @staticmethod
+    def _state() -> MagicMock:
+        from kiro_crew.skills import SkillsLoader
+
+        # A real SkillsLoader, not a bare MagicMock: `_get_skills` treats
+        # `hasattr(state, "_standalone_skills")` as "already built", but a
+        # MagicMock auto-vivifies ANY attribute access as truthy, so an
+        # unseeded MagicMock state silently returns a mock in place of the
+        # loader — collect_skills_blocking then serializes that mock into
+        # the response and 500s. Matches the pattern already used above for
+        # api_skill_detail's fake state.
+        state = MagicMock(_slots={}, context_builder=None)
+        state._standalone_skills = SkillsLoader(install_builtins=False)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_agent_with_an_explicit_mapping_sees_only_its_own_skills(self, fake_home):
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        _write_skill(fake_home / ".kiro" / "skills", "beta")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/alpha/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "custom"})
+            assert resp.status == 200
+            payload = await resp.json()
+        # an applied agent filter answers with the scoped envelope —
+        # the arrays alone are byte-identical to the legacy shape, so this
+        # flag is the ONLY way the picker can cue that filtering happened.
+        assert payload["agent_scoped"] is True
+        assert payload["agent"] == "custom"
+        assert {s["name"] for s in payload["skills"]} == {"alpha"}
+
+    @pytest.mark.asyncio
+    async def test_scoped_envelope_is_kept_when_the_mapping_matches_nothing(self, fake_home):
+        """An agent whose skill:// mapping resolves to zero listed
+        skills still gets the envelope (``skills: []``, ``agent_scoped``
+        true). This is the empty state the picker must attribute to the
+        MAPPING ("no skills mapped to this agent"), not to the catalog
+        ("no skills exist") — without the flag both are a bare ``[]``."""
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/gamma/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "custom"})
+            assert resp.status == 200
+            payload = await resp.json()
+        assert payload["agent_scoped"] is True
+        assert payload["agent"] == "custom"
+        assert payload["skills"] == []
+
+    @pytest.mark.asyncio
+    async def test_agent_without_an_explicit_mapping_sees_everything(self, fake_home):
+        """An agent with NO skill:// resources of its own (empty
+        ``agent_skill_globs``) must keep the unfiltered, legacy
+        all-or-nothing listing — the majority of agents that never
+        customized their skill set must not lose access just because a
+        DIFFERENT, customized agent exists on the same install."""
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        _write_skill(fake_home / ".kiro" / "skills", "beta")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "plain.json").write_text(json.dumps({"name": "plain"}))
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/alpha/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "plain"})
+            assert resp.status == 200
+            payload = await resp.json()
+        # No filter applied → the legacy bare-array shape, no envelope: the
+        # picker must render this with zero scope cues.
+        assert isinstance(payload, list)
+        assert {s["name"] for s in payload} == {"alpha", "beta"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_name_sees_everything(self, fake_home):
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills", params={"agent": "does-not-exist"})
+            assert resp.status == 200
+            payload = await resp.json()
+        assert isinstance(payload, list)
+        assert {s["name"] for s in payload} == {"alpha"}
+
+    @pytest.mark.asyncio
+    async def test_no_agent_param_is_unfiltered_as_before(self, fake_home):
+        _write_skill(fake_home / ".kiro" / "skills", "alpha")
+        _write_skill(fake_home / ".kiro" / "skills", "beta")
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "custom.json").write_text(json.dumps({
+            "name": "custom",
+            "resources": ["skill://~/.kiro/skills/alpha/SKILL.md"],
+        }))
+
+        async with TestClient(TestServer(_make_app(self._state()))) as client:
+            resp = await client.get("/api/skills")
+            assert resp.status == 200
+            payload = await resp.json()
+        assert isinstance(payload, list)
+        assert {s["name"] for s in payload} == {"alpha", "beta"}
+
+
+class TestSessionScopedSkillResolution:
+    """kiro-workspace/ resolution is scoped to the requesting chat slot.
+
+    With two chats on DIFFERENT projects, the keyless shared-project fallback
+    fails closed and workspace skills silently vanished. A session key now
+    selects the requesting slot's project; keyless behavior is unchanged.
+    """
+
+    def _two_project_state(self, tmp_path: Path):
+        proj_a = tmp_path / "proj-a"
+        proj_b = tmp_path / "proj-b"
+        _write_skill(proj_a / ".kiro" / "skills", "alpha-skill")
+        state = MagicMock(
+            _slots={
+                "slot-a": MagicMock(project=str(proj_a)),
+                "slot-b": MagicMock(project=str(proj_b)),
+            }
+        )
+        return state, proj_a, proj_b
+
+    def test_issue_2457_repro_two_projects_resolve_via_session_key(self, fake_home, tmp_path):
+        """The exact repro from the issue, then the fix: keyed resolution works."""
+        state, proj_a, _ = self._two_project_state(tmp_path)
+        # Pre-existing fail-closed contract without a key: ambiguous -> None.
+        assert _resolve_skill_root("kiro-workspace/alpha-skill", state) is None
+        # The fix: the requesting slot's key resolves its own project's skill.
+        out = _resolve_skill_root("kiro-workspace/alpha-skill", state, "slot-a")
+        assert out == (proj_a / ".kiro" / "skills" / "alpha-skill").resolve()
+
+    def test_other_slots_key_does_not_see_foreign_project_skill(self, fake_home, tmp_path):
+        """Scoping is per-slot: slot B must not resolve slot A's skill."""
+        state, _, _ = self._two_project_state(tmp_path)
+        assert _resolve_skill_root("kiro-workspace/alpha-skill", state, "slot-b") is None
+
+    def test_catalog_agrees_with_resolver_per_session(self, fake_home, tmp_path):
+        """enumerate_skill_catalog and _resolve_skill_root must agree per key —
+        an enumerated key that the resolver cannot resolve would be a phantom
+        entry in the editor."""
+        state, _, _ = self._two_project_state(tmp_path)
+        keyed = enumerate_skill_catalog(state, "slot-a")
+        assert "kiro-workspace/alpha-skill" in keyed
+        other = enumerate_skill_catalog(state, "slot-b")
+        assert "kiro-workspace/alpha-skill" not in other
+        keyless = enumerate_skill_catalog(state)
+        assert "kiro-workspace/alpha-skill" not in keyless  # ambiguous -> omitted
+
+    def test_keyless_single_project_fallback_unchanged(self, fake_home, tmp_path):
+        """The shared-project fallback (step 2) still serves keyless callers."""
+        proj = tmp_path / "solo"
+        _write_skill(proj / ".kiro" / "skills", "solo-skill")
+        state = MagicMock(_slots={"only": MagicMock(project=str(proj))})
+        out = _resolve_skill_root("kiro-workspace/solo-skill", state)
+        assert out == (proj / ".kiro" / "skills" / "solo-skill").resolve()
+        assert "kiro-workspace/solo-skill" in enumerate_skill_catalog(state)
+
+    def test_session_key_does_not_widen_the_allowlist(self, fake_home, tmp_path):
+        """The enumeration security boundary is untouched: with a valid key,
+        traversal names still miss, and the catalog still contains only
+        enumerated paths."""
+        state, proj_a, _ = self._two_project_state(tmp_path)
+        assert _resolve_skill_root("kiro-workspace/../secrets", state, "slot-a") is None
+        assert _resolve_skill_root("kiro-workspace//abs", state, "slot-a") is None
+        catalog = enumerate_skill_catalog(state, "slot-a")
+        for key, path in catalog.items():
+            assert ".." not in key
+            assert path.name == "SKILL.md"
+
+    def test_unknown_session_key_falls_back_not_crashes(self, fake_home, tmp_path):
+        """A stale/unknown key behaves like no key (fallback chain), never raises."""
+        state, _, _ = self._two_project_state(tmp_path)
+        assert _resolve_skill_root("kiro-workspace/alpha-skill", state, "gone-slot") is None
+
+    @pytest.mark.asyncio
+    async def test_skill_file_endpoint_honors_x_session_key(self, fake_home, tmp_path):
+        """End-to-end through the HTTP surface: the header scopes resolution."""
+        state, proj_a, _ = self._two_project_state(tmp_path)
+        state.context_builder = None
+        async with TestClient(TestServer(_make_app(state))) as client:
+            path = "/api/skills/kiro-workspace/alpha-skill/-/file?path=SKILL.md"
+            keyed = await client.get(path, headers={"X-Session-Key": "slot-a"})
+            assert keyed.status == 200
+            keyless = await client.get(path)
+            assert keyless.status == 404  # two projects, no key -> fail closed
+
+    @pytest.mark.asyncio
+    async def test_app_skill_catalog_requires_positive_slot_ownership(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        """An app permission is not authority to select another app's project.
+
+        The session header chooses which project contributes workspace skill
+        metadata. An app caller must therefore own that exact slot; a foreign,
+        unscoped, missing, or absent slot key is indistinguishable from missing.
+        """
+        from kiro_crew.dashboard.handlers import prompts
+
+        project = tmp_path / "foreign-project"
+        _write_skill(
+            project / ".kiro" / "skills",
+            "foreign-skill",
+            description="foreign metadata",
+        )
+        state = MagicMock(
+            _slots={
+                "foreign": MagicMock(project=str(project), _app="app-B"),
+                "unscoped": MagicMock(project=str(project), _app=""),
+                "owned": MagicMock(project=str(project), _app="app-A"),
+            },
+            context_builder=None,
+        )
+        audit = MagicMock()
+        monkeypatch.setattr(prompts, "_sel", lambda: audit)
+        monkeypatch.setattr(
+            prompts,
+            "collect_skills_blocking",
+            lambda _skills, _package, project_dir: [
+                {"key": "kiro-workspace/foreign-skill", "project": str(project_dir)}
+            ],
+        )
+        app = _make_app(state)
+
+        @web.middleware
+        async def inject_app(request, handler):
+            request["app"] = "app-A"
+            return await handler(request)
+
+        app.middlewares.insert(0, inject_app)
+        async with TestClient(TestServer(app)) as client:
+            for session_key in ("foreign", "unscoped", "missing", ""):
+                headers = {"X-Session-Key": session_key} if session_key else {}
+                response = await client.get("/api/skills", headers=headers)
+                assert response.status == 404, session_key
+                assert (await response.json())["code"] == "slot_not_found"
+
+            response = await client.get("/api/skills", headers={"X-Session-Key": "owned"})
+            assert response.status == 200
+            assert "kiro-workspace/foreign-skill" in {row["key"] for row in await response.json()}
+
+        denied = [
+            call
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "denied"
+        ]
+        assert len(denied) == 4
+        assert all(call.kwargs["source"] == "app_isolation" for call in denied)
+        allowed = [
+            call
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "allowed"
+        ]
+        assert len(allowed) == 1
+        assert allowed[0].kwargs == {
+            "caller": "app-A",
+            "operation": "skills_list",
+            "outcome": "allowed",
+            "source": "app_isolation",
+            "resources": "slot=owned",
+        }
+
+    @pytest.mark.asyncio
+    async def test_app_projectless_slot_cannot_fall_back_to_foreign_project(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        """An owned slot without a project must not inherit another slot's project."""
+        from kiro_crew.dashboard.handlers import api_skill_detail, prompts
+        from kiro_crew.skills import SkillsLoader
+
+        project = tmp_path / "foreign-project"
+        _write_skill(project / ".kiro" / "skills", "foreign-skill")
+        state = MagicMock(
+            _slots={
+                "foreign": MagicMock(project=str(project), _app="app-B"),
+                "owned-projectless": MagicMock(
+                    project="", project_dir="", _app="app-A"
+                ),
+            },
+            context_builder=None,
+        )
+        state._standalone_skills = SkillsLoader(install_builtins=False)
+        audit = MagicMock()
+        monkeypatch.setattr(prompts, "_sel", lambda: audit)
+        app = _make_app(state)
+        app.router.add_get("/api/skills/{name:.+}", api_skill_detail)
+
+        @web.middleware
+        async def inject_app(request, handler):
+            request["app"] = "app-A"
+            return await handler(request)
+
+        app.middlewares.insert(0, inject_app)
+        headers = {"X-Session-Key": "owned-projectless"}
+        paths = (
+            "/api/skills",
+            "/api/skills/kiro-workspace/foreign-skill/-/tree",
+            "/api/skills/kiro-workspace/foreign-skill/-/file?path=SKILL.md",
+            "/api/skills/kiro-workspace/foreign-skill",
+        )
+        async with TestClient(TestServer(app)) as client:
+            for path in paths:
+                response = await client.get(path, headers=headers)
+                assert response.status == 404, path
+                assert (await response.json())["code"] == "slot_not_found"
+
+        denied = [
+            call
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "denied"
+        ]
+        assert len(denied) == len(paths)
+        assert all(call.kwargs["source"] == "app_isolation" for call in denied)

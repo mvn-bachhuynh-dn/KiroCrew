@@ -1,37 +1,89 @@
-"""Unit tests for :mod:`kiro_crew.artifacts` — the data layer."""
+"""Unit tests for :mod:`kiro_crew.artifacts` — the data layer.
+
+This module pins the store itself: the theme-contrast detector, slugs, create, read,
+update, list, versions, pruning and delete, path safety, the lock shared across instances,
+tolerant load, the dataclass, lifecycle events, ``source_path``, the live pointer with its
+snapshot model and hardening, and impressions. Kind inference and blank documents live in
+``test_artifacts_kind_inference.py``, the ``source_root`` barrier and the visible dead
+pointer in ``test_artifacts_source_root.py``, and the optimistic-concurrency content token
+in ``test_artifacts_content_token.py``; the shared ``store`` fixture in
+``artifacts_helpers.py``.
+"""
 
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
+from artifacts_helpers import (  # noqa: F401 -- the fixture is requested by name
+    store_fixture,
+)
 
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.artifacts import (
     MAX_CONTENT_BYTES,
     MAX_VERSIONS,
     Artifact,
-    ArtifactComment,
     ArtifactError,
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactValidationError,
-    _infer_kind,
-    detect_editor_kind,
+    _validate_slug,
+    has_unthemed_hardcoded_colors,
     slugify,
 )
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-
-
-@pytest.fixture
-def store(tmp_path: Path) -> ArtifactStore:
-    """Fresh store rooted at a tmp dir."""
-    return ArtifactStore(root=tmp_path / "artifacts")
-
-
 # ── slugify ─────────────────────────────────────────────────────────────────
+
+
+class TestHasUnthemedHardcodedColors:
+    # Direct unit tests for the shared theme-contrast detector — the ONE
+    # place the verdict is computed (the gateway handlers stamp it on
+    # responses; MCP + CLI relay it).
+
+    def test_fires_on_hardcoded_hex(self) -> None:
+        assert has_unthemed_hardcoded_colors("widget", '<div style="color:#111">x</div>')
+
+    def test_fires_on_rgb_function(self) -> None:
+        assert has_unthemed_hardcoded_colors(
+            "html", "<style>body{background:rgb(255,255,255)}</style>"
+        )
+
+    def test_fires_on_uppercase_color_function(self) -> None:
+        # CSS functions are case-insensitive: RGB(...) is as hardcoded as
+        # rgb(...). Locks the IGNORECASE flag.
+        assert has_unthemed_hardcoded_colors("widget", '<div style="color:RGB(1,2,3)">x</div>')
+
+    def test_silent_on_href_fragment_links(self) -> None:
+        # href="#abc" is a fragment link, not a color — including the
+        # whitespace-spaced form (href = "#abc"), which is valid HTML a
+        # fixed-width lookbehind could not exempt. Locks the strip-based
+        # href exclusion.
+        assert not has_unthemed_hardcoded_colors(
+            "widget", '<a href="#abc">jump</a> <a href = "#facade">also</a>'
+        )
+
+    def test_silent_when_theme_vars_present(self) -> None:
+        # The recommended fallback form carries a hex literal AND a
+        # var(--…) reference — theme-aware content must not flag.
+        assert not has_unthemed_hardcoded_colors(
+            "widget", '<div style="color:var(--text,#111);background:var(--bg,#fff)">x</div>'
+        )
+
+    def test_silent_for_non_iframe_kinds(self) -> None:
+        # markdown/text/json/svg render natively (no injected theme
+        # defaults to clash with) — the lint is widget/html only.
+        assert not has_unthemed_hardcoded_colors("markdown", "color: #ff0000")
+
+    def test_silent_on_empty_content(self) -> None:
+        assert not has_unthemed_hardcoded_colors("widget", "")
+
+    def test_hex_shaped_id_selector_at_value_position_is_accepted_noise(self) -> None:
+        # Documented residual: a whitespace-preceded hex-shaped id selector
+        # can fire, because whitespace must stay in the prefix class or true
+        # positives like "border: 1px solid #ccc" are lost. Soft warning only.
+        assert has_unthemed_hardcoded_colors("widget", "<style>border: 1px solid #ccc</style>")
 
 
 class TestSlugify:
@@ -45,10 +97,21 @@ class TestSlugify:
     def test_collapses_punctuation(self) -> None:
         assert slugify("hello! world?? foo!! bar") == "hello-world-foo-bar"
 
-    def test_empty_falls_back(self) -> None:
-        assert slugify("") == "artifact"
-        assert slugify("!!!") == "artifact"
-        assert slugify("---") == "artifact"
+    def test_empty_falls_back_to_distinct_hash_slugs(self) -> None:
+        # No surviving slug-safe characters: fall back to artifact-<hash> so
+        # distinct inputs derive distinct slugs.
+        for name in ("", "!!!", "---"):
+            out = slugify(name)
+            assert out.startswith("artifact-")
+            assert _validate_slug(out) == out
+        assert slugify("!!!") != slugify("---")
+
+    def test_non_ascii_names_derive_distinct_stable_slugs(self) -> None:
+        chinese = slugify("\u4f1a\u8bae\u7eaa\u8981")
+        japanese = slugify("\u8cb7\u3044\u7269\u30ea\u30b9\u30c8")
+        assert chinese != japanese
+        assert chinese == slugify("\u4f1a\u8bae\u7eaa\u8981")
+        assert _validate_slug(chinese) == chinese
 
     def test_truncates_long_input(self) -> None:
         long = "a" * 300
@@ -145,6 +208,12 @@ class TestCreateValidation:
     def test_invalid_tag_format(self, store: ArtifactStore) -> None:
         with pytest.raises(ArtifactValidationError):
             store.create(name="x", content="a", tags=["bad tag with spaces"])
+
+    @pytest.mark.parametrize("tag", ["cr\n", "a" * 64 + "\n"])
+    def test_trailing_newline_tag_is_rejected(self, store: ArtifactStore, tag: str) -> None:
+        """A raw HTTP/store tag cannot use ``$``'s before-newline match."""
+        with pytest.raises(ArtifactValidationError):
+            store.create(name="x", content="a", tags=[tag])
 
     def test_dedupes_tags(self, store: ArtifactStore) -> None:
         art = store.create(name="x", content="a", tags=["a", "b", "a"])
@@ -247,12 +316,46 @@ class TestList:
     def test_empty(self, store: ArtifactStore) -> None:
         assert store.list() == []
 
-    def test_returns_newest_first(self, store: ArtifactStore) -> None:
+    def test_returns_newest_first(self, store: ArtifactStore, monkeypatch) -> None:
+        from kiro_crew import artifacts
+
+        # All timestamp reads within a write share its explicit instant.
+        now = "2026-01-01T00:00:00.000001+00:00"
+        monkeypatch.setattr(artifacts, "_now_iso", lambda: now)
         store.create(name="alpha", content="a")
+        now = "2026-01-01T00:00:00.000002+00:00"
         store.create(name="bravo", content="b")
+        now = "2026-01-01T00:00:00.000003+00:00"
         store.create(name="charlie", content="c")
         items = store.list()
         assert [a.slug for a in items] == ["charlie", "bravo", "alpha"]
+
+        now = "2026-01-01T00:00:00.000004+00:00"
+        store.update("alpha", content="updated oldest artifact")
+        assert [a.slug for a in store.list()] == ["alpha", "charlie", "bravo"]
+
+    def test_a_timestamp_tie_still_has_one_defined_order(
+        self, store: ArtifactStore, monkeypatch
+    ) -> None:
+        """Equal ``updated_at`` must not leave the order to the filesystem.
+
+        ``_now_iso`` is microsecond ISO, so two artifacts written inside one
+        microsecond carry the identical stamp. Sorting on ``updated_at`` alone is a
+        stable sort over equal keys, which preserves directory scan order and makes
+        "newest first" answer differently per platform and per filesystem -- Windows
+        CI failed ``test_artifacts_handlers.TestList.test_returns_items`` on exactly
+        that. The ``slug`` tie-break is what makes the answer total.
+        """
+        from kiro_crew import artifacts
+
+        monkeypatch.setattr(
+            artifacts, "_now_iso", lambda: "2026-01-01T00:00:00.000001+00:00"
+        )
+        # Created out of slug order, so passing cannot be an accident of insertion.
+        for name in ("bravo", "alpha", "charlie"):
+            store.create(name=name, content=name)
+
+        assert [a.slug for a in store.list()] == ["charlie", "bravo", "alpha"]
 
     def test_filter_by_tag(self, store: ArtifactStore) -> None:
         store.create(name="a", content="a", tags=["x"])
@@ -390,10 +493,10 @@ class TestList:
         assert {a.slug for a in results} == {"ok"}
 
     def test_list_skips_meta_with_bad_int_or_tags(self, store: ArtifactStore) -> None:
-        # Regression: _read_meta_file used to bubble ValueError (int("abc") on
-        # bad version field) and TypeError (list(non_iterable) on bad tags
-        # field) up through list(), crashing the whole library page on a
-        # single corrupted meta.json. Ensure those are now skipped+warned.
+        # _read_meta_file must skip a corrupted meta.json instead of bubbling a
+        # ValueError (int("abc") on a bad version field) or TypeError
+        # (list(non_iterable) on bad tags) up through list() and crashing the
+        # whole library page on a single bad file.
         store.create(name="ok", content="a")
 
         bad_version = store.root / "bad-version"
@@ -473,7 +576,7 @@ class TestSecurity:
         # Pretend the root path is sensitive
         from kiro_crew import artifacts as art_mod
 
-        monkeypatch.setattr(art_mod, "is_sensitive_path", lambda _p: True)
+        monkeypatch.setattr(art_mod, "sensitive_path_refusal", lambda _p: "Blocked: x")
         with pytest.raises(ArtifactError):
             ArtifactStore(root=tmp_path / "artifacts")
 
@@ -486,8 +589,11 @@ class TestSecurity:
     def test_snapshot_version_routes_through_read_gate(
         self, store: ArtifactStore, monkeypatch
     ) -> None:
-        # Regression: _snapshot_version() used to call src.read_text(encoding="utf-8") directly,
-        # bypassing the is_sensitive_path() gate enforced by self._read_text().
+        # _snapshot_version() reads through self._read_text(), not src.read_text()
+        # directly, so the sensitive-path gate always applies. The helper hands
+        # the gate the realpath it already computed through
+        # canonical_path_refusal; that is the name to patch, since the
+        # bounded is_sensitive_path is not on this read path.
         # If the gate ever started flagging artifact-internal paths (e.g. a
         # symlink expansion landing on a sensitive path), the snapshot read
         # must refuse rather than silently leak. Verify the gated helper is
@@ -495,22 +601,72 @@ class TestSecurity:
         from kiro_crew import artifacts as art_mod
 
         store.create(name="x", content="v1")
-        # First update succeeds — is_sensitive_path() returns False normally.
+        # First update succeeds: the gate returns False normally.
         store.update("x", content="v2", snapshot=True)
 
-        # Now make is_sensitive_path() return True for current.html only.
+        # Now make the gate return True for current.html only.
         # _snapshot_version reads from current.html via self._read_text() now;
         # that read must surface ArtifactError.
-        original = art_mod.is_sensitive_path
+        original = art_mod.canonical_path_refusal
 
-        def _selective(p: str) -> bool:
+        def _selective(p: str) -> str | None:
             if "current.html" in p:
-                return True
+                return "Blocked: x"
             return original(p)
 
-        monkeypatch.setattr(art_mod, "is_sensitive_path", _selective)
+        monkeypatch.setattr(art_mod, "canonical_path_refusal", _selective)
         with pytest.raises(ArtifactError):
             store.update("x", content="v3", snapshot=True)
+
+
+class TestSharedLockAcrossInstances:
+    """Two ``ArtifactStore`` instances pointed at the same root must
+    serialize against EACH OTHER, not just against themselves.
+
+    A fresh ``threading.Lock()`` per instance is correct for a single long-lived
+    store, but any code constructing its own
+    ``ArtifactStore()`` against the shared default root (rather than going
+    through :func:`get_default_store`) got an unserialized lock: a concurrent
+    write from that second instance was never mutually exclusive with the
+    singleton's own reads/writes on the same slug, exactly the class of race
+    that can make ``get()`` (no version) observe content mid-write.
+    """
+
+    def test_two_instances_on_the_same_root_share_one_lock(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifacts"
+        a = ArtifactStore(root=root)
+        b = ArtifactStore(root=root)
+        assert a._lock is b._lock
+
+    def test_instances_on_different_roots_do_not_share_a_lock(self, tmp_path: Path) -> None:
+        a = ArtifactStore(root=tmp_path / "artifacts-a")
+        b = ArtifactStore(root=tmp_path / "artifacts-b")
+        assert a._lock is not b._lock
+
+    def test_a_write_through_a_second_instance_is_visible_to_the_first(
+        self, tmp_path: Path
+    ) -> None:
+        """Not just the same lock OBJECT -- an update from a second instance
+        must actually be observable (and mutually exclusive) through the
+        first, which is what the shared lock is for."""
+        root = tmp_path / "artifacts"
+        a = ArtifactStore(root=root)
+        a.create(name="x", content="v1", kind="text")
+        b = ArtifactStore(root=root)
+        b.update("x", content="v2")
+        assert a.get("x").content == "v2"
+
+    def test_resolved_symlinked_root_shares_the_same_lock(self, tmp_path: Path) -> None:
+        real = tmp_path / "real-artifacts"
+        real.mkdir()
+        link = tmp_path / "linked-artifacts"
+        # A directory link: the subject is that the two spellings RESOLVE to one
+        # root, which a junction exercises on Windows without the symlink
+        # privilege (see testing-conventions "Links").
+        make_dir_link(link, real)
+        a = ArtifactStore(root=real)
+        b = ArtifactStore(root=link)
+        assert a._lock is b._lock
 
 
 # ── Tolerant load / persistence ─────────────────────────────────────────────
@@ -736,7 +892,7 @@ class TestSourcePath:
         assert results[0].name == "a"
 
 
-# ── Live-pointer behavior for file-backed artifacts (round 3) ──
+# ── Live-pointer behavior for file-backed artifacts ──
 
 
 class TestLivePointer:
@@ -825,7 +981,7 @@ class TestLivePointer:
 
 
 class TestExplicitSnapshotModel:
-    """round 5: saves don't bump version unless snapshot=True.
+    """Saves don't bump version unless snapshot=True.
 
     Versioning is now deliberate — like git commits. Saves silently update
     the live state. Snapshots create new numbered versions. This makes
@@ -896,7 +1052,7 @@ class TestExplicitSnapshotModel:
 
 
 class TestLiveDirtyAndSnapshotAnytime:
-    """round 6: snapshot button works whenever live differs
+    """The snapshot button works whenever live differs
     from the latest version, not just when there are unsaved edits."""
 
     def test_live_dirty_false_immediately_after_create(self, store: ArtifactStore) -> None:
@@ -982,7 +1138,7 @@ class TestLiveDirtyAndSnapshotAnytime:
 
 
 class TestSourcePathSecurityHardening:
-    """review-bot round 12 fixes: path traversal + symlink bypass + UTF-8
+    """Source-path hardening: path traversal, symlink bypass, and UTF-8
     truncation arithmetic."""
 
     def test_traversal_path_resolves_before_sensitive_check(
@@ -1012,6 +1168,7 @@ class TestSourcePathSecurityHardening:
         assert store._try_read_source_path(traversal) is None
         assert store._try_write_source_path(traversal, "data") is False
 
+    @requires_symlinks
     def test_symlink_to_sensitive_resolves_before_sensitive_check(
         self, store: ArtifactStore, tmp_path: Path, monkeypatch
     ) -> None:
@@ -1052,7 +1209,7 @@ class TestSourcePathSecurityHardening:
         f.write_text("😀" * 30, encoding="utf-8")
         result = store._try_read_source_path(str(f))
         assert result is not None
-        # Round 13: bounded read caps the disk-IO at MAX_CONTENT_BYTES+1
+        # Bounded read caps the disk-IO at MAX_CONTENT_BYTES+1
         # bytes regardless of file size. The decoded string may contain
         # U+FFFD replacement chars at the truncation boundary so its
         # re-encoded byte length CAN exceed MAX_CONTENT_BYTES — that's
@@ -1063,8 +1220,7 @@ class TestSourcePathSecurityHardening:
 
 
 class TestRoundThirteenFixes:
-    """review-bot round 13 fixes: bounded read, event_type pre-validation,
-    live_dirty not persisted."""
+    """Bounded read, event_type pre-validation, and live_dirty not persisted."""
 
     def test_oversized_file_does_not_load_full_content_into_memory(
         self, store: ArtifactStore, tmp_path: Path, monkeypatch
@@ -1097,7 +1253,7 @@ class TestRoundThirteenFixes:
     def test_invalid_event_type_does_not_leave_orphaned_version_file(
         self, store: ArtifactStore
     ) -> None:
-        # Round 13: validation happens BEFORE version bump and snapshot
+        # Validation happens BEFORE version bump and snapshot
         # write. An invalid event_type must not leave a versions/v{N}.html
         # on disk.
         store.create(name="x", content="v1", slug="x")
@@ -1118,7 +1274,7 @@ class TestRoundThirteenFixes:
         assert loaded.version == 1
 
     def test_live_dirty_not_persisted_in_meta_json(self, store: ArtifactStore) -> None:
-        # Round 13: live_dirty is computed at GET time and must not be
+        # live_dirty is computed at GET time and must not be
         # written to meta.json. Persisting would create staleness bugs.
         store.create(name="x", content="v1", slug="x")
         # Trigger a GET that sets live_dirty, then write_meta via update
@@ -1243,1249 +1399,3 @@ class TestRecordImpression:
         ref = [e for e in store.get("x").events if e["type"] == "referenced"]
         assert len(ref) == 1
         assert ref[0]["session_id"] == "s2"
-
-
-# ── Kind inference (CR-1) ─────────────────────────────────────────────────────
-
-
-class TestInferKind:
-    """Resolution order of the standalone ``_infer_kind`` helper."""
-
-    def test_explicit_wins(self) -> None:
-        # A non-empty explicit kind is returned untouched, even when the
-        # content / source_path would infer something else.
-        assert _infer_kind("# heading", "doc.html", explicit="json") == "json"
-        assert _infer_kind("<div/>", "", explicit="markdown") == "markdown"
-
-    @pytest.mark.parametrize(
-        "path,expected",
-        [
-            ("plan.md", "markdown"),
-            ("plan.markdown", "markdown"),
-            ("page.html", "html"),
-            ("page.htm", "html"),
-            ("icon.svg", "svg"),
-            ("data.json", "json"),
-            ("notes.txt", "text"),
-            ("Makefile", "text"),  # no extension → text
-            ("archive.tar.gz", "text"),  # unknown extension → text
-            ("UPPER.MD", "markdown"),  # case-insensitive
-        ],
-    )
-    def test_extension_matrix(self, path: str, expected: str) -> None:
-        # The source_path extension drives the kind regardless of the body.
-        assert _infer_kind("any body at all", source_path=path) == expected
-
-    @pytest.mark.parametrize(
-        "content,expected",
-        [
-            ("<div>x</div>", "widget"),
-            ("<table><tr></tr></table>", "widget"),
-            ("<span>hi</span>", "widget"),
-            ("<style>.a{}</style>", "widget"),
-            ("<mcwidget>body</mcwidget>", "widget"),
-            ("<!DOCTYPE html><html></html>", "widget"),
-            ("# Plan\n\nbody", "markdown"),
-            ("###### deep heading", "markdown"),
-            ("just plain prose with no tags", "markdown"),
-            ("  \n# leading whitespace then heading", "markdown"),
-            ("<p>hello</p>", "widget"),  # a tag, but not a known marker → fallback
-            ("a < b but no real tag", "widget"),  # stray '<' → fallback widget
-            ("", "widget"),  # empty → legacy default
-            ("   \n  ", "widget"),  # whitespace-only → legacy default
-        ],
-    )
-    def test_content_sniff_matrix(self, content: str, expected: str) -> None:
-        assert _infer_kind(content, source_path="") == expected
-
-    def test_extension_beats_content_sniff(self) -> None:
-        # A .md file whose body contains HTML is still markdown (extension wins).
-        assert _infer_kind("<div>x</div>", source_path="notes.md") == "markdown"
-
-
-class TestCreateKindInference:
-    """``create()`` infers the kind when the caller omits it."""
-
-    def test_create_infers_markdown_from_heading(self, store: ArtifactStore) -> None:
-        art = store.create(name="Plan", content="# Title\n\nbody")
-        assert art.kind == "markdown"
-
-    def test_create_infers_widget_from_html(self, store: ArtifactStore) -> None:
-        art = store.create(name="Dash", content="<div>x</div><table></table>")
-        assert art.kind == "widget"
-
-    def test_create_infers_from_source_path(
-        self, store: ArtifactStore, tmp_path: Path
-    ) -> None:
-        src = tmp_path / "plan.md"
-        src.write_text("# live", encoding="utf-8")
-        art = store.create(name="P", content="# live", source_path=str(src))
-        assert art.kind == "markdown"
-
-    def test_explicit_kind_overrides_inference(self, store: ArtifactStore) -> None:
-        # Plain markdown content but the caller pins widget → widget wins.
-        art = store.create(name="P", content="# Title", kind="widget")
-        assert art.kind == "widget"
-
-    def test_create_persists_inferred_kind(self, store: ArtifactStore) -> None:
-        store.create(name="P", content="plain prose, no tags here", slug="p")
-        assert store.get("p").kind == "markdown"
-
-
-class TestDetectEditorKind:
-    """:func:`detect_editor_kind` — the content sniff behind blank documents."""
-
-    @pytest.mark.parametrize(
-        "content,expected",
-        [
-            ('{"a": 1}', "json"),
-            ('   {"a": 1}   ', "json"),
-            ("[1, 2, 3]", "json"),
-            ("[]", "json"),
-            ("{}", "json"),
-            ('<svg viewBox="0 0 1 1"></svg>', "svg"),
-            ("<SVG></SVG>", "svg"),
-            ('<?xml version="1.0"?>\n<svg></svg>', "svg"),
-            ("<!DOCTYPE svg>\n<svg></svg>", "svg"),
-        ],
-    )
-    def test_detects_structured_kinds(self, content: str, expected: str) -> None:
-        assert detect_editor_kind(content) == expected
-
-    @pytest.mark.parametrize(
-        "content",
-        [
-            "",
-            "   \n  ",
-            "# A markdown heading",
-            "just some prose",
-            '{"a": 1',  # mid-edit syntax error
-            "42",  # bare JSON scalar — valid JSON, but almost certainly prose
-            "true",
-            '"a quoted string"',
-            "<div>html, not svg</div>",
-            "text before <svg></svg>",  # anchored: not an SVG document
-            "<html><body></body></html>",
-        ],
-    )
-    def test_returns_none_for_unrecognized(self, content: str) -> None:
-        """Never guesses. ``None`` is what keeps a re-typed kind from flapping."""
-        assert detect_editor_kind(content) is None
-
-    def test_never_returns_a_non_editable_kind(self) -> None:
-        """``html`` / ``widget`` would strand the editor, so they're excluded."""
-        for content in ("<div>x</div>", "<mcwidget>x</mcwidget>", "<!doctype html><html>"):
-            assert detect_editor_kind(content) not in ("html", "widget")
-
-
-class TestBlankDocumentKind:
-    """Creating a document blank, and letting its kind settle on first save."""
-
-    def test_blank_create_defaults_to_editable_markdown(self, store: ArtifactStore) -> None:
-        art = store.create(name="Untitled", content="")
-        assert art.kind == "markdown"
-        assert art.kind_auto is True
-
-    def test_whitespace_only_create_counts_as_blank(self, store: ArtifactStore) -> None:
-        art = store.create(name="Untitled", content="   \n ")
-        assert (art.kind, art.kind_auto) == ("markdown", True)
-
-    def test_content_bearing_create_pins_its_kind(self, store: ArtifactStore) -> None:
-        art = store.create(name="Doc", content="# Real content")
-        assert (art.kind, art.kind_auto) == ("markdown", False)
-
-    def test_explicit_kind_pins_even_when_blank(self, store: ArtifactStore) -> None:
-        art = store.create(name="Doc", content="", kind="json")
-        assert (art.kind, art.kind_auto) == ("json", False)
-
-    def test_file_backed_blank_is_not_auto(self, store: ArtifactStore, tmp_path: Path) -> None:
-        """An extension is a real signal, so a blank file keeps its mapped kind."""
-        src = tmp_path / "empty.json"
-        src.write_text("", encoding="utf-8")
-        art = store.create(name="Empty", content="", source_path=str(src))
-        assert (art.kind, art.kind_auto) == ("json", False)
-
-    def test_kind_auto_survives_a_reload(self, store: ArtifactStore) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        assert store.get("u").kind_auto is True
-
-    def test_legacy_meta_without_the_field_is_never_auto(self, store: ArtifactStore) -> None:
-        store.create(name="Legacy", content="# hi", slug="legacy")
-        meta_path = store.root / "legacy" / "meta.json"
-        raw = json.loads(meta_path.read_text(encoding="utf-8"))
-        del raw["kind_auto"]
-        meta_path.write_text(json.dumps(raw), encoding="utf-8")
-        assert store.get("legacy").kind_auto is False
-
-    def test_first_json_save_retypes_the_document(self, store: ArtifactStore) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        assert store.update("u", content='{"hello": "world"}').kind == "json"
-        assert store.get("u").kind == "json"
-
-    def test_first_svg_save_retypes_the_document(self, store: ArtifactStore) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        assert store.update("u", content="<svg></svg>").kind == "svg"
-
-    def test_prose_save_stays_markdown(self, store: ArtifactStore) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        assert store.update("u", content="# My notes\n\nsome prose").kind == "markdown"
-
-    def test_mid_edit_syntax_error_does_not_flap_the_kind(self, store: ArtifactStore) -> None:
-        """Once JSON, a transient parse failure must not drop back to markdown."""
-        store.create(name="Untitled", content="", slug="u")
-        store.update("u", content='{"a": 1}')
-        assert store.update("u", content='{"a": ').kind == "json"
-        assert store.update("u", content='{"a": 2}').kind == "json"
-
-    def test_retyping_stays_available_between_structured_kinds(
-        self, store: ArtifactStore
-    ) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        store.update("u", content='{"a": 1}')
-        assert store.update("u", content="<svg></svg>").kind == "svg"
-
-    def test_a_pinned_artifact_is_never_retyped(self, store: ArtifactStore) -> None:
-        store.create(name="Doc", content="# Real content", slug="d")
-        assert store.update("d", content='{"a": 1}').kind == "markdown"
-
-    def test_an_explicit_kind_on_update_pins_the_artifact(self, store: ArtifactStore) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        pinned = store.update("u", content="# prose", kind="text")
-        assert (pinned.kind, pinned.kind_auto) == ("text", False)
-        # Now that it's pinned, JSON content no longer re-types it.
-        assert store.update("u", content='{"a": 1}').kind == "text"
-
-    def test_snapshot_records_the_detected_kind_for_the_version(
-        self, store: ArtifactStore
-    ) -> None:
-        store.create(name="Untitled", content="", slug="u")
-        art = store.update("u", content='{"a": 1}', snapshot=True)
-        assert art.version_kinds[str(art.version)] == "json"
-        # v1 was blank markdown and must still read back that way.
-        assert store.get("u", version=1).kind == "markdown"
-
-
-class TestSettleBlank:
-    """:meth:`ArtifactStore.settle_blank` -- resolving a just-created blank.
-
-    This is where the keep / save / delete decision lives, and it lives here
-    rather than in the browser for one reason: it has to be atomic. Deciding in
-    the client means reading the artifact and then acting on it, and a save
-    landing in that window -- from a popout window on the same document, or from
-    an agent -- gets overwritten or deleted. Re-reading cannot close that window
-    because the window is between the read and the write.
-
-    Every case below therefore asserts the SAME safety property from a different
-    direction: unless the document is pristine on every axis the record can
-    report, it is left exactly as it is.
-    """
-
-    UNTITLED = "Untitled"
-
-    def _blank(self, store: ArtifactStore) -> None:
-        store.create(name=self.UNTITLED, content="", slug="u")
-
-    def test_deletes_an_abandoned_blank(self, store: ArtifactStore) -> None:
-        self._blank(store)
-        assert store.settle_blank("u", untitled_name=self.UNTITLED) == "deleted"
-        with pytest.raises(ArtifactNotFoundError):
-            store.get("u")
-
-    def test_saves_an_unsaved_draft_instead_of_deleting(self, store: ArtifactStore) -> None:
-        self._blank(store)
-        assert store.settle_blank("u", untitled_name=self.UNTITLED, draft="# notes") == "saved"
-        assert store.get("u").content == "# notes"
-
-    def test_a_whitespace_draft_is_not_a_draft(self, store: ArtifactStore) -> None:
-        self._blank(store)
-        assert store.settle_blank("u", untitled_name=self.UNTITLED, draft="  \n ") == "deleted"
-
-    def test_saving_a_draft_does_not_bump_the_version(self, store: ArtifactStore) -> None:
-        """The draft is the document's first content, not an edit to it."""
-        self._blank(store)
-        store.settle_blank("u", untitled_name=self.UNTITLED, draft="# notes")
-        assert store.get("u").version == 1
-
-    @pytest.mark.parametrize(
-        "draft,expected",
-        [
-            pytest.param('{"a": 1}', "json", id="json"),
-            pytest.param("<svg></svg>", "svg", id="svg"),
-            pytest.param("# notes", "markdown", id="markdown"),
-        ],
-    )
-    def test_a_settled_draft_gets_kind_detection(
-        self, store: ArtifactStore, draft: str, expected: str
-    ) -> None:
-        """A settled draft is the document's first content, so it earns the same
-        detection an ordinary save would. Without this, typing JSON into a blank
-        and navigating away stored it as markdown and rendered it wrongly."""
-        self._blank(store)
-        assert store.settle_blank("u", untitled_name=self.UNTITLED, draft=draft) == "saved"
-        assert store.get("u").kind == expected
-
-    def test_a_settled_draft_respects_an_explicitly_chosen_kind(
-        self, store: ArtifactStore
-    ) -> None:
-        """A kind the user picked must survive; only auto-assigned kinds re-detect."""
-        self._blank(store)
-        store.update("u", kind="text")
-        assert store.settle_blank("u", untitled_name=self.UNTITLED, draft='{"a": 1}') == "saved"
-        assert store.get("u").kind == "text"
-
-    def test_a_concurrent_save_is_never_overwritten(self, store: ArtifactStore) -> None:
-        """The headline race: content arrived while the page still held a draft."""
-        self._blank(store)
-        store.update("u", content="# saved in the popout")
-        assert store.settle_blank("u", untitled_name=self.UNTITLED, draft="# stale") == "kept"
-        assert store.get("u").content == "# saved in the popout"
-
-    @pytest.mark.parametrize(
-        "invest",
-        [
-            pytest.param(lambda s: s.update("u", content="# written"), id="content"),
-            pytest.param(lambda s: s.update("u", name="Release plan"), id="renamed"),
-            pytest.param(lambda s: s.update("u", description="scratch pad"), id="described"),
-            pytest.param(lambda s: s.update("u", tags=["ops"]), id="tagged"),
-            pytest.param(lambda s: s.set_folder("u", "abc123"), id="filed"),
-            pytest.param(lambda s: s.set_pinned("u", True), id="starred"),
-            pytest.param(
-                lambda s: s.add_comment("u", ArtifactComment(id="c1", body="hm")),
-                id="commented",
-            ),
-        ],
-    )
-    def test_keeps_a_document_with_any_investment(self, store: ArtifactStore, invest) -> None:
-        self._blank(store)
-        invest(store)
-        assert store.settle_blank("u", untitled_name=self.UNTITLED) == "kept"
-        assert store.get("u") is not None
-
-    @pytest.mark.parametrize(
-        "invest,check",
-        [
-            pytest.param(
-                lambda s: s.update("u", name="Release plan"),
-                lambda a: a.name == "Release plan",
-                id="renamed",
-            ),
-            pytest.param(
-                lambda s: s.update("u", tags=["ops"]), lambda a: a.tags == ["ops"], id="tagged"
-            ),
-            pytest.param(
-                lambda s: s.update("u", kind="text"), lambda a: a.kind == "text", id="typed"
-            ),
-            pytest.param(
-                lambda s: s.set_pinned("u", True), lambda a: a.pinned, id="starred"
-            ),
-        ],
-    )
-    def test_investment_does_not_cost_the_user_their_draft(
-        self, store: ArtifactStore, invest, check
-    ) -> None:
-        """The two questions are independent. Naming or tagging a document says
-        nothing about whether the editor is holding text that was never saved --
-        and refusing to write it because the name changed loses their typing.
-        Metadata survives alongside it."""
-        self._blank(store)
-        invest(store)
-        assert (
-            store.settle_blank("u", untitled_name=self.UNTITLED, draft="# first paragraph")
-            == "saved"
-        )
-        art = store.get("u")
-        assert art.content == "# first paragraph"
-        assert check(art)
-
-    def test_a_draft_is_rescued_even_when_deletion_is_forbidden(
-        self, store: ArtifactStore
-    ) -> None:
-        """``allow_delete=False`` means "I have writes you may not have applied".
-        It cannot make deletion safe; it has no bearing on saving the buffer."""
-        self._blank(store)
-        assert (
-            store.settle_blank(
-                "u", untitled_name=self.UNTITLED, draft="# typed", allow_delete=False
-            )
-            == "saved"
-        )
-        assert store.get("u").content == "# typed"
-
-    def test_deletion_is_refused_when_the_caller_forbids_it(
-        self, store: ArtifactStore
-    ) -> None:
-        self._blank(store)
-        assert (
-            store.settle_blank("u", untitled_name=self.UNTITLED, allow_delete=False) == "kept"
-        )
-        assert store.get("u") is not None
-
-    def test_keeps_a_document_with_history_even_if_emptied_again(
-        self, store: ArtifactStore
-    ) -> None:
-        """A snapshot is history worth keeping. Content alone would miss this: the
-        live body can be emptied again after a snapshot was taken."""
-        self._blank(store)
-        store.update("u", content="# v2", snapshot=True)
-        store.update("u", content="")
-        assert store.settle_blank("u", untitled_name=self.UNTITLED) == "kept"
-
-    def test_a_comment_is_seen_even_though_it_touches_no_field(
-        self, store: ArtifactStore
-    ) -> None:
-        """Comments live in a sidecar that add_comment writes WITHOUT touching
-        meta.json, so no field on the record reveals them."""
-        self._blank(store)
-        store.add_comment("u", ArtifactComment(id="c1", body="is this right?"))
-        assert store.settle_blank("u", untitled_name=self.UNTITLED) == "kept"
-        assert len(store.list_comments("u")) == 1
-
-    def test_a_differently_named_document_is_not_an_untitled_one(
-        self, store: ArtifactStore
-    ) -> None:
-        """The placeholder is supplied by the caller (it is localised), so a
-        mismatch must mean 'named' rather than 'unrecognised, delete it'."""
-        store.create(name="Sans titre", content="", slug="u")
-        assert store.settle_blank("u", untitled_name=self.UNTITLED) == "kept"
-
-    def test_missing_artifact_raises_rather_than_reporting_success(
-        self, store: ArtifactStore
-    ) -> None:
-        with pytest.raises(ArtifactNotFoundError):
-            store.settle_blank("nope", untitled_name=self.UNTITLED)
-
-
-# ── source_root barrier + visible dead pointer ────────────────────────────────
-
-
-@pytest.fixture
-def home_store(tmp_path: Path, monkeypatch) -> ArtifactStore:
-    """A store whose data home sits INSIDE a fake ``$HOME``.
-
-    The default ``store`` fixture is rooted at ``tmp_path/artifacts``, so its
-    data-home root is ``tmp_path`` — which would make every path in the test
-    tree "already allowed" and hide the barrier under test. Nesting the store
-    under a fake home (mirroring production's ``~/.kiro/crew/artifacts``) leaves
-    the rest of ``tmp_path`` genuinely outside every default root, standing in
-    for ``/workplace/...``.
-    """
-    home = tmp_path / "home"
-    (home / ".kiro" / "crew").mkdir(parents=True)
-    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
-    return ArtifactStore(root=home / ".kiro" / "crew" / "artifacts")
-
-
-@pytest.fixture
-def project_file(tmp_path: Path) -> tuple[Path, Path]:
-    """A ``/workplace``-style project root + file, outside home and the data home."""
-    proj = tmp_path / "workplace" / "nrb" / "repo"
-    src = proj / "docs" / "spec.md"
-    src.parent.mkdir(parents=True)
-    src.write_text("# live from the project", encoding="utf-8")
-    # A recorded root only authorizes a read while it still VERIFIES as a
-    # project, so the fixture is a real repo root rather than a bare directory.
-    (proj / ".git").mkdir()
-    return proj, src
-
-
-class TestSourceRootBarrier:
-    """``source_root`` is what makes a link outside ``$HOME`` readable at all."""
-
-    def test_read_refused_without_recorded_root(self, home_store, project_file) -> None:
-        _proj, src = project_file
-        # This is the silent breakage: a project file outside $HOME is refused,
-        # so the artifact would serve a stale snapshot forever.
-        assert home_store._try_read_source_path(str(src)) is None
-
-    def test_read_allowed_with_recorded_root(self, home_store, project_file) -> None:
-        proj, src = project_file
-        assert home_store._try_read_source_path(str(src), str(proj)) == "# live from the project"
-
-    def test_write_refused_without_recorded_root(self, home_store, project_file) -> None:
-        _proj, src = project_file
-        assert home_store._try_write_source_path(str(src), "edited") is False
-        assert src.read_text(encoding="utf-8") == "# live from the project"
-
-    def test_write_allowed_with_recorded_root(self, home_store, project_file) -> None:
-        proj, src = project_file
-        assert home_store._try_write_source_path(str(src), "edited", str(proj)) is True
-        assert src.read_text(encoding="utf-8") == "edited"
-
-    def test_recorded_root_does_not_widen_other_artifacts(self, home_store, tmp_path) -> None:
-        # Recording one project root must not make a SIBLING directory readable.
-        proj = tmp_path / "workplace" / "proj-a"
-        proj.mkdir(parents=True)
-        other = tmp_path / "workplace" / "proj-b" / "secret.md"
-        other.parent.mkdir(parents=True)
-        other.write_text("not yours", encoding="utf-8")
-        assert home_store._try_read_source_path(str(other), str(proj)) is None
-
-    def test_sensitive_path_still_refused_inside_recorded_root(
-        self, home_store, tmp_path, monkeypatch
-    ) -> None:
-        proj = tmp_path / "workplace" / "proj"
-        src = proj / ".aws" / "credentials"
-        src.parent.mkdir(parents=True)
-        src.write_text("SECRET", encoding="utf-8")
-        from kiro_crew import artifacts as artifacts_mod
-
-        monkeypatch.setattr(artifacts_mod, "is_sensitive_path", lambda p: p == str(src.resolve()))
-        assert home_store._try_read_source_path(str(src), str(proj)) is None
-
-    def test_forged_root_cannot_widen_the_read_boundary(
-        self, home_store, tmp_path
-    ) -> None:
-        """A persisted root is a hint, never authority.
-
-        ``meta.json`` sits in the agent-writable data home, so a record naming
-        ``source_root`` = a filesystem ancestor would otherwise hand the store
-        read access to anything under it.
-        """
-        outside = tmp_path / "etc" / "secrets"
-        outside.parent.mkdir(parents=True)
-        outside.write_text("SECRET", encoding="utf-8")
-        # The forged root is a real directory but is NOT a repo root and was
-        # never registered as a project, so it must not authorize the read.
-        assert home_store._try_read_source_path(str(outside), str(tmp_path)) is None
-
-    def test_relocate_promotes_a_copy_to_a_live_pointer(
-        self, home_store, project_file
-    ) -> None:
-        """Relocating a copied artifact must actually attach it to the file.
-
-        Relocate is an explicit "this artifact tracks THIS file" act. Leaving
-        ``source_copy_only`` set would make it silently inert -- reads and edits
-        would keep ignoring the file the user just pointed at.
-        """
-        proj, src = project_file
-        home_store.create(
-            name="Scratch",
-            content="# copied",
-            slug="scratch",
-            kind="markdown",
-            source_path="/tmp/scratch.md",
-            source_copy_only=True,
-        )
-        relocated = home_store.relocate("scratch", str(src), str(proj))
-        assert relocated.source_copy_only is False
-        # And the read is now live.
-        src.write_text("# externally edited", encoding="utf-8")
-        got = home_store.get("scratch")
-        assert got.content == "# externally edited"
-        assert got.source_missing is False
-
-    def test_write_works_without_dir_fd_via_a_by_name_atomic_replace(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """No directory-handle APIs (Windows) must not disable mirroring.
-
-        The staged payload is renamed by NAME instead of through a pinned parent.
-        That is what every editor's atomic save does, and it keeps the property
-        that actually protects data: the file is either all of the old bytes or
-        all of the new ones, never a half-write.
-        """
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-        monkeypatch.setattr(_os, "supports_dir_fd", set(), raising=False)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "new body"
-        # No staging litter left behind on this path either.
-        assert not list(src.parent.glob(".*kirocrew-*"))
-
-    @pytest.mark.skipif(
-        os.name == "nt",
-        reason=(
-            "the pinned-parent re-check lives on the dir-fd path; Windows has no dir_fd "
-            "support and takes the validated-descriptor path instead"
-        ),
-    )
-    @pytest.mark.skipif(
-        os.rename not in getattr(os, "supports_dir_fd", set()),
-        reason="the pinned-parent re-check only exists where directory-handle APIs do",
-    )
-    def test_write_refuses_when_the_pinned_parent_holds_a_different_file(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """An ancestor swap must not redirect the rename onto another file.
-
-        ``O_NOFOLLOW`` only guards the final path component, so an intermediate
-        directory can be replaced between validating the file and opening its
-        parent. Re-resolving the basename through the pinned directory fd and
-        requiring the same ``(st_dev, st_ino)`` catches that: here the target is
-        swapped for a different inode after validation, and the write is refused
-        instead of overwriting the impostor.
-        """
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-        original_stat = _os.stat
-
-        def lying_stat(*args, **kwargs):
-            st = original_stat(*args, **kwargs)
-            if kwargs.get("dir_fd") is not None:
-                # Pretend the pinned parent resolved to a different inode.
-                class _Fake:
-                    st_dev = st.st_dev
-                    st_ino = st.st_ino + 1
-
-                return _Fake()
-            return st
-
-        monkeypatch.setattr(_os, "stat", lying_stat)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is False
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "ORIGINAL"
-
-    def test_rejected_writes_do_not_leak_descriptors(
-        self, home_store, project_file
-    ) -> None:
-        """Every validation rejection must close the descriptor it opened.
-
-        The fd deliberately outlives validation (the no-dir-fd path writes
-        through it), so it cannot be closed in a blanket ``finally``. That made
-        each rejected update leak one descriptor, which would eventually exhaust
-        the gateway's limit.
-        """
-        import os as _os
-
-        proj, src = project_file
-        # A path outside the approved root is rejected during validation.
-        outside = proj.parent / "outside.md"
-        outside.write_text("x", encoding="utf-8")
-
-        def open_fds() -> int:
-            try:
-                return len(_os.listdir(f"/proc/{_os.getpid()}/fd"))
-            except OSError:  # pragma: no cover -- non-Linux
-                pytest.skip("no /proc to count descriptors")
-
-        before = open_fds()
-        for _ in range(40):
-            assert (
-                home_store._try_write_source_path(str(outside), "nope", str(proj)) is False
-            )
-        # A leak would add ~40 descriptors; allow a little slack for unrelated I/O.
-        assert open_fds() - before < 10
-
-    def test_write_refuses_when_an_acl_attribute_cannot_be_carried(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """Losing an ACL is a security regression, so the write is refused.
-
-        The rename installs a NEW inode. If the owner's POSIX ACL cannot be
-        reproduced on it, the replacement is protected LESS than the file it
-        replaced -- so the original is left alone instead.
-        """
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-
-        real_list = getattr(_os, "listxattr", None)
-        if real_list is None:  # pragma: no cover - platform without xattrs
-            pytest.skip("no xattr support on this platform")
-
-        monkeypatch.setattr(
-            _os, "listxattr", lambda *a, **k: ["system.posix_acl_access"], raising=False
-        )
-        monkeypatch.setattr(_os, "getxattr", lambda *a, **k: b"acl-bytes", raising=False)
-
-        def refuse_setxattr(*a, **k):
-            raise OSError(1, "Operation not permitted")
-
-        monkeypatch.setattr(_os, "setxattr", refuse_setxattr, raising=False)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is False
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "ORIGINAL"
-
-    def test_write_proceeds_when_only_an_informational_attribute_fails(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        # A user.* attribute is metadata, not protection. Failing the save over it
-        # would break every linked write on a filesystem that cannot store xattrs.
-        import os as _os
-
-        proj, src = project_file
-        if not hasattr(_os, "listxattr"):  # pragma: no cover
-            pytest.skip("no xattr support on this platform")
-
-        monkeypatch.setattr(_os, "listxattr", lambda *a, **k: ["user.note"], raising=False)
-        monkeypatch.setattr(_os, "getxattr", lambda *a, **k: b"x", raising=False)
-
-        def refuse_setxattr(*a, **k):
-            raise OSError(95, "Operation not supported")
-
-        monkeypatch.setattr(_os, "setxattr", refuse_setxattr, raising=False)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "new body"
-
-    def test_write_refuses_when_the_attribute_list_cannot_be_read(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """A failed listxattr is not the same as "there are none".
-
-        Treating a lookup failure as an empty list would install a replacement
-        stripped of the owner's ACL. Only "this filesystem has no xattrs"
-        (ENOTSUP/EOPNOTSUPP/ENOSYS) is safe to read as nothing-to-carry.
-        """
-        import errno as _errno
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-        if not hasattr(_os, "listxattr"):  # pragma: no cover
-            pytest.skip("no xattr support on this platform")
-
-        def failing_list(*a, **k):
-            raise OSError(_errno.EACCES, "Permission denied")
-
-        monkeypatch.setattr(_os, "listxattr", failing_list, raising=False)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is False
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "ORIGINAL"
-
-    def test_write_proceeds_where_the_filesystem_has_no_xattrs(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        # ENOTSUP means there is nothing on the source to lose, so the write goes
-        # ahead -- failing here would break linked writes on tmpfs and several
-        # network mounts.
-        import errno as _errno
-        import os as _os
-
-        proj, src = project_file
-        if not hasattr(_os, "listxattr"):  # pragma: no cover
-            pytest.skip("no xattr support on this platform")
-
-        def unsupported(*a, **k):
-            raise OSError(_errno.ENOTSUP, "Operation not supported")
-
-        monkeypatch.setattr(_os, "listxattr", unsupported, raising=False)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "new body"
-
-    def test_write_preserves_extended_attributes(
-        self, home_store, project_file
-    ) -> None:
-        """Extended attributes must survive the replace.
-
-        The in-place write this staging replaced preserved them for free by never
-        changing the inode; a fresh inode starts with none, which would silently
-        drop POSIX ACLs (stored as ``system.posix_acl_access``) and any ``user.*``
-        metadata.
-        """
-        import os
-
-        proj, src = project_file
-        try:
-            os.setxattr(str(src), "user.kirocrew_test", b"keepme")
-        except (AttributeError, OSError):
-            pytest.skip("filesystem or platform has no xattr support")
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        assert src.read_text(encoding="utf-8") == "new body"
-        assert os.getxattr(str(src), "user.kirocrew_test") == b"keepme"
-
-    def test_write_survives_a_platform_without_geteuid(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """``os.geteuid`` is POSIX-only; its absence must not raise.
-
-        On Windows the attribute does not exist, and ``AttributeError`` is not an
-        ``OSError`` -- so an unguarded call would escape every handler in this
-        path and surface as a 500 with the descriptor leaked and ``current.html``
-        already written. Simulated by deleting the attribute.
-        """
-        import os as _os
-
-        proj, src = project_file
-        monkeypatch.delattr(_os, "geteuid", raising=False)
-        assert home_store._try_write_source_path(str(src), "no euid here", str(proj)) is True
-        assert src.read_text(encoding="utf-8") == "no euid here"
-
-    def test_pinned_parent_check_only_applies_where_pinning_exists(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """The inode re-check is a Linux-only EXTRA, not the safety property.
-
-        Without directory-handle APIs there is no pinned parent to compare
-        against, so the write proceeds on the by-name path. The crash-safety
-        guarantee (atomic replace) is unchanged; only the anti-swap hardening is
-        absent, which is the documented trade.
-        """
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-        monkeypatch.setattr(_os, "supports_dir_fd", set(), raising=False)
-        assert home_store._try_write_source_path(str(src), "fallback body", str(proj)) is True
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "fallback body"
-
-    def test_a_file_owned_by_someone_else_is_still_mirrored(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """Ownership does not gate the mirror.
-
-        Replacing a file does hand the new inode to this process's user, which is
-        what any editor's atomic save does to a group-shared file. Refusing
-        instead meant a shared project file silently stopped tracking its
-        artifact, which is the worse outcome; the write goes through and the
-        permission bits and extended attributes are carried across.
-        """
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-        real_fstat = _os.fstat
-
-        def fstat_foreign(fd: int):
-            st = real_fstat(fd)
-
-            class _Foreign:
-                st_mode, st_nlink, st_size = st.st_mode, st.st_nlink, st.st_size
-                st_dev, st_ino = st.st_dev, st.st_ino
-                st_uid, st_gid = st.st_uid + 1, st.st_gid + 1
-
-            return _Foreign()
-
-        monkeypatch.setattr(_os, "fstat", fstat_foreign)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        monkeypatch.undo()
-        assert src.read_text(encoding="utf-8") == "new body"
-
-    @pytest.mark.skipif(
-        os.name == "nt",
-        reason="the staged rename is the dir-fd path, which Windows does not take",
-    )
-    def test_write_refuses_to_clobber_a_concurrent_save(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """An editor's atomic save during our staged write must win, not lose.
-
-        ``rename()`` replaces whatever the name points at when it runs. If an IDE
-        atomically saves the same file while the payload is being staged, the
-        target is a NEW inode and renaming over it would silently discard content
-        newer than what is being written here. The last-moment identity re-check
-        turns that into a refusal.
-        """
-        import os as _os
-
-        proj, src = project_file
-        src.write_text("ORIGINAL", encoding="utf-8")
-
-        real_fsync = _os.fsync
-        fired = {"done": False}
-
-        def fsync_then_replace(fd: int) -> None:
-            # Fires while the staging file is being flushed -- i.e. after the
-            # first identity check and before the rename.
-            real_fsync(fd)
-            if not fired["done"]:
-                fired["done"] = True
-                newer = src.parent / "newer.md"
-                newer.write_text("A NEWER SAVE FROM THE EDITOR", encoding="utf-8")
-                _os.replace(str(newer), str(src))
-
-        monkeypatch.setattr(_os, "fsync", fsync_then_replace)
-        assert home_store._try_write_source_path(str(src), "our body", str(proj)) is False
-        monkeypatch.undo()
-        # The editor's newer content survived; ours was refused.
-        assert src.read_text(encoding="utf-8") == "A NEWER SAVE FROM THE EDITOR"
-
-    @pytest.mark.skipif(
-        os.name == "nt",
-        reason="Windows has no POSIX permission bits; fchmod_safe is a documented no-op there",
-    )
-    def test_write_preserves_the_original_file_mode(
-        self, home_store, project_file
-    ) -> None:
-        """The atomic replace must not downgrade permissions.
-
-        Staging is created 0600; without carrying the target's mode across, a
-        shared 0644 document or an 0755 script would come back 0600 and break
-        every other reader.
-        """
-        import stat as _stat
-
-        proj, src = project_file
-        src.chmod(0o644)
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        assert src.read_text(encoding="utf-8") == "new body"
-        assert _stat.S_IMODE(src.stat().st_mode) == 0o644
-
-    def test_write_does_not_clobber_a_lookalike_staging_file(
-        self, home_store, project_file
-    ) -> None:
-        """A sibling that merely looks like our staging file is real user data.
-
-        A predictable staging name opened O_CREAT|O_TRUNC would have emptied it
-        and then renamed it away. The name is unique per call and created
-        O_EXCL, so an existing lookalike survives untouched.
-        """
-        proj, src = project_file
-        decoy = src.parent / f".{src.name}.kirocrew-tmp"
-        decoy.write_text("someone else's data", encoding="utf-8")
-        assert home_store._try_write_source_path(str(src), "new body", str(proj)) is True
-        assert src.read_text(encoding="utf-8") == "new body"
-        assert decoy.read_text(encoding="utf-8") == "someone else's data"
-
-    def test_failed_source_write_leaves_the_original_intact(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """A write that fails partway must not truncate the user's file.
-
-        Truncating before writing meant an ENOSPC/EIO partway through left the
-        project file empty or half-written with no way back.
-        """
-        proj, src = project_file
-        original = src.read_text(encoding="utf-8")
-        from kiro_crew import hooks as hooks_mod
-
-        real_write = hooks_mod.os.write
-        calls = {"n": 0}
-
-        def exploding_write(fd: int, data: bytes) -> int:
-            # Only the PAYLOAD write fails. That is what ENOSPC actually looks
-            # like on the in-place path: the truncate freed exactly the space the
-            # restore needs, so writing the original bytes back succeeds. Failing
-            # every write instead models a disk that never recovers, which no
-            # in-place scheme can survive -- and it made this test assert data
-            # loss on platforms without dir-fd support (Windows), where the
-            # restore write was being blown up too.
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise OSError(28, "No space left on device")
-            return real_write(fd, data)
-
-        monkeypatch.setattr(hooks_mod.os, "write", exploding_write)
-        assert home_store._try_write_source_path(str(src), "replacement", str(proj)) is False
-        monkeypatch.setattr(hooks_mod.os, "write", real_write)
-        assert src.read_text(encoding="utf-8") == original
-        # And no staging litter is left behind.
-        assert not list(src.parent.glob(".*kirocrew-tmp"))
-
-    def test_refused_mirror_keeps_the_edit_and_demotes_to_copy(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """A refused mirror write must not cost the user their edit.
-
-        The write can now be declined for several legitimate reasons (read-only
-        file, a concurrent save that would be clobbered, ownership we may not
-        reassign, a source too large to roll back). The edit is already in
-        current.html, but while the artifact still claims to be a live pointer the
-        next read prefers the SOURCE -- serving the old text back and reporting
-        itself clean. The artifact must take ownership of its own copy instead.
-        """
-        proj, src = project_file
-        src.write_text("# on disk", encoding="utf-8")
-        art = home_store.create(
-            name="linked",
-            content="# on disk",
-            slug="linked-demote",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        assert art.source_copy_only is False
-
-        monkeypatch.setattr(
-            type(home_store), "_try_write_source_path", lambda self, *a, **k: False
-        )
-        home_store.update("linked-demote", content="# my edit")
-
-        # The edit survived, and the source was left alone.
-        assert home_store.get("linked-demote").content == "# my edit"
-        assert src.read_text(encoding="utf-8") == "# on disk"
-        # Demoted to copy, and PERSISTED -- otherwise every later save would
-        # re-attempt the mirror and re-lose the edit.
-        assert home_store.get("linked-demote").source_copy_only is True
-        fresh = ArtifactStore(root=home_store.root)
-        assert fresh.get("linked-demote").source_copy_only is True
-        assert fresh.get("linked-demote").content == "# my edit"
-        # Provenance is kept: it still records where it came from.
-        assert fresh.get("linked-demote").source_path == str(src)
-
-    def test_snapshot_never_writes_back_to_a_linked_file(
-        self, home_store, project_file, monkeypatch
-    ) -> None:
-        """A snapshot is a READ; it must never write out to source_path.
-
-        The live read is bounded, so a source file larger than the bound yields a
-        PREFIX. Mirroring that prefix back would truncate the user's file --
-        silent, unrecoverable data loss. Writing back content that came FROM the
-        file is pointless even when it fits, so the write is skipped outright.
-        """
-        proj, src = project_file
-        home_store.create(
-            name="Spec",
-            content="# snapshot",
-            slug="spec",
-            kind="markdown",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        full = "# live from the project\n" + ("x" * 400)
-        src.write_text(full, encoding="utf-8")
-        # Force the bounded read to return a PREFIX, exactly as an oversized
-        # file would, and prove the original survives intact.
-        from kiro_crew import artifacts as artifacts_mod
-
-        monkeypatch.setattr(artifacts_mod, "MAX_CONTENT_BYTES", 32)
-        home_store.update("spec", snapshot=True)
-        assert src.read_text(encoding="utf-8") == full
-
-    def test_snapshot_of_a_copy_does_not_reimport_the_original(
-        self, home_store, project_file
-    ) -> None:
-        """Snapshotting a copied artifact must keep the user's edits.
-
-        The snapshot path re-reads live content so it can capture external
-        changes to a LINKED file. For a copy that would overwrite the edited
-        artifact with the original file's bytes.
-        """
-        proj, src = project_file
-        home_store.create(
-            name="Scratch",
-            content="# original",
-            slug="scratch",
-            kind="markdown",
-            source_path=str(src),
-            source_root=str(proj),
-            source_copy_only=True,
-        )
-        home_store.update("scratch", content="# edited in the artifact")
-        snapped = home_store.update("scratch", snapshot=True)
-        assert snapped.content == "# edited in the artifact"
-        # And the original file is untouched by the copy's edits.
-        assert src.read_text(encoding="utf-8") == "# live from the project"
-
-    def test_get_serves_live_content_when_root_recorded(self, home_store, project_file) -> None:
-        proj, src = project_file
-        art = home_store.create(
-            name="Spec",
-            content="# snapshot",
-            slug="spec",
-            kind="markdown",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        assert art.source_root == str(proj)
-        src.write_text("# externally edited", encoding="utf-8")
-        got = home_store.get("spec")
-        assert got.content == "# externally edited"
-        assert got.source_missing is False
-
-    def test_source_root_persisted_and_reloaded(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec",
-            content="# snapshot",
-            slug="spec",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        raw = json.loads((home_store._artifact_dir("spec") / "meta.json").read_text())
-        assert raw["source_root"] == str(proj)
-        assert home_store.get("spec").source_root == str(proj)
-
-    def test_legacy_meta_without_source_root_loads_empty(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec", content="s", slug="spec", source_path=str(src), source_root=str(proj)
-        )
-        meta_path = home_store._artifact_dir("spec") / "meta.json"
-        raw = json.loads(meta_path.read_text())
-        del raw["source_root"]  # simulate an artifact written before the field existed
-        meta_path.write_text(json.dumps(raw), encoding="utf-8")
-        assert home_store.get("spec").source_root == ""
-
-    def test_source_root_ignored_without_source_path(self, home_store, project_file) -> None:
-        proj, _src = project_file
-        art = home_store.create(name="Chat", content="x", source_root=str(proj))
-        # A root with nothing to authorize is meaningless metadata.
-        assert art.source_root == ""
-
-    def test_relocate_clears_stale_source_root(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec", content="s", slug="spec", source_path=str(src), source_root=str(proj)
-        )
-        home_dst = Path.home() / "moved.md"
-        home_dst.write_text("# moved", encoding="utf-8")
-        art = home_store.relocate("spec", str(home_dst))
-        # The old project root no longer authorizes anything about the new path.
-        assert art.source_path == str(home_dst)
-        assert art.source_root == ""
-
-
-class TestSourceMissingIsVisible:
-    """A dead live-pointer must be reported, not silently masked by the snapshot."""
-
-    def test_deleted_source_sets_source_missing(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec",
-            content="# snapshot",
-            slug="spec",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        src.unlink()
-        got = home_store.get("spec")
-        assert got.source_missing is True
-        assert got.content == "# snapshot"  # still viewable via the fallback
-
-    def test_refused_root_sets_source_missing(self, home_store, project_file) -> None:
-        # No recorded root → the read is refused → the pointer is effectively dead.
-        _proj, src = project_file
-        home_store.create(name="Spec", content="# snapshot", slug="spec", source_path=str(src))
-        got = home_store.get("spec")
-        assert got.source_missing is True
-        assert got.content == "# snapshot"
-
-    def test_live_dirty_cannot_report_clean_for_missing_source(
-        self, home_store, project_file
-    ) -> None:
-        # The regression: live_dirty was computed against the FALLBACK, so it
-        # compared the snapshot with itself and always said "in sync".
-        proj, src = project_file
-        home_store.create(
-            name="Spec",
-            # Snapshot matches the file, so the healthy baseline is genuinely clean.
-            content="# live from the project",
-            slug="spec",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        assert home_store.get("spec").live_dirty is False  # healthy pointer
-        src.unlink()
-        got = home_store.get("spec")
-        assert got.source_missing is True
-        assert got.live_dirty is True
-
-    def test_healthy_pointer_leaves_flag_false(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec",
-            content="# live from the project",
-            slug="spec",
-            source_path=str(src),
-            source_root=str(proj),
-        )
-        assert home_store.get("spec").source_missing is False
-
-    def test_chat_backed_artifact_never_flagged(self, store: ArtifactStore) -> None:
-        store.create(name="Widget", content="<p>hi</p>", slug="w", kind="widget")
-        assert store.get("w").source_missing is False
-
-    def test_source_missing_is_not_persisted(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec", content="s", slug="spec", source_path=str(src), source_root=str(proj)
-        )
-        src.unlink()
-        home_store.get("spec")  # computes source_missing=True
-        home_store.set_pinned("spec", True)  # any metadata write
-        raw = json.loads((home_store._artifact_dir("spec") / "meta.json").read_text())
-        assert "source_missing" not in raw
-        assert "live_dirty" not in raw
-
-    def test_snapshot_off_dead_pointer_flags_missing(self, home_store, project_file) -> None:
-        proj, src = project_file
-        home_store.create(
-            name="Spec", content="s", slug="spec", source_path=str(src), source_root=str(proj)
-        )
-        src.unlink()
-        art = home_store.update("spec", snapshot=True)
-        assert art.source_missing is True
-
-
-class TestSourcePathLengthRejected:
-    """Over-long pointers are REJECTED — truncating produced a different path."""
-
-    def test_create_rejects_overlong_source_path(self, store: ArtifactStore) -> None:
-        long_path = "/" + "a" * 600
-        with pytest.raises(ArtifactValidationError, match="refusing to truncate"):
-            store.create(name="X", content="c", slug="x", source_path=long_path)
-        # And nothing was half-created.
-        with pytest.raises(ArtifactNotFoundError):
-            store.get("x")
-
-    def test_create_rejects_overlong_source_root(self, store: ArtifactStore) -> None:
-        with pytest.raises(ArtifactValidationError, match="source_root exceeds"):
-            store.create(name="X", content="c", source_path="/p/a.md", source_root="/" + "b" * 600)
-
-    def test_relocate_rejects_overlong_source_path(self, store: ArtifactStore) -> None:
-        store.create(name="X", content="c", slug="x")
-        with pytest.raises(ArtifactValidationError, match="refusing to truncate"):
-            store.relocate("x", "/" + "a" * 600)
-
-    def test_path_at_the_cap_is_accepted_unchanged(self, store: ArtifactStore) -> None:
-        from kiro_crew.artifacts import MAX_SOURCE_PATH_LEN
-
-        at_cap = "/" + "a" * (MAX_SOURCE_PATH_LEN - 1)
-        art = store.create(name="X", content="c", slug="x", source_path=at_cap)
-        assert art.source_path == at_cap  # never silently shortened
-
-
-class TestAllowedRootsSingleProducer:
-    """All three consumers of the allowed-roots set share ONE producer.
-
-    The set had drifted into three copies (live read, live write, relocate
-    handler) and the handler's copy omitted the data-home root, so relocate
-    refused paths the store would then read happily.
-    """
-
-    def test_set_contains_home_data_home_and_configured_roots(
-        self, home_store, tmp_path, monkeypatch
-    ) -> None:
-        from kiro_crew.config.loader import KiroCrewConfig, PublishConfig
-
-        extra = tmp_path / "shared"
-        extra.mkdir()
-        cfg = KiroCrewConfig()
-        cfg.publish = PublishConfig(relocate_roots=[str(extra)])
-        monkeypatch.setattr(KiroCrewConfig, "load", staticmethod(lambda: cfg))
-        roots = home_store.allowed_source_roots()
-        assert Path.home().resolve() in roots
-        assert (Path.home() / ".kiro" / "crew").resolve() in roots  # data home
-        assert extra.resolve() in roots
-        # source_root only widens when supplied AND still verifiable. A bare
-        # directory is not: meta.json is agent-writable, so an unverified root
-        # would let a forged record widen this boundary at will.
-        assert tmp_path.resolve() not in roots
-        assert tmp_path.resolve() not in home_store.allowed_source_roots(str(tmp_path))
-        verifiable = tmp_path / "repo"
-        (verifiable / ".git").mkdir(parents=True)
-        assert verifiable.resolve() in home_store.allowed_source_roots(str(verifiable))
-
-    def test_data_home_path_accepted_by_read_and_write(self, home_store) -> None:
-        # The root the relocate handler used to omit. Read and write must agree.
-        data_home = home_store._root.resolve().parent
-        target = data_home / "note.md"
-        target.write_text("in the data home", encoding="utf-8")
-        assert home_store._try_read_source_path(str(target)) == "in the data home"
-        assert home_store._try_write_source_path(str(target), "edited") is True
-
-    def test_no_second_copy_of_the_root_assembly_in_source(self) -> None:
-        """Anti-drift pin: only ``allowed_source_roots`` may assemble the set.
-
-        Guards against a fourth copy appearing. Both markers below exist exactly
-        once in the store (inside ``allowed_source_roots``) and never in the
-        handler, which must call the store instead.
-        """
-        import kiro_crew.artifacts as artifacts_mod
-        import kiro_crew.dashboard.handlers.artifacts as handlers_mod
-
-        store_src = Path(artifacts_mod.__file__).read_text(encoding="utf-8")
-        handler_src = Path(handlers_mod.__file__).read_text(encoding="utf-8")
-        assert store_src.count("Path.home().resolve()") == 1
-        assert store_src.count(".publish.relocate_roots") == 1
-        assert "Path.home()" not in handler_src
-        assert ".publish.relocate_roots" not in handler_src
-        assert "allowed_source_roots()" in handler_src

@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from kiro_crew.config.paths import config_dir
+from kiro_crew.owner_only_files import mkdirs_owner_only, owner_only_opener, write_text_owner_only
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +23,30 @@ def _validate_id(value: str, label: str = "id") -> str:
     return value
 
 
+def is_valid_id(value: str) -> bool:
+    """Whether :func:`_validate_id` would accept ``value``.
+
+    Every function in this module validates by RAISING, which is right for an
+    internal caller that has no answer for a bad id. An HTTP handler does have
+    one -- a 400 -- and reaching it needs the question asked without the
+    exception.
+
+    This delegates to :func:`_validate_id` rather than re-testing
+    ``_SAFE_ID_RE``, so a caller's notion of a valid id cannot drift from the
+    one the path join actually enforces. Widening the validator widens this in
+    the same commit, by construction.
+    """
+    try:
+        _validate_id(value)
+    except ValueError:
+        return False
+    return True
+
+
 def workspace_dir(session_id: str) -> Path:
     """Return ~/.kiro/crew/sessions/{session_id}/, creating if needed."""
     d = config_dir() / _SESSIONS_DIR / _validate_id(session_id, "session_id")
-    d.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(d)  # transcripts and sub-agent results: 0700
     return d
 
 
@@ -37,7 +58,7 @@ def history_path(session_id: str) -> Path:
 def append_history(session_id: str, entry: dict) -> None:
     """Append a JSONL entry to the session's history.jsonl."""
     p = history_path(session_id)
-    with p.open("a", encoding="utf-8") as f:
+    with open(p, "a", encoding="utf-8", opener=owner_only_opener) as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
@@ -65,14 +86,14 @@ def result_path(session_id: str, agent_id: str) -> Path:
 def write_result(session_id: str, agent_id: str, content: str) -> Path:
     """Write sub-agent result to agent-{id}.md. Returns path."""
     p = result_path(session_id, agent_id)
-    p.write_text(content, encoding="utf-8")
+    write_text_owner_only(p, content)
     return p
 
 
 def append_result(session_id: str, agent_id: str, chunk: str) -> Path:
     """Append a chunk to a sub-agent result file (streaming). Returns path."""
     p = result_path(session_id, agent_id)
-    with p.open("a", encoding="utf-8") as f:
+    with open(p, "a", encoding="utf-8", opener=owner_only_opener) as f:
         f.write(chunk)
     return p
 
@@ -94,11 +115,15 @@ def list_results(session_id: str) -> list[dict]:
     results = []
     for p in sorted(d.glob("agent-*.md")):
         agent_id = p.stem.removeprefix("agent-")
+        try:
+            size = p.stat().st_size
+        except FileNotFoundError:
+            continue
         results.append(
             {
                 "agent_id": agent_id,
                 "path": str(p),
-                "size": p.stat().st_size,
+                "size": size,
             }
         )
     return results

@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
+from kiro_crew.llm_helpers import _steer_host_deny
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -16,6 +18,15 @@ from kiro_crew.providers.base import (
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+#: What the model is told when the judge refuses a tool call. The judge SURFACE
+#: runs no tools at all -- nothing about the call was judged -- so the reason
+#: says what this surface permits (nothing), which is what the surface-policy
+#: notice tells the model to read.
+_JUDGE_DENY_REASON = (
+    "the eval judge runs no tools: it only scores a transcript and answers with "
+    "a JSON verdict, so every tool call is refused here"
+)
 
 JUDGE_PROMPT = """You are an evaluation judge for an AI assistant's memory and context capabilities.
 
@@ -91,6 +102,14 @@ class LLMJudge:
                     source="eval_judge",
                 )
                 if event.request_id:
+                    # Audit FIRST, then tell the model in-band that the HOST
+                    # refused this (a rejected permission reaches it as
+                    # kiro-cli's "User denied tool execution"), then answer
+                    # the wire. The SURFACE refuses every call, so the notice
+                    # says what the judge permits, not a sanctioned alternative.
+                    await _steer_host_deny(
+                        self._provider, event, _JUDGE_DENY_REASON, cause=DENY_CAUSE_SURFACE_POLICY
+                    )
                     await self._provider.reject_tool(event.request_id)
             elif event.kind == EVENT_COMPLETE:
                 break
@@ -100,6 +119,6 @@ class LLMJudge:
             end = raw.rindex("}") + 1
             data = json.loads(raw[start:end])
             return JudgeVerdict(score=float(data["score"]), reason=data.get("reason", ""))
-        except (ValueError, KeyError, json.JSONDecodeError):
+        except (ValueError, KeyError):
             logger.warning("Judge returned unparseable response: %s", raw[:200])
             return JudgeVerdict(score=0, reason=f"parse_error: {raw[:100]}")

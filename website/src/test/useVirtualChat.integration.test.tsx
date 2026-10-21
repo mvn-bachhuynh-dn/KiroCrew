@@ -17,11 +17,26 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { renderHook, render as rtlRender, act } from '@testing-library/react'
 import { type RefObject } from 'react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Resolved from the vitest cwd (website/), used by the chokepoint source guard.
-const HOOK_SRC = 'src/hooks/virtualizer/useVirtualChat.ts'
+// The virtualizer is a facade over composed owners, so the source guards below
+// read EVERY module in its directory: a new owner file is covered the moment it
+// exists, and a raw write cannot escape the guard by moving to another file.
+const VIRTUALIZER_DIR = 'src/hooks/virtualizer'
+const CHOKEPOINT_SRC = join(VIRTUALIZER_DIR, 'followPolicy.ts')
+const virtualizerSources = (): { file: string; src: string }[] =>
+  readdirSync(VIRTUALIZER_DIR)
+    .filter((f) => /\.tsx?$/.test(f))
+    .sort()
+    .map((f) => ({ file: f, src: readFileSync(join(VIRTUALIZER_DIR, f), 'utf8').replace(/\r\n/g, '\n') }))
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
+import {
+  HEIGHT_SCHEMA_VERSION,
+  SCHEMA_VERSION_KEY,
+  TOUCHED_AT_KEY,
+} from '../hooks/virtualizer/HeightCache'
 import type { UseVirtualChatOptions } from '../hooks/virtualizer/types'
 
 interface Geom { scrollTop: number; scrollHeight: number; clientHeight: number }
@@ -47,7 +62,7 @@ interface Item { id: string }
 const getKey = (it: Item) => it.id
 const mkItems = (n: number): Item[] => Array.from({ length: n }, (_, i) => ({ id: `m${i}` }))
 
-function render(geom: Geom, items: Item[], sessionId: string) {
+function render(geom: Geom, items: Item[], sessionId: string, extra?: Partial<UseVirtualChatOptions<Item>>) {
   const { el, state } = makeScroller(geom)
   const ref: RefObject<HTMLDivElement | null> = { current: el }
   const initialProps: UseVirtualChatOptions<Item> = {
@@ -55,6 +70,7 @@ function render(geom: Geom, items: Item[], sessionId: string) {
     sessionId,
     getKey,
     externalScrollerRef: ref,
+    ...extra,
   }
   const view = renderHook(
     (props: UseVirtualChatOptions<Item>) => useVirtualChat<Item>(props),
@@ -109,6 +125,43 @@ describe('useVirtualChat integration: follow / pin wiring', () => {
 
     // Position preserved — no yank back to 1800.
     expect(el.scrollTop).toBe(600)
+  })
+
+  it('sets overflow-anchor none while followed and auto once the reader scrolls up (Firefox autoscroll)', () => {
+    // Firefox's native scroll anchoring, left on, holds a node above the tail
+    // and drags scrollTop up off the bottom as output streams — read by the
+    // follow guard as a user scroll-up, releasing the pin for the rest of the
+    // turn. The pin therefore turns native anchoring OFF while it owns the
+    // position, and back ON when the reader scrolls up (where it is relied on).
+    const { el, state, view } = render(
+      { scrollTop: 0, scrollHeight: 2000, clientHeight: 400 },
+      mkItems(5),
+      'ff-anchor',
+    )
+    // Slot entry force-pinned to the bottom (follow armed) → anchoring off.
+    expect(el.scrollTop).toBe(1600)
+    expect(el.style.overflowAnchor).toBe('none')
+
+    // A streamed append while followed re-pins and keeps anchoring off.
+    act(() => {
+      state.scrollHeight = 2400
+      view.rerender({ items: mkItems(6), sessionId: 'ff-anchor', getKey, externalScrollerRef: { current: el } })
+    })
+    expect(el.scrollTop).toBe(2000)
+    expect(el.style.overflowAnchor).toBe('none')
+
+    // The reader scrolls up to read history: follow releases and native
+    // anchoring is handed back on so it steadies their view.
+    act(() => { state.scrollTop = 600; el.dispatchEvent(new Event('scroll')) })
+    expect(el.style.overflowAnchor).toBe('auto')
+
+    // A later append must not yank them, and anchoring stays on while released.
+    act(() => {
+      state.scrollHeight = 2800
+      view.rerender({ items: mkItems(7), sessionId: 'ff-anchor', getKey, externalScrollerRef: { current: el } })
+    })
+    expect(el.scrollTop).toBe(600)
+    expect(el.style.overflowAnchor).toBe('auto')
   })
 
   it('force-pins to the bottom on slot switch even if the previous slot was scrolled up', () => {
@@ -367,28 +420,39 @@ describe('useVirtualChat: every scroll write goes through the one chokepoint', (
   // load-bearing). Asserting it at the source level does discriminate: adding a
   // raw write fails this test immediately.
   it('has no raw scrollTop / scrollTo writes outside writeScrollTop', () => {
-    const src = readFileSync(HOOK_SRC, 'utf8')
-    // Isolate the chokepoint body — the one place raw writes are allowed.
-    const chokeStart = src.indexOf('const writeScrollTop = useCallback(')
+    const choke = readFileSync(CHOKEPOINT_SRC, 'utf8').replace(/\r\n/g, '\n')
+    // The chokepoint body — the one place raw writes are allowed — lives in the
+    // follow owner. Its declaration must exist there exactly once.
+    const chokeStart = choke.indexOf('const writeScrollTop = useCallback(')
     expect(chokeStart).toBeGreaterThan(-1)
-    const chokeEnd = src.indexOf('\n  )', chokeStart)
-    const outside = src.slice(0, chokeStart) + src.slice(chokeEnd)
+    expect(choke.indexOf('const writeScrollTop = useCallback(', chokeStart + 1)).toBe(-1)
+    const chokeEnd = choke.indexOf('\n  )', chokeStart)
+    expect(chokeEnd).toBeGreaterThan(chokeStart)
 
-    const rawWrites = outside
-      .split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter(({ line }) => !line.startsWith('//'))
-      .filter(({ line }) => /\.scrollTop\s*(=|\+=|-=)/.test(line) || /\.scrollTo\(\{/.test(line))
+    const rawWrites: string[] = []
+    for (const { file, src } of virtualizerSources()) {
+      const outside = file === 'followPolicy.ts' ? src.slice(0, chokeStart) + src.slice(chokeEnd) : src
+      outside
+        // Prose that names a write (`el.scrollTop = target` in a doc) is not one.
+        // Only a block that OPENS a line is stripped: a `/*` inside a `//`
+        // comment or after code must not open a span that hides real code.
+        .replace(/^\s*\/\*[\s\S]*?\*\//gm, '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => !line.startsWith('//'))
+        .filter((line) => /\.scrollTop\s*(=|\+=|-=)/.test(line) || /\.scrollTo\(\{/.test(line))
+        .forEach((line) => rawWrites.push(`${file}: ${line}`))
+    }
 
     expect(
-      rawWrites.map((r) => r.line),
+      rawWrites,
       'raw scroll writes must go through writeScrollTop(el, top, behavior, accounting)',
     ).toEqual([])
   })
 
   it('states an accounting disposition at every call site', () => {
-    const src = readFileSync(HOOK_SRC, 'utf8')
-    const calls = [...src.matchAll(/writeScrollTop\(\s*el[^)]*\)/g)].map((m) => m[0])
+    const calls = virtualizerSources().flatMap(({ src }) =>
+      [...src.matchAll(/writeScrollTop\(\s*el[^)]*\)/g)].map((m) => m[0]))
     // Every call site (excluding the declaration) passes 'pin' or 'release'.
     expect(calls.length).toBeGreaterThanOrEqual(5)
     for (const c of calls) {
@@ -538,6 +602,20 @@ describe('useVirtualChat: smooth-pin guard (GPT MEDIUM round 4)', () => {
     expect(h.wheelAborts()).toBe(false) // already disarmed by the backward move
   })
 
+  it('hands overflow-anchor back to auto when the reader grabs the scroller mid-glide (Firefox autoscroll)', () => {
+    // The grab is a release with no write of ours after it, so nothing but the
+    // scroll handler can restore native anchoring for the reader who now owns
+    // the position (see followAnchorMode).
+    const h = smoothPinHarness('smooth-grab-anchor')
+    // The smooth pin re-armed follow, so native anchoring stands down.
+    expect(h.el.style.overflowAnchor).toBe('none')
+    h.scrollTo(1400)
+    expect(h.el.style.overflowAnchor).toBe('none')
+    h.scrollTo(900) // grabbed: scrollTop moved backward against the glide
+    expect(h.result.current.isAtBottom).toBe(false)
+    expect(h.el.style.overflowAnchor).toBe('auto')
+  })
+
   it('a wheel abort freezes the glide in place instead of only releasing stick', () => {
     const h = smoothPinHarness('smooth-freeze')
     h.scrollTo(1400)
@@ -640,7 +718,8 @@ describe('useVirtualChat: adaptive height estimate is wired into the offsets (GP
   beforeEach(() => localStorage.clear())
 
   const seed = (sid: string, keys: string[], h: number) => {
-    const blob: Record<string, number> = {}
+    // Unstamped, the blob is discarded on load and every row reads unmeasured.
+    const blob: Record<string, number | string> = { [SCHEMA_VERSION_KEY]: HEIGHT_SCHEMA_VERSION }
     for (const k of keys) blob[k] = h
     localStorage.setItem(`vc_heights_${sid}`, JSON.stringify(blob))
   }
@@ -661,7 +740,10 @@ describe('useVirtualChat: adaptive height estimate is wired into the offsets (GP
   it('the spacer offsets follow the adaptive estimate too', () => {
     const sid = 'estimate-wiring-spacers'
     seed(sid, Array.from({ length: 10 }, (_, i) => `m${i}`), 500)
-    const { view } = render({ scrollTop: 0, scrollHeight: 1000, clientHeight: 400 }, mkItems(200), sid)
+    // A NON-following reader: while follow is armed the window is tail-anchored
+    // by design, so a top-pinned window (the scenario this test needs) only
+    // exists for a reader who scrolled up / released follow.
+    const { view } = render({ scrollTop: 0, scrollHeight: 1000, clientHeight: 400 }, mkItems(200), sid, { followOutput: false })
     // offsetBefore + rendered window + offsetAfter must reconstruct the total,
     // so an under-estimate anywhere would show up as a mismatch.
     const v = view.result.current
@@ -688,7 +770,7 @@ describe('useVirtualChat: OffsetIndex is rebuilt on session switch (GPT MEDIUM)'
   // the Fenwick tree serving the previous transcript's heights and rendering
   // wrong spacers until a measurement tick corrected it.
   const seedHeights = (sessionId: string, n: number, h: number) => {
-    const blob: Record<string, number> = {}
+    const blob: Record<string, number | string> = { [SCHEMA_VERSION_KEY]: HEIGHT_SCHEMA_VERSION }
     for (let i = 0; i < n; i++) blob[`m${i}`] = h
     window.localStorage.setItem(`vc_heights_${sessionId}`, JSON.stringify(blob))
   }
@@ -744,13 +826,18 @@ describe('useVirtualChat: height-cache eviction cap is wired to the row count', 
   beforeEach(clearSeeds)
   afterEach(clearSeeds)
   const seed = (sessionId: string, n: number) => {
-    const blob: Record<string, number> = {}
+    const blob: Record<string, number | string> = { [SCHEMA_VERSION_KEY]: HEIGHT_SCHEMA_VERSION }
     for (let i = 0; i < n; i++) blob[`m${i}`] = 40 + (i % 5)
     window.localStorage.setItem(`vc_heights_${sessionId}`, JSON.stringify(blob))
   }
+  // HEIGHTS only. The schema stamp and the lastTouched stamp share the blob but
+  // are not rows, and counting them would put every cap assertion off the cap
+  // it names.
   const persistedCount = (sessionId: string) => {
     const raw = window.localStorage.getItem(`vc_heights_${sessionId}`)
-    return raw ? Object.keys(JSON.parse(raw) as Record<string, number>).length : 0
+    if (!raw) return 0
+    return Object.keys(JSON.parse(raw) as Record<string, number>)
+      .filter((k) => k !== SCHEMA_VERSION_KEY && k !== TOUCHED_AT_KEY).length
   }
   // Mount, then push ONE real measurement through the hook's own measure path.
   // That matters: flush() skips when the cache isn't dirty, so without a write
@@ -1051,6 +1138,159 @@ describe('useVirtualChat: scroll-anchor preservation (T4/#5)', () => {
     } finally {
       globalThis.requestAnimationFrame = origRaf
       globalThis.IntersectionObserver = origIO
+    }
+  })
+})
+
+// Feature: chat-virtualizer — initialPlacement: 'top' (the list/gallery contract).
+//
+// The default is the chat contract: tail window + a slot-entry force-pin to the
+// bottom. A gallery consuming this hook opens at the HEAD instead — and beyond
+// the landing position this is the flicker fix: at the tail every unmeasured
+// row is ABOVE the viewport, so each measurement forces a scrollTop
+// compensation write; at the head they are all below, and corrections land in
+// the bottom spacer invisibly.
+describe('initialPlacement: top', () => {
+  const geom = { scrollTop: 0, scrollHeight: 4000, clientHeight: 800 }
+
+  function renderTop(items: Item[], extra?: Partial<UseVirtualChatOptions<Item>>) {
+    const { el, state } = makeScroller({ ...geom, ...((extra as { geom?: Geom })?.geom ?? {}) })
+    const ref: RefObject<HTMLDivElement | null> = { current: el }
+    const view = renderHook((props: UseVirtualChatOptions<Item>) => useVirtualChat<Item>(props), {
+      initialProps: {
+        items,
+        sessionId: 'gallery-top',
+        getKey,
+        externalScrollerRef: ref,
+        followOutput: false,
+        initialPlacement: 'top',
+        ...extra,
+      } as UseVirtualChatOptions<Item>,
+    })
+    return { view, el, state }
+  }
+
+  it('mounts the HEAD window, not the tail', () => {
+    const { view } = renderTop(mkItems(40))
+    const mounted = view.result.current.virtualItems.filter((v) => v.mounted).map((v) => v.index)
+    expect(mounted).toContain(0)
+    expect(mounted).not.toContain(39)
+    // Nothing above the first mounted row — measurements can only grow the
+    // bottom spacer, which is what makes mount quiet.
+    expect(view.result.current.offsetBefore).toBe(0)
+  })
+
+  it('slot entry lands at scrollTop 0 even on an inherited scroller, and does not bottom-pin', () => {
+    // The page-column scroller outlives the gallery view, so it can carry
+    // leftover scrollTop from whatever it showed before.
+    const { state } = renderTop(mkItems(40), { geom: { scrollTop: 500, scrollHeight: 4000, clientHeight: 800 } } as never)
+    expect(state.scrollTop).toBe(0)
+  })
+
+  it('default placement still takes the chat contract (tail window)', () => {
+    const { el, state } = makeScroller(geom)
+    const ref: RefObject<HTMLDivElement | null> = { current: el }
+    const { result } = renderHook(() =>
+      useVirtualChat<Item>({ items: mkItems(40), sessionId: 'chat-default', getKey, externalScrollerRef: ref }),
+    )
+    const mounted = result.current.virtualItems.filter((v) => v.mounted).map((v) => v.index)
+    expect(mounted).toContain(39)
+    expect(mounted).not.toContain(0)
+    // Slot entry force-pinned to the bottom.
+    expect(state.scrollTop).toBe(geom.scrollHeight - geom.clientHeight)
+  })
+
+  it('measures sub-pixel row heights instead of rounding to integers', () => {
+    // offsetHeight rounds; content scaled to width is fractional (an image at
+    // a 696:204 ratio in a 342px column is 100.24px tall). The rounding error
+    // accumulates across the list into a few-pixel drift that cashes out at
+    // window boundaries on engines without scroll anchoring (iOS Safari).
+    const { view } = renderTop(mkItems(10), { eagerFirstMeasure: true } as never)
+    const before = view.result.current.totalHeight
+    const node = document.createElement('div')
+    Object.defineProperty(node, 'offsetHeight', { configurable: true, get: () => 405 })
+    node.getBoundingClientRect = () =>
+      ({ height: 404.688, width: 342, top: 0, left: 0, bottom: 404.688, right: 342, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
+    act(() => { view.result.current.measureRef(0)(node) })
+    // Unmeasured rows re-estimate from the measured average, so pin the
+    // DISCRIMINATING property rather than the arithmetic: the fraction
+    // survives into the total (404.688 → quarter-px 404.75). Rounding through
+    // offsetHeight instead yields an integer total.
+    expect(before % 1).toBe(0)
+    expect(view.result.current.totalHeight % 1).not.toBe(0)
+  })
+
+  it('eagerFirstMeasure lands a first measurement in the offset math immediately, even under a mounting streak', () => {
+    // The downward-scroll bounce: scrolling down mounts a new card every few
+    // dozen ms; each seed measurement used to (re-)arm the 120ms debounce, so
+    // the offset tree stayed frozen at estimates for the whole gesture, and
+    // every row the window front handed from real DOM to the before-spacer
+    // shrank the content above the viewport by (real − estimate).
+    const { view } = renderTop(mkItems(10), { eagerFirstMeasure: true } as never)
+    const before = view.result.current.totalHeight
+    const measure = (i: number, h: number) => {
+      const node = document.createElement('div')
+      Object.defineProperty(node, 'offsetHeight', { configurable: true, get: () => h })
+      view.result.current.measureRef(i)(node)
+    }
+    // Two seeds in quick succession — no timers advanced in between, exactly
+    // the streak that used to starve the debounced sync. Directional assert:
+    // unmeasured rows re-estimate from the measured average, so the exact
+    // total is the cache's business; what matters is it moved NOW.
+    act(() => { measure(0, 560) })
+    act(() => { measure(1, 560) })
+    expect(view.result.current.totalHeight).toBeGreaterThan(before)
+  })
+
+  it('without the option, first measurements stay debounced (the chat contract)', () => {
+    // Pins the default: the upward-anchor compensation's commit ordering
+    // depends on seeds riding the debounce, so eager sync must be opt-in.
+    const { view } = renderTop(mkItems(10))
+    const before = view.result.current.totalHeight
+    const node = document.createElement('div')
+    Object.defineProperty(node, 'offsetHeight', { configurable: true, get: () => 560 })
+    act(() => { view.result.current.measureRef(0)(node) })
+    expect(view.result.current.totalHeight).toBe(before)
+  })
+
+  it('maps scrollTop through the leading offset when content sits above the list', () => {
+    // A page column carrying header/toolbar content ABOVE the list: raw
+    // scrollTop is NOT a list offset. With 1600px of leading content and the
+    // scroller at scrollTop 1600, the viewport is exactly at the list's first
+    // row — a raw conversion would instead compute row ~20 (1600px / 80px
+    // estimate) and swap the window away from the rows actually on screen,
+    // at the same scroll positions every time (the fixed-position bounce).
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top + 800, right: 390, width: 390, height: 800, x: 0, y: top, toJSON: () => ({}) }) as DOMRect
+    const { el, state } = makeScroller({ scrollTop: 0, scrollHeight: 4800, clientHeight: 800 })
+    ;(el as unknown as { getBoundingClientRect: () => DOMRect }).getBoundingClientRect = () => rect(0)
+    const ref: RefObject<HTMLDivElement | null> = { current: el }
+    const frames: FrameRequestCallback[] = []
+    const origRaf = globalThis.requestAnimationFrame
+    globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => { frames.push(cb); return frames.length }) as typeof requestAnimationFrame
+    try {
+      const { result } = renderHook(() =>
+        useVirtualChat<Item>({
+          items: mkItems(40),
+          sessionId: 'lead-offset',
+          getKey,
+          externalScrollerRef: ref,
+          followOutput: false,
+          initialPlacement: 'top',
+        }),
+      )
+      // The list's own top sentinel: at scrollTop 1600 it sits exactly at the
+      // viewport top, i.e. the leading content is 1600px tall.
+      const sentinel = document.createElement('div')
+      ;(sentinel as unknown as { getBoundingClientRect: () => DOMRect }).getBoundingClientRect = () => rect(0)
+      ;(result.current.topSentinelRef as { current: HTMLDivElement | null }).current = sentinel
+      act(() => { state.scrollTop = 1600; el.dispatchEvent(new Event('scroll')) })
+      act(() => { frames.forEach((cb) => cb(0)); frames.length = 0 })
+      const indices = result.current.virtualItems.map((v) => v.index)
+      // The viewport is at the FIRST row: the window must still cover it.
+      expect(Math.min(...indices)).toBe(0)
+    } finally {
+      globalThis.requestAnimationFrame = origRaf
     }
   })
 })

@@ -155,6 +155,36 @@ class TestSignature(_Env):
         source = inspect.getsource(webhook.verify_signature)
         self.assertIn("compare_digest", source)
 
+    def test_a_non_ascii_signature_is_a_clean_rejection_not_a_raise(self) -> None:
+        """A malformed header must not escape the refusal as an exception.
+
+        ``hmac.compare_digest`` raises ``TypeError`` when either ``str`` operand
+        holds a non-ASCII character. ``provided`` is the attacker-chosen
+        ``X-OMC-Signature`` header, and aiohttp decodes a header byte that is not
+        valid UTF-8 into a lone surrogate, so both an ordinary accented character
+        and a lone surrogate reach this compare. Each must produce the same
+        ``(False, "signature mismatch")`` a wrong hex signature gets — never a
+        ``TypeError`` that would answer 500 and skip the caller's audit line.
+
+        The subTest label is ASCII on purpose: pytest-xdist serializes the
+        subTest context to the controller, and a lone surrogate in that context
+        cannot be UTF-8 encoded (``execnet ... DumpError``). The surrogate is
+        built with ``chr`` so it is never written as a literal either.
+        """
+        body = _body()
+        cases = (
+            ("accented", "\u00e9"),
+            ("accented_suffix", "abc\u00e9"),
+            ("lone_surrogate", chr(0xDCFF)),
+            ("hex_prefix_with_accent", "0" * 63 + "\u00e9"),
+        )
+        for label, malformed in cases:
+            with self.subTest(case=label):
+                accepted, detail = webhook.enqueue(body, malformed)
+                self.assertFalse(accepted)
+                self.assertEqual(detail, "signature mismatch")
+        self.assertEqual(webhook.queue_depth(), 0)
+
 
 class TestUnauthenticatedInputIsNeverParsed(_Env):
     def setUp(self) -> None:
@@ -232,10 +262,10 @@ class TestPayloadValidation(_Env):
     def test_peek_does_not_consume_the_queue(self) -> None:
         """A READ must not destroy delivered signals.
 
-        This test used to assert the opposite (`drain` emptying the spool), which is the
-        bug: `poll_all` is called by the Signals-tab read and by the claim-authorization
-        check as well as by the heartbeat, so a "Poll now" click permanently destroyed
-        every queued alert — signature-verified, delivered, and then silently nothing.
+        `drain` emptying the spool on a read is the bug: `poll_all` is called by the
+        Signals-tab read and by the claim-authorization check as well as by the
+        heartbeat, so a "Poll now" click would permanently destroy every queued alert —
+        signature-verified, delivered, and then silently nothing.
         """
         self._send(_body(id="a"))
         self._send(_body(id="b"))
@@ -275,10 +305,10 @@ class TestPayloadValidation(_Env):
 class TestAlertmanagerEnvelope(_Env):
     """The v4 ``{status, alerts:[...]}`` body — the most common machine-readable alert.
 
-    Previously rejected outright: a raw Alertmanager body carries no top-level
-    ``title``/``summary``, so ``signal_from_payload`` returned None and the ingress
-    answered 400 "payload has no title" — while this module's own docstring named
-    Alertmanager as a supported sender.
+    Accepted rather than rejected outright: a raw Alertmanager body carries no top-level
+    ``title``/``summary``, so a title-only read returns None and the ingress answers
+    400 "payload has no title" — for the sender this module's own docstring names as
+    supported.
     """
 
     def setUp(self) -> None:
@@ -442,14 +472,14 @@ class TestAlertmanagerEnvelope(_Env):
 
 
 class TestProviderSideSuppressionIsHonoured(_Env):
-    """Alertmanager publishes suppression two ways, and only one shape used to parse.
+    """Alertmanager publishes suppression two ways, and both shapes must parse.
 
     The v4 webhook envelope sends a scalar ``status``. Anything relaying
     ``GET /api/v2/alerts`` sends the ``gettableAlert`` OBJECT
-    ``{"state": "suppressed", "silencedBy": [...]}``, which the previous scalar-only read
-    stringified — so it normalized to ``unknown`` and ``silencedBy`` was dropped entirely.
-    A sender being perfectly explicit about a human having parked the alert produced a
-    signal indistinguishable from garbage.
+    ``{"state": "suppressed", "silencedBy": [...]}``, which a scalar-only read
+    stringifies — normalizing it to ``unknown`` and dropping ``silencedBy`` entirely.
+    A sender being perfectly explicit about a human having parked the alert then
+    produces a signal indistinguishable from garbage.
     """
 
     def setUp(self) -> None:
@@ -612,9 +642,9 @@ class TestProviderSideSuppressionIsHonoured(_Env):
 class TestRejectStatusMapping(unittest.TestCase):
     """A payload fault is not an auth failure.
 
-    Everything used to return 401, so a sender debugging a bad body was told
-    "Unauthorized" and would re-check credentials that were fine — while a genuine
-    signature failure looked identical to a typo.
+    Answering 401 for everything tells a sender debugging a bad body
+    "Unauthorized", so it re-checks credentials that are fine — and a genuine
+    signature failure looks identical to a typo.
     """
 
     def test_trust_failures_are_401(self) -> None:

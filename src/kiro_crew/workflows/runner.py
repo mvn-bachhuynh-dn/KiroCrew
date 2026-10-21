@@ -15,9 +15,9 @@ Gates closed here:
 * (consumes A4/B6 from ``context``: ``Budget`` ceiling, ``AgentCounter`` cap.)
 
 Agent execution is injected as ``agent_fn`` so the runner is testable against a
-stub now; the real wiring (subagent-by-default via ``SubagentManager``, ``session=``
-via ``SessionManager``) drops in later WITHOUT changing the frozen ``ctx`` contract.
-The runner never spawns real ``kiro-cli`` — that is the caller's ``agent_fn``.
+stub; production supplies ``agent_exec.build_agent_fn`` (a fresh isolated session
+per call) or ``agent_pool.build_pooled_agent_fn`` (warm sessions). The runner never
+spawns real ``kiro-cli`` — that is the caller's ``agent_fn``.
 
 ``now`` is a fixed run-start stamp supplied by the caller (NOT ``time`` inside the
 script's scope) so the stream stays deterministic / resume-stable. ``time`` is used
@@ -30,15 +30,21 @@ Spec: ``docs/system-specs/modules/workflows.md``.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
+import inspect
 import json
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+
+from kiro_crew.metrics.events import WORKFLOW_RUNS, emit_counter
 
 from . import BudgetExceeded, WorkflowEvent
 from .context import DEFAULT_MAX_AGENTS_PER_RUN, AgentCounter, Budget, build_safe_globals
+from .dsl import _call_stage, _maybe_await
 from .dsl import parallel as _parallel
 from .dsl import pipeline as _pipeline
 from .events import EventStream
@@ -86,9 +92,38 @@ MAX_RUN_TIMEOUT_SECS = 6 * 3600
 MAX_AGENT_ERROR_CHARS = 500
 
 
-def clamp_run_timeout(
-    value: Optional[int], *, default: int = DEFAULT_RUN_TIMEOUT_SECS
-) -> int:
+async def _drain_cleanup(task: asyncio.Future[Any]) -> bool:
+    """Drain owned cleanup and report caller cancellation without forwarding it."""
+    caller = asyncio.current_task()
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A cleanup task cancelling itself is not a caller's cancel request.
+            cancelled = cancelled or (caller is not None and caller.cancelling() > 0)
+        except Exception:  # cleanup failures must not replace the run outcome
+            break
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+    return cancelled
+
+
+def host_now_iso() -> str:
+    """Real wall-clock UTC stamp for ONE event (the HOST clock).
+
+    Distinct from ``ctx.now`` (the fixed, script-visible run-start stamp): the
+    event journal records when each event actually happened, while the script's
+    only clock stays fixed for determinism / resume-stability. It lives in host
+    code and never reaches the sandboxed script, so it grants no new time
+    capability inside a workflow.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def clamp_run_timeout(value: Optional[int], *, default: int = DEFAULT_RUN_TIMEOUT_SECS) -> int:
     """Clamp a caller-supplied run ceiling into ``[MIN, MAX]``.
 
     ``None``, non-numeric, or non-positive input falls back to ``default`` — so a
@@ -131,6 +166,58 @@ def describe_agent_error(exc: BaseException) -> str:
     if len(text) > MAX_AGENT_ERROR_CHARS:
         text = text[:MAX_AGENT_ERROR_CHARS] + "…"
     return text
+
+
+def _call_fingerprint(prompt: str, opts: dict, position: tuple) -> str:
+    """Identity of one agent call for replay: its *position* in the run (see
+    :class:`_CallScope`), the prompt, and every option that reaches the model,
+    without the display-only ``label`` and ``phase``.
+
+    The position keeps apart two branches that make the same call with the same
+    options: each replays the answer its own call got, not the other branch's.
+    Returns "" when the options cannot be serialized; a call without a
+    fingerprint is never replayed and always runs live.
+    """
+    keyed = {k: v for k, v in opts.items() if k not in ("label", "phase")}
+    try:
+        blob = json.dumps(
+            {"position": list(position), "prompt": prompt, "opts": keyed},
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+class _CallScope:
+    """Where a call sits in its run: the branch path and the next ordinal in it.
+
+    The root scope's path is ``()``. Each ``ctx.parallel`` / ``ctx.pipeline``
+    fan-out takes one ordinal in the scope that starts it, and branch (or item)
+    ``i`` runs in the scope ``path + (ordinal, i)``. A call's position is its
+    scope's path plus the ordinal it takes there. The calls inside one branch run
+    one after another, so a call's position is set by the script and its
+    arguments, whatever order the scheduler starts the branches' calls in.
+    """
+
+    __slots__ = ("owner", "path", "_next")
+
+    def __init__(self, owner: object, path: tuple) -> None:
+        self.owner = owner
+        self.path = path
+        self._next = 0
+
+    def take(self) -> int:
+        ordinal = self._next
+        self._next += 1
+        return ordinal
+
+
+#: The scope of the branch the running task belongs to; see ``_RunContext._scope``.
+_CALL_SCOPE: "contextvars.ContextVar[Optional[_CallScope]]" = contextvars.ContextVar(
+    "workflow_call_scope", default=None
+)
 
 
 @asynccontextmanager
@@ -213,7 +300,7 @@ class RunResult:
     events: list[WorkflowEvent]
     error: Optional[str] = None
     # Per-agent-call results (call_index → result), so a resume/restart-subtree
-    # can replay the unchanged prefix (M6.6). Populated on EVERY terminal path —
+    # can replay the unchanged prefix. Populated on EVERY terminal path —
     # success, ceiling, cancel, budget, and script crash — so an interrupted run
     # still hands back the work it already finished. ``result`` is the script's own
     # return value and stays None when the script never got to return one; these
@@ -223,12 +310,12 @@ class RunResult:
     # ``describe_agent_error``). Empty for runs where every call succeeded.
     agent_errors: dict = field(default_factory=dict)
     # The script actually executed. Equals the input ``source`` unless the run
-    # authored it from an ``intent`` (M6.7) — surfaced so a background run can
+    # authored it from an ``intent`` — surfaced so a background run can
     # store the authored script on its handle for rerun/restart.
     source: str = ""
 
 
-# Signature of the injected authoring step (M6.7): intent -> {ok, source, errors}.
+# Signature of the injected authoring step: intent -> {ok, source, errors}.
 # Kept as a narrow injected callable (NOT a hard import of the service) so the
 # runner stays at the top of the layering and authoring uses the host's model
 # plumbing. ``on_progress(msg)`` lets authoring stream human-readable progress.
@@ -236,10 +323,14 @@ AuthorFn = Callable[..., Awaitable[dict]]
 
 # Signature of the per-call checkpoint hook, mirroring how ``on_source`` publishes
 # the authored script mid-run:
-#   on_agent_result(call_index: int, *, result: Any, ok: bool, error: str) -> None
+#   on_agent_result(call_index: int, *, result: Any, ok: bool, error: str,
+#                   fingerprint: str) -> None
 # Called as soon as EACH agent call settles, so the host can persist that payload
 # before the run reaches a terminal state. Without it, results would live only in
 # process memory until the run finished, and any interruption would throw them away.
+# ``fingerprint`` is the call's identity for replay (see ``_call_fingerprint``, ""
+# when it has none); it lands with the result, so a record that holds a result
+# also holds what a rerun needs to replay it.
 AgentResultFn = Callable[..., None]
 
 
@@ -266,8 +357,8 @@ class _RunContext:
     """Concrete ``WorkflowContext`` assembled per run (satisfies the frozen Protocol).
 
     Wires ``dsl.parallel/pipeline`` + ``Budget`` + ``AgentCounter`` + ``EventStream``.
-    KiroCrew-native ports (cron/memory/learn/knowledge) are None until M4; ``agent``
-    delegates to the injected ``agent_fn`` (stub in tests, real spawner in prod).
+    The ports native to Kiro Crew (cron/memory/learn/knowledge) are None unless the host
+    wired them; ``agent`` delegates to the injected ``agent_fn``.
     """
 
     def __init__(
@@ -291,18 +382,19 @@ class _RunContext:
         replay_results: Optional[dict] = None,
         replay_before: int = 0,
         on_agent_result: Optional[AgentResultFn] = None,
+        replay_fingerprints: Optional[dict] = None,
     ) -> None:
         self.args = args
         self.now = now
         self.owner_dm = owner_dm
-        self.budget = budget
+        self._budget = budget
         # Originating session key (dashboard slot / channel key) for this run.
         # Threaded from start()/run_background() so session-bound native ports
         # (e.g. ``ctx.nudge`` → AutoNudge) know which session to act on. Empty
         # when the run was not launched from a nudge-able session.
         self._session_key = session_key
 
-        # KiroCrew-native ports (M4) — injected per run; None when the host did
+        # Ports native to Kiro Crew — injected per run; None when the host did
         # not grant/wire them (the frozen contract allows None, like AppContext).
         ports = ports or {}
         self.cron = ports.get("cron")
@@ -325,17 +417,36 @@ class _RunContext:
         self._current_phase = ""
         self._events: list[WorkflowEvent] = []
         self._on_event = on_event
-        # Resume / restart-subtree (M6.6): cached agent results from a prior run,
+        # Resume / restart-subtree: cached agent results from a prior run,
         # replayed for call_index < replay_before; calls at/after re-execute live.
         # ``agent_results`` collects THIS run's results for the next resume.
         self._replay_results: dict[int, Any] = replay_results or {}
         self._replay_before = replay_before
+        # A replayed call is matched to the prior run's call by fingerprint, not
+        # by call_index. Inside ``parallel``/``pipeline`` a replayed call returns
+        # without suspending, so the calls of a rerun start in a different order
+        # than the prior run's did, and the same index names a different call.
+        # The fingerprint includes the call's position in its branch
+        # (``_CallScope``), so two branches that make the same call each get
+        # their own result back. Every call in a run has its own position, so
+        # no two calls of one run share a fingerprint.
+        # fingerprint → the prior call index with that fingerprint. Only prior
+        # calls before ``replay_before`` that carry a fingerprint are eligible;
+        # any other call runs live.
+        prior_fingerprints = replay_fingerprints or {}
+        self._replay_indices: dict[str, int] = {}
+        for prior_index in sorted(k for k in self._replay_results if isinstance(k, int)):
+            prior_fp = prior_fingerprints.get(prior_index)
+            if prior_index < replay_before and isinstance(prior_fp, str) and prior_fp:
+                self._replay_indices.setdefault(prior_fp, prior_index)
         self.agent_results: dict[int, Any] = {}
+        self._root_scope = _CallScope(self, ())
         # call_index → why that call failed (bounded/redacted). Kept alongside
         # agent_results so "no result" is always accompanied by a reason.
         self.agent_errors: dict[int, str] = {}
         # Per-call durable checkpoint sink (see ``AgentResultFn``).
         self._on_agent_result = on_agent_result
+        self._execution_guard: Optional[Callable[[], Awaitable[None]]] = None
         # RUN-GLOBAL agent concurrency. ``parallel``/``pipeline`` each build their
         # OWN semaphore, so they bound one fan-out but not the run: nested or
         # sequentially overlapping combinators could exceed the configured cap, and
@@ -347,10 +458,15 @@ class _RunContext:
             asyncio.Semaphore(concurrency) if (concurrency and concurrency > 0) else None
         )
 
+    @property
+    def budget(self) -> Budget:
+        """The host owns the binding; script aliases cannot replace its accounting."""
+        return self._budget
+
     # --- event sink (shared with the runner) ---
     def _record(self, event: WorkflowEvent) -> None:
         self._events.append(event)
-        # Live fan-out (M6): the registry / WS push consumes events as they happen.
+        # Live fan-out: the registry / WS push consumes events as they happen.
         if self._on_event is not None:
             try:
                 self._on_event(event)
@@ -374,6 +490,12 @@ class _RunContext:
     ) -> Any:
         # B6 cap + A4 ceiling are checked BEFORE the call so a script cannot run
         # past either limit. would_exceed lets us stop at the boundary cleanly.
+        # Taken before the first await, so calls that start together in one
+        # branch keep their start order.
+        position = self._call_position()
+        guard = getattr(self, "_execution_guard", None)
+        if guard is not None:
+            await guard()
         self._counter.increment()
         if self.budget.would_exceed():
             raise BudgetExceeded("budget exhausted before agent call")
@@ -401,13 +523,15 @@ class _RunContext:
             "session": session,
             "nudge": nudge,
         }
+        fingerprint = _call_fingerprint(prompt, opts, position)
+        replay_index = self._replay_indices.pop(fingerprint, None) if fingerprint else None
         error = ""
         try:
-            if call_index < self._replay_before and call_index in self._replay_results:
-                # Resume (M6.6): replay the cached result from the prior run instead
-                # of re-calling the model. Determinism (no time/random + stable
-                # call_index) makes this sound — same script+args ⇒ same call order.
-                result = self._replay_results[call_index]
+            if replay_index is not None:
+                # Resume: replay the prior run's result for this same call (same
+                # position in the same branch, same prompt and options: the
+                # fingerprint) instead of re-calling the model.
+                result = self._replay_results[replay_index]
                 ok = result is not None
                 if not ok:
                     error = "replayed a call that had already failed in the prior run"
@@ -449,7 +573,9 @@ class _RunContext:
         # Best-effort — a failing sink never breaks a run.
         if self._on_agent_result is not None:
             try:
-                self._on_agent_result(call_index, result=result, ok=ok, error=error)
+                self._on_agent_result(
+                    call_index, result=result, ok=ok, error=error, fingerprint=fingerprint
+                )
             except Exception:  # noqa: BLE001 - checkpointing must not break a run
                 pass
         self._record(
@@ -483,14 +609,56 @@ class _RunContext:
     # combinator limit preserves per-fan-out shape, the global slot is what stops
     # overlapping combinators from exceeding the cap in aggregate.
     async def parallel(self, thunks: list) -> list:
-        return await _parallel(thunks, limit=self._concurrency)
+        group = self._call_position()
+
+        def in_branch(index: int, thunk: Any) -> Callable[[], Awaitable[Any]]:
+            async def run() -> Any:
+                token = _CALL_SCOPE.set(_CallScope(self, group + (index,)))
+                try:
+                    return await _maybe_await(thunk if inspect.isawaitable(thunk) else thunk())
+                finally:
+                    _CALL_SCOPE.reset(token)
+
+            return run
+
+        branches = [in_branch(i, t) for i, t in enumerate(thunks)]
+        return await _parallel(branches, limit=self._concurrency)
 
     async def pipeline(self, items: list, *stages: Callable) -> list:
-        return await _pipeline(items, *stages, limit=self._concurrency)
+        group = self._call_position()
+        # One scope per item, shared by its stages: an item's stages run one
+        # after another, so its calls keep one ordinal sequence.
+        chains: dict[int, _CallScope] = {}
+
+        def in_chain(stage: Callable) -> Callable[[Any, Any, int], Awaitable[Any]]:
+            async def run(prev: Any, item: Any, index: int) -> Any:
+                chain = chains.setdefault(index, _CallScope(self, group + (index,)))
+                token = _CALL_SCOPE.set(chain)
+                try:
+                    return await _call_stage(stage, prev, item, index)
+                finally:
+                    _CALL_SCOPE.reset(token)
+
+            return run
+
+        return await _pipeline(items, *[in_chain(s) for s in stages], limit=self._concurrency)
+
+    def _scope(self) -> _CallScope:
+        """The scope of the branch this task runs in, or the run's root scope."""
+        scope = _CALL_SCOPE.get()
+        return scope if scope is not None and scope.owner is self else self._root_scope
+
+    def _call_position(self) -> tuple:
+        """Take the next position in the current scope (see :class:`_CallScope`)."""
+        scope = self._scope()
+        return scope.path + (scope.take(),)
 
     async def workflow(self, name: str, args: Optional[dict] = None) -> Any:
-        # Nested workflow execution lands with the registry (M5); contract present now.
-        raise NotImplementedError("nested ctx.workflow() arrives with the registry (M5)")
+        # Contract-only. ``workflow`` is not in CORE_CTX_SURFACE and no shipped host
+        # wires a ``workflow`` port, so the pre-exec surface check rejects a script
+        # that names it in the entrypoint. This stays reachable through the gap that
+        # check leaves open on purpose: a helper handed the real ctx is not scanned.
+        raise NotImplementedError("nested ctx.workflow() is not implemented")
 
     # --- progress / UI ---
     def phase(self, title: str) -> "_PhaseContextManager":
@@ -517,7 +685,7 @@ class _RunContext:
         self._record(self._stream.log(self.now, message=message))
         return _NoOpContextManager()
 
-    # --- KiroCrew-native (M4): delegate to injected port fns; clear error if a
+    # --- ports native to Kiro Crew: delegate to injected port fns; clear error if a
     #     workflow uses a primitive the host did not wire/permit for this run. ---
     def nudge(self, *, idle_secs: int, message: str, max_cycles: int = 0) -> "_NoOpContextManager":
         if self._nudge_fn is None:
@@ -565,8 +733,8 @@ class WorkflowRunner:
     ``agent_fn`` is the injected agent executor (stub in tests). ``timeout_secs``
     is the B5 wall-clock ceiling — a runaway backstop, not a data-loss event: every
     terminal path returns the agent results collected so far. ``concurrency`` bounds
-    agent calls RUN-GLOBALLY (and each ``parallel``/``pipeline`` fan-out); the caller
-    passes ``resolve_max_subagents()`` in prod, ``None`` for no limit.
+    agent calls RUN-GLOBALLY (and each ``parallel``/``pipeline`` fan-out); the
+    dashboard passes its fixed workflow cap in prod, a test ``None`` for no limit.
     """
 
     def __init__(
@@ -580,16 +748,17 @@ class WorkflowRunner:
         ports: Optional[dict] = None,
         on_complete: Optional[Callable[[], Awaitable[None]]] = None,
         pre_terminal: Optional[Callable[[], Awaitable[None]]] = None,
+        execution_guard: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
         self._agent_fn = agent_fn
         self._timeout_secs = timeout_secs
         self._max_agents = max_agents_per_run
         self._concurrency = concurrency
-        # B10 audit sink (default = real SEL) + M4 native ports (default = none wired).
+        # B10 audit sink (default = real SEL) + native ports (default = none wired).
         self._audit = _guarded_audit(audit or _default_audit)
         self._ports = ports or {}
         # Optional async teardown fired once when a background run reaches its
-        # terminal state (success/fail/cancel). Used to shut down a per-run warm
+        # terminal state (success/fail/cancel). Shuts down a per-run warm
         # session pool (agent_pool) so its warm sessions are released exactly when
         # the run ends. Best-effort — a teardown failure never changes the outcome.
         self._on_complete = on_complete
@@ -597,6 +766,7 @@ class WorkflowRunner:
         # session-bound side effects (e.g. in-flight ctx.nudge arms) can land
         # their outcome logs inside the event stream's contract (terminal last).
         self._pre_terminal = pre_terminal
+        self._execution_guard = execution_guard
 
     async def run(
         self,
@@ -617,24 +787,28 @@ class WorkflowRunner:
         author_fn: Optional[AuthorFn] = None,
         on_source: Optional[Callable[[str], None]] = None,
         on_agent_result: Optional[AgentResultFn] = None,
+        replay_fingerprints: Optional[dict] = None,
     ) -> RunResult:
         """Execute a workflow script end-to-end, returning result + event stream.
 
-        ``on_event`` (M6) is fired for every event as it is produced — lifecycle
+        ``on_event`` is fired for every event as it is produced — lifecycle
         (run_started/finished/…) AND in-script (phase/log/agent) — so a background
         registry / WS push can monitor the run live. It must never raise.
 
-        ``replay_results`` + ``replay_before`` (M6.6) drive resume / restart-subtree:
+        ``replay_results`` + ``replay_before`` drive resume / restart-subtree:
         agent calls with ``call_index < replay_before`` reuse the cached prior
         result instead of re-calling the model; calls at/after re-execute live.
 
-        ``intent`` + ``author_fn`` (M6.7) author the script *inside the run* when no
+        ``intent`` + ``author_fn`` author the script *inside the run* when no
         ``source`` is given: authoring becomes a visible "Authoring" phase whose
         progress streams to ``on_event`` (sidebar + chat) — so ``workflow_run`` can
         return a run_id instantly instead of blocking on a slow synchronous author.
         """
         args = args or {}
-        stream = EventStream(run_id)
+        # B5: the run's ONE wall-clock deadline, taken before authoring so the
+        # in-run author step and the script share the ceiling.
+        deadline = time.monotonic() + self._timeout_secs
+        stream = EventStream(run_id, clock=host_now_iso)
         events: list[WorkflowEvent] = []
 
         def emit(ev: WorkflowEvent) -> WorkflowEvent:
@@ -659,8 +833,17 @@ class WorkflowRunner:
                 "outcome": "started",
             },
         )
+        # Beside the audit, and for the same reason: this is the one place every
+        # run passes before executing anything, foreground or background
+        # (``run_background`` drives this method). ``authored`` marks a run whose
+        # script this run writes from an intent; ``replay`` marks a
+        # restart-subtree that reuses cached agent results.
+        emit_counter(
+            WORKFLOW_RUNS,
+            {"authored": bool(intent and not source), "replay": bool(replay_results)},
+        )
 
-        # 0. Author-in-run (M6.7): if we were handed an intent and no source, turn
+        # 0. Author-in-run: if we were handed an intent and no source, turn
         # the intent into a validated script HERE, as a visible "Authoring" phase.
         # This is why workflow_run(intent=…) can return a run_id instantly: the slow
         # model call(s) happen in the background run, streaming progress, not behind
@@ -678,8 +861,33 @@ class WorkflowRunner:
             def _auth_progress(msg: str) -> None:
                 emit(stream.log(now, message=msg))
 
+            # Authoring runs under the run's deadline with the same guard and the
+            # same cancellation handling the script gets in _exec_validated: a
+            # hung author ends at the ceiling, and a caller cancel is answered
+            # with a result instead of escaping run().
+            author_task: Optional["asyncio.Future[Any]"] = None
             try:
-                authored = await author_fn(intent, on_progress=_auth_progress)
+                author_task = asyncio.ensure_future(author_fn(intent, on_progress=_auth_progress))
+                done, _pending = await asyncio.wait(
+                    {author_task}, timeout=max(0.0, deadline - time.monotonic())
+                )
+                if author_task not in done:
+                    author_task.cancel()
+                    await _drain_cleanup(author_task)
+                    emit(
+                        stream.run_failed(
+                            now, error=f"run exceeded {self._timeout_secs}s", where="ceiling"
+                        )
+                    )
+                    return RunResult(run_id, ok=False, result=None, events=events, error="timeout")
+                authored = author_task.result()
+            except asyncio.CancelledError:
+                if author_task is not None:
+                    if not author_task.done():
+                        author_task.cancel()
+                    await _drain_cleanup(author_task)
+                emit(stream.run_cancelled(now, reason="cancelled"))
+                return RunResult(run_id, ok=False, result=None, events=events, error="cancelled")
             except Exception as exc:  # noqa: BLE001 - authoring failure → failed run
                 emit(stream.run_failed(now, error=f"authoring error: {exc!r}", where="author"))
                 return RunResult(
@@ -715,6 +923,7 @@ class WorkflowRunner:
                 )
             return await self._exec_validated(
                 source,
+                deadline=deadline,
                 run_id=run_id,
                 now=now,
                 args=args,
@@ -729,6 +938,7 @@ class WorkflowRunner:
                 events=events,
                 emit=emit,
                 on_agent_result=on_agent_result,
+                replay_fingerprints=replay_fingerprints,
             )
 
         # 1. Validate (B-group static). A bad script fails before any exec.
@@ -752,6 +962,7 @@ class WorkflowRunner:
         )
         return await self._exec_validated(
             source,
+            deadline=deadline,
             run_id=run_id,
             now=now,
             args=args,
@@ -766,12 +977,14 @@ class WorkflowRunner:
             events=events,
             emit=emit,
             on_agent_result=on_agent_result,
+            replay_fingerprints=replay_fingerprints,
         )
 
     async def _exec_validated(
         self,
         source: str,
         *,
+        deadline: float,
         run_id: str,
         now: str,
         args: dict,
@@ -786,10 +999,13 @@ class WorkflowRunner:
         events: list[WorkflowEvent],
         emit: Callable[[WorkflowEvent], WorkflowEvent],
         on_agent_result: Optional[AgentResultFn] = None,
+        replay_fingerprints: Optional[dict] = None,
     ) -> RunResult:
         """Build the run context, exec the (already validated) script under the
         wall-clock guard, and emit the terminal event. Shared by the source-given
         and the author-in-run paths; assumes ``run_started`` was already emitted.
+        *deadline* is the run's ``time.monotonic()`` deadline, taken when
+        :meth:`run` starts, so the script gets only what authoring left of it.
         """
         # Defense-in-depth: re-validate before exec so a future refactor that
         # bypasses the caller's validate() step cannot reach exec unchecked.
@@ -845,26 +1061,34 @@ class WorkflowRunner:
             replay_results=replay_results,
             replay_before=replay_before,
             on_agent_result=on_agent_result,
+            replay_fingerprints=replay_fingerprints,
         )
+        ctx._execution_guard = self._execution_guard
         ctx._events = events  # share the sink so phase/log/agent events land in order
         safe_globals = build_safe_globals(ctx)
 
-        async def _pre_terminal() -> None:
+        async def _pre_terminal() -> bool:
             """Drain session-bound side effects (ctx.nudge arms) BEFORE the
             terminal event: the event-stream contract says terminal events are
             last, so outcome logs must precede run_finished/failed/cancelled.
             Best-effort — teardown must never mask the run outcome."""
             if self._pre_terminal is not None:
                 try:
-                    await self._pre_terminal()
+                    return await _drain_cleanup(asyncio.ensure_future(self._pre_terminal()))
                 except Exception:  # noqa: BLE001
                     pass
+            return False
 
-        # 3. exec the module (defines `workflow`) then await it under a wall clock.
+        # 3. Execute the statically validated module in the B7 restricted namespace,
+        # then await it under a wall clock. This is the engine's sole execution boundary.
         started = time.monotonic()
         task: Optional["asyncio.Task[Any]"] = None
         try:
-            exec(compile(source, f"<workflow:{run_id}>", "exec"), safe_globals)  # noqa: S102  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
+            if self._execution_guard is not None:
+                await self._execution_guard()
+            exec(  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
+                compile(source, f"<workflow:{run_id}>", "exec"), safe_globals
+            )  # noqa: S102
             entry = safe_globals.get("workflow")
             if entry is None:
                 raise RuntimeError("script defines no 'workflow' coroutine")
@@ -877,15 +1101,16 @@ class WorkflowRunner:
             # ``run_failed`` (where="ceiling") instead of propagating cancellation.
             run_task: "asyncio.Task[Any]" = asyncio.ensure_future(entry(ctx))
             task = run_task  # keep an outer ref for the cancel handler below
-            done, _pending = await asyncio.wait({run_task}, timeout=self._timeout_secs)
+            # What is left of the run's deadline: authoring, when it ran, already
+            # spent its share, so the script never gets a second full ceiling.
+            done, _pending = await asyncio.wait(
+                {run_task}, timeout=max(0.0, deadline - time.monotonic())
+            )
             if run_task not in done:
                 # Runaway: cancel it and drain its cancellation quietly so no
                 # CancelledError escapes and no "task was destroyed" warning fires.
                 run_task.cancel()
-                try:
-                    await run_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+                await _drain_cleanup(run_task)
                 await _pre_terminal()
                 emit(
                     stream.run_failed(
@@ -903,11 +1128,15 @@ class WorkflowRunner:
                     source=source,
                 )
             result = run_task.result()  # re-raises the script's own exception, if any
+            if self._execution_guard is not None:
+                await self._execution_guard()
         except asyncio.CancelledError:
-            # The RUN itself was cancelled by our caller (not a timeout) — stop the
-            # in-flight script and report it as cancelled.
-            if task is not None and not task.done():
-                task.cancel()
+            # Drain owned work before publishing a terminal event, including any
+            # cleanup logs/checkpoints and exceptions raised during cancellation.
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await _drain_cleanup(task)
             await _pre_terminal()
             emit(stream.run_cancelled(now, reason="cancelled"))
             return RunResult(
@@ -948,7 +1177,20 @@ class WorkflowRunner:
             )
 
         duration = time.monotonic() - started
-        await _pre_terminal()
+        if await _pre_terminal():
+            # The script returned, but no terminal outcome had been published.
+            # Cleanup has already settled; do not invoke its hook a second time.
+            emit(stream.run_cancelled(now, reason="cancelled"))
+            return RunResult(
+                run_id,
+                ok=False,
+                result=None,
+                events=events,
+                error="cancelled",
+                agent_results=dict(ctx.agent_results),
+                agent_errors=dict(ctx.agent_errors),
+                source=source,
+            )
         emit(stream.run_finished(now, result=result, duration_s=duration))
         # B10: record successful completion with a result hash (never the raw data).
         self._audit(
@@ -988,20 +1230,29 @@ class WorkflowRunner:
         author: str = "",
         replay_results: Optional[dict] = None,
         replay_before: int = 0,
+        replay_fingerprints: Optional[dict] = None,
+        source_is_original: bool = True,
+        execution_binding_version: int = 0,
+        execution_context: Any = None,
+        memory_mode: str = "persistent",
+        workflow_id: str = "",
+        workflow_slug: str = "",
+        workflow_revision: int = 0,
         intent: str = "",
         author_fn: Optional[AuthorFn] = None,
+        admission_closed: Optional[Callable[[], bool]] = None,
     ) -> str:
-        """Start this workflow as a BACKGROUND run tracked in ``registry`` (M6).
+        """Start this workflow as a BACKGROUND run tracked in ``registry``.
 
         Returns the ``run_id`` immediately; the run drives on the event loop and
         streams its events into the registry handle (so chat MCP tools and the
         Workflows tab can monitor/cancel it by id). On terminal state the registry
-        fires its ``on_done`` (M6.4 result-to-chat injection).
+        fires its ``on_done`` (result-to-chat injection).
 
-        ``replay_results``/``replay_before`` (M6.6) let a restart-subtree re-run
+        ``replay_results``/``replay_before`` let a restart-subtree re-run
         replay the unchanged prefix from a prior run's cached agent results.
 
-        ``intent``/``author_fn`` (M6.7): when ``source`` is empty, the script is
+        ``intent``/``author_fn``: when ``source`` is empty, the script is
         authored *inside* the run (a visible "Authoring" phase) so this returns a
         run_id instantly instead of blocking on a slow synchronous author. The
         authored script is written back onto the handle for rerun/restart.
@@ -1015,7 +1266,7 @@ class WorkflowRunner:
                 h.source = src
                 # Durably checkpoint the script now so an authored-in-run
                 # workflow's source survives a restart even before it finishes.
-                persist = getattr(registry, "persist", None)
+                persist = getattr(registry, "persist_soon", None)
                 if persist is not None:
                     try:
                         persist(run_id)
@@ -1023,7 +1274,12 @@ class WorkflowRunner:
                         pass
 
         def _checkpoint_agent_result(
-            call_index: int, *, result: Any, ok: bool = True, error: str = ""
+            call_index: int,
+            *,
+            result: Any,
+            ok: bool = True,
+            error: str = "",
+            fingerprint: str = "",
         ) -> None:
             """Record ONE settled agent call on the run handle the moment it lands.
 
@@ -1034,12 +1290,22 @@ class WorkflowRunner:
             it lands lets the terminal paths read them back and the terminal
             transition flush them to disk. A hard kill of the gateway mid-run can
             still lose whatever no write has covered yet.
+
+            The call's ``fingerprint`` is recorded with its result, so a run the
+            gateway's restart interrupted can still be restarted with replay.
             """
             record = getattr(registry, "record_agent_result", None)
             if record is None:  # pragma: no cover - registry always provides it
                 return
             try:
-                record(run_id, call_index, result=result, ok=ok, error=error)
+                record(
+                    run_id,
+                    call_index,
+                    result=result,
+                    ok=ok,
+                    error=error,
+                    fingerprint=fingerprint,
+                )
             except Exception:  # noqa: BLE001 - checkpointing must never break a run
                 pass
 
@@ -1064,6 +1330,7 @@ class WorkflowRunner:
                     author_fn=author_fn,
                     on_source=_publish_source,
                     on_agent_result=_checkpoint_agent_result,
+                    replay_fingerprints=replay_fingerprints,
                 )
             finally:
                 # Fire per-run teardown (e.g. warm-pool shutdown) on EVERY exit —
@@ -1071,7 +1338,7 @@ class WorkflowRunner:
                 # released. Best-effort: never let teardown mask the run outcome.
                 if self._on_complete is not None:
                     try:
-                        await self._on_complete()
+                        await _drain_cleanup(asyncio.ensure_future(self._on_complete()))
                     except Exception:  # noqa: BLE001 - teardown must not mask outcome
                         pass
             # Belt-and-suspenders: ensure the final source is on the handle even if
@@ -1098,5 +1365,13 @@ class WorkflowRunner:
             author=author,
             session_key=session_key,
             source=source,
+            source_is_original=source_is_original,
+            execution_binding_version=execution_binding_version,
+            execution_context=execution_context,
+            memory_mode=memory_mode,
             args=args or {},
+            workflow_id=workflow_id,
+            workflow_slug=workflow_slug,
+            workflow_revision=workflow_revision,
+            admission_closed=admission_closed,
         )

@@ -56,6 +56,7 @@ import subprocess
 from collections.abc import Awaitable, Callable
 
 from kiro_crew import platform_compat
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger("kiro_crew.dashboard.port_reclaim")
 
@@ -84,10 +85,16 @@ def _listeners_on_port(port: int) -> list[int] | None:
         if not platform_compat.listening_pid_tool_available():
             return None
         return platform_compat.find_listening_pids(port)
+    # Resolve lsof from the trusted system directories, never from PATH: a
+    # same-uid-writable dir leading PATH could otherwise substitute the tool
+    # whose output decides which PIDs get signalled.
+    lsof_bin = platform_compat.trusted_system_bin("lsof")
+    if lsof_bin is None:
+        return None
     try:
         out = subprocess.check_output(
-            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            text=True,
+            [lsof_bin, "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            **UTF8_TEXT,
             stderr=subprocess.DEVNULL,
             timeout=5,
         ).strip()

@@ -5,11 +5,19 @@ const {
   channelForFlavor,
   channelForVersion,
   resolveChannel,
+  isNewerVersion,
+  shouldAutoOffer,
   buildFeedBase,
   configureUpdater,
+  readExternallyManaged,
   DEFAULT_FEED_BASE,
   SUPPORTED_PLATFORMS,
+  resolveMacDistArch,
+  manualDownloadUrl,
+  DOWNLOAD_BASE,
 } = require("../auto-update");
+
+const { makeDeps } = require("./auto-update-test-helpers");
 
 // ---------------------------------------------------------------------------
 // Pure channel helpers (unchanged surface from the hand-rolled updater).
@@ -58,11 +66,125 @@ test("resolveChannel: production stamps follow the preference when set", () => {
   assert.strictEqual(resolveChannel("insider", "stable"), "stable");
 });
 
-test("resolveChannel: no/invalid preference falls back to the stamp", () => {
+test("resolveChannel: no/invalid preference defaults to STABLE, not to the stamp", () => {
+  // A stable release is PROMOTED, not rebuilt: the stable and insider downloads
+  // of a promoted version are the same file carrying the same prerelease stamp,
+  // so the stamp cannot say which feed to follow. Insider is an explicit opt-in.
   assert.strictEqual(resolveChannel("stable", ""), "stable");
-  assert.strictEqual(resolveChannel("insider", undefined), "insider");
+  assert.strictEqual(resolveChannel("insider", undefined), "stable");
   assert.strictEqual(resolveChannel("stable", "nightly"), "stable"); // nightly is not a valid opt-in
-  assert.strictEqual(resolveChannel("insider", "bogus"), "insider");
+  assert.strictEqual(resolveChannel("insider", "bogus"), "stable");
+});
+
+test("a promoted -insider.N build with no preference follows the STABLE feed", async () => {
+  // The regression this exists for: promoting 0.3.0 publishes the insider
+  // candidate's exact bytes to stable, so every stable install would otherwise
+  // read its own version stamp and migrate itself onto the insider feed.
+  const { deps, calls } = makeDeps({ appVersion: "0.3.0-insider.13" });
+  deps.getChannelPreference = () => "";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(calls.setFeedURL.length >= 1);
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/stable/"),
+    `expected stable feed urls, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().channel, "stable");
+});
+
+test("an explicit insider preference still selects insider on promoted bytes", async () => {
+  const { deps, calls } = makeDeps({ appVersion: "0.3.0-insider.13" });
+  deps.getChannelPreference = () => "insider";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/insider/"),
+    `expected insider feed urls, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().channel, "insider");
+});
+
+// ---------------------------------------------------------------------------
+// Single-arch macOS builds follow their OWN feed directory. electron-updater
+// names the channel file from the platform alone on darwin (latest-mac.yml,
+// no arch suffix), so feed/<channel>/<arch>/ -- the directory
+// sign-and-notarize.yml's mac_variant legs write -- is the only seam, and the
+// universal build (no stamp) must keep reading the channel root untouched.
+// ---------------------------------------------------------------------------
+
+test("a universal mac build (no stamp) reads the channel root, as before", async () => {
+  const { deps, calls } = makeDeps({ appVersion: "1.0.0" });
+  deps.macDistArch = "";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(calls.setFeedURL.length >= 1);
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/stable/"),
+    `expected the universal channel root, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().downloadUrl, `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew.dmg`);
+});
+
+test("an arm64-only mac build reads feed/<channel>/arm64/ and is offered its own DMG", async () => {
+  const { deps, calls } = makeDeps({ appVersion: "1.0.0" });
+  deps.macDistArch = "arm64";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(calls.setFeedURL.length >= 1);
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/stable/arm64/"),
+    `expected the arm64 feed directory, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().downloadUrl, `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-arm64.dmg`);
+});
+
+test("an x64-only mac build reads feed/<channel>/x64/ whatever the host arch says", async () => {
+  // An x64-only app under Rosetta on Apple Silicon still reports the BUILD's
+  // arch: the feed it follows is a property of the bytes on disk, not the CPU.
+  const { deps, calls } = makeDeps({ appVersion: "1.0.0" });
+  deps.macDistArch = "x64";
+  deps.osArch = "arm64";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/stable/x64/"),
+    `expected the x64 feed directory, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().downloadUrl, `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-x64.dmg`);
+});
+
+test("manualDownloadUrl: the mac DMG follows the BUILD arch, not the host arch", () => {
+  assert.strictEqual(
+    manualDownloadUrl("nightly", "darwin", "arm64", "", ""),
+    `${DOWNLOAD_BASE}/desktop/nightly/latest/KiroCrew.dmg`,
+  );
+  assert.strictEqual(
+    manualDownloadUrl("nightly", "darwin", "arm64", "", "arm64"),
+    `${DOWNLOAD_BASE}/desktop/nightly/latest/KiroCrew-arm64.dmg`,
+  );
+  assert.strictEqual(
+    manualDownloadUrl("nightly", "darwin", "arm64", "", "x64"),
+    `${DOWNLOAD_BASE}/desktop/nightly/latest/KiroCrew-x64.dmg`,
+  );
+  // The stamp is mac-only: a Linux install never grows a mac suffix from it.
+  assert.strictEqual(
+    manualDownloadUrl("stable", "linux", "x64", "", "arm64"),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-x86_64.AppImage`,
+  );
+});
+
+test("resolveMacDistArch: the stamp, and nothing but the two known values", () => {
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "arm64" }) }), "arm64");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "x64" }) }), "x64");
+  // Unstamped = universal. So is anything the build never writes: an unknown
+  // value or an unreadable package.json must fall back to the universal feed
+  // (which every mac install can run), never throw on the update path.
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({}) }), "");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "universal" }) }), "");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "x86_64" }) }), "");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => { throw new Error("boom"); } }), "");
+  // The repo's own package.json carries no stamp: a dev run is universal.
+  assert.strictEqual(resolveMacDistArch(), "");
 });
 
 // ---------------------------------------------------------------------------
@@ -164,6 +286,300 @@ test("configureUpdater: allowDowngrade=true (difference-based gate: retraction +
   assert.strictEqual(updater.allowDowngrade, true);
 });
 
+// ---------------------------------------------------------------------------
+// Downgrade-nag guard: allowDowngrade=true means the library reports
+// "available" for ANY feed version that differs from the running one, so a
+// build running AHEAD of its channel's published latest gets nagged to install
+// an OLDER build. isNewerVersion + shouldAutoOffer are the direction gate that
+// suppresses that automatic path while leaving deliberate channel switches and
+// explicit downloads alone.
+// ---------------------------------------------------------------------------
+
+test("isNewerVersion: strictly-greater release core is newer, older/equal is not", () => {
+  assert.strictEqual(isNewerVersion("0.5.0", "0.3.0"), true);
+  assert.strictEqual(isNewerVersion("0.3.0", "0.5.0"), false); // the reported bug
+  assert.strictEqual(isNewerVersion("1.0.0", "1.0.0"), false);
+});
+
+test("isNewerVersion understands the prerelease stamps this app ships", () => {
+  // A prerelease sorts BELOW its release core; a higher core wins regardless.
+  assert.strictEqual(isNewerVersion("0.3.0-insider.13", "0.3.0"), false);
+  assert.strictEqual(isNewerVersion("0.3.0", "0.3.0-insider.13"), true);
+  assert.strictEqual(isNewerVersion("0.5.0-nightly.20260801t000000", "0.3.0"), true);
+});
+
+test("isNewerVersion: unrankable input is null (fail-open, never a false 'not newer')", () => {
+  assert.strictEqual(isNewerVersion("", "1.0.0"), null);
+  assert.strictEqual(isNewerVersion("1.0.0", undefined), null);
+});
+
+test("shouldAutoOffer: same-channel downgrade is NOT offered (the fix)", () => {
+  // Exactly the reported case: a stable-stamped 0.5.0 following the stable feed
+  // whose latest published build is 0.3.0.
+  assert.strictEqual(
+    shouldAutoOffer({
+      candidate: "0.3.0",
+      current: "0.5.0",
+      followedChannel: "stable",
+      defaultChannel: "stable",
+    }),
+    false,
+  );
+});
+
+test("shouldAutoOffer: same-channel upgrade IS offered", () => {
+  assert.strictEqual(
+    shouldAutoOffer({
+      candidate: "0.6.0",
+      current: "0.5.0",
+      followedChannel: "stable",
+      defaultChannel: "stable",
+    }),
+    true,
+  );
+});
+
+test("shouldAutoOffer: a deliberate channel switch is exempt (followed != default lane)", () => {
+  // The user's explicit preference moved this install OFF its default lane
+  // (stable -> insider): landing on an older build of the chosen channel is the
+  // intended, user-initiated outcome allowDowngrade exists for.
+  assert.strictEqual(
+    shouldAutoOffer({
+      candidate: "0.3.0-insider.4",
+      current: "0.5.0",
+      followedChannel: "insider",
+      defaultChannel: "stable",
+    }),
+    true,
+  );
+});
+
+test("shouldAutoOffer: promoted-stable bytes are NOT read as a switch (byte-stamp trap)", () => {
+  // A promoted stable build carries the insider stamp, but with no preference it
+  // follows stable and its DEFAULT lane is also stable, so followed == default:
+  // it is a same-channel install and a lower feed version must NOT be offered.
+  // (Keying on the raw stamp — insider — would wrongly exempt it.)
+  assert.strictEqual(
+    shouldAutoOffer({
+      candidate: "0.3.0",
+      current: "0.5.0-insider.20",
+      followedChannel: "stable",
+      defaultChannel: "stable",
+    }),
+    false,
+  );
+});
+
+test("shouldAutoOffer: an unrankable version is offered (fail-open, no silent hide)", () => {
+  assert.strictEqual(
+    shouldAutoOffer({
+      candidate: "garbage",
+      current: "0.5.0",
+      followedChannel: "stable",
+      defaultChannel: "stable",
+    }),
+    true,
+  );
+});
+
+test("guard: a same-channel downgrade neither nags nor auto-downloads", async () => {
+  // Reproduces the screenshots: stable-stamped 0.5.0 on the stable feed, feed
+  // latest is 0.3.0, auto-download ON. The pre-fix behavior downloaded 0.3.0
+  // and popped "Update ready"; the guard must report up to date instead.
+  const seen = [];
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "0.5.0" });
+  deps.getAutoDownloadPreference = () => true;
+  deps.notifyUpdateFound = (v, o) => seen.push([v, o]);
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.3.0", releaseNotes: "older" });
+  assert.strictEqual(calls.downloadUpdate, 0, "a same-channel downgrade must never auto-download");
+  assert.deepStrictEqual(seen, [], "a same-channel downgrade must never fire the OS nudge");
+  assert.ok(!states.some((s) => s.state === "found"), "must not surface a 'found' downgrade");
+  assert.strictEqual(states.at(-1).state, "not-available", "reports up to date instead");
+});
+
+test("guard: a same-channel UPGRADE still auto-downloads (no regression)", async () => {
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "0.5.0" });
+  deps.getAutoDownloadPreference = () => true;
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.6.0", releaseNotes: "newer" });
+  assert.strictEqual(calls.downloadUpdate, 1, "a real upgrade must still download");
+  assert.ok(states.some((s) => s.state === "found"), "a real upgrade must still surface 'found'");
+});
+
+test("guard: a prerelease-stamped build ahead of stable is NOT nagged (byte-stamp trap)", async () => {
+  // The regression both local reviewers caught: an insider-STAMPED build
+  // (0.5.0-insider.20) with no channel preference follows the STABLE feed by
+  // default. channelForVersion() reports 'insider' for the bytes, but the
+  // install is a plain stable follower running ahead of the stable feed's 0.3.0.
+  // Keying the switch exemption on the raw stamp would treat followed=stable !=
+  // stamped=insider as a deliberate switch and re-open the downgrade nag; keying
+  // it on the DEFAULT lane (also stable) correctly reads it as same-channel.
+  const seen = [];
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "0.5.0-insider.20" });
+  deps.getAutoDownloadPreference = () => true;
+  deps.notifyUpdateFound = (v, o) => seen.push([v, o]);
+  // No getChannelPreference override -> defaults to "" -> follows stable.
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.3.0", releaseNotes: "older stable" });
+  assert.strictEqual(calls.downloadUpdate, 0, "a promoted/ahead build must not auto-download a downgrade");
+  assert.deepStrictEqual(seen, [], "no OS nudge for a byte-stamp-only channel mismatch");
+  assert.ok(!states.some((s) => s.state === "found"), "must not surface a 'found' downgrade");
+  assert.strictEqual(states.at(-1).state, "not-available");
+});
+
+// The feed's answer is the ONLY honest input for "which lane are these bytes
+// from", because promotion re-points the soaked candidate's file at stable
+// without re-stamping it: the stable feed's release is literally
+// `0.4.1-insider.1`, so channelForVersion() reports `insider` for a stable
+// install. The display layer therefore reads `laneVersion` /
+// `runningAheadOfLane` instead, and the About panel's version chip and
+// "you are on a prerelease" note key on those. The auto-offer guard above is
+// deliberately NOT keyed on them -- suppressing an unsolicited downgrade is a
+// separate decision from labelling the running build honestly.
+test("records what the followed lane publishes, so an ahead build is not mislabelled", async () => {
+  const { deps, emit } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => "stable";
+  const u = initAutoUpdate(deps);
+  // Before any check the answer is UNKNOWN, never "ahead": a boot-time panel
+  // must not un-fold every promoted-stable version on a comparison never made.
+  assert.strictEqual(u.getInfo().laneVersion, "");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, null);
+
+  await u.check();
+  // The stable lane's current release, which the direction gate then (correctly)
+  // declines to auto-offer -- the version must survive that suppression.
+  emit("update-available", { version: "0.4.1-insider.1" });
+  assert.strictEqual(u.getInfo().laneVersion, "0.4.1-insider.1");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, true);
+});
+
+test("a lane that publishes exactly the running build reports not-ahead", async () => {
+  // The promoted-stable population: prerelease-STAMPED bytes that ARE the stable
+  // release. `update-not-available` fires because the feed matches the running
+  // version, which is what makes this a definite false rather than an unknown.
+  const { deps, emit } = makeDeps({ appVersion: "0.4.1-insider.1" });
+  deps.getChannelPreference = () => "stable";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-not-available", { version: "0.4.1-insider.1" });
+  assert.strictEqual(u.getInfo().laneVersion, "0.4.1-insider.1");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, false);
+});
+
+test("a build running BEHIND its lane is not ahead of it", async () => {
+  const { deps, emit } = makeDeps({ appVersion: "0.4.0-insider.14" });
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.4.1-insider.1" });
+  assert.strictEqual(u.getInfo().runningAheadOfLane, false);
+});
+
+test("lifecycle payloads carry the lane pair, so a push-driven renderer agrees with getInfo", async () => {
+  const { deps, emit, states } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => "stable";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.4.1-insider.1" });
+  const last = states.at(-1);
+  assert.strictEqual(last.laneVersion, "0.4.1-insider.1");
+  assert.strictEqual(last.runningAheadOfLane, true);
+});
+
+test("a lane answer is dropped once the install follows a different channel", async () => {
+  // Design review caught this: `update:set-channel` stores the preference and
+  // returns getInfo() SYNCHRONOUSLY while its re-check is still in flight, so a
+  // retained answer from the old lane gets paired with the new channel. On an
+  // up-to-date insider build flipped to stable, a kept `runningAheadOfLane: false`
+  // says "these bytes ARE the stable release" -- folding the chip to a version
+  // that does not exist and suppressing the prerelease ask, i.e. the very bug the
+  // lane pair exists to fix, for as long as the next check keeps failing.
+  let preference = "insider";
+  const { deps, emit } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => preference;
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-not-available", { version: "0.5.0-insider.2" });
+  assert.strictEqual(u.getInfo().runningAheadOfLane, false, "insider lane publishes these bytes");
+
+  // The switcher flips. No check has completed for stable yet.
+  preference = "stable";
+  assert.strictEqual(u.getInfo().laneVersion, "", "the insider answer does not describe stable");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, null, "unknown, never a stale false");
+});
+
+test("a lane answer is attributed to the lane whose feed was fetched, not to a later flip", async () => {
+  // Mirror of shouldAutoOffer's feedChannel rule: if the preference changes while
+  // a check is in flight, the answer that comes back describes the OLD lane.
+  let preference = "stable";
+  const { deps, emit } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => preference;
+  const u = initAutoUpdate(deps);
+  await u.check(); // feed configured for stable
+  preference = "insider"; // user flips mid-flight
+  emit("update-available", { version: "0.4.1-insider.1" }); // ...stable's answer arrives
+  assert.strictEqual(u.getInfo().laneVersion, "", "not reported as the insider lane's answer");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, null);
+});
+
+test("guard: an EXPLICIT channel switch off the default lane is still offered", async () => {
+  // Stable-stamped build whose user explicitly picked insider: the preference
+  // moves it off its default (stable) lane, so a lower insider build is a
+  // deliberate switch and must still be offered.
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "0.5.0" });
+  deps.getAutoDownloadPreference = () => true;
+  deps.getChannelPreference = () => "insider";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.4.0-insider.1", releaseNotes: "insider lane" });
+  assert.strictEqual(calls.downloadUpdate, 1, "a deliberate channel switch must still download");
+  assert.ok(states.some((s) => s.state === "found"), "a deliberate switch must surface 'found'");
+});
+
+test("guard: a channel flip mid-check does not authorize a stale-feed downgrade (TOCTOU)", async () => {
+  // The GPT [BLOCK-MERGE] on #6011: an in-flight STABLE check, then the user
+  // picks insider before the response lands. The candidate (0.3.0) came from
+  // the stable feed the check configured; the guard must compare against THAT
+  // captured lane (feedChannel), not the now-insider live preference. A live
+  // read would make followedChannel=insider != default=stable, wrongly treat
+  // the stable downgrade as a deliberate insider switch, and stage it.
+  let pref = "";
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "0.5.0" });
+  deps.getAutoDownloadPreference = () => true;
+  deps.getChannelPreference = () => pref;
+  const u = initAutoUpdate(deps);
+  await u.check(); // configureFeed() captures feedChannel = "stable"
+  pref = "insider"; // user flips the switcher while the check is in flight
+  emit("update-available", { version: "0.3.0", releaseNotes: "stale stable feed" });
+  assert.strictEqual(calls.downloadUpdate, 0, "a stale-feed downgrade must not download after a mid-check channel flip");
+  assert.ok(!states.some((s) => s.state === "found"), "must not surface a 'found' downgrade");
+  assert.strictEqual(states.at(-1).state, "not-available");
+});
+
+test("guard: a stage armed for a downgrade is discarded and disarmed", async () => {
+  // A 0.3.0 stage carried over (from before the fix, or a race): a later check
+  // that re-reports 0.3.0 on the same channel must drop it so it cannot install
+  // on the next quit.
+  const { deps, emit, states, appRemoved } = makeDeps({ appVersion: "0.5.0" });
+  deps.getAutoDownloadPreference = () => true;
+  const u = initAutoUpdate(deps);
+  await u.check();
+  // Force a staged state by driving the downloaded event directly.
+  emit("update-downloaded", { version: "0.3.0" });
+  assert.strictEqual(u.isReady(), true, "precondition: a stage exists");
+  states.length = 0;
+  emit("update-available", { version: "0.3.0" });
+  assert.strictEqual(u.isReady(), false, "the downgrade stage must be discarded");
+  assert.ok(
+    appRemoved.some((r) => r.ev === "before-quit"),
+    "the deferred-install-on-quit hook must be removed",
+  );
+  assert.strictEqual(states.at(-1).state, "not-available");
+});
+
 test("configureUpdater: allowPrerelease=true (nightly/insider stamps are semver prereleases)", () => {
   const updater = {};
   configureUpdater(updater);
@@ -199,64 +615,17 @@ test("CONTRACT: relative channel-file names resolve under the feed base director
 });
 
 // ---------------------------------------------------------------------------
-// initAutoUpdate fixture: fake electron-updater AppUpdater (EventEmitter-like,
-// recording setFeedURL / checkForUpdates / downloadUpdate / quitAndInstall)
-// plus fake electron app/dialog/Notification. Platform comes in through the
-// injected osPlatform dep -- no process.platform mutation needed.
+// Logger wiring contract: a provided `log` dep must become autoUpdater.logger,
+// verbatim. This is what routes electron-updater's own lifecycle/error output
+// through the caller's sink -- if the assignment drifts, a packaged app's
+// update diagnostics silently fall back to console and are lost.
 // ---------------------------------------------------------------------------
 
-function makeDeps(opts = {}) {
-  const {
-    appVersion = "1.0.0",
-    osPlatform = "darwin",
-    isPackaged = true,
-    // Bundle location seams. Default to a normal /Applications install so every
-    // pre-existing test keeps arming the updater; the bundle-location guard
-    // tests below drive these to the refused states.
-    resourcesPath = "/Applications/Kiro Crew.app/Contents/Resources",
-    bundleWritable = true,
-  } = opts;
-  const calls = { setFeedURL: [], checkForUpdates: 0, downloadUpdate: 0, quitAndInstall: [] };
-  const handlers = {};
-  const states = [];
-  const appOnce = [];
-  const appRemoved = [];
-  const autoUpdater = {
-    setFeedURL: (o) => calls.setFeedURL.push(o),
-    checkForUpdates: async () => { calls.checkForUpdates += 1; },
-    downloadUpdate: async () => { calls.downloadUpdate += 1; },
-    quitAndInstall: (...args) => calls.quitAndInstall.push(args),
-    on: (ev, fn) => { handlers[ev] = fn; },
-  };
-  const deps = {
-    app: {
-      isPackaged,
-      getVersion: () => appVersion,
-      once: (ev, fn) => appOnce.push({ ev, fn }),
-      removeListener: (ev, fn) => appRemoved.push({ ev, fn }),
-      // Must exist: the force-exit failsafe timer (unref'd but still live)
-      // calls app.exit(0) if the suite outlives it; without this stub it
-      // would fall through to process.exit and kill the test runner.
-      exit: () => {},
-    },
-    autoUpdater,
-    dialog: { showMessageBox: async () => ({ response: 1 }) },
-    Notification: function () { return { show: () => {} }; },
-    getFlavor: () => "stable",
-    stopGateway: async () => {},
-    osPlatform,
-    resourcesPath,
-    // Stubbed so the writable-vs-read-only axis is decided by the test, not by
-    // whatever the host filesystem happens to allow.
-    probeBundleWritable: () => bundleWritable,
-    feedBase: "https://cdn.example.dev/feed",
-    onUpdateState: (s) => states.push(s),
-    log: { info: () => {}, warn: () => {}, error: () => {} },
-  };
-  const emit = (ev, payload) => handlers[ev] && handlers[ev](payload);
-  const stateNames = () => states.map((s) => s.state);
-  return { deps, calls, handlers, emit, states, stateNames, appOnce, appRemoved };
-}
+test("initAutoUpdate wires the provided log dep as autoUpdater.logger", () => {
+  const { deps } = makeDeps();
+  initAutoUpdate(deps);
+  assert.strictEqual(deps.autoUpdater.logger, deps.log);
+});
 
 // ---------------------------------------------------------------------------
 // #709 regression guard: every state that renders a version must report the
@@ -366,12 +735,12 @@ test("#709 contract: the library adds its own no-cache query when no headers are
     "isAddNoCacheQuery is gone -- the client-side cache-bust that replaced our feedNonce no longer exists",
   );
 });
-// win32 has none yet (#598) and must come back disabled -- WITHOUT touching
-// the updater at all. Dev (unpackaged) builds have no update lane either.
+// Dev (unpackaged) builds have no update lane, and must come back disabled
+// WITHOUT touching the updater at all.
 // ---------------------------------------------------------------------------
 
-test("SUPPORTED_PLATFORMS is exactly {darwin, linux}", () => {
-  assert.deepStrictEqual([...SUPPORTED_PLATFORMS].sort(), ["darwin", "linux"]);
+test("SUPPORTED_PLATFORMS is exactly {darwin, linux, win32}", () => {
+  assert.deepStrictEqual([...SUPPORTED_PLATFORMS].sort(), ["darwin", "linux", "win32"]);
 });
 
 test("darwin initialises the updater (not disabled)", () => {
@@ -390,15 +759,61 @@ test("linux initialises the updater (not disabled)", () => {
   assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
 });
 
-test("win32 returns disabled:'platform' and never touches the updater", () => {
-  const { deps, calls } = makeDeps({ osPlatform: "win32" });
+// A nightly-stamped version, kept because these cases were written against one.
+// Windows now publishes on every known channel, so the choice no longer matters;
+// the stable case is asserted separately below.
+const WIN_NIGHTLY = "1.0.0-nightly.20260817t170500";
+
+test("win32 initialises the updater (not disabled)", () => {
+  const { deps, calls } = makeDeps({ osPlatform: "win32", appVersion: WIN_NIGHTLY });
   const u = initAutoUpdate(deps);
-  assert.strictEqual(u.disabled, "platform");
-  assert.strictEqual(calls.setFeedURL.length, 0);
-  assert.strictEqual(deps.autoUpdater.autoDownload, undefined, "policy flags must not be applied");
-  // The disabled surface must still be safely callable.
-  assert.strictEqual(typeof u.check, "function");
-  assert.strictEqual(typeof u.getInfo, "function");
+  assert.strictEqual(u.disabled, undefined);
+  assert.ok(calls.setFeedURL.length >= 1, "feed must be configured at init");
+  assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
+});
+
+// autoInstallOnAppQuit stays false on every platform, and off darwin that flag
+// is what keeps BaseUpdater from registering a quit handler. On win32 that
+// matters more than on Linux: NsisUpdater's quit handler would spawn the NSIS
+// installer while the Python gateway is still running, so the deliberate
+// stop-gateway-then-install ordering in applyUpdateAndRestart is the only path
+// that may install.
+test("win32 never arms install-on-quit", () => {
+  const { deps } = makeDeps({ osPlatform: "win32", appVersion: WIN_NIGHTLY });
+  initAutoUpdate(deps);
+  assert.strictEqual(deps.autoUpdater.autoInstallOnAppQuit, false);
+});
+
+// Stable now publishes Windows too, by promoting the verified bundle's installer
+// rather than rebuilding it. Windows therefore carries no channel restriction of
+// its own, and this case exists to keep that from silently regressing.
+test("win32 on stable arms the updater like every other channel", () => {
+  const { deps, calls } = makeDeps({ osPlatform: "win32", appVersion: "1.0.0" });
+  const u = initAutoUpdate(deps);
+  assert.strictEqual(u.disabled, undefined);
+  assert.ok(calls.setFeedURL.length >= 1, "feed must be configured at init");
+  assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
+});
+
+// NOT tested here, deliberately: the disabled:"channel" branch in initAutoUpdate
+// is currently UNREACHABLE. currentChannel() runs the preference through
+// resolveChannel, which falls back to the version-stamped channel for anything it
+// does not recognise, so it can only ever return a member of KNOWN_CHANNELS. The
+// branch is kept as a fail-closed guard for the day a channel is added to
+// KNOWN_CHANNELS before its publish lane exists -- arming an updater against a
+// feed nobody wrote is the failure it prevents -- but a test would have to fake
+// module state to reach it, and a test that can only pass by faking the thing
+// under test is worse than an honest note.
+//
+// channelHasLane itself is NOT dead: manualDownloadUrl takes an arbitrary channel
+// argument, and auto-update-errors.test.js covers it rejecting an unknown one.
+
+// Every platform keeps every known channel.
+test("darwin on stable keeps its lane", () => {
+  const { deps, calls } = makeDeps({ osPlatform: "darwin", appVersion: "1.0.0" });
+  const u = initAutoUpdate(deps);
+  assert.strictEqual(u.disabled, undefined);
+  assert.ok(calls.setFeedURL.length >= 1);
 });
 
 test("dev (unpackaged) build returns disabled:'dev'", () => {
@@ -484,265 +899,6 @@ test("an unreadable bundle path fails safe to updatable", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Consent flow with the electron-updater event shape. autoDownload=false makes
-// 'update-available' a DISCOVERY event: surfacing it must never download.
-// ---------------------------------------------------------------------------
-
-test("'update-available' surfaces 'found' and does NOT call downloadUpdate (discovery never downloads)", async () => {
-  const { deps, calls, emit, states } = makeDeps({ appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  await u.check();
-  assert.strictEqual(calls.checkForUpdates, 1);
-  emit("update-available", { version: "1.1.0", releaseNotes: "Fixes things", releaseDate: "2026-07-28T00:00:00Z" });
-  assert.strictEqual(calls.downloadUpdate, 0, "discovery must never download");
-  const found = states.find((s) => s.state === "found");
-  assert.ok(found, "'found' state must be emitted");
-  assert.strictEqual(found.version, "1.1.0");
-  assert.strictEqual(found.notes, "Fixes things");
-  assert.strictEqual(found.pubDate, "2026-07-28T00:00:00Z");
-});
-
-test("download() is the consent gate: it alone calls downloadUpdate", async () => {
-  const { deps, calls, emit, stateNames } = makeDeps({ appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  await u.check();
-  emit("update-available", { version: "1.1.0" });
-  assert.strictEqual(calls.downloadUpdate, 0);
-  await u.download();
-  assert.strictEqual(calls.downloadUpdate, 1);
-  assert.ok(stateNames().includes("downloading"));
-});
-
-test("download() with nothing discovered checks first instead of blind-downloading", async () => {
-  const { deps, calls } = makeDeps();
-  const u = initAutoUpdate(deps);
-  await u.download();
-  assert.strictEqual(calls.downloadUpdate, 0, "no consent target yet -- must not download");
-  assert.strictEqual(calls.checkForUpdates, 1, "must fall back to discovery");
-});
-
-test("'download-progress' surfaces 'downloading' with the percent", () => {
-  const { deps, emit, states } = makeDeps();
-  initAutoUpdate(deps);
-  emit("download-progress", { percent: 42.5, bytesPerSecond: 1024 });
-  const s = states.find((x) => x.state === "downloading");
-  assert.ok(s, "'downloading' state must be emitted");
-  assert.strictEqual(s.percent, 42.5);
-});
-
-test("'update-downloaded' surfaces 'downloaded' and arms install-on-quit", () => {
-  const { deps, emit, states, appOnce } = makeDeps();
-  initAutoUpdate(deps);
-  emit("update-downloaded", { version: "1.1.0", releaseNotes: "notes" });
-  const s = states.find((x) => x.state === "downloaded");
-  assert.ok(s, "'downloaded' state must be emitted");
-  assert.strictEqual(s.version, "1.1.0");
-  assert.strictEqual(s.notes, "notes");
-  // UI-driven mode still installs on a natural quit if the user picks Later.
-  assert.ok(appOnce.some((c) => c.ev === "before-quit"), "deferred install must be armed");
-});
-
-test("release-notes arrays ({version,note}[] feed shape) are flattened", () => {
-  const { deps, emit, states } = makeDeps();
-  initAutoUpdate(deps);
-  emit("update-downloaded", { version: "1.1.0", releaseNotes: [{ note: "first" }, { note: "second" }] });
-  const s = states.find((x) => x.state === "downloaded");
-  assert.strictEqual(s.notes, "first\n\nsecond");
-});
-
-test("check failure surfaces 'error' instead of throwing", async () => {
-  const { deps, emit, states, stateNames } = makeDeps();
-  deps.autoUpdater.checkForUpdates = async () => { throw new Error("feed HTTP 403"); };
-  const u = initAutoUpdate(deps);
-  await u.check(); // must not reject
-  assert.ok(stateNames().includes("error"));
-  assert.ok(states.find((s) => s.state === "error").message.includes("feed HTTP 403"));
-  // A later updater 'error' event is also surfaced.
-  emit("error", new Error("boom"));
-  assert.ok(states.filter((s) => s.state === "error").length >= 2);
-});
-
-test("'update-not-available' surfaces 'not-available'", async () => {
-  const { deps, emit, stateNames } = makeDeps();
-  const u = initAutoUpdate(deps);
-  await u.check();
-  emit("update-not-available");
-  assert.ok(stateNames().includes("not-available"));
-});
-
-// ---------------------------------------------------------------------------
-// Re-check / re-click semantics: a manual check is never a silent no-op, and
-// an in-flight download is never restarted underneath itself.
-// ---------------------------------------------------------------------------
-
-test("re-check with a staged download consults the feed and RE-SURFACES 'downloaded' when the stage is still latest (no dead button)", async () => {
-  const { deps, calls, emit, states } = makeDeps({ appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  emit("update-downloaded", { version: "1.1.0", releaseNotes: "notes" });
-  states.length = 0;
-  await u.check();
-  // The check MUST consult the feed even with a stage in hand -- short-circuiting
-  // here would pin the user to a stale stage when a newer version ships
-  // mid-session. What it must NOT do is re-download.
-  assert.strictEqual(calls.checkForUpdates, 1);
-  assert.strictEqual(calls.downloadUpdate, 0);
-  // Feed still reports the staged version -> re-surface the install prompt.
-  emit("update-available", { version: "1.1.0", releaseNotes: "notes" });
-  const s = states.find((x) => x.state === "downloaded");
-  assert.ok(s, "staged version must be re-surfaced");
-  assert.strictEqual(s.version, "1.1.0");
-  assert.strictEqual(calls.downloadUpdate, 0, "must not re-download an already-staged version");
-});
-
-test("a NEWER version discovered while one is staged supersedes the stale stage", async () => {
-  const { deps, calls, emit, states, stateNames } = makeDeps({ appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  emit("update-downloaded", { version: "1.1.0", releaseNotes: "old" });
-  assert.strictEqual(u.isReady(), true);
-  states.length = 0;
-  await u.check();
-  // Feed has moved on: 1.2.0 is now latest. The staged 1.1.0 must be discarded
-  // and re-offered as a fresh find, NOT installed as if it were current.
-  emit("update-available", { version: "1.2.0", releaseNotes: "new" });
-  assert.strictEqual(u.isReady(), false, "stale stage must be discarded");
-  const found = states.find((x) => x.state === "found");
-  assert.ok(found, "the newer version must be surfaced as a fresh find");
-  assert.strictEqual(found.version, "1.2.0");
-  assert.ok(
-    !stateNames().includes("downloaded"),
-    "must not re-surface the superseded stage as installable",
-  );
-  // Consent now downloads the NEWER build.
-  await u.download();
-  assert.strictEqual(calls.downloadUpdate, 1);
-});
-
-test("re-check and re-click while a download is in flight report progress instead of restarting", async () => {
-  const { deps, calls, emit, states, stateNames } = makeDeps();
-  const pending = [];
-  deps.autoUpdater.downloadUpdate = () => {
-    calls.downloadUpdate += 1;
-    return new Promise((resolve) => pending.push(resolve));
-  };
-  const u = initAutoUpdate(deps);
-  await u.check();
-  emit("update-available", { version: "1.1.0" });
-  const dl = u.download(); // in flight -- do not await yet
-  await new Promise((r) => setImmediate(r));
-  assert.strictEqual(calls.downloadUpdate, 1);
-  states.length = 0;
-  // Impatient re-check AND re-click mid-download: neither may restart the
-  // updater flow underneath the running download.
-  await u.check();
-  await u.download();
-  assert.strictEqual(calls.checkForUpdates, 1);
-  assert.strictEqual(calls.downloadUpdate, 1);
-  assert.ok(stateNames().includes("downloading"));
-  // Completion clears the flag and surfaces install.
-  emit("update-downloaded", { version: "1.1.0" });
-  assert.ok(stateNames().includes("downloaded"));
-  pending.forEach((resolve) => resolve());
-  await dl;
-});
-
-test("updater 'error' clears the in-flight download so consent can retry", async () => {
-  const { deps, calls, emit, stateNames } = makeDeps();
-  const pending = [];
-  deps.autoUpdater.downloadUpdate = () => {
-    calls.downloadUpdate += 1;
-    return new Promise((resolve) => pending.push(resolve));
-  };
-  const u = initAutoUpdate(deps);
-  await u.check();
-  emit("update-available", { version: "1.1.0" });
-  const dl1 = u.download(); // in flight -- resolved at the end
-  await new Promise((r) => setImmediate(r));
-  emit("error", new Error("network dropped"));
-  assert.ok(stateNames().includes("error"));
-  // The flag is cleared: a new consent click re-engages the download.
-  const dl2 = u.download();
-  await new Promise((r) => setImmediate(r));
-  assert.strictEqual(calls.downloadUpdate, 2);
-  pending.forEach((resolve) => resolve());
-  await Promise.all([dl1, dl2]);
-});
-
-// ---------------------------------------------------------------------------
-// install(): STRICT ORDER -- stopGateway must complete BEFORE quitAndInstall.
-// A live gateway child during the bundle swap can leave a half-replaced app.
-// ---------------------------------------------------------------------------
-
-test("install() awaits stopGateway BEFORE quitAndInstall (strict order)", async () => {
-  const { deps, emit } = makeDeps();
-  const events = [];
-  deps.stopGateway = async () => {
-    events.push("stopGateway:begin");
-    // Real async gap: if install() failed to await, quitAndInstall would be
-    // recorded between begin and done and the deepStrictEqual below fails.
-    await new Promise((r) => setTimeout(r, 20));
-    events.push("stopGateway:done");
-  };
-  deps.autoUpdater.quitAndInstall = (...args) => { events.push(`quitAndInstall(${args.join(",")})`); };
-  const u = initAutoUpdate(deps);
-  // install() now REQUIRES a staged update (an unstaged install would hit
-  // MacUpdater's wait-for-Squirrel branch and be killed by the failsafe), so
-  // stage one first -- this test is about the ORDER of the install steps.
-  emit("update-downloaded", { version: "1.1.0" });
-  await u.install();
-  assert.deepStrictEqual(events, [
-    "stopGateway:begin",
-    "stopGateway:done",
-    // isSilent=false, isForceRunAfter=true: relaunch the app after the swap.
-    "quitAndInstall(false,true)",
-  ]);
-});
-
-test("install() proceeds to quitAndInstall even when stopGateway errors (still in order)", async () => {
-  const { deps, emit } = makeDeps();
-  const events = [];
-  deps.stopGateway = async () => {
-    events.push("stopGateway:threw");
-    throw new Error("gateway already dead");
-  };
-  deps.autoUpdater.quitAndInstall = () => events.push("quitAndInstall");
-  const u = initAutoUpdate(deps);
-  // install() now REQUIRES a staged update (an unstaged install would hit
-  // MacUpdater's wait-for-Squirrel branch and be killed by the failsafe), so
-  // stage one first -- this test is about the ORDER of the install steps.
-  emit("update-downloaded", { version: "1.1.0" });
-  await u.install();
-  assert.deepStrictEqual(events, ["stopGateway:threw", "quitAndInstall"]);
-});
-
-test("install path arms a force-exit failsafe after quitAndInstall (app-still-running guard)", async () => {
-  const { deps, emit } = makeDeps();
-  const events = [];
-  deps.app.exit = (code) => events.push(`exit:${code}`);
-  deps.autoUpdater.quitAndInstall = () => events.push("quitAndInstall");
-  // Capture the failsafe timer instead of waiting 5s of wall clock.
-  const realSetTimeout = global.setTimeout;
-  let failsafe = null;
-  global.setTimeout = (fn, ms, ...rest) => {
-    if (ms === 5000) { failsafe = fn; return { unref: () => {} }; }
-    return realSetTimeout(fn, ms, ...rest);
-  };
-  try {
-    const u = initAutoUpdate(deps);
-  // install() now REQUIRES a staged update (an unstaged install would hit
-  // MacUpdater's wait-for-Squirrel branch and be killed by the failsafe), so
-  // stage one first -- this test is about the ORDER of the install steps.
-  emit("update-downloaded", { version: "1.1.0" });
-    await u.install();
-  } finally {
-    global.setTimeout = realSetTimeout;
-  }
-  assert.deepStrictEqual(events, ["quitAndInstall"]);
-  assert.ok(failsafe, "failsafe timer must be armed");
-  failsafe(); // simulate the app still being alive 5s later
-  assert.deepStrictEqual(events, ["quitAndInstall", "exit:0"]);
-});
-
-// ---------------------------------------------------------------------------
 // Channel wiring: the feed url follows the version-derived channel and the
 // user's opt-in preference; nightly is pinned. setFeedURL always uses the
 // generic provider with a trailing-slash directory url.
@@ -796,99 +952,232 @@ test("nightly build reports not switchable and stays on nightly despite a prefer
 });
 
 // ---------------------------------------------------------------------------
-// Update nudge: 'found' fires notifyUpdateFound (discovery-only); up-to-date
-// and error paths never do. Once-per-version dedupe lives in main.js.
+// Characterization of the updater's owners. The facade keeps the policy
+// (channels, feeds, markers, install-shape probes) and composes the lanes and
+// the state reporter; these pin the observable shapes and orderings any move
+// between those owners must keep.
 // ---------------------------------------------------------------------------
 
-test("found fires notifyUpdateFound with the discovered version", async () => {
-  const nudges = [];
-  const { deps, emit } = makeDeps({ appVersion: "1.0.0" });
-  deps.notifyUpdateFound = (v) => nudges.push(v);
-  const u = initAutoUpdate(deps);
-  await u.check();
-  emit("update-available", { version: "1.1.0" });
-  assert.deepStrictEqual(nudges, ["1.1.0"]);
+const nodePath = require("node:path");
+const nodeFs = require("node:fs");
+const NodeModule = require("node:module");
+
+const AUTO_UPDATE_EXPORTS = [
+  "initAutoUpdate",
+  "channelForFlavor",
+  "channelForVersion",
+  "resolveChannel",
+  "isNewerVersion",
+  "shouldAutoOffer",
+  "buildFeedBase",
+  "configureUpdater",
+  "classifyError",
+  "manualDownloadUrl",
+  "resolveLinuxInstall",
+  "resolveMacDistArch",
+  "readExternallyManaged",
+  "canRewriteMarker",
+  "DEFAULT_FEED_BASE",
+  "DOWNLOAD_BASE",
+  "SUPPORTED_PLATFORMS",
+];
+
+test("the facade exports exactly its seventeen names, in order", () => {
+  assert.deepStrictEqual(Object.keys(require("../auto-update")), AUTO_UPDATE_EXPORTS);
 });
 
-test("up-to-date and failed checks never nudge", async () => {
-  const nudges = [];
-  const same = makeDeps({ appVersion: "1.0.0" });
-  same.deps.notifyUpdateFound = (v) => nudges.push(v);
-  const u1 = initAutoUpdate(same.deps);
-  await u1.check();
-  same.emit("update-not-available");
-  const err = makeDeps({ appVersion: "1.0.0" });
-  err.deps.notifyUpdateFound = (v) => nudges.push(v);
-  err.deps.autoUpdater.checkForUpdates = async () => { throw new Error("offline"); };
-  const u2 = initAutoUpdate(err.deps);
-  await u2.check();
-  assert.deepStrictEqual(nudges, []);
+test("the update runtime loads without Electron and without load-time effects", () => {
+  const electronDir = nodePath.join(__dirname, "..");
+  const updateFiles = [nodePath.join(electronDir, "auto-update.js")];
+  const runtimeDir = nodePath.join(electronDir, "runtime", "update");
+  const owners = nodeFs.readdirSync(runtimeDir).filter((name) => name.endsWith(".js")).sort();
+  assert.deepStrictEqual(owners, ["feed-lane.js", "managed-lane.js", "state-reporter.js"]);
+  const facade = nodeFs.readFileSync(updateFiles[0], "utf8");
+  for (const owner of owners) {
+    updateFiles.push(nodePath.join(runtimeDir, owner));
+    assert.match(facade, new RegExp(`require\\("\\./runtime/update/${owner.replace(/\.js$/, "")}"\\)`));
+    assert.doesNotMatch(
+      nodeFs.readFileSync(nodePath.join(runtimeDir, owner), "utf8"),
+      /__dirname|require\(\s*["'](?:\.\.\/\.\.\/)?auto-update["']\s*\)/,
+      `${owner} must neither anchor on its own directory nor require the facade`,
+    );
+  }
+  const cached = new Map();
+  for (const file of updateFiles) {
+    cached.set(file, require.cache[file]);
+    delete require.cache[file];
+  }
+  const originalLoad = NodeModule._load;
+  const timers = [];
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  NodeModule._load = function load(request, ...rest) {
+    if (request === "electron") throw new Error("electron must not load at module scope");
+    return originalLoad.call(this, request, ...rest);
+  };
+  global.setTimeout = (...args) => { timers.push(args); return originalSetTimeout(() => {}, 0); };
+  global.setInterval = (...args) => { timers.push(args); return originalSetInterval(() => {}, 1e9); };
+  try {
+    const fresh = require("../auto-update");
+    assert.deepStrictEqual(Object.keys(fresh), AUTO_UPDATE_EXPORTS);
+    assert.strictEqual(timers.length, 0, "loading arms no timer");
+  } finally {
+    NodeModule._load = originalLoad;
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+    for (const [file, entry] of cached) {
+      if (entry) require.cache[file] = entry;
+      else delete require.cache[file];
+    }
+  }
 });
 
-test("a throwing nudge callback does not break discovery ('found' still emitted)", async () => {
-  const { deps, emit, stateNames } = makeDeps({ appVersion: "1.0.0" });
-  deps.notifyUpdateFound = () => { throw new Error("boom"); };
-  const u = initAutoUpdate(deps);
-  await u.check();
-  emit("update-available", { version: "1.1.0" });
-  assert.ok(stateNames().includes("found"), `states: ${stateNames()}`);
+test("the baked marker defaults to EXTERNALLY-MANAGED beside main.js", (t) => {
+  const looked = [];
+  t.mock.method(nodeFs, "lstatSync", (target) => {
+    looked.push(target);
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  });
+  assert.strictEqual(
+    readExternallyManaged({ env: {}, resourcesPath: "/virtual/resources", isPackaged: true }),
+    null,
+  );
+  assert.deepStrictEqual(looked, [
+    nodePath.join(__dirname, "..", "EXTERNALLY-MANAGED"),
+    nodePath.join("/virtual/resources", "EXTERNALLY-MANAGED"),
+  ]);
 });
 
-// ---------------------------------------------------------------------------
-// Review-round fixes. Each was a reachable defect found by the local review
-// gate, so each gets a test that fails if the fix is undone.
-// ---------------------------------------------------------------------------
+test("every lane hands back the handle shape its callers read", () => {
+  const keys = (opts) => {
+    const { deps } = makeDeps(opts);
+    const handle = initAutoUpdate(deps);
+    return { keys: Object.keys(handle), disabled: handle.disabled };
+  };
+  const stub = ["check", "download", "install", "getInfo", "disabled"];
+  assert.deepStrictEqual(keys({ externallyManaged: { managedBy: "m", updateCommand: "" } }),
+    { keys: stub, disabled: "externally-managed" });
+  assert.deepStrictEqual(keys({ isPackaged: false }), { keys: stub, disabled: "dev" });
+  assert.deepStrictEqual(keys({ osPlatform: "freebsd" }), { keys: stub, disabled: "platform" });
+  assert.deepStrictEqual(keys({ appVersion: "1.0.0" }).keys, ["check", "download", "install", "getInfo", "isReady"]);
 
-test("a feed reporting up-to-date DISARMS a staged update (retraction path)", () => {
-  // Retraction repoints the feed at an older/other version. With a stage armed,
-  // "no update" must discard it -- otherwise the WITHDRAWN build still installs
-  // on the next quit, because deferredInstallOnQuit only checks updateReady.
-  const { deps, emit, appOnce, appRemoved } = makeDeps({ appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  emit("update-downloaded", { version: "1.1.0", releaseNotes: "withdrawn" });
-  assert.strictEqual(u.isReady(), true, "precondition: an update is staged");
-  assert.ok(appOnce.some((a) => a.ev === "before-quit"), "precondition: quit hook armed");
+  const restoreTimers = (() => {
+    const originalSetTimeout = global.setTimeout;
+    const originalSetInterval = global.setInterval;
+    global.setTimeout = () => ({ unref() {} });
+    global.setInterval = () => ({ unref() {} });
+    return () => {
+      global.setTimeout = originalSetTimeout;
+      global.setInterval = originalSetInterval;
+    };
+  })();
+  try {
+    assert.deepStrictEqual(
+      keys({ externallyManaged: { managedBy: "m", updateCommand: "apply", checkCommand: "check" } }),
+      { keys: ["check", "download", "install", "getInfo"], disabled: undefined },
+    );
+  } finally {
+    restoreTimers();
+  }
 
-  emit("update-not-available", { version: "1.0.0" });
-  assert.strictEqual(u.isReady(), false, "a retracted stage must be discarded");
-  assert.ok(
-    appRemoved.some((a) => a.ev === "before-quit"),
-    "the before-quit install hook must be disarmed, or the withdrawn build installs on quit",
+  assert.deepStrictEqual(
+    keys({ resourcesPath: "/Volumes/Kiro Crew/Kiro Crew.app/Contents/Resources", bundleWritable: false }),
+    { keys: stub, disabled: "volume" },
   );
 });
 
-test("install() with nothing staged is refused, so the force-exit failsafe is never armed", async () => {
-  // MacUpdater.quitAndInstall() does NOT install when Squirrel has not yet
-  // consumed the zip -- it registers a listener and waits. Arming
-  // forceExitFailsafe there kills the process 5s later, mid-fetch, and the app
-  // dies without swapping or relaunching.
-  const { deps, calls, states } = makeDeps({ appVersion: "1.0.0" });
-  const stopped = [];
-  deps.stopGateway = async () => { stopped.push(1); };
+test("getInfo and every lifecycle payload keep their key order", async () => {
+  const { deps, states } = makeDeps();
   const u = initAutoUpdate(deps);
-  await u.install();
-  assert.strictEqual(calls.quitAndInstall.length, 0, "must not quitAndInstall with nothing staged");
-  assert.strictEqual(stopped.length, 0, "must not stop the gateway for an install that cannot proceed");
-  assert.ok(states.length > 0, "must report state rather than silently no-op");
+  assert.deepStrictEqual(Object.keys(u.getInfo()), [
+    "version",
+    "channel",
+    "stampedChannel",
+    "channelSwitchable",
+    "channelPreference",
+    "laneVersion",
+    "runningAheadOfLane",
+    "autoDownload",
+    "managedBy",
+    "updateCommand",
+    "platform",
+    "packaged",
+    "downloadUrl",
+    "lastState",
+  ]);
+  await u.check();
+  assert.deepStrictEqual(Object.keys(states[0]), [
+    "state",
+    "channel",
+    "version",
+    "installHandoff",
+    "laneVersion",
+    "runningAheadOfLane",
+  ]);
+  assert.strictEqual(states[0].state, "checking");
 });
 
-test("install() proceeds once an update IS staged", async () => {
-  const { deps, calls, emit } = makeDeps({ appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  emit("update-downloaded", { version: "1.1.0" });
-  await u.install();
-  assert.strictEqual(calls.quitAndInstall.length, 1);
+test("the feed lane arms policy, events, feed and timers in one fixed order", () => {
+  const order = [];
+  const { deps } = makeDeps();
+  const updater = {};
+  for (const flag of ["autoDownload", "autoInstallOnAppQuit", "allowDowngrade", "allowPrerelease", "logger"]) {
+    Object.defineProperty(updater, flag, {
+      configurable: true,
+      set(value) { order.push(`set ${flag}=${flag === "logger" ? "log" : value}`); },
+      get() { return undefined; },
+    });
+  }
+  updater.on = (event) => order.push(`on ${event}`);
+  updater.setFeedURL = (options) => order.push(`setFeedURL ${options.url}`);
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  global.setTimeout = (_fn, ms) => { order.push(`setTimeout ${ms}`); return { unref() {} }; };
+  global.setInterval = (_fn, ms) => { order.push(`setInterval ${ms}`); return { unref() {} }; };
+  try {
+    initAutoUpdate({ ...deps, autoUpdater: updater });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+  }
+  assert.deepStrictEqual(order, [
+    "set autoDownload=false",
+    "set autoInstallOnAppQuit=false",
+    "set allowDowngrade=true",
+    "set allowPrerelease=true",
+    "set logger=log",
+    "on error",
+    "on checking-for-update",
+    "on update-not-available",
+    "on update-available",
+    "on download-progress",
+    "on update-downloaded",
+    "setFeedURL https://cdn.example.dev/feed/stable/",
+    "setTimeout 30000",
+    "setInterval 14400000",
+  ]);
 });
 
-test("BLOCKING-fix contract: package.json declares a publish entry so app-update.yml is emitted", () => {
-  // electron-updater's downloadUpdate() -> getOrCreateDownloadHelper() awaits
-  // configOnDisk -> readFile(app-update.yml). electron-builder only writes that
-  // file when a publish config exists (its repository-info fallback resolves
-  // null here). Without it, DISCOVERY works and every consented download throws
-  // ENOENT -- a dead updater that no unit test with a fake autoUpdater can see.
-  const pkg = require("../package.json");
-  const publish = pkg.build && pkg.build.publish;
-  assert.ok(Array.isArray(publish) && publish.length > 0, "build.publish must be a non-empty array");
-  assert.strictEqual(publish[0].provider, "generic");
-  assert.match(publish[0].url, /^https:\/\//, "baked publish url must be https");
+test("the managed lane arms only its launch check and poll, never the feed", () => {
+  const order = [];
+  const { deps } = makeDeps({
+    externallyManaged: { managedBy: "m", updateCommand: "/usr/bin/apply", checkCommand: "/usr/bin/check" },
+  });
+  const updater = {
+    on: (event) => order.push(`on ${event}`),
+    setFeedURL: () => order.push("setFeedURL"),
+  };
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  global.setTimeout = (_fn, ms) => { order.push(`setTimeout ${ms}`); return { unref() { order.push("unref"); } }; };
+  global.setInterval = (_fn, ms) => { order.push(`setInterval ${ms}`); return { unref() { order.push("unref"); } }; };
+  try {
+    initAutoUpdate({ ...deps, autoUpdater: updater });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+  }
+  assert.deepStrictEqual(order, ["setTimeout 30000", "setInterval 14400000", "unref", "unref"]);
 });

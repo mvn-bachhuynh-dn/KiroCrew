@@ -18,8 +18,10 @@ Everything stays inside ``tmp_path``: no network, no subprocess, no fixed port
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,10 +31,65 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.dashboard import server as srv
+from kiro_crew.platform_compat import unlink_link_or_junction
+from kiro_crew.testing import wait
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import async_wait_until
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+
+async def _sweep_once_released(path: Path, *, timeout: float | None = None) -> None:
+    """Remove ``path`` once the server has let go of the file it served from it.
+
+    ``web.FileResponse`` closes its file on an executor thread after the client
+    already holds the body, and Windows refuses to unlink a file any handle still
+    holds (``[WinError 32]``). So the sweep retries on ``PermissionError`` under a
+    bounded deadline, off the loop so the server's close can run, and fails by name,
+    chained to the last ``PermissionError``, if the handle is never released.
+    """
+
+    def _swept() -> bool:
+        shutil.rmtree(path)
+        return True
+
+    await async_wait_until(
+        _swept,
+        timeout=timeout,
+        ignoring=(PermissionError,),
+        off_loop=True,
+        describe=lambda: f"{path} exists={path.exists()}",
+    )
+
+
+@pytest.fixture
+def virtual_wait_clock(monkeypatch):
+    """Drive ``kiro_crew.testing.wait``'s deadline and evaluation bound in the test.
+
+    ``async_wait_until`` reaches its deadline through a :class:`ManualClock`, so a
+    timeout passes in virtual time at no wall-clock cost. Its per-evaluation bound,
+    which times each ``off_loop=True`` call against the real clock, is replaced with
+    one that awaits the evaluation to completion: the test's predicate is an instant
+    mock, so running it inline removes any dependence on how fast a worker thread
+    schedules. The verdict is then fixed by the mock, never by runner speed.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    real_asyncio_sleep = asyncio.sleep
+
+    async def virtual_asyncio_sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        await real_asyncio_sleep(0)
+
+    async def run_to_completion(awaitable, bound, predicate=None):
+        return await awaitable
+
+    monkeypatch.setattr(wait, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(wait, "_sleep", clock.sleep)
+    monkeypatch.setattr(wait, "_asyncio_sleep", virtual_asyncio_sleep)
+    monkeypatch.setattr(wait, "_bounded", run_to_completion)
+    return clock
 
 
 class _FakeInhibitor:
@@ -82,7 +139,7 @@ class TestShouldPreventSleep:
         loader.load.side_effect = RuntimeError("corrupt config")
         monkeypatch.setattr(srv, "KiroCrewConfig", loader)
 
-        assert await srv._should_prevent_sleep(_state(sessions=MagicMock())) is False
+        assert await srv._should_prevent_sleep(_state(sessions=MagicMock()), 0) is False
 
     @pytest.mark.asyncio
     async def test_opt_out_allows_sleep_without_consulting_sessions(
@@ -93,7 +150,7 @@ class TestShouldPreventSleep:
         monkeypatch.setattr(srv, "KiroCrewConfig", loader)
         sessions = MagicMock()
 
-        assert await srv._should_prevent_sleep(_state(sessions=sessions)) is False
+        assert await srv._should_prevent_sleep(_state(sessions=sessions), 0) is False
         assert not sessions.any_active_turn.called
 
     @pytest.mark.asyncio
@@ -102,7 +159,7 @@ class TestShouldPreventSleep:
         loader.load.return_value = _cfg(prevent_sleep=True)
         monkeypatch.setattr(srv, "KiroCrewConfig", loader)
 
-        assert await srv._should_prevent_sleep(_state(sessions=None)) is False
+        assert await srv._should_prevent_sleep(_state(sessions=None), 0) is False
 
     @pytest.mark.asyncio
     async def test_active_turn_blocks_sleep(self, monkeypatch) -> None:
@@ -111,7 +168,7 @@ class TestShouldPreventSleep:
         monkeypatch.setattr(srv, "KiroCrewConfig", loader)
         sessions = MagicMock(any_active_turn=MagicMock(return_value=True))
 
-        assert await srv._should_prevent_sleep(_state(sessions=sessions)) is True
+        assert await srv._should_prevent_sleep(_state(sessions=sessions), 0) is True
 
     @pytest.mark.asyncio
     async def test_active_turn_probe_failure_allows_sleep(self, monkeypatch) -> None:
@@ -122,7 +179,7 @@ class TestShouldPreventSleep:
             any_active_turn=MagicMock(side_effect=RuntimeError("map busy"))
         )
 
-        assert await srv._should_prevent_sleep(_state(sessions=sessions)) is False
+        assert await srv._should_prevent_sleep(_state(sessions=sessions), 0) is False
 
 
 # ── _extra_frame_ancestors ──────────────────────────────────────────────
@@ -199,15 +256,91 @@ class TestWindowEntryHandler:
     async def test_handler_serves_the_file_bound_at_registration(
         self, tmp_path
     ) -> None:
-        entry = tmp_path / "board.html"
+        entry = tmp_path / "src" / "apps" / "papyrus" / "board.html"
+        entry.parent.mkdir(parents=True)
         entry.write_text("<h1>board</h1>", encoding="utf-8")
         app = web.Application()
-        app.router.add_get("/w.html", srv._window_entry_handler(entry))
+        app.router.add_get("/w.html", srv._window_entry_handler(tmp_path, "papyrus/board.html"))
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/w.html")
             assert resp.status == 200
             assert await resp.text() == "<h1>board</h1>"
+
+    @pytest.mark.asyncio
+    async def test_handler_follows_a_re_pointed_dist(self, tmp_path) -> None:
+        """A window route resolves the served dist per request, not at registration.
+
+        Staging re-points ``static/dist`` at a fresh copy and sweeps the old one;
+        a route pinned to the old copy at startup would 404 from then on.
+        """
+        for name, body in (("old", "<h1>old</h1>"), ("new", "<h1>new</h1>")):
+            entry = tmp_path / name / "src" / "apps" / "papyrus" / "board.html"
+            entry.parent.mkdir(parents=True)
+            entry.write_text(body, encoding="utf-8")
+        served = tmp_path / "served"
+        make_dir_link(served, tmp_path / "old")
+        app = web.Application()
+        app.router.add_get("/w.html", srv._window_entry_handler(served, "papyrus/board.html"))
+
+        async with TestClient(TestServer(app)) as client:
+            assert await (await client.get("/w.html")).text() == "<h1>old</h1>"
+            unlink_link_or_junction(served)
+            make_dir_link(served, tmp_path / "new")
+            await _sweep_once_released(tmp_path / "old")
+            resp = await client.get("/w.html")
+            assert resp.status == 200
+            assert await resp.text() == "<h1>new</h1>"
+
+    @pytest.mark.asyncio
+    async def test_sweep_waits_out_a_handle_released_late(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A sharing violation that clears is retried until the tree is gone."""
+        old = tmp_path / "old"
+        (old / "sub").mkdir(parents=True)
+        (old / "sub" / "board.html").write_text("x", encoding="utf-8")
+        real_rmtree = shutil.rmtree
+        calls: list[Path] = []
+
+        def held_twice(path, *args, **kwargs):
+            calls.append(Path(path))
+            if len(calls) <= 2:
+                raise PermissionError(32, "being used by another process")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", held_twice)
+
+        await _sweep_once_released(old)
+
+        assert not old.exists()
+        assert calls == [old, old, old]
+
+    @pytest.mark.asyncio
+    async def test_sweep_fails_by_name_when_the_handle_is_never_released(
+        self, tmp_path, monkeypatch, virtual_wait_clock
+    ) -> None:
+        """A handle that never closes is a leak: the sweep must not swallow it.
+
+        The wait's deadline runs on a manual clock and each evaluation runs inline,
+        so the only thing that decides the verdict is the always-raising ``rmtree``
+        mock: the sweep reaches the deadline and fails with its "still false"
+        message, chained to the ``PermissionError``, at no wall-clock cost.
+        """
+        old = tmp_path / "old"
+        old.mkdir()
+
+        def always_held(path, *args, ignore_errors=False, **kwargs):
+            if not ignore_errors:
+                raise PermissionError(32, "being used by another process")
+
+        monkeypatch.setattr(shutil, "rmtree", always_held)
+
+        with pytest.raises(AssertionError, match="still false") as excinfo:
+            await _sweep_once_released(old, timeout=0.2)
+
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+        assert old.exists()
 
     @pytest.mark.asyncio
     async def test_app_window_entries_are_registered_as_get_routes(
@@ -233,26 +366,10 @@ class TestWindowEntryHandler:
         assert f"/{srv.APP_WINDOW_URL_PREFIX}/papyrus/editor.html" in canonical
         # App Store brand assets: without this mount the builtin app icons and
         # hero images fall through to the SPA shell and render as placeholders.
-        prefixes = {
-            r.get_info().get("prefix")
-            for r in app.router.resources()
-            if r.get_info().get("prefix")
-        }
-        assert "/app-assets" in prefixes
+        assert "/app-assets/{tail}" in canonical
 
 
-# ── _migrate_playwright_to_proxy / _precompute_telemetry ────────────────
-
-
-def test_migrate_playwright_delegates_to_the_owned_registration_sweep(
-    monkeypatch,
-) -> None:
-    called = MagicMock()
-    monkeypatch.setattr(srv, "migrate_owned_playwright_registration", called)
-
-    srv._migrate_playwright_to_proxy()
-
-    called.assert_called_once_with()
+# ── _precompute_telemetry ────────────────────────
 
 
 class TestPrecomputeTelemetry:
@@ -424,9 +541,9 @@ class TestReviveIntendedInstances:
         registry = MagicMock(
             list=MagicMock(
                 return_value=[
-                    SimpleNamespace(id="boom", was_connected=True),
-                    SimpleNamespace(id="degraded", was_connected=True),
-                    SimpleNamespace(id="ok", was_connected=True),
+                    SimpleNamespace(id="boom", was_connected=True, disabled=False),
+                    SimpleNamespace(id="degraded", was_connected=True, disabled=False),
+                    SimpleNamespace(id="ok", was_connected=True, disabled=False),
                 ]
             )
         )
@@ -453,6 +570,133 @@ class TestReviveIntendedInstances:
             "degraded",
             "ok",
         ]
+
+
+# ── _register_connections_warm_lifecycle ────────────────────────────────
+
+
+class TestConnectionsWarmLifecycle:
+    @pytest.mark.asyncio
+    async def test_kick_tracks_scavenging_without_blocking_and_cleanup_retires_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kiro_crew.connections import warm
+
+        calls: list[str] = []
+        scavenge_started = asyncio.Event()
+        scavenge_release = asyncio.Event()
+
+        def _scavenge() -> int:
+            calls.append("scavenge")
+            return 0
+
+        async def _to_thread(func: Any, *args: Any) -> Any:
+            scavenge_started.set()
+            await scavenge_release.wait()
+            return func(*args)
+
+        async def _shutdown() -> None:
+            calls.append("shutdown")
+
+        # Patched on ``connections.warm``, which is where the deferred imports resolve both
+        # names: the scavenge import happens inside the kick's worker thread and the
+        # shutdown import inside the cleanup hook, to keep the warm dependency graph off
+        # the gateway boot path, so this module's globals never hold them.
+        monkeypatch.setattr(warm, "scavenge_warm_mint_artifacts", _scavenge)
+        monkeypatch.setattr(warm, "shutdown_warm_mint", _shutdown)
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        app = web.Application()
+        state = _state()
+        srv._register_connections_warm_lifecycle(app, state)
+        assert not any(
+            hook.__name__.startswith("_connections_warm") for hook in app.on_startup
+        ), "scavenging must not ride on_startup: those hooks run before the listener binds"
+        cleanup = next(
+            hook for hook in app.on_cleanup if hook.__name__ == "_connections_warm_shutdown"
+        )
+
+        srv._kick_connections_warm_scavenge(state)
+        await scavenge_started.wait()
+
+        assert calls == []
+        assert len(state._background_tasks) == 1
+
+        scavenge_release.set()
+        await asyncio.gather(*state._background_tasks)
+        await cleanup(app)
+
+        assert calls == ["scavenge", "shutdown"]
+
+    def test_both_gateway_modes_register_the_same_lifecycle(self) -> None:
+        registration = "_register_connections_warm_lifecycle(app, state)"
+        kick = "_kick_connections_warm_scavenge(state)"
+        for entrypoint in (srv.start_dashboard, srv.start_api_server):
+            source = inspect.getsource(entrypoint)
+            assert registration in source
+            assert kick in source
+            # The kick must run strictly AFTER the listener binds: an on_startup hook (or
+            # any pre-bind call) puts the scavenge's deferred import in front of the bind,
+            # which no-new-work-on-gateway-boot-path forbids. The serving step differs per
+            # entrypoint: start_dashboard listens on its pre-reserved socket via SockSite
+            # ("await site.start()"); start_api_server binds via _start_site.
+            serving = (
+                "_start_site(site, port)"
+                if "_start_site(site, port)" in source
+                else "await site.start()"
+            )
+            assert source.index(serving) < source.index(kick)
+
+
+# ── _register_browser_view_cleanup ──────────────────────────────────────
+
+
+class TestBrowserSessionsLifecycle:
+    @pytest.mark.asyncio
+    async def test_startup_reclaim_parks_in_the_state_background_tasks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reclaim runs off the boot path as a background task, and that task
+        lives in ``state._background_tasks`` with every other one ``server.py``
+        holds -- there is no second, module-global task set for it."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        def _reclaim() -> int:
+            calls.append("reclaim")
+            return 0
+
+        async def _to_thread(func: Any, *args: Any) -> Any:
+            started.set()
+            await release.wait()
+            return func(*args)
+
+        monkeypatch.setattr(srv.browser_cli_launcher, "reclaim_stranded", _reclaim)
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        app = web.Application()
+        state = _state()
+        srv._register_browser_view_cleanup(app, state)
+        startup = next(
+            hook for hook in app.on_startup if hook.__name__ == "_browser_sessions_startup"
+        )
+
+        await startup(app)
+        await started.wait()
+
+        assert calls == []  # still in flight: the hook did not wait on the CLI
+        assert len(state._background_tasks) == 1
+        assert not hasattr(srv, "_startup_tasks")
+
+        release.set()
+        await asyncio.gather(*state._background_tasks)
+        assert calls == ["reclaim"]
+        assert state._background_tasks == set()  # the done callback discards it
+
+    def test_the_gateway_passes_its_state_to_the_registration(self) -> None:
+        source = inspect.getsource(srv.start_dashboard)
+        assert "_register_browser_view_cleanup(app, state)" in source
 
 
 # ── _register_prevent_sleep_shutdown ────────────────────────────────────
@@ -517,7 +761,7 @@ class TestArmPreventSleepPoll:
         monkeypatch.setattr(srv, "SleepInhibitor", lambda: inhibitor)
         monkeypatch.setattr(srv, "_PREVENT_SLEEP_POLL_INTERVAL_SECS", interval)
         state = _state()
-        srv._arm_prevent_sleep_poll(state)
+        srv._arm_prevent_sleep_poll(state, 0)
         return state
 
     @pytest.mark.asyncio
@@ -526,7 +770,7 @@ class TestArmPreventSleepPoll:
     ) -> None:
         polled = asyncio.Event()
 
-        async def _should(_state_arg: Any) -> bool:
+        async def _should(_state_arg: Any, _port: int) -> bool:
             polled.set()
             return True
 
@@ -547,7 +791,7 @@ class TestArmPreventSleepPoll:
     async def test_a_refusing_inhibitor_keeps_the_poll_alive(self, monkeypatch) -> None:
         polled = asyncio.Event()
 
-        async def _should(_state_arg: Any) -> bool:
+        async def _should(_state_arg: Any, _port: int) -> bool:
             polled.set()
             return True
 
@@ -674,6 +918,22 @@ class TestStartApiServerResidualPaths:
         monkeypatch.setattr(srv, "sel", MagicMock(return_value=audit))
         subagents = MagicMock()
         subagents.spawn.side_effect = RuntimeError("spawn exploded")
+        from kiro_crew.execution_context import bind_session_execution, execution_for_store
+
+        # Admit a real captured caller so the identity and privacy gates reach
+        # the crashing spawn; the body must claim that same authenticated caller.
+        session_key = "dashboard:audit-crash"
+        bind_session_execution(session_key, execution_for_store(""))
+        # The caller also has to PROVE the key it declares, the way its production
+        # counterpart does, or the identity gate answers ahead of the spawn and the
+        # crash under test never happens.
+        from kiro_crew import member_memory_auth
+
+        monkeypatch.setattr(
+            member_memory_auth,
+            "verify_session_token",
+            lambda token: token.removeprefix("signed:"),
+        )
 
         runner, _state_obj = await _start_api(
             tmp_path, monkeypatch, subagents=subagents
@@ -687,13 +947,18 @@ class TestStartApiServerResidualPaths:
             async with TestClient(TestServer(runner.app)) as client:
                 resp = await client.post(
                     "/api/spawn",
-                    json={"task": "noop"},
-                    headers={"X-Internal-Secret": secret},
+                    json={"task": "noop", "parent_session": session_key},
+                    headers={
+                        "X-Internal-Secret": secret,
+                        "X-Session-Key": session_key,
+                        "X-Session-Token": f"signed:{session_key}",
+                    },
                 )
                 assert resp.status == 500
         finally:
             await runner.cleanup()
 
+        subagents.spawn.assert_called_once()
         errors = [
             call.kwargs
             for call in audit.log_api_access.call_args_list
@@ -734,3 +999,69 @@ class TestStartApiServerResidualPaths:
             for call in audit.log_api_access.call_args_list
         }
         assert audited.get("/api/crons") == "ok"
+
+
+class TestSttHooks:
+    """The idle sweep and the model release, for both server modes.
+
+    Registered by one helper because the two copies were byte-identical, and an
+    event-loop-blocking import in them therefore had to be found and fixed twice.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_engine_is_imported_off_the_event_loop(self, monkeypatch) -> None:
+        """169 ms of numpy and native binding must not run inline on the loop.
+
+        The boot delay was not enough on its own: it moved the import out of
+        ``runner.setup()`` (so it does not delay the first socket bind) but leaves it
+        running on the loop, where it stalls every socket and heartbeat the gateway is
+        serving at that moment.
+
+        Asserted on the THREAD the import runs in, not on elapsed time. A timing
+        assertion cannot tell the two apart, because a blocked loop also blocks the
+        test's own assertions until it clears.
+        """
+        import threading
+
+        seen: list[str] = []
+
+        def _spy() -> Any:
+            seen.append(threading.current_thread().name)
+            return SimpleNamespace(idle_sweep_loop=AsyncMock())
+
+        monkeypatch.setattr(srv, "_STT_SWEEP_BOOT_DELAY_SECS", 0)
+        monkeypatch.setattr(srv, "_import_stt_engine", _spy)
+
+        await srv._stt_idle_sweep()
+
+        assert seen, "the engine was never imported"
+        assert (
+            seen[0] != threading.main_thread().name
+        ), f"the import ran on {seen[0]}, i.e. inline on the event loop"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_build_an_engine_that_never_existed(self, monkeypatch) -> None:
+        """`stt.close()` resolves through `stt.session`, which imports numpy at module
+        scope and whose `shared_engine()` CREATES an engine when none exists. On a
+        gateway that never transcribed anything, closing therefore pulled the
+        recogniser binding and built a WhisperEngine purely to release nothing.
+
+        Asserted as "the engine module is still not imported", which is the effect
+        rather than a stand-in for it, and needs nothing stubbed.
+        """
+        import sys
+
+        app = web.Application()
+        srv._register_stt_hooks(app)
+        # A fresh Application already carries aiohttp's own cleanup context, so this
+        # checks that OUR pair landed rather than counting the signals.
+        names = {h.__name__ for h in app.on_startup} | {h.__name__ for h in app.on_cleanup}
+        assert {"_stt_startup", "_stt_shutdown"} <= names, names
+
+        # No sweep task was ever created, and nothing imported the engine.
+        monkeypatch.delitem(sys.modules, "kiro_crew.stt.engine", raising=False)
+        for hook in app.on_cleanup:
+            await hook(app)
+        assert (
+            "kiro_crew.stt.engine" not in sys.modules
+        ), "shutdown imported the recogniser to release a model that cannot exist"

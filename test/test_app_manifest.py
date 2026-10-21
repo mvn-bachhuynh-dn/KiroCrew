@@ -1,37 +1,37 @@
-"""Tests for kiro_crew.apps.manifest — AppManifest parser and validator."""
+"""Tests for kiro_crew.apps.manifest — AppManifest parser and validator.
+
+This module pins validation, the serialization round trip (property-based too), parse edge
+cases, setup hooks, dependencies, signature fields, the ``platform`` block, scalar grants,
+UI overlays, the shipped builtin manifests and the ``signedPrincipal`` opt-in. The commands
+and panel tabs a manifest contributes, with the vocabulary a signature freezes, live in
+``test_app_manifest_contributes.py``; the minimal valid manifest in
+``app_manifest_helpers.py``.
+"""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
+from app_manifest_helpers import (
+    _valid_manifest,
+)
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from conftest import make_escaping_link
 from kiro_crew.apps.manifest import (
+    _MAX_CONFIG_KEY_CHARS,
+    _MAX_CONFIG_KEYS,
     AppManifest,
     CapabilityDependencies,
     Dependencies,
     SetupConfig,
 )
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _valid_manifest(**overrides) -> dict:
-    """Return a minimal valid manifest dict with optional overrides."""
-    base = {
-        "name": "test-app",
-        "version": "1.0.0",
-        "displayName": "Test App",
-        "description": "A test app",
-        "author": "tester",
-    }
-    base.update(overrides)
-    return base
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -39,10 +39,82 @@ def _valid_manifest(**overrides) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("refuse_root", [False, True])
+def test_resource_containment_does_not_resolve_refused_path(tmp_path, monkeypatch, refuse_root):
+    from kiro_crew import hooks
+    from kiro_crew.apps.manifest import PATH_SCREEN_REFUSAL, _app_path_refusal
+
+    root = tmp_path / "app"
+    root.mkdir()
+    candidate = root / "agent.json"
+    candidate.write_text("{}")
+    refused = root if refuse_root else candidate
+    validate = hooks.screen_file_path
+    resolve = Path.resolve
+    resolved = []
+
+    def screen(raw, **kwargs):
+        return hooks.PathDecline.REFUSED if Path(raw) == refused else validate(raw, **kwargs)
+
+    def record(path, *args, **kwargs):
+        if path == refused:
+            resolved.append(path)
+        return resolve(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hooks, "screen_file_path", screen)
+        patch.setattr(Path, "resolve", record)
+        refusal = _app_path_refusal("agent.json", root)
+    assert resolved == []
+    assert refusal == PATH_SCREEN_REFUSAL
+
+
 class TestValidation:
     def test_valid_minimal(self):
         m = AppManifest.from_dict(_valid_manifest())
         assert m.validate() == []
+
+    def test_config_keys_round_trip(self):
+        m = AppManifest.from_dict(_valid_manifest(config_keys=["secretary"]))
+        assert m.validate() == []
+        assert m.to_dict()["config_keys"] == ["secretary"]
+        assert b'"config_keys":["secretary"]' in m.signing_payload()
+        assert "config_keys" not in m.extra
+
+    @pytest.mark.parametrize("invalid", ["secretary", {"secretary": True}, 1, None])
+    def test_config_keys_rejects_non_list(self, invalid):
+        m = AppManifest.from_dict(_valid_manifest(config_keys=invalid))
+        assert "config_keys must be an array" in m.validate()
+
+    def test_config_keys_rejects_invalid_entries(self):
+        m = AppManifest.from_dict(_valid_manifest(config_keys=["secretary", ""]))
+        assert "config_keys entries must be non-empty strings" in m.validate()
+
+    def test_config_keys_accepts_exact_count_bound(self):
+        keys = [f"key-{index}" for index in range(_MAX_CONFIG_KEYS)]
+        m = AppManifest.from_dict(_valid_manifest(config_keys=keys))
+        assert m.validate() == []
+        assert m.config_keys == keys
+
+    def test_config_keys_rejects_over_count_bound(self):
+        keys = [f"key-{index}" for index in range(_MAX_CONFIG_KEYS + 1)]
+        m = AppManifest.from_dict(_valid_manifest(config_keys=keys))
+        assert m.config_keys == []
+        assert f"config_keys must contain at most {_MAX_CONFIG_KEYS} entries" in m.validate()
+
+    def test_config_keys_accepts_exact_length_bound(self):
+        key = "k" * _MAX_CONFIG_KEY_CHARS
+        m = AppManifest.from_dict(_valid_manifest(config_keys=[key]))
+        assert m.validate() == []
+        assert m.config_keys == [key]
+
+    def test_config_keys_rejects_over_length_bound(self):
+        m = AppManifest.from_dict(_valid_manifest(config_keys=["k" * (_MAX_CONFIG_KEY_CHARS + 1)]))
+        assert m.config_keys == []
+        assert (
+            f"config_keys entries must be at most {_MAX_CONFIG_KEY_CHARS} characters"
+            in m.validate()
+        )
 
     def test_missing_name(self):
         m = AppManifest.from_dict(_valid_manifest(name=""))
@@ -68,6 +140,73 @@ class TestValidation:
         m = AppManifest.from_dict(_valid_manifest(name="Not_Kebab"))
         errors = m.validate()
         assert any("kebab-case" in e for e in errors)
+
+    def test_reserved_name_rejected(self):
+        """The system.* notification namespace stays un-shadowable."""
+        m = AppManifest.from_dict(_valid_manifest(name="system"))
+        errors = m.validate()
+        assert any("reserved" in e for e in errors)
+
+    @pytest.mark.parametrize("name", ["registry", "registries", "blob", "install", "register"])
+    def test_literal_route_segment_name_rejected(self, name):
+        """The literal first-segment routes under /api/apps/ are
+        shared routes registered before the /api/apps/{name} catch-all. Reserving
+        these names is the defense-in-depth backstop that keeps NEW apps from
+        claiming them (the token_auth carve-out is the primary boundary)."""
+        from kiro_crew.apps.manifest import app_name_error, is_reserved_app_name
+
+        reason = app_name_error(name)
+        assert reason is not None
+        assert "reserved" in reason
+        assert is_reserved_app_name(name) is True
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("reserved" in e for e in errors), (name, errors)
+
+    @pytest.mark.parametrize("name", ["file-explorer", "registry-viewer", "installer"])
+    def test_names_merely_resembling_a_route_segment_stay_valid(self, name):
+        """The reservation matches the exact literal segment only: kebab names
+        that merely contain or resemble a segment must still validate."""
+        from kiro_crew.apps.manifest import app_name_error, is_reserved_app_name
+
+        assert app_name_error(name) is None
+        assert is_reserved_app_name(name) is False
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        assert m.validate() == []
+
+    @pytest.mark.parametrize("name", sorted(WINDOWS_DEVICE_STEMS))
+    def test_every_windows_device_stem_is_rejected(self, name):
+        """The whole documented device-name set, not just the stems that happen
+        to fail on one build. An app name is a persistent published identity, so
+        admitting a stem is a one-way door while over-refusing is freely
+        relaxable."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("not portable" in e for e in errors), (name, errors)
+
+    def test_device_stem_vocabulary_is_not_duplicated(self):
+        """One definition, shared with the git-branch grammar. Two copies of a
+        22-name set drift, and the branch rule is the precedent this follows."""
+        from kiro_crew.apps.manifest import UNPORTABLE_APP_NAMES
+
+        assert UNPORTABLE_APP_NAMES is WINDOWS_DEVICE_STEMS
+
+    @pytest.mark.parametrize("name", ["null-app", "console", "com10", "lpt10", "connect"])
+    def test_names_merely_resembling_a_device_stay_valid(self, name):
+        """The rule matches the exact stem. ``com10``/``lpt10`` are outside the
+        reserved 1-9 range and the rest are ordinary words."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        assert m.validate() == []
+
+    @pytest.mark.parametrize("name", ["demo\n", "nul\n", "system\n", "demo\r\n", "demo\n\n"])
+    def test_a_trailing_newline_cannot_slip_through(self, name):
+        """``$`` also matches before a trailing newline, so a ``$``-anchored
+        grammar admits ``"demo\\n"`` — and worse, ``"nul\\n"`` and ``"system\\n"``
+        evade the reserved-name checks that run after it, because those compare
+        against the exact string. ``KEBAB_RE`` is anchored with ``\\Z``."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("kebab-case" in e for e in errors), (name, errors)
 
     def test_invalid_version_format(self):
         m = AppManifest.from_dict(_valid_manifest(version="not-semver"))
@@ -205,14 +344,37 @@ class TestValidation:
         for value, expected in ((False, False), (True, True)):
             m = AppManifest.from_dict(
                 _valid_manifest(
-                    crons=[{"name": "j1", "every": 300, "message": "go", "enabled": value}]
+                    crons=[{"name": "j1", "every": 300, "message": "go", "enabled": value}],
+                    permissions={"cron": True},
                 )
             )
             assert m.validate() == []
             assert m.crons[0].enabled is expected
+
+    @pytest.mark.parametrize("selector", ["command", "script"])
+    def test_cron_execution_selector_non_string_is_rejected(self, selector):
+        m = AppManifest.from_dict(
+            _valid_manifest(crons=[{"name": "j1", "every": 300, "message": "go", selector: 7}])
+        )
+
+        assert m.crons[0].command == ""
+        assert m.crons[0].script == ""
+        errors = m.validate()
+        assert any(selector in error and "wrong JSON type" in error for error in errors)
+
+    @pytest.mark.parametrize("selector", ["command", "script"])
+    def test_cron_null_execution_selector_remains_absent(self, selector):
+        m = AppManifest.from_dict(
+            _valid_manifest(crons=[{"name": "j1", "every": 300, "message": "go", selector: None}])
+        )
+
+        assert not any(selector in error for error in m.validate())
         # Absent key: default enabled, no error.
         m = AppManifest.from_dict(
-            _valid_manifest(crons=[{"name": "j1", "every": 300, "message": "go"}])
+            _valid_manifest(
+                crons=[{"name": "j1", "every": 300, "message": "go"}],
+                permissions={"cron": True},
+            )
         )
         assert m.validate() == []
         assert m.crons[0].enabled is True
@@ -270,7 +432,7 @@ class TestValidation:
                 "crons": [{"name": "refresh", "every": 3600, "message": "refresh data"}],
                 "ui": {"pages": [{"route": "/apps/owt", "label": "Dashboard", "icon": "Shield"}]},
                 "backend": {"entryPoint": "backend/app.py"},
-                "permissions": {"mcpTools": ["GetPipelineHealth"], "storage": True},
+                "permissions": {"mcpTools": ["GetPipelineHealth"], "storage": True, "cron": True},
                 "setup": {"onInstall": "backend/setup.py:on_install"},
                 "tags": ["oncall"],
                 "jobFamilies": ["SDE"],
@@ -334,6 +496,7 @@ class TestRoundTrip:
                 "network": True,
                 "memory": "shared",
                 "cron": True,
+                "sessionApproval": True,
             },
             "setup": {
                 "onInstall": "setup.py:init",
@@ -346,6 +509,17 @@ class TestRoundTrip:
         serialized = json.loads(m.to_json())
         m2 = AppManifest.from_dict(serialized)
         assert m2.to_dict() == m.to_dict()
+
+    @pytest.mark.parametrize("raw", ["false", "true", "yes", 1, {}, [], None])
+    def test_session_approval_requires_json_true(self, raw):
+        m = AppManifest.from_dict(_valid_manifest(permissions={"sessionApproval": raw}))
+        assert m.permissions.sessionApproval is False
+        assert "sessionApproval" not in m.to_dict().get("permissions", {})
+
+    def test_session_approval_round_trips_when_true(self):
+        m = AppManifest.from_dict(_valid_manifest(permissions={"sessionApproval": True}))
+        assert m.permissions.sessionApproval is True
+        assert m.to_dict()["permissions"]["sessionApproval"] is True
 
     def test_extra_fields_preserved(self):
         data = _valid_manifest(customField="hello", anotherOne=42)
@@ -628,9 +802,7 @@ class TestDependencies:
         assert deps.to_dict() == {"optionalCommands": ["pdflatex", "tectonic"]}
 
     def test_optional_commands_are_independent_of_required_ones(self):
-        deps = Dependencies.from_dict(
-            {"commands": ["gh"], "optionalCommands": ["glab"]}
-        )
+        deps = Dependencies.from_dict({"commands": ["gh"], "optionalCommands": ["glab"]})
         assert deps.commands == ["gh"]
         assert deps.optionalCommands == ["glab"]
         restored = Dependencies.from_dict(deps.to_dict())
@@ -666,11 +838,10 @@ class TestDependencies:
         silent, so the useful thing to pin is the general property.
         """
         import json
-        from pathlib import Path
 
         from kiro_crew.apps.manifest import AppManifest
 
-        builtins = Path("src/kiro_crew/apps/builtins")
+        builtins = _REPO_ROOT / "src/kiro_crew/apps/builtins"
         for app_json in sorted(builtins.glob("*/app.json")):
             raw = json.loads(app_json.read_text(encoding="utf-8"))
             declared = raw.get("dependencies") or {}
@@ -940,7 +1111,6 @@ class TestRequiresDesktopApp:
 
     def test_mochi_builtin_declares_it(self):
         """Mochi is the first consumer: its panel needs the Electron shell."""
-        from pathlib import Path
 
         import kiro_crew.apps.builtins as builtins_pkg
 
@@ -975,3 +1145,279 @@ class TestRequiresDesktopApp:
         from kiro_crew.apps.manifest import PlatformConfig
 
         assert PlatformConfig().supports_platform("win32") is False
+
+
+class TestScalarGrantDoesNotBecomeAWildcard:
+    """A list-valued grant given a JSON SCALAR must deny, not be coerced.
+
+    `[str(x) for x in value]` over a STRING iterates its characters, so a manifest
+    that wrote a bare string where a list belongs was handed the tokens those
+    characters spell -- including the wildcards each of these fields honours:
+
+      exposeToApps  `"*"`         -> ["*"] -> every sibling app may observe my slots
+      events        `"*"`         -> ["*"] -> the whole WS scope vocabulary
+      api           `"/api/chat"` -> ["/", "a", ...] and `app_token_path_allowed`
+                                     matches the prefix "/" against every path
+      mcpTools      `"*"`         -> ["*"]
+
+    Same defect class as `bool("false")` on the boolean grants above, and the same
+    direction of fix: an unexpected value withholds the grant.
+    """
+
+    def test_scalar_star_never_yields_the_wildcard(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        for field in ("exposeToApps", "events", "api", "mcpTools"):
+            perms = Permissions.from_dict({field: "*"})
+            assert (
+                getattr(perms, field) == []
+            ), f"{field}: a scalar must not be exploded into a wildcard"
+
+    def test_scalar_path_never_yields_a_match_everything_prefix(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        assert Permissions.from_dict({"api": "/api/chat"}).api == []
+
+    def test_other_scalar_shapes_also_deny(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        for value in (True, 1, {"a": "b"}, None):
+            assert Permissions.from_dict({"exposeToApps": value}).exposeToApps == []
+
+    def test_a_real_list_still_works(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        perms = Permissions.from_dict(
+            {
+                "exposeToApps": ["mochi", "", "workflows"],
+                "events": ["slots:own", "notification"],
+                "api": ["/api/chat", "/api/ws"],
+                "mcpTools": ["cron_add"],
+            }
+        )
+        # Falsy entries are still dropped; everything else is preserved verbatim.
+        assert perms.exposeToApps == ["mochi", "workflows"]
+        assert perms.events == ["slots:own", "notification"]
+        assert perms.api == ["/api/chat", "/api/ws"]
+        assert perms.mcpTools == ["cron_add"]
+
+    def test_the_wildcard_still_works_when_declared_as_a_list(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        assert Permissions.from_dict({"exposeToApps": ["*"]}).exposeToApps == ["*"]
+        assert Permissions.from_dict({"events": ["*"]}).events == ["*"]
+
+
+# ---------------------------------------------------------------------------
+# UI overlays
+# ---------------------------------------------------------------------------
+
+
+def _overlay_manifest(*overlays) -> AppManifest:
+    return AppManifest.from_dict(_valid_manifest(ui={"overlays": list(overlays)}))
+
+
+def test_overlay_parses_and_round_trips():
+    decl = {"id": "command-bar", "replaces": "quick-search"}
+    m = _overlay_manifest(decl)
+    assert len(m.ui.overlays) == 1
+    assert m.ui.overlays[0].id == "command-bar"
+    assert m.ui.overlays[0].replaces == "quick-search"
+    assert m.validate() == []
+    # Round-trip must preserve the declaration, or the frontend stops seeing the slot.
+    assert AppManifest.from_dict(m.to_dict()).ui.overlays == m.ui.overlays
+    assert m.to_dict()["ui"]["overlays"] == [decl]
+
+
+def test_overlay_without_overlays_key_is_empty_not_none():
+    m = AppManifest.from_dict(_valid_manifest(ui={"pages": [{"route": "/x", "label": "X"}]}))
+    assert m.ui.overlays == []
+    assert "overlays" not in m.to_dict()["ui"]
+
+
+def test_overlay_non_dict_entries_are_dropped():
+    m = AppManifest.from_dict(_valid_manifest(ui={"overlays": ["nope", 7, None]}))
+    assert m.ui.overlays == []
+
+
+@pytest.mark.parametrize("value", [None, "overlays", 7, {"id": "x"}])
+def test_overlay_non_list_value_parses_to_empty(value):
+    """A present-but-not-a-list ``overlays`` must not raise.
+
+    ``dict.get`` returns the stored value rather than the default when the key
+    exists, so a hand-edited manifest carrying ``"overlays": null`` would otherwise
+    iterate ``None`` and take install validation down with a TypeError.
+    """
+    m = AppManifest.from_dict(_valid_manifest(ui={"overlays": value}))
+    assert m.ui.overlays == []
+    assert m.validate() == []
+
+
+@pytest.mark.parametrize(
+    "decl,expected",
+    [
+        ({"replaces": "quick-search"}, "ui overlay missing required field: id"),
+        (
+            {"id": "Command-Bar", "replaces": "quick-search"},
+            "ui overlay id must be kebab-case: 'Command-Bar'",
+        ),
+        ({"id": "-lead", "replaces": "quick-search"}, "ui overlay id must be kebab-case: '-lead'"),
+        ({"id": "a/b", "replaces": "quick-search"}, "ui overlay id must be kebab-case: 'a/b'"),
+        # An overlay is opened only through a slot the host owns, so a declaration
+        # without one could never be shown.
+        ({"id": "ok"}, "ui overlay 'ok' missing required field: replaces"),
+    ],
+)
+def test_overlay_validation_rejects(decl, expected):
+    assert expected in _overlay_manifest(decl).validate()
+
+
+def test_overlay_duplicate_ids_rejected():
+    decl = {"id": "dup", "replaces": "quick-search"}
+    assert "ui overlay duplicate id: 'dup'" in _overlay_manifest(decl, dict(decl)).validate()
+
+
+def test_overlay_replaces_must_be_a_slug():
+    errors = _overlay_manifest({"id": "ok", "replaces": "Quick Search"}).validate()
+    assert any("replaces must be kebab-case: 'Quick Search'" in e for e in errors)
+
+
+def test_overlay_builtins_must_not_ship_a_ui_bundle():
+    """A builtin declaring ``ui.overlays`` must not also declare ``ui.entry``.
+
+    Slot ownership requires ``origin == "builtin"``, which is the only provenance a
+    self-registering app cannot forge. But ``register_builtin_apps`` re-derives origin
+    on every startup for an already-registered builtin and downgrades it to ``local``
+    when the manifest carries a ``ui.entry`` bundle. Such an app would therefore be
+    refused its own slot after the first restart, and the refusal surfaces only as a
+    browser console warning. This is a build failure instead, because the combination
+    is invisible at runtime until someone notices the surface silently reverted.
+    """
+    offenders = []
+    for entry in sorted((_REPO_ROOT / "src/kiro_crew/apps/builtins").iterdir()):
+        manifest_path = entry / "app.json"
+        if not manifest_path.is_file():
+            continue
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        ui = raw.get("ui") or {}
+        if ui.get("overlays") and ui.get("entry"):
+            offenders.append(raw.get("name"))
+    assert not offenders, (
+        "builtins declaring both ui.overlays and ui.entry (origin is downgraded to "
+        f"'local' on restart, so the slot is refused): {offenders}"
+    )
+
+
+def test_command_bar_builtin_is_overlay_only_and_default_on():
+    """The shipped Command Bar app is the first overlay-only builtin.
+
+    Its shape is load-bearing: no page (it is not routed), no backend entry point (so
+    being enabled spawns no process), and default-ON: the launcher owns the
+    quick-search gesture on a fresh install, and the legacy palette is what a reader
+    opts back into by disabling the app. The default-on decision itself is declared
+    in ``manager._DEFAULT_ON_BUILTINS``; the opt-in policy tests read it from there.
+    """
+    raw = json.loads(
+        (_REPO_ROOT / "src/kiro_crew/apps/builtins/command_bar/app.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    m = AppManifest.from_dict(raw)
+    assert m.validate() == []
+    assert raw["defaultEnabled"] is True
+    assert m.ui.pages == []
+    assert not m.backend.entryPoint
+    assert [(o.id, o.replaces) for o in m.ui.overlays] == [("command-bar", "quick-search")]
+
+
+class TestShippedManifestsAreWellFormedJson:
+    """Every shipped ``app.json`` must be JSON no reader can disagree about.
+
+    A duplicate key is not a parse error in Python or in JavaScript -- both keep the LAST
+    occurrence -- so a manifest carrying two ``"platform"`` blocks loads, validates, and
+    behaves, while saying two different things to anyone reading it. That is how five
+    built-in manifests came to declare ``"os": ["macos", "linux"]`` immediately above
+    ``"os": ["macos", "linux", "windows"]``: an edit appended a second block instead of
+    changing the first, and last-wins hid it.
+
+    Two reasons that is worth a test rather than a one-time cleanup. A stricter reader
+    rejects the file outright -- ``jq`` flags it, JSON Schema validators flag it, and Rust
+    and Go parsers error by default -- so the manifests are one tool away from being
+    unreadable. And an editor who later deletes "the" ``platform`` block has even odds of
+    deleting the live one, silently dropping a platform with nothing failing.
+    """
+
+    def _builtin_manifests(self) -> list[Path]:
+        paths = sorted((_REPO_ROOT / "src/kiro_crew/apps/builtins").glob("*/app.json"))
+        assert paths, "no built-in manifests found -- the glob or the layout moved"
+        return paths
+
+    def test_no_shipped_manifest_has_a_duplicate_key(self):
+        """Recursively: a duplicate anywhere, at any nesting depth, fails here."""
+        offenders: list[str] = []
+
+        def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict:
+            seen: set[str] = set()
+            for key, _value in pairs:
+                if key in seen:
+                    offenders.append(key)
+                seen.add(key)
+            return dict(pairs)
+
+        for manifest in self._builtin_manifests():
+            offenders.clear()
+            json.loads(manifest.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicates)
+            assert not offenders, (
+                f"{manifest.parent.name}/app.json declares {sorted(set(offenders))!r} "
+                "more than once. Both copies load and the LAST one wins, so the file "
+                "reads as two different manifests -- edit the existing block instead of "
+                "appending a second one."
+            )
+
+    def test_every_builtin_declares_its_platforms_exactly_once(self):
+        """The specific shape that went wrong, asserted on the shipped files.
+
+        Complements the general check: this one names ``platform`` so a regression here
+        reports the field a reader cares about rather than a generic duplicate.
+        """
+        for manifest in self._builtin_manifests():
+            raw = manifest.read_text(encoding="utf-8")
+            count = raw.count('"platform"')
+            assert count <= 1, (
+                f'{manifest.parent.name}/app.json contains {count} "platform" keys; '
+                "the effective value is whichever comes last, which is not what the "
+                "file appears to say."
+            )
+
+
+class TestSignedPrincipalManifest:
+    """``backend.signedPrincipal`` is a strict, default-off opt-in."""
+
+    def test_defaults_off_and_stays_out_of_the_canonical_dict(self):
+        manifest = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": "server.py"}))
+        assert manifest.backend.signedPrincipal is False
+        assert "signedPrincipal" not in manifest.to_dict()["backend"]
+
+    def test_true_round_trips(self):
+        manifest = AppManifest.from_dict(
+            _valid_manifest(backend={"entryPoint": "server.py", "signedPrincipal": True})
+        )
+        assert manifest.backend.signedPrincipal is True
+        assert manifest.to_dict()["backend"]["signedPrincipal"] is True
+        assert AppManifest.from_dict(manifest.to_dict()).backend.signedPrincipal is True
+
+    @pytest.mark.parametrize("raw", ["true", "false", 1, 0, {}, [], None])
+    def test_only_the_json_boolean_true_turns_it_on(self, raw):
+        manifest = AppManifest.from_dict(
+            _valid_manifest(backend={"entryPoint": "server.py", "signedPrincipal": raw})
+        )
+        assert manifest.backend.signedPrincipal is False
+        assert "signedPrincipal" not in manifest.to_dict()["backend"]
+
+    def test_admission_signature_covers_the_flag(self):
+        ordinary = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": "server.py"}))
+        opted_in = AppManifest.from_dict(
+            _valid_manifest(backend={"entryPoint": "server.py", "signedPrincipal": True})
+        )
+        assert b"signedPrincipal" not in ordinary.signing_payload()
+        assert b'"signedPrincipal":true' in opted_in.signing_payload()

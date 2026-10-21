@@ -10,6 +10,8 @@ text without rendering it; both producers must apply it.
 
 from __future__ import annotations
 
+import time
+
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.preview_text import strip_markdown_preview
 
@@ -38,12 +40,79 @@ class TestStripMarkdownPreview:
     def test_inline_code_keeps_literal_text(self):
         assert strip_markdown_preview("run `npm ci` first") == "run npm ci first"
 
+    def test_keep_visible_marker_stripped(self):
+        # the collapse-exemption marker is emitted "as its final line"
+        # (prompt contract) — a trailing tag LINE is stripped from previews.
+        assert (
+            strip_markdown_preview("Fleet synthesis banked.\n<!-- keep-visible -->")
+            == "Fleet synthesis banked."
+        )
+
+    def test_html_comment_control_tags_stripped(self):
+        # Heartbeat delivery routing tags are HTML comments too — appended as
+        # trailing lines. Mid-body occurrences are rendered content (the
+        # tail-anchored grammar shared with the frontend recognizer): they
+        # are what makes tags quoted in ANY code dialect untouchable.
+        assert strip_markdown_preview("done\n<!-- deliver:dashboard -->") == "done"
+        assert "deliver" in strip_markdown_preview("before <!-- deliver:dashboard --> after")
+
+    def test_unterminated_control_tag_no_longer_swallows_text(self):
+        # The old generic strip treated an unclosed <!-- as a comment to EOF,
+        # which silently deleted everything after it — the data-loss shape
+        # the scoped strip exists to prevent. A truncated control tag now
+        # leaks literally (visible garbage beats silent loss).
+        assert (
+            strip_markdown_preview("visible tail <!-- keep-visible")
+            == "visible tail <!-- keep-visible"
+        )
+
+    def test_ordinary_html_comments_are_preserved(self):
+        # Only recognized control tags are stripped: an ordinary comment the
+        # assistant quotes is visible rendered content in inline code, and
+        # inline code is NOT fence-placeholdered — a generic strip deleted it.
+        assert (
+            strip_markdown_preview("use `<!-- ordinary -->` here") == "use <!-- ordinary --> here"
+        )
+
+    def test_html_comment_inside_code_fence_stays_placeholdered(self):
+        # Fences are placeholder-protected BEFORE the comment strip runs.
+        assert strip_markdown_preview("```html\n<!-- x -->\n```") == "(code)"
+
+    def test_recognized_tag_quoted_in_inline_code_is_preserved(self):
+        # A RECOGNIZED control tag quoted in inline code renders literally in
+        # the dashboard — visible content the preview must keep. Round-5
+        # review: the old anywhere-strip deleted it while search/copy kept
+        # it, a grammar divergence between the projections.
+        assert (
+            strip_markdown_preview("the `<!-- keep-visible -->` marker")
+            == "the <!-- keep-visible --> marker"
+        )
+
+    def test_plan_task_id_tag_is_stripped(self):
+        # Third control-tag family (task planner anchors) — same leak class
+        # as deliver: routing tags; covered by the shared constant.
+        assert strip_markdown_preview("plan ready\n<!-- plan_task_id:abc123 -->") == "plan ready"
+
     def test_link_keeps_label(self):
         assert strip_markdown_preview("see [the docs](https://x.y/z)") == "see the docs"
 
     def test_image_uses_alt_or_placeholder(self):
         assert strip_markdown_preview("![screenshot](/tmp/a.png)") == "screenshot"
         assert strip_markdown_preview("![](/tmp/a.png)") == "(image)"
+
+    def test_a_balanced_pair_in_a_link_url_leaves_only_the_label(self):
+        url = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+        assert strip_markdown_preview(f"see [Python]({url}) now") == "see Python now"
+
+    def test_a_balanced_pair_in_an_image_url_leaves_only_the_alt(self):
+        assert strip_markdown_preview("![chart](https://x.y/a_(b).png) now") == "chart now"
+        assert strip_markdown_preview("![](https://x.y/a_(b).png) now") == "(image) now"
+
+    def test_an_unbalanced_link_url_is_left_as_written(self):
+        # No channel renderer and no CommonMark reader links this, so the
+        # preview shows what the message shows.
+        src = "see [a](https://x.y/(b) now"
+        assert strip_markdown_preview(src) == src
 
     def test_headers_quotes_bullets_stripped(self):
         src = "## Summary\n> quoted\n- item one\n2. item two"
@@ -68,6 +137,41 @@ class TestStripMarkdownPreview:
 
     def test_whitespace_collapsed(self):
         assert strip_markdown_preview("a\n\n\nb   c") == "a b c"
+
+    def test_zwsp_only_message_yields_empty(self):
+        # Quiet monitor-loop cycles reply with a bare U+200B. ``str.split()``
+        # does not treat Cf format chars as whitespace, so without the drop
+        # the preview is truthy-but-invisible and the downstream
+        # empty-preview fallbacks never fire.
+        assert strip_markdown_preview("\u200b") == ""
+
+    def test_invisible_only_mix_yields_empty(self):
+        # ZWSP, ZWNJ, ZWJ, word joiner, BOM and soft hyphen with plain
+        # whitespace between: the whole Cf class collapses, not one codepoint.
+        assert strip_markdown_preview("\u200b\u200c \u200d\u2060\t\ufeff\u00ad") == ""
+
+    def test_format_chars_dropped_from_mixed_content(self):
+        # Dropped, not turned into spaces: visible text stays intact.
+        assert strip_markdown_preview("a\u200bb c") == "ab c"
+
+    def test_indented_line_markers_still_stripped(self):
+        # The line-anchored markers accept horizontal indentation only
+        # ([^\S\n], not \s) — same visible result, linear scan.
+        src = "  > quoted\n\t- item\n   2. two\n  ---  \nend"
+        assert strip_markdown_preview(src) == "quoted item two end"
+
+    def test_blank_line_runs_do_not_backtrack(self):
+        # CWE-1333 / py/polynomial-redos regression: with MULTILINE ^\s*,
+        # every line-start anchor in a run of blank lines rescanned the
+        # run's remainder — O(n^2). A ~100k-char whitespace-heavy preview
+        # wedged the gateway event loop past the 25s watchdog window at
+        # dashboard boot, and the same persisted slot re-triggered it on
+        # every restart (dump-then-exit crash loop). Linear now.
+        evil = "x" + "\n" * 100_000 + " " * 100_000 + "tail"
+        start = time.perf_counter()
+        assert strip_markdown_preview(evil) == "x tail"
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"preview strip too slow ({elapsed:.2f}s) — may backtrack"
 
 
 class TestSlotLastMessageStripsMarkdown:
@@ -115,12 +219,32 @@ class TestSlotLastMessageStripsMarkdown:
         s = self._slot_with(("assistant", "---"))
         assert s.to_dict()["last_message"] == ""
 
+    def test_zwsp_only_message_falls_back_to_older_preview(self):
+        # A quiet monitor-loop cycle's say-nothing reply (bare U+200B) must
+        # not blank the sidebar subtitle: with format chars dropped the
+        # preview is empty, so the walk lands on the last real message.
+        s = self._slot_with(
+            ("assistant", "here is the real answer"),
+            ("assistant", "\u200b"),
+        )
+        assert s.to_dict()["last_message"] == "here is the real answer"
+
     def test_credential_split_by_markdown_is_still_redacted(self):
         # Codex PR-243 HIGH finding: stripping must run BEFORE redaction.
         # Markdown markers inside a secret split the credential signature past
         # the scanner; stripping afterwards would rejoin the fragments into a
         # valid credential in the broadcast preview.
         s = self._slot_with(("assistant", "key is AKIA**IOSFODNN7EXAMPLE** ok"))
+        msg = s.to_dict()["last_message"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in msg
+        assert msg.startswith("key is ")
+
+    def test_credential_split_by_zwsp_is_still_redacted(self):
+        # The format-char drop can REASSEMBLE a credential that zero-width
+        # characters had split, so strip-before-redact is load-bearing for
+        # this class too: stripping after redaction would rejoin the halves
+        # into a live key in the broadcast preview.
+        s = self._slot_with(("assistant", "key is AKIA\u200bIOSFODNN7EXAMPLE ok"))
         msg = s.to_dict()["last_message"]
         assert "AKIAIOSFODNN7EXAMPLE" not in msg
         assert msg.startswith("key is ")
@@ -141,3 +265,32 @@ class TestHistoryLastMessagePreviewStripsMarkdown:
         ]
         log._path(key).write_text("\n".join(lines) + "\n")
         assert log.last_message_preview(key) == "Compacted the GitHub Triage rail"
+
+    def test_last_message_info_falls_back_past_zwsp_only_row(self, tmp_path):
+        import json
+        from datetime import datetime
+
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.init()
+        key = "dash-test"
+        lines = [
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "the real answer",
+                    "ts": "2026-01-01T00:00:00Z",
+                }
+            ),
+            # Newest row is a quiet monitor-cycle reply: a bare U+200B. Its
+            # preview must come out empty so the skip-empty scan passes it.
+            json.dumps({"role": "assistant", "content": "\u200b", "ts": "2026-01-02T00:00:00Z"}),
+        ]
+        log._path(key).write_text("\n".join(lines) + "\n")
+        preview, epoch, stopped = log.last_message_info(key)
+        assert preview == "the real answer"
+        # The timestamp travels with the row the preview came from.
+        assert epoch == datetime.fromisoformat("2026-01-01T00:00:00+00:00").timestamp()
+        # Newest real row is the quiet reply, not a stop.
+        assert stopped is False

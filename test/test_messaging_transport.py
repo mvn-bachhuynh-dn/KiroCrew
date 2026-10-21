@@ -24,6 +24,7 @@ from kiro_crew.messaging import (
     TransportCapabilities,
     chunk_text,
 )
+from kiro_crew.messaging.renderer import TOOL_RESULT
 
 
 class TestTransportCapabilities:
@@ -120,6 +121,22 @@ class TestAbstract:
         assert t.authorize(None) is False
 
 
+class TestSessionProvenanceTag:
+    def test_tag_is_stable_short_and_keyed(self):
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
+        first = session_provenance_tag("dashboard:chat-1")
+        assert first == session_provenance_tag("dashboard:chat-1")
+        assert len(first) == 12
+        assert set(first) <= set("0123456789abcdef")
+        assert first != session_provenance_tag("dashboard:chat-2")
+
+    def test_empty_key_has_no_tag(self):
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
+        assert session_provenance_tag("") == ""
+
+
 class TestChunkText:
     def test_empty(self):
         assert chunk_text("", 10) == []
@@ -148,7 +165,12 @@ class _RecordingRenderer(Renderer):
     async def on_tool_call(self, tool_call_id, title, tool_kind="", tool_purpose=""):
         self.calls.append(("tool_call", tool_call_id, title))
 
-    async def on_prompt_choice(self, options, request_id):
+    async def on_tool_result(self, tool_call_id, tool_status):
+        self.calls.append(("tool_result", tool_call_id, tool_status))
+
+    async def on_prompt_choice(
+        self, options, request_id, tool_title="", tool_purpose="", tool_input=""
+    ):
         self.calls.append(("prompt_choice", options, request_id))
 
     async def on_compaction(self, context_usage_pct):
@@ -164,6 +186,7 @@ class TestRendererDispatch:
             TEXT_CHUNK,
             THINKING,
             TOOL_CALL,
+            TOOL_RESULT,
             PROMPT_CHOICE,
             COMPACTION,
             DONE,
@@ -175,6 +198,7 @@ class TestRendererDispatch:
         events = [
             OutputEvent(kind=TEXT_CHUNK, text="hi"),
             OutputEvent(kind=TOOL_CALL, tool_call_id="t1", title="grep"),
+            OutputEvent(kind=TOOL_RESULT, tool_call_id="t1", tool_status="failed"),
             OutputEvent(kind=PROMPT_CHOICE, options=[{"id": "a"}], request_id="r1"),
             OutputEvent(kind=DONE, stop_reason="end_turn"),
         ]
@@ -184,8 +208,14 @@ class TestRendererDispatch:
                 await r.dispatch(ev)
 
         asyncio.run(run())
-        assert [c[0] for c in r.calls] == ["text_chunk", "tool_call", "prompt_choice", "done"]
-        assert r.calls[2] == ("prompt_choice", [{"id": "a"}], "r1")
+        assert [c[0] for c in r.calls] == [
+            "text_chunk",
+            "tool_call",
+            "tool_result",
+            "prompt_choice",
+            "done",
+        ]
+        assert r.calls[3] == ("prompt_choice", [{"id": "a"}], "r1")
 
     def test_unknown_kind_raises(self):
         r = _RecordingRenderer(TransportCapabilities())

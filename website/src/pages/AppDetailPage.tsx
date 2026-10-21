@@ -6,196 +6,90 @@
  * Shows full description, features, screenshots, tags, and action buttons.
  */
 import { useEffect, useState, useCallback, useRef } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   ArrowLeft, Download, Check, Loader2, Power, PowerOff,
   Trash2, RefreshCw, Bot, Zap, ArrowUp,
-  Clock, ChevronLeft, ChevronRight, X, Monitor, Copy, Terminal,
-  Sparkles,
+  Clock, X, Monitor, Copy, Terminal,
+  Target, Settings2, Star, ShieldAlert,
 } from 'lucide-react'
 import { needsDesktopApp } from '../lib/electron'
 import { api } from '../api/client'
+import { isNotFoundError } from '../api/apiError'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
+import { uiLocation } from '../uiLocations/uiLocation'
+import SessionApprovalModes from '../components/appstore/SessionApprovalModes'
 import AppIcon from '../components/AppIcon'
-import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
+import TrustAppModal, {
+  APP_EXECUTION_DENIED, DESKTOP_BUILD_STEP_UNSUPPORTED, isTrustDeniedError, useTrustGate,
+} from '../components/appstore/TrustAppModal'
+import { isRegistrySourced, normalizeRegistryApp, type RegistryApp } from '../components/appstore/types'
+import AppSource from '../components/appstore/AppSource'
+import { consentTierFor } from '../components/appstore/registryTier'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
-import AskAgentButton from '../components/AskAgentButton'
+import ErrorNotice from '../components/ErrorNotice'
+import { useConfirm } from '../components/ConfirmDialog'
+import { findReport, recordError } from '../utils/errorReport'
+import { copyCode } from '../utils/clipboard'
 
 import { i18nT } from '../i18n/t'
-import { appDisplayName, appDescription, appHighlights } from '../components/appstore/appManifest'
-import { fmtDateNumeric } from '../i18n/format'
-type AppInfo = {
-  name: string
-  displayName: string
-  description: string
-  version: string
-  author: string
-  icon?: string
-  iconUrl?: string
-  tags?: string[]
-  highlights?: string[]
-  screenshots?: string[]
-  screenshotsDark?: string[]
-  heroImage?: string
-  heroImageDark?: string
-  heroImageDetail?: string
-  heroImageDetailDark?: string
-  repo?: string
-  branch?: string
-  // Installed state
-  installed: boolean
-  installedVersion?: string
-  enabled?: boolean
-  managed?: string
-  source?: string
-  installedAt?: string
-  updateAvailable?: boolean
-  // Three-axis classification
-  origin?: string     // "builtin" | "registry" | "local" | "external"
-  resources?: string  // "gateway" | "app"
-  lifecycle?: string  // "gateway" | "app" | "locked"
-  // Platform
-  platform?: { os?: string[]; installMode?: string; clientInstall?: { shell?: string; postInstall?: string }
-    // Set when the app's UI needs the Electron shell (native windows,
-    // global shortcuts, tray). A UX gate only — the marker is client-side.
-    requiresDesktopApp?: boolean }
-  // Manifest (from installed app)
-  manifest?: AppManifest
-}
-
-interface McpServerConfig {
-  url?: string
-  command?: string
-  autoApprove?: string[]
-  [key: string]: unknown
-}
-
-interface AppPermissions {
-  api?: string[]
-  events?: string[]
-  mcpTools?: string[]
-  storage?: boolean
-  cron?: boolean
-  network?: boolean
-  memory?: boolean | string
-  [key: string]: unknown
-}
-
-/** A registry app entry from /api/apps/registry — a superset of the fields we
- *  read here, spread into AppInfo when there's no installed app. */
-interface RegistryEntry extends Partial<AppInfo> {
-  name: string
-  updateAvailable?: boolean
-}
-
-interface AppManifest {
-  displayName?: string
-  description?: string
-  version?: string
-  author?: string
-  tags?: string[]
-  highlights?: string[]
-  screenshots?: string[]
-  screenshotsDark?: string[]
-  // Store-listing metadata. For built-in apps these live on the manifest
-  // (preserved through AppManifest.extra) rather than on a registry entry —
-  // built-ins are not part of the /api/apps/registry feed.
-  iconUrl?: string
-  heroImage?: string
-  heroImageDark?: string
-  heroImageDetail?: string
-  heroImageDetailDark?: string
-  ui?: { pages?: { route?: string; label?: string; icon?: string; iconUrl?: string }[] }
-  // Installed apps carry the platform config here (a registry/catalog entry
-  // exposes it top-level instead); `needsDesktopApp` reads both. Without this the
-  // desktop requirement was invisible on surfaces that pass the manifest shape.
-  platform?: { requiresDesktopApp?: boolean; os?: string[] }
-  agents?: string[]
-  skills?: string[]
-  crons?: { name: string }[]
-  mcpServers?: Record<string, McpServerConfig>
-  permissions?: AppPermissions
-  minKiroCrewVersion?: string
-}
-
-function ScreenshotGallery({ screenshots }: { screenshots: string[] }) {
-  const [selected, setSelected] = useState<number | null>(null)
-
-  if (screenshots.length === 0) return null
-
-  return (
-    <>
-      <div className="mb-6">
-        <div className="text-[12px] text-muted uppercase tracking-wider mb-3">{i18nT('pages.appDetailPage.screenshots')}</div>
-        <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
-          {screenshots.map((url, i) => (
-            <button
-              key={i}
-              type="button"
-              aria-label={i18nT('pages.appDetailPage.open_screenshot', { n: i + 1 })}
-              className="p-0 border-none bg-transparent shrink-0 cursor-pointer"
-              onClick={() => setSelected(i)}
-            >
-              {/* onError is an image-load lifecycle handler (hide broken images), */}
-              {/* not a user interaction; the rule flags onError regardless. */}
-              {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
-              <img
-                src={url}
-                alt={i18nT('pages.appDetailPage.screenshot', { n: i + 1 })}
-                className="h-40 rounded-lg border border-border hover:border-accent/40 hover:shadow-md transition-all object-cover"
-                onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
-              />
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Lightbox */}
-      {selected !== null && (
-        // Modal backdrop: click-to-dismiss is a mouse affordance; keyboard users
-        // dismiss/navigate via the onKeyDown handler (Escape / arrows) below.
-        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-        <div
-          className="fixed inset-0 z-[9999] flex items-center justify-center bg-bg/80 backdrop-blur-sm"
-          onClick={() => setSelected(null)}
-          onKeyDown={e => {
-            if (e.key === 'Escape') setSelected(null)
-            if (e.key === 'ArrowRight' && selected < screenshots.length - 1) setSelected(selected + 1)
-            if (e.key === 'ArrowLeft' && selected > 0) setSelected(selected - 1)
-          }}
-          tabIndex={-1}
-          ref={el => el?.focus()}
-          role="dialog"
-          aria-modal="true"
-        >
-          {/* Presentational wrapper: stops backdrop-dismiss when clicking the image. */}
-          {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
-          <div className="relative max-w-4xl max-h-[80vh] mx-4" onClick={e => e.stopPropagation()}>
-            <img src={screenshots[selected]} alt="" className="max-w-full max-h-[80vh] rounded-xl shadow-2xl" />
-            <button className="absolute top-2 right-2 bg-bg/80 rounded-full p-1.5 text-muted hover:text-text" onClick={() => setSelected(null)} aria-label={i18nT('pages.appDetailPage.close')}><X size={18} /></button>
-            {selected > 0 && (
-              <button className="absolute left-2 top-1/2 -translate-y-1/2 bg-bg/80 rounded-full p-2 text-muted hover:text-text" onClick={e => { e.stopPropagation(); setSelected(selected - 1) }} aria-label={i18nT('pages.appDetailPage.previous')}><ChevronLeft size={20} /></button>
-            )}
-            {selected < screenshots.length - 1 && (
-              <button className="absolute right-2 top-1/2 -translate-y-1/2 bg-bg/80 rounded-full p-2 text-muted hover:text-text" onClick={e => { e.stopPropagation(); setSelected(selected + 1) }} aria-label={i18nT('pages.appDetailPage.next')}><ChevronRight size={20} /></button>
-            )}
-            <div className="absolute bottom-3 left-1/2 -translate-x-1/2 text-[12px] text-muted bg-bg/80 px-3 py-1 rounded-full">{selected + 1} / {screenshots.length}</div>
-          </div>
-        </div>
-      )}
-    </>
-  )
-}
+import type { AppContributor } from '../types'
+import {
+  appDisplayName, appDescription, appHighlights, appUseCases, appConfiguration,
+} from '../components/appstore/appManifest'
+import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
+import { classifyManifestArt, installedArt, installedArtList, installedArtListAligned, installedIcon } from '../components/appstore/useHeroArt'
+import { fmtDateNumeric, fmtCompact, fmtNumber } from '../i18n/format'
+import { HeroBanner, ScreenshotGallery } from './AppDetailPageArt'
+import type { AppInfo, NormalizedRegistryEntry, RegistryEntry } from './appDetailPageTypes'
+// The page's parts live in sibling owners that never import this module:
+// `AppDetailPageArt.tsx` (the hero banner and the screenshot gallery, each with
+// its local-art second chance) and `appDetailPageTypes.ts` (the page's view
+// model). Callers import the two art components from this module.
+export { HeroBanner, ScreenshotGallery }
 
 export default function AppDetailPage() {
   const { name } = useParams<{ name: string }>()
+  const [app, setApp] = useState<AppInfo | null>(null)
+  const { data: registriesData, error: registriesError } = useQuery({
+    queryKey: ['registries'],
+    queryFn: () => api.listRegistries(),
+    enabled: !!app?._registry && app.origin !== 'local',
+  })
+  const sourceNames = [...(registriesData?.pinned || []), ...(registriesData?.registries || [])]
+    .map(r => ({ name: r.name || r.repo, label: r.label || r.name || r.repo, review: r.review, trust: r.trust }))
   const navigate = useNavigate()
   const location = useLocation()
   const { theme: resolvedMode } = useTheme()
-  const [app, setApp] = useState<AppInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  /**
+   * Success reflection for an in-place sync. This page otherwise has only an
+   * error surface, so a successful ``update`` re-rendered a byte-identical page:
+   * re-copying a source directory normally carries the same version, which makes
+   * silence indistinguishable from a no-op. The list card states the outcome for
+   * the same reason, and both paths this fix wires need to say it.
+   */
+  const [successMsg, setSuccessMsg] = useState('')
+  const reconsentMsg = app?.sessionApprovalConsentPending
+    ? i18nT('pages.appDetailPage.session_approval_reconsent_notice', { name: appDisplayName(app) })
+    : ''
+  // Declared api/events entries outside the approved set (`approvedGrants`) are
+  // held back: the app runs without them until the owner approves them here.
+  const stagedApi = app?.approvedGrants
+    ? (app.manifest?.permissions?.api || []).filter(p => !(app.approvedGrants?.api || []).includes(p))
+    : []
+  const stagedEvents = app?.approvedGrants
+    ? (app.manifest?.permissions?.events || []).filter(e => !(app.approvedGrants?.events || []).includes(e))
+    : []
+  const hasStagedGrants = stagedApi.length + stagedEvents.length > 0
+  // Shown where the notice was once the owner approves, so the moment is confirmed.
+  const [grantsApprovedMsg, setGrantsApprovedMsg] = useState('')
+  const enableLabel = app?.sessionApprovalConsentPending
+    ? i18nT('pages.appDetailPage.enable_and_allow_chat_control')
+    : i18nT('pages.appDetailPage.enable')
   const clearError = useCallback(() => {
     setError('')
   }, [])
@@ -203,19 +97,89 @@ export default function AppDetailPage() {
   const [installLog, setInstallLog] = useState('')
   const [showInstallLog, setShowInstallLog] = useState(false)
   const [installDone, setInstallDone] = useState(false)
+  /**
+   * Dismiss for the permanent desktop refusal's banner: one event, one control.
+   * The refusal renders the banner AND the install-log panel whose header states
+   * the same outcome, so clearing the banner alone would leave "Install failed"
+   * on screen beside a re-enabled Install -- or, once `error` is empty, flip the
+   * panel's header to "Install complete" over a log that ends in a refusal.
+   * Dropping the panel with the banner leaves the page as it was before the
+   * attempt, which is what a retry starts from.
+   */
+  const dismissRefusal = useCallback(() => {
+    setError('')
+    setShowInstallLog(false)
+  }, [])
   const installLogRef = useRef<HTMLPreElement>(null)
   const installAbortRef = useRef<AbortController | null>(null)
+  /**
+   * The last install failure as reported: its message, for the trust retry to
+   * throw, and the machine `code` the stream's `done` payload carried beside it.
+   *
+   * A REF, not state: the retry closure reads it immediately after `runInstall()`
+   * returns, and a state update is not visible in that same tick. The message is
+   * the string `reportInstallFailure` journaled, so the consent modal's
+   * `ErrorNotice` recovers the endpoint and the install log tail from the same
+   * key it renders; the code rides on the thrown error so the modal can tell a
+   * permanent refusal from a failure worth retrying.
+   */
+  const installFailureRef = useRef<{ message: string; code: string }>({ message: '', code: '' })
   const [clientInstall, setClientInstall] = useState<{ shell?: string; postInstall?: string } | null>(null)
   const [copied, setCopied] = useState(false)
   const [serverHostname, setServerHostname] = useState('')
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
   const [keepData, setKeepData] = useState(true)
 
-  // Helper: open chat with a pre-filled message (same mechanism as useChatLauncher from app-sdk)
-  const openChatWithMessage = useCallback((message: string) => {
-    ;(window as Window & { __mc_chat_launch?: { message: string; ts: number } }).__mc_chat_launch = { message, ts: Date.now() }
-    navigate('/chat')
-  }, [navigate])
+  // Contributors row (Details panel). Resolved GitHub repo URL for the app's
+  // source, its top contributors, and the fetch's loading state. The row hides
+  // entirely unless a GitHub repo URL resolves and the fetch yields entries.
+  const [repoUrl, setRepoUrl] = useState('')
+  const [contributors, setContributors] = useState<AppContributor[]>([])
+  const [contribLoading, setContribLoading] = useState(false)
+  /** A rejected contributors fetch, kept apart from `[]` so a transport failure
+   *  does not read as "no contributors". */
+  const [contribError, setContribError] = useState('')
+
+  useEffect(() => {
+    // Prefer the registry/manifest repo, then the git URL the app was trusted
+    // from, then its source. GitHub-only in v1; a non-GitHub value leaves the
+    // row hidden (the backend also returns [] for one).
+    const candidates = [app?.repo, app?.manifest?.repo, app?.trustRepository, app?.source]
+    const url = candidates.find(
+      (v): v is string => typeof v === 'string' && /^https:\/\/github\.com\//i.test(v),
+    ) || ''
+    setRepoUrl(url)
+    setContribError('')
+    if (!url) { setContributors([]); setContribLoading(false); return }
+    let cancelled = false
+    setContribLoading(true)
+    api.appContributors(url)
+      .then(res => { if (!cancelled) setContributors(res.contributors || []) })
+      .catch((e: unknown) => { if (!cancelled) { setContributors([]); setContribError(e instanceof Error ? e.message : String(e)) } })
+      .finally(() => { if (!cancelled) setContribLoading(false) })
+    return () => { cancelled = true }
+  }, [app])
+
+  /** Journal an install failure WITH the tail of its log, then show it.
+   *
+   *  The streaming install bypasses the `api.*` journal hook, so without this the
+   *  agent hand-off on the failure notice would carry only the one-line message.
+   *  The log is read from the rendered <pre> (the accumulated state, not a stale
+   *  closure); `recordError` redacts and caps it. The message string is the
+   *  journal key, so it must be exactly what `setError` shows. `code` is the
+   *  `done` payload's machine code, when it carried one, journaled so a client
+   *  can act on the failure instead of matching its prose. */
+  const reportInstallFailure = useCallback((message: string, source: 'api' | 'system', code = '') => {
+    recordError({
+      source,
+      message,
+      code: code || undefined,
+      endpoint: '/api/apps/registry/install-stream',
+      detail: installLogRef.current?.textContent || undefined,
+    })
+    installFailureRef.current = { message, code }
+    setError(message)
+  }, [])
 
   // Abort in-flight streaming install on unmount
   useEffect(() => () => { installAbortRef.current?.abort() }, [])
@@ -223,71 +187,227 @@ export default function AppDetailPage() {
   const load = useCallback(async () => {
     if (!name) return
     setLoading(true)
+    // Drop the previous record before resolving the new name: a genuine miss
+    // sets nothing below, and without this an in-session navigation from a
+    // loaded app to a non-existent one would keep rendering the old app under
+    // the new URL instead of the not-found page.
+    setApp(null)
     clearError()
     try {
-      // Try installed app first
-      const installed = await api.getApp(name).catch(() => null)
-      // Also check registry for richer metadata (screenshots, highlights)
-      const registryData = await api.listRegistry().catch(() => ({ apps: [], serverPlatform: { os: '', arch: '' } }))
-      const registryList = (registryData.apps || []) as RegistryEntry[]
+      // Try installed app first. Only a 404 means "not installed"; any other
+      // rejection is a load failure and must not be shown as "not found".
+      let installed: Awaited<ReturnType<typeof api.getApp>> | null = null
+      try {
+        installed = await api.getApp(name)
+      } catch (e: unknown) {
+        if (!isNotFoundError(e)) throw e
+      }
+      // Also check registry for richer metadata (screenshots, highlights). A
+      // failure here is held rather than swallowed: an INSTALLED app can still
+      // render from its manifest, but the reader is told the catalog was not
+      // reachable; an app that is not installed cannot be resolved without it.
+      //
+      // Rows are normalized ONCE here, at the fetch site, by the same
+      // `normalizeRegistryApp` the browse list uses -- so every branch below
+      // reads coerced display fields and a sanitized star count instead of
+      // re-defending them field by field. The RAW rows are kept beside them for
+      // one reader only: `mergeBuiltinRow` is row-first, and normalize fills a
+      // missing `displayName` with the slug, which would then beat the
+      // manifest's own name. The merge already accepts a loose row and fills
+      // its own gaps, so it is handed the row as the server sent it.
+      let rawRegistryList: RegistryEntry[] = []
+      let registryList: NormalizedRegistryEntry[] = []
+      let sideFailure: unknown = null
+      try {
+        const registryData = await api.listRegistry()
+        rawRegistryList = (registryData.apps || []) as RegistryEntry[]
+        registryList = rawRegistryList.map(
+          (r) => normalizeRegistryApp(r as RegistryApp) as NormalizedRegistryEntry,
+        )
+      } catch (e: unknown) {
+        sideFailure = e
+      }
 
       // Fetch server hostname for client install template variables
-      const sysInfo = await api.system().catch(() => ({ hostname: '' }))
-      if (sysInfo.hostname) setServerHostname(sysInfo.hostname)
+      try {
+        const sysInfo = await api.system()
+        if (sysInfo.hostname) setServerHostname(sysInfo.hostname)
+      } catch (e: unknown) {
+        sideFailure ??= e
+      }
       const registryEntry = registryList.find((r) => r.name === name)
+      const rawRegistryEntry = rawRegistryList.find((r) => r.name === name)
 
       if (installed) {
         const m = installed.manifest || {}
-        setApp({
-          name: installed.name,
-          displayName: installed.displayName || m.displayName || installed.name,
-          description: m.description || '',
-          version: registryEntry?.version || m.version || installed.version || '0.0.0',
-          author: m.author || registryEntry?.author || '',
-          // Built-in apps aren't in the registry feed, so registryEntry is
-          // undefined for them — their icon/hero metadata lives on the
-          // manifest. Fall back to it so built-in detail pages render the real
-          // icon and hero instead of the generic Package box.
-          icon: registryEntry?.icon || m.ui?.pages?.[0]?.icon || '',
-          iconUrl: registryEntry?.iconUrl || m.iconUrl || m.ui?.pages?.[0]?.iconUrl || '',
-          tags: m.tags || registryEntry?.tags || [],
-          highlights: m.highlights || registryEntry?.highlights || [],
-          screenshots: registryEntry?.screenshots || m.screenshots || [],
-          screenshotsDark: registryEntry?.screenshotsDark || m.screenshotsDark || [],
-          heroImage: registryEntry?.heroImage || m.heroImage || '',
-          heroImageDark: registryEntry?.heroImageDark || m.heroImageDark || '',
-          heroImageDetail: registryEntry?.heroImageDetail || m.heroImageDetail || '',
-          heroImageDetailDark: registryEntry?.heroImageDetailDark || m.heroImageDetailDark || '',
-          repo: registryEntry?.repo || '',
-          installed: true,
-          installedVersion: installed.version,
-          enabled: installed.enabled,
-          managed: installed.managed,
-          source: installed.source,
-          installedAt: installed.installedAt,
-          origin: installed.origin,
-          resources: installed.resources,
-          lifecycle: installed.lifecycle,
-          updateAvailable: registryEntry?.updateAvailable || false,
-          manifest: m,
-        })
+        // A built-in the registry response carries goes through the SAME merge
+        // the browse list uses. Spelled separately, the two chains disagreed:
+        // this page preferred the manifest (`m.author || registryEntry?.author`)
+        // while the list preferred the row, so one app could read
+        // "Kiro Crew · Developer Tools" in the list and "kirocrew · Productivity"
+        // one click later. The catalog is the store's inventory on both surfaces
+        // or on neither.
+        if (rawRegistryEntry && registryEntry && isBuiltinServerRow(registryEntry)) {
+          setApp({
+            ...mergeBuiltinRow(rawRegistryEntry, { ...m, version: installed.version }),
+            name: installed.name,
+            installed: true,
+            installedVersion: installed.version,
+            enabled: installed.enabled,
+            sessionApprovalConsentPending: installed.sessionApprovalConsentPending,
+            approvedGrants: installed.approvedGrants,
+            managed: installed.managed,
+            source: installed.source,
+            installedAt: installed.installedAt,
+            origin: installed.origin,
+            resources: installed.resources,
+            lifecycle: installed.lifecycle,
+            updateAvailable: registryEntry.updateAvailable || false,
+            // Built-ins never carry a star count (they have no repository of
+            // their own) — enforce the invariant here rather than trusting the
+            // spread above, since mergeBuiltinRow copies the raw server row.
+            stargazersCount: undefined,
+            manifest: m,
+          })
+        } else {
+          // A non-built-in installed app may have no registry row carrying art
+          // at all — a local-directory install has none, and a row built from a
+          // cached manifest older than the release that added the art carries
+          // those fields empty. The manifest on disk still has the paths, and
+          // since the app IS installed those paths resolve against its own
+          // install directory through `installedArt` — no repo identifier, no
+          // clone, no network.
+          // A page's own icon ships inside the app's UI bundle, not at the repo
+          // root, so a relative value resolves against the app's UI asset route —
+          // the same base the rail and the command palette use. A cross-origin
+          // value is refused here for the same reason it is everywhere else on
+          // this path: the manifest is untrusted, and requesting it would leak the
+          // viewer to whatever host it names.
+          const pageIcon: unknown = m.ui?.pages?.[0]?.iconUrl
+          const pageIconKind = classifyManifestArt(pageIcon)
+          const pageIconUrl = pageIconKind === 'same-origin' ? pageIcon as string
+            : pageIconKind === 'relative' ? `/apps/${installed.name}/ui/${pageIcon as string}`
+              : ''
+          setApp({
+            name: installed.name,
+            displayName: installed.displayName || m.displayName || installed.name,
+            description: m.description || '',
+            // The installed record wins, and the registry row is the LAST
+            // resort. Version is the one field where the catalog does not get
+            // to speak for the machine: the row is fetched from the network and
+            // cached, so it can name an older version than the clone installed
+            // here — a repo publishing 0.1.0 while this machine runs 0.2.0. The
+            // built-in branch above resolves it the same way
+            // (`mergeBuiltinRow(registryEntry, { ...m, version: installed.version })`,
+            // whose contract names version as its one reversed field), so both
+            // branches agree rather than disagreeing the way the comment there
+            // records for `author`.
+            version: installed.version || m.version || registryEntry?.version || '0.0.0',
+            author: m.author || registryEntry?.author || '',
+            _registry: registryEntry?._registry,
+            provenance: registryEntry?.provenance,
+            catalogListed: !!registryEntry,
+            icon: registryEntry?.icon || m.ui?.pages?.[0]?.icon || '',
+            // `iconPath` is preferred over a manifest-declared `iconUrl` for the
+            // same reason the backend honours only `iconPath`: a repo-relative
+            // path stays on our own proxy, which enforces the extension
+            // allowlist and the trusted-repo gate. The `iconUrl` fallback goes
+            // through the same resolver rather than straight to `<img>`, so a
+            // manifest naming an external host is refused on this surface too.
+            iconUrl: registryEntry?.iconUrl
+              || installedIcon(m.iconPath, m.iconUrl, installed.name) || pageIconUrl || '',
+            iconUrlDark: registryEntry?.iconUrlDark
+              || installedIcon(m.iconPathDark, m.iconUrlDark, installed.name) || '',
+            // The app IS installed on this branch, so its icon bytes are on
+            // local disk: carry that route as a LOAD-failure fallback for
+            // AppIcon. Deliberately not a precedence change — the registry's
+            // immutable content-addressed asset above stays the primary `src`
+            // and keeps its cache-forever win (#6804 rejects a flip); the local
+            // candidate is consulted only when that src errors (offline,
+            // captive portal, blocked host). When the local candidate itself
+            // won the precedence above, AppIcon skips the identical URL.
+            iconUrlFallback: installedIcon(m.iconPath, m.iconUrl, installed.name) || '',
+            iconUrlFallbackDark: installedIcon(m.iconPathDark, m.iconUrlDark, installed.name) || '',
+            tags: m.tags || registryEntry?.tags || [],
+            highlights: m.highlights || registryEntry?.highlights || [],
+            useCases: m.useCases || registryEntry?.useCases || [],
+            configuration: m.configuration || registryEntry?.configuration || [],
+            // `||` would be wrong for the list fields: an empty array is truthy,
+            // so a declared-but-unresolvable list would short-circuit the
+            // blob-proxy fallback instead of falling through to it.
+            screenshots: registryEntry?.screenshots
+              || installedArtList(m.screenshots, installed.name),
+            screenshotsDark: registryEntry?.screenshotsDark
+              || installedArtList(m.screenshotsDark, installed.name),
+            heroImage: registryEntry?.heroImage || installedArt(m.heroImage, installed.name),
+            heroImageDark: registryEntry?.heroImageDark
+              || installedArt(m.heroImageDark, installed.name),
+            heroImageDetail: registryEntry?.heroImageDetail
+              || installedArt(m.heroImageDetail, installed.name),
+            heroImageDetailDark: registryEntry?.heroImageDetailDark
+              || installedArt(m.heroImageDetailDark, installed.name),
+            // The app IS installed on this branch, so its hero/screenshot
+            // bytes are on local disk: carry those routes as LOAD-failure
+            // fallbacks, the same shape as the icon pair above. Deliberately
+            // not a precedence change — the registry assets stay the primary
+            // `src` (#6804 rejects a flip); these are consulted only when a
+            // primary errors (offline, captive portal, blocked host) (#6864).
+            heroImageFallback: installedArt(m.heroImage, installed.name),
+            heroImageDarkFallback: installedArt(m.heroImageDark, installed.name),
+            heroImageDetailFallback: installedArt(m.heroImageDetail, installed.name),
+            heroImageDetailDarkFallback: installedArt(m.heroImageDetailDark, installed.name),
+            // The screenshot fallbacks pair with their primaries BY INDEX, so
+            // they use the aligned resolver (refused entries stay as ''
+            // placeholders) — the filtered list would shift every entry after
+            // a refusal and pair a thumbnail with its neighbour's art. Set
+            // only when the registry supplied the primary list: when the
+            // local list won the precedence above, the primary already IS the
+            // local route (filtered, so aligned indices would not match), and
+            // retrying an identical URL is a guaranteed second failure.
+            screenshotsFallback: registryEntry?.screenshots
+              ? installedArtListAligned(m.screenshots, installed.name)
+              : undefined,
+            screenshotsDarkFallback: registryEntry?.screenshotsDark
+              ? installedArtListAligned(m.screenshotsDark, installed.name)
+              : undefined,
+            // Left as the row's own value: this field also names the repo in the
+            // trust-consent prompt and the details list, and widening those to a
+            // fallback identifier is a separate decision from resolving art.
+            repo: registryEntry?.repo || '',
+            trustRepository: installed.trustRepository,
+            stargazersCount: registryEntry?.stargazersCount,
+            installed: true,
+            installedVersion: installed.version,
+            enabled: installed.enabled,
+            sessionApprovalConsentPending: installed.sessionApprovalConsentPending,
+            approvedGrants: installed.approvedGrants,
+            managed: installed.managed,
+            source: installed.source,
+            installedAt: installed.installedAt,
+            origin: installed.origin,
+            resources: installed.resources,
+            lifecycle: installed.lifecycle,
+            updateAvailable: registryEntry?.updateAvailable || false,
+            manifest: m,
+          })
+        }
       } else if (registryEntry) {
         setApp({
+          // Already normalized at the fetch site: display fields are strings
+          // with their fallbacks filled and the star count is sanitized.
           ...registryEntry,
-          // Required AppInfo fields — registry entries normally carry these, but
-          // fall back so the object always satisfies AppInfo.
-          name: registryEntry.name,
-          displayName: registryEntry.displayName || registryEntry.name,
-          description: registryEntry.description || '',
-          version: registryEntry.version || '0.0.0',
-          author: registryEntry.author || '',
           // Preserve install status from registry (set by detectInstalled)
           installed: registryEntry.installed ?? false,
           platform: registryEntry.platform,
         })
-      } else {
-        setError(i18nT('pages.appDetailPage.app_not_found_2', { name }))
+      } else if (sideFailure) {
+        // Neither installed nor in the catalog — but the catalog read FAILED, so
+        // this is a load failure, not a missing app.
+        throw sideFailure
       }
+      // Otherwise a real not-found: `app` stays null with no error, and the
+      // render below shows the "doesn't exist" page for exactly that pair.
+      if (sideFailure) setError(sideFailure instanceof Error ? sideFailure.message : String(sideFailure))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to_load_app'))
     } finally {
@@ -315,6 +435,15 @@ export default function AppDetailPage() {
     autoActionTriggered.current = true
     // Clear the state so a refresh or Back/Forward doesn't re-fire it.
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
+    // An installed app whose bytes came from a directory on this machine has no
+    // registry row to install from — its refresh is the update endpoint, which
+    // re-copies the source directory recorded at install. The streaming registry
+    // install is for everything else: a registry-sourced app, and an app not
+    // installed at all.
+    if (stateAction === 'update' && app.installed && !isRegistrySourced(app)) {
+      handleAction('update')
+      return
+    }
     handleInstall()
   }, [app, location]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -338,6 +467,9 @@ export default function AppDetailPage() {
     setInstallDone(false)
     setShowInstallLog(true)
     clearError()
+    // Drop the previous attempt's reason: a retry that fails for a new cause (or
+    // is aborted, which has none) must never show the first attempt's.
+    installFailureRef.current = { message: '', code: '' }
     setClientInstall(null)
     installAbortRef.current?.abort()
     const controller = new AbortController()
@@ -388,7 +520,7 @@ export default function AppDetailPage() {
         await load()
         window.dispatchEvent(new Event('mc:apps-changed'))
       } else {
-        setError(result.error || i18nT('pages.appDetailPage.install_failed'))
+        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system', result.code || '')
         return 'failed'
       }
     } catch (e: unknown) {
@@ -408,7 +540,7 @@ export default function AppDetailPage() {
         return 'trust-required'
       }
       setInstallDone(true)
-      setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.install_failed'))
+      reportInstallFailure(e instanceof Error ? e.message : i18nT('pages.appDetailPage.install_failed'), 'api')
       return 'failed'
     } finally {
       // Only clear loading if this is still the active install —
@@ -423,13 +555,27 @@ export default function AppDetailPage() {
 
   /** The single enable path — shared by the action buttons and the trust retry. */
   const runEnable = useCallback(async (name: string) => {
-    await api.enableApp(name)
+    await api.enableApp(name, app?.sessionApprovalConsentPending === true)
     recordEvent('app_enable', { app: name, version: app?.installedVersion || app?.version })
     await load()
     window.dispatchEvent(new Event('mc:apps-changed'))
   }, [app, load])
 
   const trust = useTrustGate(runEnable)
+  // The listing registry's review tier, resolved at RENDER time rather than
+  // when the gate opens: the Get button's autoAction install can be refused
+  // before the registries list lands, and a tier snapshotted then would be
+  // missing for the whole dialog. A local app has no listing, so it carries no
+  // claim, the same rule the Source line applies. Display only. The app's
+  // `_registry` rides on the target too, as it does on Discover and Library, so
+  // the dialog's source badge names the listing registry (whatever its tier)
+  // instead of the first-party fallback label (#20656).
+  // Until the registries list lands (or when it fails) the tier is unknown, so
+  // the not-vetted box shows (`consentTierFor`) rather than read it as vetted.
+  const consentTarget = trust.target && app && app.name === trust.target.name && app.origin !== 'local' && app._registry
+    ? { ...trust.target, _registry: app._registry, ...consentTierFor(app._registry, sourceNames, registriesData === undefined) }
+    : trust.target
+  const { confirm: confirmConsent, confirmDialog: consentDialog } = useConfirm()
 
   /**
    * Get / Install / Update entry point — owns the consent modal.
@@ -444,7 +590,16 @@ export default function AppDetailPage() {
     if (!app) return
     if (await runInstall() !== 'trust-required') return
     trust.open(
-      { name: app.name, displayName: app.displayName, repo: app.repo, origin: app.origin },
+      {
+        name: app.name,
+        displayName: app.displayName,
+        trustRepository: app.trustRepository,
+        origin: app.origin,
+        sessionApproval: app.manifest?.permissions?.sessionApproval === true,
+        retryInstalls: true,
+        // The Update buttons funnel here too, over an app that is already there.
+        replacesInstalled: app.installed === true,
+      },
       async () => {
         // ANY unsuccessful retry must REJECT, not resolve. `useTrustGate` rolls the
         // fresh grant back on rejection (and only then), so resolving here on an
@@ -454,7 +609,19 @@ export default function AppDetailPage() {
         // silent no-op.
         const outcome = await runInstall()
         if (outcome === 'trust-required') throw new Error(APP_EXECUTION_DENIED)
-        if (outcome !== 'done') throw new Error(i18nT('pages.appDetailPage.install_failed'))
+        // The server's own sentence, so the modal can show WHY instead of only
+        // the generic copy, with the machine code beside it so the modal can tell
+        // a permanent refusal from a failure worth retrying (`errorCode` reads a
+        // direct `code` property). `installFailureRef` holds what
+        // `reportInstallFailure` journaled; an abort reports nothing, so it falls
+        // back to the generic string rather than reusing a stale reason.
+        if (outcome !== 'done') {
+          const { message, code } = installFailureRef.current
+          throw Object.assign(
+            new Error(message || i18nT('pages.appDetailPage.install_failed')),
+            code ? { code } : {},
+          )
+        }
       },
     )
   }
@@ -468,15 +635,51 @@ export default function AppDetailPage() {
       return
     }
     setActionLoading(action)
+    let updateResult: { notice?: string } | undefined
     clearError()
+    setSuccessMsg('')
     try {
-      if (action === 'enable') { await runEnable(app.name); return }
+      if (action === 'enable') {
+        // Consent to chat control is restated at click time, on the trusted and
+        // the untrusted path alike, so the button has one ceremony: a dialog
+        // that names the grant, then enable (the trust modal may still follow
+        // for an untrusted repository).
+        if (app.sessionApprovalConsentPending) {
+          const ok = await confirmConsent({
+            title: i18nT('pages.appDetailPage.session_approval_confirm_title', { name: appDisplayName(app) }),
+            body: i18nT('pages.appDetailPage.session_approval_desc'),
+            confirmLabel: i18nT('pages.appDetailPage.enable_and_allow_chat_control'),
+            danger: false,
+          })
+          if (!ok) return
+        }
+        await runEnable(app.name)
+        await load()
+        return
+      }
       if (action === 'disable') await api.disableApp(app.name)
-      else if (action === 'update') await api.updateApp(app.name)
+      else if (action === 'update') updateResult = await api.updateApp(app.name)
       if (action === 'disable') {
         recordEvent('app_disable', { app: app.name, version: app.installedVersion || app.version })
       }
       await load()
+      // `load()` clears the error but does not speak to success, and a same-version
+      // re-copy changes nothing visible, so say it explicitly. The Sync button that
+      // reaches here is not gated on source, and `handle_update_app` re-clones a
+      // registry-sourced app from the registry rather than copying a directory, so
+      // each case has to name where the update actually came from.
+      if (action === 'update') {
+        // A widened session-approval grant leaves the app DISABLED pending
+        // re-consent (`notice: session_approval_reconsent`). Saying "updated"
+        // alone would report success over an app that just stopped running, so
+        // that case gets its own persistent notice instead of the 4s toast.
+        if (updateResult?.notice !== 'session_approval_reconsent') {
+          setSuccessMsg(isRegistrySourced(app)
+            ? i18nT('pages.appsPage.updated_from_the_registry', { name: appDisplayName(app) })
+            : i18nT('pages.appsPage.synced_from_its_source_directory', { name: appDisplayName(app) }))
+          setTimeout(() => setSuccessMsg(''), 4000)
+        }
+      }
       window.dispatchEvent(new Event('mc:apps-changed'))
     } catch (e: unknown) {
       // A third-party app that has not been granted execution trust yet is a
@@ -484,7 +687,13 @@ export default function AppDetailPage() {
       // let the modal grant it inline instead of sending the user to a blanket
       // switch. Every OTHER failure still renders its own prose.
       if (action === 'enable' && isTrustDeniedError(e)) {
-        trust.open({ name: app.name, displayName: app.displayName, repo: app.repo, origin: app.origin })
+        trust.open({
+          name: app.name,
+          displayName: app.displayName,
+          trustRepository: app.trustRepository,
+          origin: app.origin,
+          sessionApproval: app.manifest?.permissions?.sessionApproval === true,
+        })
       } else {
         setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to', { action }))
       }
@@ -523,11 +732,23 @@ export default function AppDetailPage() {
   }
 
   if (!app) {
+    // Two different pages share this branch: `error` set means the load FAILED
+    // (transport, 5xx), so the header must not announce "not found" and the
+    // failure gets the shared surface plus a retry; no error means the name
+    // genuinely resolves to nothing.
     return (
       <>
-        <PageHeader title={i18nT('pages.appDetailPage.app_not_found')} subtitle={error || i18nT('pages.appDetailPage.doesnt_exist', { name })} />
-        <div className="flex-1 flex items-center justify-center p-8">
-          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}</Btn>
+        <PageHeader
+          title={error ? i18nT('pages.appDetailPage.apps') : i18nT('pages.appDetailPage.app_not_found')}
+          subtitle={error ? i18nT('pages.appDetailPage.failed_to_load_app') : i18nT('pages.appDetailPage.doesnt_exist', { name })}
+        />
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8">
+          {/* Nothing on this page is editable, so the hand-off loses nothing. */}
+          <ErrorNotice message={error} askAgent />
+          <div className="flex items-center gap-2">
+            {error && <Btn onClick={() => { void load() }}>{i18nT('pages.appDetailPage.retry')}</Btn>}
+            <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}</Btn>
+          </div>
         </div>
       </>
     )
@@ -543,9 +764,13 @@ export default function AppDetailPage() {
   const desktopOnly = needsDesktopApp(app)
   const canUpdate = app.lifecycle === 'gateway'
   const canUninstall = app.lifecycle !== 'locked'
-  const agentCount = app.manifest?.agents?.length || 0
-  const skillCount = app.manifest?.skills?.length || 0
-  const cronCount = app.manifest?.crons?.length || 0
+  // Resource lists, derived once. `manifest` is absent for a registry-only app,
+  // and `normalizeInstalledApp` fills the lists for an installed one — so the
+  // fallback here is the registry case, not a defence against a partial
+  // manifest, and nothing below re-asserts past it (#3689).
+  const agents = app.manifest?.agents || []
+  const skills = app.manifest?.skills || []
+  const crons = app.manifest?.crons || []
   // Theme-aware hero banner source (mirrors the Browse card resolution).
   // Prefer the wide detail-ratio banner (heroImageDetail*); fall back to the
   // Browse hero, then the opposite theme.
@@ -560,55 +785,240 @@ export default function AppDetailPage() {
   // 1200x288 (25:6) ratio so object-cover doesn't horizontally crop the art
   // on viewports narrower than 1200px. Fall back to 16:9 for the Browse hero.
   const heroIsDetail = Boolean(heroDetailSrc)
+  // Local-art fallback candidate (#6864): the SAME two-level choice
+  // re-evaluated over the fallback fields. The detail-vs-Browse order cannot
+  // put detail-ratio art into the 16:9 container: a non-empty detail FALLBACK
+  // implies a detail PRIMARY (the primary resolution above already falls back
+  // to the same local candidate when the registry has none), so whenever the
+  // first term below is non-empty, heroIsDetail is true and the container is
+  // already sized 25:6. The reachable cross-tier case is the converse — a
+  // registry detail banner failing with only local Browse art on disk — where
+  // borrowing the other tier's art beats no art, the ratio stays keyed on the
+  // primary (heroIsDetail above), and object-cover crops rather than distorts.
+  const heroDetailFallback = resolvedMode === 'dark'
+    ? (app.heroImageDetailDarkFallback || app.heroImageDetailFallback || '')
+    : (app.heroImageDetailFallback || app.heroImageDetailDarkFallback || '')
+  const heroBrowseFallback = resolvedMode === 'dark'
+    ? (app.heroImageDarkFallback || app.heroImageFallback || '')
+    : (app.heroImageFallback || app.heroImageDarkFallback || '')
+  const heroSrcFallback = heroDetailFallback || heroBrowseFallback
+  // Resolve untrusted registry metadata once and use the same normalized arrays
+  // for both visibility and content. Reading the raw field for visibility would
+  // render an empty titled card when a third-party index supplied a string or a
+  // mixed array that the resolver correctly rejects.
+  const useCases = appUseCases(app)
+  const configuration = appConfiguration(app)
+  // The journal entry behind the current error, when there is one: its `code` is
+  // the `done` payload's machine code, journaled by `reportInstallFailure`, and
+  // it selects the error box's copy below. Looked up by the message, which is
+  // the journal key, so a later unrelated `setError` never inherits an install
+  // failure's code.
+  const errorReport = error ? findReport(error) : undefined
+  // The desktop build-step refusal is permanent for this app as it is: the
+  // Install / Update buttons below are disabled while its banner is up, because
+  // pressing them runs the same clone and build into the same refusal. The
+  // banner's dismiss clears `error`, which is how a retry is reached once the
+  // app's author has shipped the packages. The disabled buttons SAY so: a
+  // reader who met the banner's label alone could not tell what dismissing a
+  // notice had to do with being allowed to install again, so the causality is
+  // stated at the point of action too -- a `title` on the button they are
+  // actually looking at.
+  const installRefusedForGood = Boolean(error) && errorReport?.code === DESKTOP_BUILD_STEP_UNSUPPORTED
+  // The verb follows the action the user pressed: on an INSTALLED app the button
+  // beside "Installed version" is Update, and a banner saying "can't be
+  // installed" with a dismiss that "re-enables Install" would describe a button
+  // that is not there. Every key is resolved as a LITERAL (`check-i18n-keys.mjs`
+  // verifies only a key it can read at the `i18nT()` call site), and the page
+  // help sentence carries the shared explanation in `{{help}}` either way.
+  const refusalHelp = i18nT('components.appstore.trustAppModal.failed_desktop_unsupported_help')
+  const refusalCopy = !installRefusedForGood
+    ? undefined
+    : app.installed
+      ? {
+        title: i18nT('pages.appDetailPage.update_desktop_unsupported'),
+        message: i18nT('pages.appDetailPage.update_desktop_unsupported_help', { help: refusalHelp }),
+        dismiss: i18nT('pages.appDetailPage.dismiss_to_update_again'),
+        disabledTitle: i18nT('pages.appDetailPage.dismiss_notice_to_update_again'),
+      }
+      : {
+        title: i18nT('pages.appDetailPage.install_desktop_unsupported'),
+        message: i18nT('pages.appDetailPage.install_desktop_unsupported_help', { help: refusalHelp }),
+        dismiss: i18nT('pages.appDetailPage.dismiss_to_install_again'),
+        disabledTitle: i18nT('pages.appDetailPage.dismiss_notice_to_install_again'),
+      }
+  const installDisabledTitle = refusalCopy?.disabledTitle
 
   return (
     <>
       <PageHeader title={i18nT('pages.appDetailPage.apps')} subtitle={appDisplayName(app)} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {/* Back link */}
         <button className="flex items-center gap-1.5 text-[13px] text-muted hover:text-text mb-5 bg-transparent border-none cursor-pointer p-0 font-body transition-colors" onClick={() => navigate('/apps')}>
           <ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}
         </button>
 
-        {/* Error */}
-        {error && (
-          <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
-            <div className="flex-1 min-w-0">
-              {/* No special execution-policy branch here any more: an untrusted
-                  third-party app is refused with `app_execution_denied`, and that
-                  refusal is now resolved INLINE by the consent modal (granting
-                  this one app) rather than by sending the user off to flip a
-                  blanket switch. Everything that still reaches this box is an
-                  unrecognized backend failure, so it renders the prose — better
-                  than swallowing it — plus a hand-off to the agent, since raw
-                  backend prose is otherwise a dead end. */}
-              <span className="text-danger text-sm block">{error}</span>
-              <div className="mt-2">
-                <AskAgentButton message={error} />
-              </div>
-            </div>
-            <button aria-label={i18nT('pages.appDetailPage.dismiss_error')} className="text-danger/60 hover:text-danger text-sm shrink-0" onClick={clearError}><X className="lucide-inline" /></button>
+        {/* In-place sync succeeded. Stated because nothing else on the page
+            changes when a re-copy carries the same version. No dismiss control:
+            unlike the error box below — which persists until cleared and so needs
+            one — this clears itself, and a close button on a self-closing notice
+            is a control whose only outcome is to race the timer. */}
+        {successMsg && (
+          <div className="mb-4 bg-ok/10 border border-ok/20 rounded-lg p-3 animate-rise">
+            <span className="text-ok text-sm block">{successMsg}</span>
           </div>
+        )}
+
+        {/* Re-consent after an update that widened the session-approval grant.
+            Warn-styled like the PR's other session-approval surfaces -- the text
+            says "it is now disabled", so a green box would contradict it. Cleared
+            when the user enables the app again (the action the notice asks for). */}
+        {reconsentMsg && (
+          <div
+            role="status"
+            className="mb-4 flex items-start gap-2 rounded-lg border border-warn/30 bg-warn-subtle p-3 animate-rise"
+          >
+            <ShieldAlert size={14} className="mt-[3px] shrink-0 text-warn" />
+            <span className="text-text text-sm">{reconsentMsg}</span>
+          </div>
+        )}
+
+        {app.installed && hasStagedGrants && (
+          <div
+            role="status"
+            className="mb-4 flex flex-wrap items-start gap-3 rounded-lg border border-warn/30 bg-warn-subtle p-3 animate-rise"
+          >
+            <ShieldAlert size={14} className="mt-[3px] shrink-0 text-warn" />
+            <div className="text-text text-sm flex-1 min-w-0 grid gap-2">
+              <span>
+                {app.enabled
+                  ? i18nT('pages.appDetailPage.grants_reconsent_notice', { name: appDisplayName(app) })
+                  : i18nT('pages.appDetailPage.grants_reconsent_notice_disabled', { name: appDisplayName(app) })}
+              </span>
+              {app.enabled && (
+                <span className="text-[13px] text-text">{i18nT('pages.appDetailPage.grants_reconsent_keep', { name: appDisplayName(app) })}</span>
+              )}
+              {stagedApi.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_api')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedApi.map(p => (
+                      <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{p}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {stagedEvents.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_events')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedEvents.map(e => (
+                      <code key={e} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{e}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {app.enabled && (
+                <span className="text-[13px] text-muted">{i18nT('pages.appDetailPage.grants_reconsent_undo', { name: appDisplayName(app) })}</span>
+              )}
+            </div>
+            {/* Approval is offered only on a running app: on a disabled one the
+                enable route would also switch the app on. Enabling it first runs
+                it on the approved set, and the notice stays until approval. */}
+            {app.enabled && (
+            <Btn
+              primary
+              onClick={async () => {
+                setActionLoading('approve_grants')
+                const approved = [...stagedApi, ...stagedEvents].join(', ')
+                try {
+                  await api.enableApp(app.name, false, { api: stagedApi, events: stagedEvents })
+                  setGrantsApprovedMsg(i18nT('pages.appDetailPage.grants_approved', { entries: approved }))
+                  await load()
+                  window.dispatchEvent(new Event('mc:apps-changed'))
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e))
+                } finally {
+                  setActionLoading(null)
+                }
+              }}
+              disabled={actionLoading === 'approve_grants'}
+            >
+              {i18nT('pages.appDetailPage.approve_new_permissions')}
+            </Btn>
+            )}
+          </div>
+        )}
+        {grantsApprovedMsg && !hasStagedGrants && (
+          <div role="status" className="mb-4 bg-ok/10 border border-ok/20 rounded-lg p-3 animate-rise">
+            <span className="text-ok text-sm block">{grantsApprovedMsg}</span>
+          </div>
+        )}
+
+        {/* Error. No special execution-policy branch here any more: an untrusted
+            third-party app is refused with `app_execution_denied`, and that
+            refusal is now resolved INLINE by the consent modal (granting this
+            one app) rather than by sending the user off to flip a blanket
+            switch. Everything that still reaches this box is an unrecognized
+            backend failure, so it renders the prose — better than swallowing
+            it — plus the agent hand-off, since raw backend prose is otherwise
+            a dead end. The page holds no draft (every action commits on
+            click), so the hand-off is safe.
+
+            One recognized case: the desktop build-step refusal. An app that is
+            ALREADY trusted never opens the consent modal, so its refusal lands
+            here, and the raw sentence alone is developer vocabulary with no hint
+            that retrying is futile. The journal carries the `done` payload's code
+            beside the message (`reportInstallFailure`), so the code the modal
+            keys its copy on is read here too. One verb on both surfaces: the
+            refusal is the install's (the build step runs at install and nowhere
+            else, so the untrusted path reaches the modal's copy from this same
+            Install button), and a reader who meets the modal's sentence and then
+            this banner behind it must not have to wonder whether installing and
+            turning on are two steps. The plain sentence beneath is shared, with
+            this page's own trailing sentence naming the way back to a retry: the
+            banner's dismiss is that way, so the control carries a visible label
+            saying so instead of the icon-only ✕ -- nothing else on the page
+            re-enables Install. The server's own sentence is NOT repeated here:
+            the install-log panel beneath shows it verbatim as the streamed
+            refusal line, and the agent hand-off carries it through the report,
+            so the banner says the refusal once in plain words rather than three
+            times in three registers. */}
+        {refusalCopy ? (
+          <ErrorNotice
+            title={refusalCopy.title}
+            message={refusalCopy.message}
+            report={errorReport}
+            askAgent
+            onDismiss={dismissRefusal}
+            dismissLabel={refusalCopy.dismiss}
+            dismissLabelVisible
+            className="mb-4 animate-rise"
+          />
+        ) : (
+          <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
         )}
 
         {/* Third-party execution-trust consent. Opened when an enable OR a
             registry install is refused with code `app_execution_denied`, instead
             of surfacing the raw backend string in the error card above. */}
         <TrustAppModal
-          app={trust.target}
+          app={consentTarget}
           pending={trust.pending}
           failed={trust.failed}
+          detail={trust.detail}
+          detailCode={trust.detailCode}
           granted={trust.granted}
           onCancel={trust.cancel}
           onConfirm={trust.confirm}
         />
+        {consentDialog}
 
         {/* Uninstall confirmation modal */}
         {showUninstallConfirm && app && (
           // Modal backdrop: click-to-dismiss is a mouse affordance; keyboard
           // users dismiss via the Escape handler in onKeyDown below.
           // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-xs animate-rise"
             onClick={() => setShowUninstallConfirm(false)}
             onKeyDown={e => { if (e.key === 'Escape') setShowUninstallConfirm(false) }}
             tabIndex={-1} ref={el => el?.focus()} role="dialog" aria-modal="true" aria-label={i18nT('pages.appDetailPage.confirm_uninstall')}
@@ -643,24 +1053,18 @@ export default function AppDetailPage() {
           </div>
         )}
 
-        {/* Hero banner (only when the app ships one) */}
-        {heroSrc && (
-          <div className={`w-full ${heroIsDetail ? 'aspect-[25/6]' : 'aspect-video'} max-h-72 rounded-2xl border border-border overflow-hidden mb-6 bg-[var(--card)]`}>
-            {/* onError is an image-load lifecycle handler (hide broken images). */}
-            {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
-            <img
-              src={heroSrc}
-              alt=""
-              className="w-full h-full object-cover"
-              onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
-            />
-          </div>
-        )}
+        {/* Hero banner (only when the app ships one, or its local fallback survives a load failure) */}
+        <HeroBanner src={heroSrc} fallbackSrc={heroSrcFallback || undefined} isDetail={heroIsDetail} />
 
         {/* Hero */}
         <div className="flex items-start gap-5 mb-6">
-          <div className="w-24 h-24 rounded-2xl bg-accent/10 flex items-center justify-center shrink-0 overflow-hidden">
-            <AppIcon icon={app.icon} iconUrl={app.iconUrl} size={64} />
+          {/* `relative` is load-bearing, not decoration: `rasterFill` absolutely
+              insets the image, so without a positioned plate the icon resolves
+              against the nearest positioned ancestor — there is none above this
+              hero row, so it would escape to a page-level box. `overflow-hidden`
+              is what makes the bled image take this plate's `rounded-2xl`. */}
+          <div className="w-24 h-24 rounded-2xl bg-accent/10 flex items-center justify-center shrink-0 overflow-hidden relative">
+            <AppIcon icon={app.icon} iconUrl={app.iconUrl} iconUrlDark={app.iconUrlDark} iconUrlFallback={app.iconUrlFallback} iconUrlFallbackDark={app.iconUrlFallbackDark} size={64} rasterFill />
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 mb-1 flex-wrap">
@@ -670,12 +1074,27 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && <Badge variant="ok">{i18nT('pages.appDetailPage.self_managed')}</Badge>}
               {app.installed && !isSelfManaged && !isBuiltin && <Badge variant={app.enabled ? 'ok' : 'warn'}>{app.enabled ? i18nT('pages.appDetailPage.enabled') : i18nT('pages.appDetailPage.disabled')}</Badge>}
             </div>
-            <div className="text-[13px] text-muted mb-3">{app.author} {i18nT('pages.appDetailPage.v_2')}{app.version}</div>
+            <div className="text-[13px] text-muted mb-3 flex items-center gap-1 flex-wrap">
+              <span>{app.author} {i18nT('pages.appDetailPage.v_2')}{app.version}</span>
+              {typeof app.stargazersCount === 'number' && (
+                <span className="inline-flex items-center gap-0.5">
+                  · <Star size={13} className="shrink-0" role="img" aria-label={i18nT('pages.appDetailPage.github_stars')} />
+                  {fmtCompact(app.stargazersCount)}
+                </span>
+              )}
+            </div>
+
+            <div className="mb-3">
+              <AppSource app={app} sources={sourceNames} unlisted={app.installed && (app.catalogListed === false || app.origin === 'local')} />
+              {app._registry && app.origin !== 'local' && registriesError && (
+                <ErrorNotice message={registriesError.message} variant="inline" askAgent />
+              )}
+            </div>
 
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
               {!app.installed && !clientInstall && (
-                <Btn primary onClick={handleInstall} disabled={actionLoading === 'install'}>
+                <Btn {...uiLocation('apps.detail.install')} primary onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle}>
                   {actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.installing')}</> : <><Download size={14} /> {i18nT('pages.appDetailPage.install')}</>}
                 </Btn>
               )}
@@ -698,7 +1117,7 @@ export default function AppDetailPage() {
                        store row / feature card keep the badge alone (the decision
                        does not happen there). */
                     <>
-                    <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {i18nT('pages.appDetailPage.enable')}</Btn>
+                    <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {enableLabel}</Btn>
                     {desktopOnly && (
                     <span className="text-[13px] text-muted flex items-center gap-1.5">
                       <Monitor size={14} /> {i18nT('pages.appDetailPage.desktop_app_hint')}
@@ -711,14 +1130,14 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && (
                 <>
                   <div className="text-[13px] text-ok flex items-center gap-1.5"><Check size={14} /> {i18nT('pages.appDetailPage.installed_version', { version: app.installedVersion })}</div>
-                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install'} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
                   {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'} title={i18nT('pages.appDetailPage.removes_kirocrew_metadata_only_the_app_itself_is')}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
               {app.installed && !isSelfManaged && !isBuiltin && (
                 <>
                   {app.enabled ? (
-                    <Btn onClick={() => handleAction('disable')} disabled={actionLoading === 'disable'}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
+                    <Btn {...uiLocation('apps.detail.disable')} onClick={() => handleAction('disable')} disabled={actionLoading === 'disable'}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
                   ) : (
                     /* Enable stays available in a browser: enabling is a
                        server-side state change (backend, agents and crons run
@@ -726,9 +1145,9 @@ export default function AppDetailPage() {
                        desktop shell. Replacing the button with a static claim
                        left every browser user at a dead end — and this page is
                        where store rows land, so it was the common path. Same
-                       pattern as AppListRow / FeatureCard. */
+                       pattern as AppListRow / FeaturedSpotlight rows. */
                     <>
-                    <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {i18nT('pages.appDetailPage.enable')}</Btn>
+                    <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {enableLabel}</Btn>
                     {desktopOnly && (
                     /* The consequence is VISIBLE here, not only in `title`. A
                        hover tooltip does not exist on touch and is not reachable
@@ -745,9 +1164,9 @@ export default function AppDetailPage() {
                   )}
                     </>
                   )}
-                  {canUpdate && app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install'} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
-                  {canUpdate && !app.updateAvailable && <Btn onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
-                  {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
+                  {canUpdate && app.updateAvailable && <Btn {...uiLocation('apps.detail.update')} onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {canUpdate && !app.updateAvailable && <Btn {...uiLocation('apps.detail.sync')} onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
+                  {canUninstall && <Btn {...uiLocation('apps.detail.uninstall')} danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
             </div>
@@ -761,31 +1180,44 @@ export default function AppDetailPage() {
               <div className="flex items-center gap-2">
                 {!installDone && <Loader2 size={14} className="animate-spin text-accent" />}
                 {installDone && !error && <Check size={14} className="text-ok" />}
-                {installDone && error && <X size={14} className="text-danger" />}
-                <CardTitle>
-                  {!installDone ? i18nT('pages.appDetailPage.installing') : error ? i18nT('pages.appDetailPage.install_failed') : i18nT('pages.appDetailPage.install_complete')}
-                </CardTitle>
+                {installDone && error && !installRefusedForGood ? (
+                  /* The failure headline is the shared surface, not a bespoke
+                     "Fix with AI" button. The hand-off resolves the journal entry
+                     `reportInstallFailure` wrote for this exact message, so it
+                     carries the log tail the old button pasted by hand. The
+                     message itself already shows in the page banner above; this
+                     row states the outcome. */
+                  <ErrorNotice
+                    variant="inline"
+                    message={i18nT('pages.appDetailPage.install_failed')}
+                    report={findReport(error)}
+                    askAgent
+                  />
+                ) : (
+                  /* Under the permanent desktop refusal's banner the row is a
+                     plain title naming what the panel is -- the log -- not the
+                     outcome: the banner already carries the explanation, the
+                     agent hand-off and the one dismiss, and a second red notice
+                     with its own copies of both left a reader unable to tell why
+                     there were two or which dismiss clears what. The log stays
+                     reachable beneath it. The title takes the verb of the path
+                     the banner took (Update on an installed app), so the panel
+                     under an update-verbed banner is not named for an install. */
+                  <CardTitle>
+                    {!installDone
+                      ? i18nT('pages.appDetailPage.installing')
+                      : error
+                        ? app.installed
+                          ? i18nT('pages.appDetailPage.update_log')
+                          : i18nT('pages.appDetailPage.install_log')
+                        : i18nT('pages.appDetailPage.install_complete')}
+                  </CardTitle>
+                )}
               </div>
               <div className="flex items-center gap-2">
-                {installDone && error && (
-                  <Btn onClick={() => {
-                    const appSourcePath = `~/.kiro/crew/app-sources/${app?.name || name}/`
-                    const msg = [
-                      `App "${app?.displayName || name}" installation failed. Error log:`,
-                      '',
-                      '```',
-                      installLog.slice(-2000),
-                      '```',
-                      '',
-                      `The app source is at: ${appSourcePath}`,
-                      `Read the README.md and any setup instructions in that directory, then fix the environment and complete the installation.`,
-                    ].join('\n')
-                    openChatWithMessage(msg)
-                  }}>
-                    <Sparkles size={14} /> {i18nT('pages.appDetailPage.fix_with_ai')}
-                  </Btn>
-                )}
-                {installDone && (
+                {/* One dismiss while the refusal banner is up -- the banner's,
+                    which drops this panel too. */}
+                {installDone && !installRefusedForGood && (
                   <button className="text-muted hover:text-text transition-colors p-1" onClick={() => setShowInstallLog(false)} aria-label={i18nT('pages.appDetailPage.close')}>
                     <X size={14} />
                   </button>
@@ -795,7 +1227,7 @@ export default function AppDetailPage() {
             <pre
               ref={installLogRef}
               className="bg-bg border border-border rounded-lg p-3 text-[12px] text-muted whitespace-pre-wrap font-mono max-h-64 overflow-y-auto"
-            >{installLog || i18nT('pages.appDetailPage.starting_install')}</pre>
+            >{installLog || (installDone ? '' : i18nT('pages.appDetailPage.starting_install'))}</pre>
           </Card>
         )}
 
@@ -823,12 +1255,15 @@ export default function AppDetailPage() {
                 <div className="relative group/cmd">
                   <pre className="bg-bg border border-border rounded-lg p-3 pr-10 text-[13px] font-mono text-text overflow-x-auto whitespace-pre-wrap break-all">{resolvedShell}</pre>
                   <button
-                    className="absolute top-2 right-2 p-1.5 rounded-md bg-bg-elevated border border-border text-muted hover:text-text hover:border-accent/40 transition-all opacity-0 group-hover/cmd:opacity-100"
+                    className="absolute top-2 right-2 p-1.5 rounded-md bg-bg-elevated border border-border text-muted hover:text-text hover:border-accent/40 transition-all opacity-0 group-hover/cmd:opacity-100 [@media(hover:none)]:opacity-100"
                     aria-label={i18nT('pages.appDetailPage.copy_command')}
-                    onClick={() => {
-                      navigator.clipboard.writeText(resolvedShell)
-                      setCopied(true)
-                      setTimeout(() => setCopied(false), 2000)
+                    onClick={async () => {
+                      // Gate the confirmation on the boolean: a tick over an
+                      // unchanged clipboard is worse than no affordance.
+                      if (await copyCode(resolvedShell)) {
+                        setCopied(true)
+                        setTimeout(() => setCopied(false), 2000)
+                      }
                     }}
                   >
                     {copied ? <Check size={14} className="text-ok" /> : <Copy size={14} />}
@@ -854,11 +1289,61 @@ export default function AppDetailPage() {
         </Card>
 
         {/* Screenshots */}
-        <ScreenshotGallery screenshots={(() => {
+        {(() => {
           const dark = app.screenshotsDark || []
           const light = app.screenshots || []
-          return resolvedMode === 'dark' && dark.length ? dark : light
-        })()} />
+          const useDark = resolvedMode === 'dark' && dark.length > 0
+          // The fallback list must come from the SAME theme family the
+          // primary list came from: the two arrays pair by index against the
+          // same declared manifest field, so mixing families (dark primary,
+          // light fallback) could pair a thumbnail with a different image
+          // entirely. When the matching family has no local list, the gallery
+          // stays default-inert, exactly as before #6864.
+          return (
+            <ScreenshotGallery
+              screenshots={useDark ? dark : light}
+              fallbacks={useDark ? app.screenshotsDarkFallback : app.screenshotsFallback}
+            />
+          )
+        })()}
+
+        {/* Concise operator guidance, kept separate from the marketing feature list. */}
+        {(useCases.length > 0 || configuration.length > 0) && (
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
+            {useCases.length > 0 && (
+              <Card>
+                <CardTitle>
+                  <Target className="lucide-inline text-accent" />{' '}
+                  {i18nT('pages.appDetailPage.use_cases')}
+                </CardTitle>
+                <div className="grid gap-2 mt-2">
+                  {useCases.map((item, i) => (
+                    <div key={i} className="flex items-start gap-2.5 text-[13px] text-text">
+                      <span className="mt-[7px] size-1.5 rounded-full bg-accent shrink-0" />
+                      <span>{item}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
+            {configuration.length > 0 && (
+              <Card>
+                <CardTitle>
+                  <Settings2 className="lucide-inline text-accent" />{' '}
+                  {i18nT('pages.appDetailPage.configuration')}
+                </CardTitle>
+                <div className="grid gap-2 mt-2">
+                  {configuration.map((item, i) => (
+                    <div key={i} className="flex items-start gap-2.5 text-[13px] text-text">
+                      <span className="mt-[7px] size-1.5 rounded-full bg-accent shrink-0" />
+                      <span>{item}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
+          </div>
+        )}
 
         {/* Features */}
         {(app.highlights || []).length > 0 && (
@@ -887,7 +1372,10 @@ export default function AppDetailPage() {
                     <div className="text-muted text-[11px] uppercase tracking-wider mb-1">{i18nT('pages.appDetailPage.api_access')}</div>
                     <div className="flex flex-wrap gap-1">
                       {(app.manifest.permissions.api || []).map((p: string) => (
-                        <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{p}</code>
+                        <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">
+                          {p}
+                          {stagedApi.includes(p) && <span className="ml-1 text-warn">· {i18nT('pages.appDetailPage.grant_not_approved')}</span>}
+                        </code>
                       ))}
                     </div>
                   </div>
@@ -897,7 +1385,10 @@ export default function AppDetailPage() {
                     <div className="text-muted text-[11px] uppercase tracking-wider mb-1">{i18nT('pages.appDetailPage.websocket_events')}</div>
                     <div className="flex flex-wrap gap-1">
                       {(app.manifest.permissions.events || []).map((e: string) => (
-                        <code key={e} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{e}</code>
+                        <code key={e} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">
+                          {e}
+                          {stagedEvents.includes(e) && <span className="ml-1 text-warn">· {i18nT('pages.appDetailPage.grant_not_approved')}</span>}
+                        </code>
                       ))}
                     </div>
                   </div>
@@ -907,8 +1398,26 @@ export default function AppDetailPage() {
                     <div className="text-muted text-[11px] uppercase tracking-wider mb-1">{i18nT('pages.appDetailPage.mcp_tools')}</div>
                     <div className="flex flex-wrap gap-1">
                       {(app.manifest.permissions.mcpTools || []).map((t: string) => (
-                        <code key={t} className="bg-ok-subtle border border-ok/20 px-1.5 py-0.5 rounded text-[11px] text-ok">{t}</code>
+                        <code key={t} className="bg-ok-subtle border border-ok/20 px-1.5 py-0.5 rounded text-[11px] text-ok-text">{t}</code>
                       ))}
+                    </div>
+                  </div>
+                )}
+                {app.manifest.permissions.sessionApproval && (
+                  <div className="rounded-md border border-warn/30 bg-warn-subtle px-2.5 py-2">
+                    {/* Plain words first: the manifest key alone told a reader nothing
+                        about what the app can do to their sessions. The key stays as
+                        the secondary label so it matches the manifest they may read. */}
+                    <div className="flex items-start gap-2 text-text">
+                      <ShieldAlert size={13} className="mt-[2px] shrink-0 text-warn" />
+                      <span>{i18nT('pages.appDetailPage.session_approval_desc')}</span>
+                    </div>
+                    <SessionApprovalModes
+                      className="mt-1.5 text-[12px]"
+                      label={i18nT('pages.appDetailPage.session_approval_modes')}
+                    />
+                    <div className="mt-1.5 text-[11px] text-muted">
+                      {i18nT('pages.appDetailPage.session_approval_manifest_key')}: <code>sessionApproval</code>
                     </div>
                   </div>
                 )}
@@ -935,7 +1444,7 @@ export default function AppDetailPage() {
                     {(sConfig.autoApprove || []).length > 0 && (
                       <div className="flex flex-wrap gap-1 mt-1.5">
                         {(sConfig.autoApprove || []).map((t: string) => (
-                          <span key={t} className="bg-ok-subtle border border-ok/20 px-1 py-0 rounded text-[10px] text-ok">{t}</span>
+                          <span key={t} className="bg-ok-subtle border border-ok/20 px-1 py-0 rounded text-[10px] text-ok-text">{t}</span>
                         ))}
                       </div>
                     )}
@@ -958,26 +1467,26 @@ export default function AppDetailPage() {
           )}
 
           {/* Resources (installed only) */}
-          {app.installed && (agentCount > 0 || skillCount > 0 || cronCount > 0) && (
+          {app.installed && (agents.length > 0 || skills.length > 0 || crons.length > 0) && (
             <Card>
               <CardTitle>{i18nT('pages.appDetailPage.resources')}</CardTitle>
               <div className="grid gap-1.5 mt-2 text-[13px]">
-                {(app.manifest?.agents || []).length > 0 && (
+                {agents.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Bot size={13} className="mt-0.5 shrink-0" />
-                    <div>{app.manifest!.agents!.map((a: string) => a.split('/').pop()?.replace('.json', '')).join(', ')}</div>
+                    <div>{agents.map((a: string) => a.split('/').pop()?.replace('.json', '')).join(', ')}</div>
                   </div>
                 )}
-                {(app.manifest?.skills || []).length > 0 && (
+                {skills.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Zap size={13} className="mt-0.5 shrink-0" />
-                    <div>{app.manifest!.skills!.map((s: string) => s.split('/').pop()).join(', ')}</div>
+                    <div>{skills.map((s: string) => s.split('/').pop()).join(', ')}</div>
                   </div>
                 )}
-                {(app.manifest?.crons || []).length > 0 && (
+                {crons.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Clock size={13} className="mt-0.5 shrink-0" />
-                    <div>{app.manifest!.crons!.map((c) => c.name).join(', ')}</div>
+                    <div>{crons.map((c) => c.name).join(', ')}</div>
                   </div>
                 )}
               </div>
@@ -989,7 +1498,62 @@ export default function AppDetailPage() {
             <CardTitle>{i18nT('pages.appDetailPage.details')}</CardTitle>
             <div className="grid gap-1.5 mt-2 text-[13px] text-muted">
               {app.repo && <div>{i18nT('pages.appDetailPage.repository')} {app.repo}</div>}
+              {typeof app.stargazersCount === 'number' && <div>{i18nT('pages.appDetailPage.github_stars_2', { value: fmtNumber(app.stargazersCount) })}</div>}
               {app.author && <div>{i18nT('pages.appDetailPage.author')} {app.author}</div>}
+              {repoUrl && (contribLoading || contributors.length > 0 || contribError) && (
+                <div className="flex items-start gap-2 flex-wrap">
+                  <span className="shrink-0">{i18nT('pages.appDetailPage.contributors')}</span>
+                  {contribLoading ? (
+                    <div className="flex gap-1.5">
+                      {[0, 1, 2].map(i => (
+                        <span
+                          key={i}
+                          className="inline-block h-[22px] w-16 rounded-full animate-pulse"
+                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}
+                        />
+                      ))}
+                    </div>
+                  ) : contribError ? (
+                    /* Read-only details row: the hand-off has nothing to lose. */
+                    <ErrorNotice message={contribError} variant="inline" askAgent />
+                  ) : (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {contributors.slice(0, 6).map(c => (
+                        <span
+                          key={c.login}
+                          title={c.name}
+                          className="inline-flex items-center gap-1.5 rounded-full pl-0.5 pr-2 py-0.5"
+                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text)' }}
+                        >
+                          <span
+                            className="relative inline-flex h-[18px] w-[18px] items-center justify-center overflow-hidden rounded-full text-[10px]"
+                            style={{ background: 'var(--accent-subtle)', color: 'var(--accent)' }}
+                          >
+                            <span>{(c.name || c.login).slice(0, 1).toUpperCase()}</span>
+                            {c.avatarUrl && /^https:\/\/[^"')(\s]+$/.test(c.avatarUrl) && (
+                              <span
+                                aria-hidden="true"
+                                className="absolute inset-0 rounded-full"
+                                style={{ backgroundImage: `url("${c.avatarUrl}")`, backgroundSize: 'cover', backgroundPosition: 'center' }}
+                              />
+                            )}
+                          </span>
+                          <span className="text-[12px]">{c.name}</span>
+                        </span>
+                      ))}
+                      <a
+                        href={`${repoUrl.replace(/\.git$/, '').replace(/\/$/, '')}/graphs/contributors`}
+                        target="_blank"
+                        rel="noreferrer noopener"
+                        className="inline-flex items-center rounded-full px-2 py-0.5 text-[12px] no-underline"
+                        style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--muted)' }}
+                      >
+                        {i18nT('pages.appDetailPage.all_contributors')}
+                      </a>
+                    </div>
+                  )}
+                </div>
+              )}
               {app.installedAt && <div>{i18nT('pages.appDetailPage.installed')} {fmtDateNumeric(app.installedAt)}</div>}
               {app.origin && <div>{i18nT('pages.appDetailPage.origin')} {app.origin} {i18nT('pages.appDetailPage.resources_2')} {app.resources || 'gateway'} {i18nT('pages.appDetailPage.lifecycle')} {app.lifecycle || 'gateway'}</div>}
               {app.manifest?.minKiroCrewVersion && <div>{i18nT('pages.appDetailPage.min_kirocrew_v')}{app.manifest.minKiroCrewVersion}</div>}

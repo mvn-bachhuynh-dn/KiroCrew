@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from body_stream_helpers import attach_json_body
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
@@ -44,7 +45,7 @@ def _req(
     r.match_info = match or {}
     r.query = {}
     r._restricted = restricted
-    r.read = AsyncMock(return_value=json.dumps(body).encode() if isinstance(body, dict) else b"")
+    attach_json_body(r, json.dumps(body).encode() if isinstance(body, dict) else b"")
     r.app = {"state": MagicMock()}
     return r
 
@@ -557,7 +558,7 @@ class TestCommentLifecycleEvents:
             text="anchored",
             anchor={"quote": "some body text", "start_offset": 9, "end_offset": 23},
         )
-        # Rewrite content so the anchor no longer matches → rescan orphans it.
+        # Rewrite content so the anchor stops matching → rescan orphans it.
         store.update("doc", content="# Hello\n\ncompletely different")
         resp = await h.api_artifact_comments(_req(match={"slug": "doc"}))
         cmt = _j(resp)["comments"][0]

@@ -2,13 +2,39 @@ import React from 'react'
 import { twMerge } from 'tailwind-merge'
 import { motion, useMotionValue, useSpring, useMotionTemplate, useReducedMotion } from 'framer-motion'
 import InfoTip from './InfoTip'
+import { useLabelTip } from './InstantTip'
 import { i18nT } from '../i18n/t'
+import { haptic } from '../lib/haptic'
+import { autoSiteRef } from '../uiLocations/targetRegistry'
 
 /* ── Shared UI primitives ── */
 
 export function Card({ children, className = '', ...rest }: Omit<React.ComponentPropsWithoutRef<'div'>, 'dangerouslySetInnerHTML'>) {
+  // Written narrow-first, like the rest of the layout: the unprefixed inset is
+  // the phone one (10px horizontal, 20px vertical) and `md:` widens it. Only the
+  // HORIZONTAL value changes, because horizontal is the axis a phone cannot
+  // spare and a vertical change would move every card's height. This inset
+  // stacks on the page gutter — the budget both serve is in
+  // website/docs/page-layout.md.
+  //
+  // A caller that sets padding OWNS that axis, and the base inset for it is
+  // dropped rather than merged. This is not a convenience: the base inset is
+  // breakpoint-scoped (`md:px-5`) and twMerge only collapses classes colliding
+  // at the SAME breakpoint, so a caller's bare `p-3` would sit BESIDE `md:px-5`
+  // and the card would silently widen back to 20px from `md` up. Dropping the
+  // base is what makes `p-3` mean 12px at every width, the way a reader of that
+  // call site would assume.
+  //
+  // Deciding it from the final string, at render time, is deliberate: a lexical
+  // test cannot see a computed `className={cond ? 'p-3' : ''}`, and two such
+  // `Card` call sites already exist. `md:`-prefixed overrides need no help —
+  // they collide with the base at their own breakpoint, so twMerge resolves them.
+  const owned = className.split(/\s+/)
+  const ownsX = owned.some((c) => /^(?:p|px)-/.test(c))
+  const ownsY = owned.some((c) => /^(?:p|py)-/.test(c))
+  const inset = [ownsX ? '' : 'px-2 md:px-5', ownsY ? '' : 'py-5'].filter(Boolean).join(' ')
   return (
-    <div className={twMerge('card-glow border border-border bg-card rounded-lg p-5 mb-4 animate-rise shadow-sm transition-all', className)} {...rest}>
+    <div className={twMerge(`card-glow border border-border bg-card rounded-lg ${inset} mb-4 animate-rise shadow-sm transition-all`, className)} {...rest}>
       {children}
     </div>
   )
@@ -18,15 +44,36 @@ export function CardTitle({ children, className, ...rest }: Omit<React.Component
   return <h3 className={twMerge("text-sm font-semibold tracking-tight text-text-strong mb-3.5 flex items-center gap-2", className)} {...rest}>{children}</h3>
 }
 
+/**
+ * `danger` colours the LABEL unconditionally, not on `:hover`.
+ *
+ * A touch viewport never produces `hover`, so the previous
+ * `text-text hover:text-danger` rendered a destructive button identically to
+ * the non-destructive buttons beside it on a phone — the same class of defect
+ * as a hover-revealed control: the affordance existed only under a pointer
+ * (#3937). Found on the Channels page at 390px, where `Close` (which dismisses
+ * every agent in the channel) sat in a wrapped header row beside the frequent
+ * `3 agents` and `Clear Context` buttons at identical visual weight.
+ *
+ * Hover still does something on a pointer device — it brings up the border and
+ * a subtle fill — so the desktop affordance is not lost, only made
+ * unnecessary for recognising the control.
+ *
+ * This satisfies the enabled≠disabled invariant `ui.test.tsx` pins: that
+ * assertion exists because an idle label in `text-muted` reads as greyed out,
+ * and `text-danger` is emphatically not that. The assertion was written against
+ * the `text-text` token because that was the only foreground a Btn then had;
+ * it now checks the invariant it states.
+ */
 export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HTMLButtonElement> & { danger?: boolean; primary?: boolean }>(
   ({ children, danger, primary, className, ...rest }, ref) => (
     <button
-      ref={ref}
+      ref={autoSiteRef((rest as Record<string, unknown>)['data-ui-auto'], ref)}
       className={twMerge(`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[13px] cursor-pointer font-body transition-all active:scale-[0.97] active:duration-75 disabled:opacity-30 disabled:cursor-not-allowed ${
         primary
           ? 'bg-accent text-accent-fg border-accent hover:bg-accent-hover hover:shadow-[0_0_12px_var(--accent-glow)]'
           : danger
-            ? 'border-border bg-transparent text-text hover:text-danger hover:border-danger'
+            ? 'border-border bg-transparent text-danger hover:text-danger-text hover:border-danger hover:bg-danger-subtle'
             : 'border-border bg-transparent text-text hover:border-border-strong hover:bg-bg-hover'
       }`, className)}
       {...rest}
@@ -36,10 +83,18 @@ export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttribute
   )
 )
 
-export function SendBtn({ children, onClick, disabled, style, className, ...rest }: { children: React.ReactNode } & Omit<React.ComponentPropsWithoutRef<'button'>, 'children' | 'dangerouslySetInnerHTML'>) {
+export const SendBtn = React.forwardRef<HTMLButtonElement, { children: React.ReactNode } & Omit<React.ComponentPropsWithoutRef<'button'>, 'children' | 'dangerouslySetInnerHTML'>>(function SendBtn({ children, onClick, disabled, style, className, ...rest }, ref) {
   return (
     <button
-      className={twMerge("btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover hover:shadow-[0_0_20px_var(--accent-glow)] disabled:opacity-30 disabled:cursor-not-allowed transition-all font-body", className)}
+      ref={autoSiteRef((rest as Record<string, unknown>)['data-ui-auto'], ref)}
+      // `min-h-9`, not `h-9`. A fixed height around inline content clips the
+      // label instead of growing for it: at a narrow width a two-line label
+      // needs ~40px and `h-9` gives it 36, so 12px of text is cut off — and the
+      // labels here are translated into 12 languages, so the width at which one
+      // wraps is not the one it was designed at. Growing leaves the row's
+      // heights uneven, which is the lesser defect: uneven is legible, clipped
+      // is not.
+      className={twMerge("btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 min-h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover hover:shadow-[0_0_20px_var(--accent-glow)] disabled:opacity-30 disabled:cursor-not-allowed transition-all font-body", className)}
       onClick={onClick}
       disabled={disabled}
       style={style}
@@ -48,45 +103,55 @@ export function SendBtn({ children, onClick, disabled, style, className, ...rest
       {children}
     </button>
   )
-}
+})
 
 /* ── Icon button group ──
  * The hover-revealed capsule of small square icon buttons used in chat session
  * rows, the widget header, and other row/card affordances. `IconButtonGroup`
  * is the bordered `bg-card` capsule; pass `reveal` to fade it in on the parent's
  * :hover / focus-within (the parent element must carry the `group` class).
- * `IconButton` is a single square icon button; `variant` sets the hover color. */
+ * `IconButton` is a single square icon button; `variant` sets the hover color.
+ * With no `title`, hovering or focusing it shows its `aria-label` in an
+ * `InstantTip` (`useLabelTip`). A caller that passes `title` keeps that native
+ * tooltip instead, since several use it to say more than the label does. */
 const ICON_BUTTON_VARIANTS: Record<'default' | 'accent' | 'danger' | 'active', string> = {
   default: 'text-muted hover:text-text hover:bg-bg-hover',
   accent: 'text-muted hover:text-accent hover:bg-bg-hover',
-  danger: 'text-muted hover:text-danger hover:bg-danger-subtle',
+  danger: 'text-muted hover:text-danger-text hover:bg-danger-subtle',
   active: 'text-accent hover:bg-bg-hover',
 }
 
 export const IconButton = React.forwardRef<
   HTMLButtonElement,
   Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'aria-label'> & { variant?: keyof typeof ICON_BUTTON_VARIANTS; 'aria-label': string }
->(({ variant = 'default', className, children, ...rest }, ref) => (
-  <button
-    ref={ref}
-    type="button"
-    className={twMerge(
-      'p-[4px] rounded transition-all active:scale-[0.97] active:duration-75 cursor-pointer bg-transparent border-none disabled:opacity-30 disabled:cursor-not-allowed',
-      ICON_BUTTON_VARIANTS[variant],
-      className,
-    )}
-    {...rest}
-  >
-    {children}
-  </button>
-))
+>(({ variant = 'default', className, children, onPointerEnter, onPointerDown, onPointerUp, onMouseEnter, onMouseLeave, onFocus, onBlur, ...rest }, ref) => {
+  const { handlers, bubble } = useLabelTip(rest.title === undefined ? rest['aria-label'] : undefined, {
+    onPointerEnter, onPointerDown, onPointerUp, onMouseEnter, onMouseLeave, onFocus, onBlur,
+  })
+  return (
+    <button
+      ref={autoSiteRef((rest as Record<string, unknown>)['data-ui-auto'], ref)}
+      type="button"
+      className={twMerge(
+        'p-[4px] rounded transition-all active:scale-[0.97] active:duration-75 cursor-pointer bg-transparent border-none disabled:opacity-30 disabled:cursor-not-allowed',
+        ICON_BUTTON_VARIANTS[variant],
+        className,
+      )}
+      {...rest}
+      {...handlers}
+    >
+      {children}
+      {bubble}
+    </button>
+  )
+})
 
 export function IconButtonGroup({ reveal, className, children }: { reveal?: boolean; className?: string; children: React.ReactNode }) {
   return (
     <div
       className={twMerge(
         'flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm transition-all',
-        reveal ? 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100' : '',
+        reveal ? 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100' : '',
         className,
       )}
     >
@@ -99,7 +164,7 @@ export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttribute
   ({ className = '', ...props }, ref) => (
     <input
       ref={ref}
-      className={twMerge('bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 transition-colors focus-ring', className)}
+      className={twMerge('bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-hidden flex-1 min-w-0 transition-colors focus-ring', className)}
       {...props}
     />
   )
@@ -110,7 +175,7 @@ export function SearchInput({ className = '', ...props }: React.InputHTMLAttribu
     <div className={`relative ${className}`}>
       <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted pointer-events-none stroke-current fill-none" viewBox="0 0 24 24" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       <input
-        className="w-full bg-bg-elevated border border-border rounded-md pl-7 pr-3 py-1.5 text-text text-[13px] font-body outline-none transition-all focus-ring placeholder:text-muted/50"
+        className="w-full bg-bg-elevated border border-border rounded-md pl-7 pr-3 py-1.5 text-text text-[13px] font-body outline-hidden transition-all focus-ring placeholder:text-muted/50"
         {...props}
       />
     </div>
@@ -119,25 +184,34 @@ export function SearchInput({ className = '', ...props }: React.InputHTMLAttribu
 
 export function Badge({ variant, children, className, ...rest }: { variant: 'ok' | 'err' | 'warn' | 'aim' | 'muted' } & Omit<React.ComponentPropsWithoutRef<'span'>, 'children' | 'dangerouslySetInnerHTML'> & { children: React.ReactNode }) {
   const cls =
-    variant === 'ok' ? 'bg-ok-subtle text-ok'
-    : variant === 'err' ? 'bg-danger-subtle text-danger'
+    variant === 'ok' ? 'bg-ok-subtle text-ok-text'
+    : variant === 'err' ? 'bg-danger-subtle text-danger-text'
     : variant === 'aim' ? 'bg-aim-subtle text-aim'
     : variant === 'muted' ? 'bg-[var(--bg-hover)] text-[var(--muted)]'
-    : 'bg-warn-subtle text-warn'
+    : 'bg-warn-subtle text-warn-text'
   return (
-    <span className={twMerge(`inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono whitespace-nowrap hover:scale-105 transition-transform ${cls}`, className)} {...rest}>
+    // No hover transform: a Badge is a non-interactive status label, so growing
+    // it under the cursor announced an affordance that isn't there.
+    <span className={twMerge(`inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono whitespace-nowrap ${cls}`, className)} {...rest}>
       {children}
     </span>
   )
 }
 
-export function SourceBadge({ source }: { source: string }) {
+/** `source` picks the colour; pass `children` to show a translated label instead
+ *  of the raw field value, which is an internal identifier in every language.
+ *  `tone="neutral"` forces the grey style for every source — used where several
+ *  of these sit together (the template list) and one coloured chip among grey
+ *  peers reads as "why is this one different?" rather than as a category. */
+export function SourceBadge({ source, children, tone = 'auto', title }: { source: string; children?: React.ReactNode; tone?: 'auto' | 'neutral'; title?: string }) {
+  const neutral = 'bg-bg-elevated text-muted border-border'
   const cls =
-    source === 'package' ? 'bg-aim-subtle text-aim border-aim/30'
-    : source === 'kirocrew' ? 'bg-bg-elevated text-muted border-border'
+    tone === 'neutral' ? neutral
+    : source === 'package' ? 'bg-aim-subtle text-aim border-aim/30'
+    : source === 'kirocrew' ? neutral
     : source === 'project' ? 'text-ok border-ok/30'
-    : 'bg-bg-elevated text-muted border-border'
-  return <span className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{source}</span>
+    : neutral
+  return <span title={title} className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{children ?? source}</span>
 }
 
 export function StatCard({ label, value, accent, colorClass, delay, onClick, active, title, className, ...rest }: { label: string; value?: string | number | null; accent?: boolean; colorClass?: string; delay?: number; onClick?: () => void; active?: boolean; title?: string } & Omit<React.ComponentPropsWithoutRef<'div'>, 'title' | 'onClick' | 'dangerouslySetInnerHTML'>) {
@@ -148,7 +222,7 @@ export function StatCard({ label, value, accent, colorClass, delay, onClick, act
     // the conditional role, hence the scoped disables.
     /* eslint-disable-next-line jsx-a11y/no-static-element-interactions */
     <div
-      className={twMerge(`stat-accent relative overflow-hidden bg-card rounded-md px-4 py-3.5 border shadow-[inset_0_1px_0_var(--card-hl)] animate-rise hover:border-border-strong hover:-translate-y-0.5 hover:shadow-md transition-all ${active ? 'border-accent ring-1 ring-accent/40' : 'border-border'} ${onClick ? 'cursor-pointer' : ''}`, className)}
+      className={twMerge(`stat-accent relative overflow-hidden bg-card rounded-md px-4 py-3.5 border shadow-[inset_0_1px_0_var(--card-hl)] animate-rise hover:border-border-strong hover:shadow-md transition-all ${active ? 'border-accent ring-1 ring-accent/40' : 'border-border'} ${onClick ? 'cursor-pointer' : ''}`, className)}
       style={delay ? { animationDelay: `${delay}ms` } : undefined}
       onClick={onClick}
       role={onClick ? 'button' : undefined}
@@ -338,8 +412,21 @@ export function PanelSectionHeader({ label, count, trailing, className }: {
 
 export function PageHeader({ title, subtitle, actions }: { title: React.ReactNode; subtitle?: string; actions?: React.ReactNode }) {
   return (
-    <div className="flex items-end justify-between gap-4 px-6 pt-2 pb-3" data-testid="page-header">
-      <div>
+    // 16px below `md`, the SAME gutter as the page content container, so the title
+    // shares its left edge with the cards and rows it labels. That shared edge is
+    // the page's content column, and the title belongs to the content -- not to the
+    // chrome above it.
+    //
+    // The top bar is now held to the same line rather than exempted from it: its
+    // hamburger's box is `pl-2` + `p-2` = 16px, plus a 2.5px transform that pulls
+    // the glyph's artwork onto the line too (`Menu` does not fill its own box).
+    // An earlier round instead moved THIS header out to meet a 20px top bar, which
+    // read worse -- the title then sat inside the cards directly beneath it. The
+    // defect was always in the chrome, not in the content column.
+    //
+    // Measured budget and the full rationale: website/docs/narrow-viewport.md.
+    <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-4 md:px-6 pt-2 pb-3" data-testid="page-header">
+      <div className="min-w-0">
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
         {subtitle && <div className="text-muted text-sm mt-1" data-testid="page-subtitle">{subtitle}</div>}
       </div>
@@ -348,10 +435,12 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
   )
 }
 
-export function Toggle({ checked, onChange, disabled, label, describedBy, tone = 'accent' }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted' }) {
+export function Toggle({ checked, onChange, disabled, label, describedBy, tone = 'accent', 'data-ui-auto': uiAuto }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted'; /** The build's auto-tier marker (scripts/lib/ui-auto-stamp.mjs), put on the switch a guide points at. */ 'data-ui-auto'?: string }) {
   return (
     <div
       role="switch"
+      data-ui-auto={uiAuto}
+      ref={autoSiteRef<HTMLDivElement>(uiAuto)}
       aria-checked={checked}
       // Without this a screen reader announces a disabled switch as actionable:
       // the disabled state was carried only by `tabIndex={-1}` and an opacity
@@ -363,8 +452,10 @@ export function Toggle({ checked, onChange, disabled, label, describedBy, tone =
       // user hears it before acting rather than discovering it by exploring.
       aria-describedby={describedBy}
       tabIndex={disabled ? -1 : 0}
-      onClick={() => !disabled && onChange(!checked)}
-      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); onChange(!checked) } }}
+      // A switch is the one control whose physical twin clicks under the thumb, so
+      // it gets a tap where the device can give one (phones); elsewhere no-op.
+      onClick={() => { if (!disabled) { haptic(); onChange(!checked) } }}
+      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); haptic(); onChange(!checked) } }}
       // `muted` is for a LIST of switches, where an accent fill on every row
       // shouts and duplicates a state the row's own grouping already carries.
       // The knob position still reads the state, so nothing is lost by dropping
@@ -396,8 +487,15 @@ export interface SliderProps {
   ticks?: boolean
   /** When true, the knob pulses an accent halo while parked at the max notch. */
   emphasizeMax?: boolean
+  /** Independent reference marker on the same axis, such as a configured default. */
+  markerValue?: number
+  /** Visible and accessible label for markerValue. */
+  markerLabel?: string
   className?: string
   'aria-label'?: string
+  /** Id of a description the slider reads out after its name, such as why it
+   *  is disabled -- a `title` on a wrapper reaches only a hovering pointer. */
+  'aria-describedby'?: string
 }
 
 /** macOS-style range slider: accent fill, circular knob, optional step ticks.
@@ -406,7 +504,8 @@ export interface SliderProps {
  *  (arrows = step, Shift+arrow / PageUp-Down = ×10, Home/End = min/max). */
 export function Slider({
   value, onChange, min = 0, max = 100, step = 1, disabled,
-  label, showValue, formatValue, ticks, emphasizeMax, className = '', 'aria-label': ariaLabel,
+  label, showValue, formatValue, ticks, emphasizeMax, markerValue, markerLabel, className = '', 'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
 }: SliderProps) {
   const trackRef = React.useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = React.useState(false)
@@ -426,6 +525,13 @@ export function Slider({
   const pct = ((current - min) / range) * 100
   const display = formatValue ? formatValue(current) : String(current)
   const atMax = emphasizeMax && current >= max
+  const markerCurrent = markerValue === undefined ? null : clamp(markerValue)
+  const markerFrac = markerCurrent === null ? null : (markerCurrent - min) / range
+  const markerTransform = markerCurrent === min
+    ? 'translateX(0)'
+    : markerCurrent === max
+      ? 'translateX(-100%)'
+      : 'translateX(-50%)'
 
   // Discrete-stepper detection: a small, even number of steps. Discrete sliders
   // render tick marks AND spring to each notch even while dragging; continuous
@@ -462,6 +568,27 @@ export function Slider({
     if (next !== value) onChange(next)
   }
 
+  // Armed only when setPointerCapture is missing or throws on pointer-down:
+  // window-level up/cancel listeners for that specific pointerId, so an
+  // uncaptured drag can always terminate — the same acquisition-side
+  // fallback the shared usePointerDrag hook arms.
+  const fallbackRef = React.useRef<{ pointerId: number; dispose: () => void } | null>(null)
+  const disarmFallback = React.useCallback(() => {
+    fallbackRef.current?.dispose()
+    fallbackRef.current = null
+  }, [])
+  // Single-fire end path shared by the element handlers, the capture-loss
+  // handler and the window fallback below.
+  const terminateDrag = React.useCallback(() => {
+    if (!pointerDown.current) return
+    pointerDown.current = false
+    disarmFallback()
+    setDragging(false)
+  }, [disarmFallback])
+  // If the component unmounts mid-uncaptured-drag, the window listeners must
+  // not outlive it.
+  React.useEffect(() => disarmFallback, [disarmFallback])
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (disabled) return
     e.preventDefault()
@@ -469,7 +596,30 @@ export function Slider({
     // focus the track explicitly — otherwise arrow keys after a click-to-seek go
     // to whatever had focus before instead of the slider.
     trackRef.current?.focus()
-    ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    // A new press replaces whatever gesture was in flight, so a fallback armed
+    // for the outgoing pointer goes with it.
+    disarmFallback()
+    // Capture is best-effort (missing or throwing): the seek below still runs.
+    // But an uncaptured drag gets no retargeting, so without a fallback a
+    // release outside the track strands `pointerDown` with the slider pressed.
+    let captured = true
+    try { (e.target as Element).setPointerCapture(e.pointerId) } catch { captured = false }
+    if (!captured) {
+      const pointerId = e.pointerId
+      const onWindowEnd = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        terminateDrag()
+      }
+      window.addEventListener('pointerup', onWindowEnd)
+      window.addEventListener('pointercancel', onWindowEnd)
+      fallbackRef.current = {
+        pointerId,
+        dispose: () => {
+          window.removeEventListener('pointerup', onWindowEnd)
+          window.removeEventListener('pointercancel', onWindowEnd)
+        },
+      }
+    }
     pointerDown.current = true
     // A click (down without move) is a discrete seek — leave `dragging` false
     // so the knob springs to the new spot. Movement below flips into drag mode.
@@ -492,9 +642,8 @@ export function Slider({
   const onPointerLeave = () => { if (!pointerDown.current) setHoverVal(null) }
   const endDrag = (e: React.PointerEvent) => {
     if (!pointerDown.current) return
-    pointerDown.current = false
-    ;(e.target as Element).releasePointerCapture?.(e.pointerId)
-    setDragging(false)
+    try { (e.target as Element).releasePointerCapture(e.pointerId) } catch { /* best-effort */ }
+    terminateDrag()
   }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -531,6 +680,7 @@ export function Slider({
         ref={trackRef}
         role="slider"
         aria-label={ariaLabel || label}
+        aria-describedby={ariaDescribedBy}
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={current}
@@ -543,8 +693,17 @@ export function Slider({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        // A capture steal (another element capturing mid-drag) stops
+        // retargeting pointerup here with no further event: end the drag on
+        // the loss itself, as the shared usePointerDrag hook does.
+        onLostPointerCapture={endDrag}
         onPointerLeave={onPointerLeave}
-        className={`group relative h-[18px] flex items-center select-none touch-none outline-none ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+        // outline-hidden is CORRECT here and must stay: the knob below already
+        // carries the replacement cue (`group-focus-visible:ring-2`), which
+        // points at the current value instead of boxing the whole track. Letting
+        // the global :focus-visible outline through as well would paint two
+        // indicators on one control.
+        className={`group relative h-[18px] flex items-center select-none touch-none outline-hidden ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       >
         {/* groove */}
         <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-1 rounded-full bg-border" />
@@ -585,13 +744,34 @@ export function Slider({
             the value; the inner circle owns press/drag scale + focus ring. */}
         <motion.div aria-hidden className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2" style={{ left: motionPos }}>
           <motion.div
-            className="relative w-[18px] h-[18px] rounded-full bg-white border border-black/10 shadow-[0_1px_3px_rgba(0,0,0,.3),0_0.5px_1px_rgba(0,0,0,.2)] group-focus-visible:ring-2 group-focus-visible:ring-[var(--ring)] group-focus-visible:ring-offset-1 group-focus-visible:ring-offset-[var(--bg)]"
+            className="relative w-[18px] h-[18px] rounded-full bg-white border border-black/10 group-hover:border-black/30 shadow-[0_1px_3px_rgba(0,0,0,.3),0_0.5px_1px_rgba(0,0,0,.2)] group-focus-visible:ring-2 group-focus-visible:ring-[var(--ring)] group-focus-visible:ring-offset-1 group-focus-visible:ring-offset-[var(--bg)]"
             animate={{ scale: reduceMotion ? 1 : (dragging ? 1.15 : 1), boxShadow: dragging ? '0 2px 7px rgba(0,0,0,.4)' : atMax ? '0 0 10px var(--accent)' : '0 1px 3px rgba(0,0,0,.3)' }}
-            whileHover={disabled || reduceMotion ? undefined : { scale: 1.12 }}
+            // The knob is the visual grab target, so pointing at the slider has to
+            // say so — the removed `whileHover` scale was its only cue. It darkens
+            // its BORDER via `group-hover` rather than deepening its shadow, because
+            // `animate` above owns `boxShadow` as an INLINE style and an inline style
+            // beats any class, so a shadow cue would simply never paint. Nothing
+            // animates borderColor, so the two cannot fight, and no geometry changes.
+            // `group` is the same one the focus ring already keys on.
             whileTap={disabled || reduceMotion ? undefined : { scale: 1.2 }}
             transition={reduceMotion ? { duration: 0 } : { type: 'spring', stiffness: 500, damping: 26 }}
           />
         </motion.div>
+        {/* Rendered AFTER the knob on purpose: the focus-cue gate looks for the
+            knob's `group-focus-visible:` ring within a fixed window below the
+            track's opening tag, and this block would push it out. z-10 keeps the
+            label above the knob regardless of DOM order. */}
+        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
+          <span
+            role="img"
+            aria-label={markerLabel}
+            data-slider-marker
+            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-muted"
+            style={{ left: center(markerFrac), transform: markerTransform }}
+          >
+            {markerLabel}
+          </span>
+        )}
       </div>
 
       {/* discrete tick marks under the groove (static reference; the hover

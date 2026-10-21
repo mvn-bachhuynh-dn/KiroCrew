@@ -9,11 +9,12 @@ command instead of dumping a raw
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -120,8 +121,23 @@ class TestFormatRuntimeRpcError:
 
         assert f"'{agent}.json'" in text  # names the file that is missing
         assert str(tmp_path) in text  # names where it was looked for
-        assert "kirocrew setup --agent-only --clean" in text  # names the repair
+        assert "kirocrew setup --agent-only`" in text  # names the repair
+        assert "--clean" not in text  # which would drop the operator's own config
         assert "-32603" not in text and "Mode" not in text  # no raw protocol noise
+
+    def test_skill_view_alias_does_not_send_the_user_to_setup(self, tmp_path):
+        # A skill-view alias is generated, so setup cannot restore it, and kiro-cli
+        # answers "not found" for one that is on disk but unloaded.
+        name = "kirocrew-skill-view-" + "0123456789abcdef01234567"
+        err = {"code": -32603, "message": "Internal error", "data": f"Mode '{name}' not found"}
+        with patch("kiro_crew.acp.runtime.kiro_agents_dir", return_value=tmp_path):
+            text = _format_runtime_rpc_error(err)
+
+        assert name in text
+        assert "setup" not in text and "not installed" not in text and "found no" not in text
+        assert "KIROCREW_NATIVE_SKILL_PROJECTION=0" in text  # names the mitigation
+        assert "new session" in text  # names the retry
+        assert "-32603" not in text
 
     def test_unknown_shape_keeps_the_raw_dict(self):
         # Never swallow an unrecognized error: the raw dict is the only record of
@@ -180,10 +196,16 @@ class TestGatewayInstallVerification:
             vector = stack.enter_context(patch("kiro_crew.vector_memory.VectorMemoryStore"))
             vector.return_value = MagicMock()
             stack.enter_context(patch("kiro_crew.agent.rebuild_agent_config", rebuild))
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"kiro-cli 2.16.0", b""))
             stack.enter_context(
-                patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="kiro-cli 2.16.0"))
+                patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
             )
-            orch._init_services()
+            try:
+                asyncio.run(orch._init_services())
+            finally:
+                orch._stop_memory_startup()
 
     def test_install_exception_logs_error_not_warning(self, tmp_path, caplog, capsys):
         orch = _make_orchestrator()

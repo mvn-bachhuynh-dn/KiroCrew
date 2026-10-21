@@ -23,9 +23,40 @@ class _FakeSlot:
         self.messages: list[dict] = []
         self.linked_session_key = ""
         self.title = ""
+        # Mirror the delivery seam append_and_surface reads: append's own
+        # broadcast callback (the SSE door, mid-carrying) and the reader flag
+        # that suppresses it. Deliveries land in ``delivered`` so tests can
+        # assert the row went out exactly once, with identity.
+        self._has_reader = False
+        self.delivered: list[dict] = []
+        # Dismissed-source-link contract the fallback rebind now exercises: a
+        # reused fallback slot's stale set is cleared + marked unhydrated on a
+        # link change (mirrors the real _ChatSlot so the injector can call it).
+        self._dismissed_source_links: set[str] = set()
+        self._dismissed_hydrated = True
 
-    def append(self, role, content, cls="", ts="", *, broadcast=True, meta=None):
-        self.messages.append({"role": role, "content": content})
+    def invalidate_source_links(self) -> None:
+        pass
+
+    def _on_message(self, _key, msg) -> None:
+        self.delivered.append(msg)
+
+    def append(
+        self, role, content, cls="", ts="", *, broadcast=True, broadcast_user=False, meta=None
+    ):
+        # Mirror the real ``_ChatSlot.append`` contract: mint ``meta.mid``, hand
+        # the appended row back, and deliver ONE live copy via ``_on_message``
+        # when no reader is draining (the injector reads the id off the return
+        # to stamp the durable transcript copy with the same identity).
+        msg = {
+            "role": role,
+            "content": content,
+            "meta": {**(meta or {}), "mid": f"m-test-{len(self.messages)}"},
+        }
+        self.messages.append(msg)
+        if broadcast and (role != "user" or broadcast_user) and not self._has_reader:
+            self._on_message(self.key, msg)
+        return msg
 
 
 class _FakeState:
@@ -106,7 +137,7 @@ def test_summary_header_format_is_pinned_for_frontend() -> None:
     (arrow is the U+2192 rightwards arrow). This cross-layer contract has no
     shared constant, so pin the format here — if the header wording drifts, this
     test fails instead of the launch/completion card silently degrading in the
-    UI. See PR #245 design review, finding 2."""
+    UI."""
     snap = {"name": "pizza", "run_id": "wf_1", "status": "finished", "result": {"n": 1}}
     body = _summarize(snap)
     lines = body.splitlines()
@@ -115,8 +146,8 @@ def test_summary_header_format_is_pinned_for_frontend() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Routing: result lands in the ORIGINATING chat slot (regression — it used to
-# go to a separate workflow-<id> slot the user never saw).
+# Routing: result lands in the ORIGINATING chat slot, not a separate
+# workflow-<id> slot the user never sees.
 # --------------------------------------------------------------------------- #
 
 
@@ -129,8 +160,11 @@ def test_inject_routes_to_originating_slot_and_broadcasts_live() -> None:
     origin = _FakeSlot("chat-2-123")
     state = _FakeState({"chat-2-123": origin})
     snap = {
-        "name": "pizza", "run_id": "wf_2", "status": "finished",
-        "session_key": "dashboard:chat-2-123", "result": {"report": "/tmp/r.md"},
+        "name": "pizza",
+        "run_id": "wf_2",
+        "status": "finished",
+        "session_key": "dashboard:chat-2-123",
+        "result": {"report": "/tmp/r.md"},
     }
     ok = inject_workflow_result(state, "wf_2", snap)
     assert ok is True
@@ -138,17 +172,24 @@ def test_inject_routes_to_originating_slot_and_broadcasts_live() -> None:
     assert state.created == []  # never created a fallback slot
     assert len(origin.messages) == 1
     assert "pizza" in origin.messages[0]["content"]
-    # Live chat_message broadcast to that slot so it shows without a manual fetch.
-    chat_msgs = [p for k, p in state.broadcasts if k == "chat_message"]
-    assert chat_msgs and chat_msgs[0]["slot"] == "chat-2-123"
-    assert chat_msgs[0]["role"] == "assistant"
+    # Live delivery goes through append's OWN mid-carrying door exactly once
+    # (no reader active). A second hand-built broadcast_ws frame would be
+    # mid-less and render as a duplicate bubble.
+    assert len(origin.delivered) == 1
+    assert origin.delivered[0]["meta"]["mid"] == origin.messages[0]["meta"]["mid"]
+    # The route kind rides meta, which both delivery doors carry.
+    assert origin.delivered[0]["meta"]["kind"] == "workflow_result"
+    assert [p for k, p in state.broadcasts if k == "chat_message"] == []
 
 
 def test_inject_falls_back_when_origin_slot_gone() -> None:
-    state = _FakeState({})  # originating slot no longer exists
+    state = _FakeState({})  # originating slot is gone
     snap = {
-        "name": "pizza", "run_id": "wf_9", "status": "finished",
-        "session_key": "dashboard:chat-gone", "result": {"ok": True},
+        "name": "pizza",
+        "run_id": "wf_9",
+        "status": "finished",
+        "session_key": "dashboard:chat-gone",
+        "result": {"ok": True},
     }
     ok = inject_workflow_result(state, "wf_9", snap)
     assert ok is True
@@ -161,12 +202,40 @@ def test_inject_no_session_key_returns_false() -> None:
     assert inject_workflow_result(state, "wf_0", snap) is False
 
 
+def test_durable_copy_carries_the_window_rows_id() -> None:
+    # The durable transcript copy must ride with the SAME ``meta.mid`` the
+    # window copy was minted; a re-minted or absent id leaves a bounded
+    # slot-detail read unable to reconcile the two copies as one message.
+    from unittest.mock import MagicMock, patch
+
+    origin = _FakeSlot("chat-2-123")
+    state = _FakeState({"chat-2-123": origin})
+    state.conversation_log = MagicMock()
+    snap = {
+        "name": "pizza",
+        "run_id": "wf_2",
+        "status": "finished",
+        "session_key": "dashboard:chat-2-123",
+        "result": {"ok": True},
+    }
+    with patch("kiro_crew.dashboard.workflow_inject.append_if_absent_off_loop") as durable:
+        assert inject_workflow_result(state, "wf_2", snap) is True
+    assert len(origin.messages) == 1
+    window_mid = origin.messages[0]["meta"]["mid"]
+    assert (
+        durable.call_args.kwargs["mid"] == window_mid
+    ), "the durable copy did not carry the window row's id"
+
+
 def test_inject_dedups_on_refire() -> None:
     origin = _FakeSlot("chat-5")
     state = _FakeState({"chat-5": origin})
     snap = {
-        "name": "x", "run_id": "wf_5", "status": "finished",
-        "session_key": "dashboard:chat-5", "result": {"v": 1},
+        "name": "x",
+        "run_id": "wf_5",
+        "status": "finished",
+        "session_key": "dashboard:chat-5",
+        "result": {"v": 1},
     }
     inject_workflow_result(state, "wf_5", snap)
     inject_workflow_result(state, "wf_5", snap)  # re-fire
@@ -185,11 +254,16 @@ def test_on_injected_fires_for_originating_slot() -> None:
     origin = _FakeSlot("chat-2-123")
     state = _FakeState({"chat-2-123": origin})
     snap = {
-        "name": "pizza", "run_id": "wf_2", "status": "finished",
-        "session_key": "dashboard:chat-2-123", "result": {"n": 1},
+        "name": "pizza",
+        "run_id": "wf_2",
+        "status": "finished",
+        "session_key": "dashboard:chat-2-123",
+        "result": {"n": 1},
     }
     fired: list = []
-    ok = inject_workflow_result(state, "wf_2", snap, on_injected=lambda s, sn: fired.append((s, sn)))
+    ok = inject_workflow_result(
+        state, "wf_2", snap, on_injected=lambda s, sn: fired.append((s, sn))
+    )
     assert ok is True
     assert len(fired) == 1
     assert fired[0][0] is origin  # the live originating slot
@@ -201,8 +275,11 @@ def test_on_injected_not_fired_for_fallback_slot() -> None:
     # so the auto-turn callback must NOT fire.
     state = _FakeState({})
     snap = {
-        "name": "x", "run_id": "wf_9", "status": "finished",
-        "session_key": "dashboard:chat-gone", "result": {"ok": True},
+        "name": "x",
+        "run_id": "wf_9",
+        "status": "finished",
+        "session_key": "dashboard:chat-gone",
+        "result": {"ok": True},
     }
     fired: list = []
     ok = inject_workflow_result(state, "wf_9", snap, on_injected=lambda s, sn: fired.append(s))
@@ -215,8 +292,11 @@ def test_on_injected_not_fired_on_dedup_refire() -> None:
     origin = _FakeSlot("chat-5")
     state = _FakeState({"chat-5": origin})
     snap = {
-        "name": "x", "run_id": "wf_5", "status": "finished",
-        "session_key": "dashboard:chat-5", "result": {"v": 1},
+        "name": "x",
+        "run_id": "wf_5",
+        "status": "finished",
+        "session_key": "dashboard:chat-5",
+        "result": {"v": 1},
     }
     fired: list = []
     cb = lambda s, sn: fired.append(s)  # noqa: E731
@@ -230,5 +310,8 @@ def test_on_injected_not_fired_for_ui_only_run() -> None:
     state = _FakeState({})
     snap = {"name": "x", "run_id": "wf_0", "status": "finished", "result": {}, "session_key": ""}
     fired: list = []
-    assert inject_workflow_result(state, "wf_0", snap, on_injected=lambda s, sn: fired.append(s)) is False
+    assert (
+        inject_workflow_result(state, "wf_0", snap, on_injected=lambda s, sn: fired.append(s))
+        is False
+    )
     assert fired == []

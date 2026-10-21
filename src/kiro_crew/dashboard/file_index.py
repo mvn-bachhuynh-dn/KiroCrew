@@ -8,16 +8,32 @@ import os
 import time
 
 from kiro_crew import platform_compat
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.security import is_sensitive_canonical_path
 
 logger = logging.getLogger(__name__)
 
-# Dot-prefixed dirs (.kirocrew, .kiro, .aim, .git) are already excluded by
-# the ``not d.startswith(".")`` guard in _walk(), so only non-dot dirs here.
-_SKIP_DIRS = frozenset({
-    "node_modules", "__pycache__", "venv",
-    "dist", "build", "env", "out", "target",
-})
+# Directory names never offered as @-mention candidates and never descended
+# into, by either search path. This is the SINGLE source of truth: the walk
+# fallback in dashboard/file_api/search.py imports it, so the indexed fast path
+# and the fallback cannot diverge. Dot-prefixed noise dirs (.git, .cache,
+# .venv) are listed EXPLICITLY here -- the candidate collection does not filter
+# on a leading dot, which would hide the .github/.kiro/.claude dirs that must be
+# offered, so each dot-dir to suppress must be named.
+_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".cache",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        "venv",
+        "dist",
+        "build",
+        "env",
+        "out",
+        "target",
+    }
+)
 
 _REFRESH_SECS = 30
 _MAX_ENTRIES = 100_000
@@ -120,19 +136,40 @@ class FileIndex:
         # a dismissed consent dialog would be re-triggered on every refresh --
         # which is how one prompt becomes a recurring stream of them.
         for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = platform_compat.tcc_prune_walk_dirs(
+            # A dot-prefixed directory (.github, .kiro, .claude) should be
+            # OFFERED as a search candidate even though we must not DESCEND into
+            # it -- pruning ``dirnames`` in place before the collection loop below
+            # would conflate the two concerns.
+            #
+            # Build the candidate list (what we offer AND stat) first, then
+            # derive the narrower descent list from it. Both must honour:
+            #   * _SKIP_DIRS (.git, node_modules, ...) -- never offered, never
+            #     descended.
+            #   * tcc_prune_walk_dirs -- on macOS from a $HOME root the TCC-gated
+            #     folders (Downloads, Desktop, Library, ...) must be dropped from
+            #     candidates too: merely offering one means os.stat-ing it, which
+            #     pops a consent modal. So it is applied to candidate_dirs.
+            # Only the leading-dot rule differs: a dot-dir is a valid candidate
+            # but must not be descended into, so it is removed from the descent
+            # list alone.
+            candidate_dirs = platform_compat.tcc_prune_walk_dirs(
                 self.root,
                 dirpath,
-                [d for d in dirnames if not d.startswith(".") and d not in _SKIP_DIRS],
+                [d for d in dirnames if d not in _SKIP_DIRS],
             )
-            for dname in dirnames:
+            dirnames[:] = [d for d in candidate_dirs if not d.startswith(".")]
+            for dname in candidate_dirs:
                 if len(entries) >= _MAX_ENTRIES:
                     truncated = True
                     break
                 dfull = os.path.join(dirpath, dname)
                 # Resolve symlinks before the sensitivity check so a link
-                # pointing into a sensitive tree cannot slip through.
-                if is_sensitive_path(os.path.realpath(dfull)):
+                # pointing into a sensitive tree cannot slip through. The
+                # canonical gate matches inline on this worker thread: the
+                # bounded gate would submit one more resolution per entry to the
+                # small ``mc-pathres`` pool the event loop waits on, and a
+                # rebuild of this size fills its queue.
+                if is_sensitive_canonical_path(os.path.realpath(dfull)):
                     continue
                 try:
                     st = os.stat(dfull)
@@ -151,7 +188,7 @@ class FileIndex:
                 if fname.startswith("."):
                     continue
                 fpath = os.path.join(dirpath, fname)
-                if is_sensitive_path(os.path.realpath(fpath)):
+                if is_sensitive_canonical_path(os.path.realpath(fpath)):
                     continue
                 try:
                     st = os.stat(fpath)

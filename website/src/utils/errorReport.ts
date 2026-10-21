@@ -29,6 +29,8 @@
  */
 
 import { safeSetSessionItem } from './safeStorage'
+import { errMessage } from './thunkError'
+import { withBase } from '@/lib/basePath'
 
 /** Where the error was observed. */
 export type ErrorSource =
@@ -38,6 +40,14 @@ export type ErrorSource =
   | 'render'
   /** An uncaught error or unhandled rejection on `window`. */
   | 'window'
+  /**
+   * A subsystem the backend reports as broken inside a SUCCESSFUL response — a
+   * remote crew whose tunnel is down, carried in a 200 status poll. Distinct
+   * from `api` because no request failed: publishing it as `api` would name a
+   * failing endpoint that in fact answered, sending a reader to audit the wrong
+   * layer.
+   */
+  | 'system'
 
 export interface ErrorReport {
   id: string
@@ -50,12 +60,20 @@ export interface ErrorReport {
   status?: number
   /**
    * Machine-readable `code` from a JSON error body. Backend-owned error bodies
-   * carry one by convention (AGENTS.md § User-facing strings) precisely so a
+   * carry one by convention (docs/system-specs/common/code-style.md) precisely so a
    * client can act on the failure instead of regex-matching prose.
    */
   code?: string
   /** Failing request path, query string stripped. */
   endpoint?: string
+  /**
+   * HTTP method of the failing request, for a transport rejection that produced
+   * no `Response` (see {@link recordTransportRejection}) — the method is the one
+   * fact such a failure has that an answered one reads off the `Response`. Only
+   * set on that path; an answered failure leaves it undefined (the method is not
+   * worth a field when a status already names the outcome).
+   */
+  method?: string
   /**
    * Route the user was on when it happened. **Path only** — see
    * {@link currentRoute} for why the query string is dropped.
@@ -175,17 +193,27 @@ export function requestPath(url: string | undefined): string | undefined {
   }
 }
 
-/** Pull the backend's machine-readable `code` out of a JSON error body, if present. */
-export function parseErrorCode(body: string | undefined): string | undefined {
+/** Pull one non-empty string field out of a JSON error body, if present. The
+ *  one parse of a backend error envelope -- trimmed, object-shaped, well-formed
+ *  -- so a caller after `code`, or after another field the route names beside
+ *  it (`mode` on a refused consolidation target), reads it here rather than
+ *  parsing the body again on its own. */
+export function parseErrorField(body: string | undefined, field: string): string | undefined {
   if (!body) return undefined
   const trimmed = body.trim()
   if (!trimmed.startsWith('{')) return undefined
   try {
-    const parsed = JSON.parse(trimmed) as { code?: unknown }
-    return typeof parsed.code === 'string' && parsed.code ? parsed.code : undefined
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>
+    const value = parsed[field]
+    return typeof value === 'string' && value ? value : undefined
   } catch {
     return undefined
   }
+}
+
+/** Pull the backend's machine-readable `code` out of a JSON error body, if present. */
+export function parseErrorCode(body: string | undefined): string | undefined {
+  return parseErrorField(body, 'code')
 }
 
 // Newest first. Plain module state: the journal is per-tab, per-page-load
@@ -220,6 +248,7 @@ export function recordError(input: {
   status?: number
   code?: string
   endpoint?: string
+  method?: string
   detail?: string
   route?: string
 }): ErrorReport {
@@ -231,6 +260,7 @@ export function recordError(input: {
     status: input.status,
     code: input.code,
     endpoint: input.endpoint,
+    method: input.method,
     route: input.route ?? currentRoute(),
     detail: normalizeDetail(input.detail),
   }
@@ -241,9 +271,135 @@ export function recordError(input: {
   return report
 }
 
+/**
+ * Per-endpoint burst cap for transport REJECTIONS (a `fetch` that never produced
+ * a `Response`), so recording them cannot wipe the journal.
+ *
+ * `recordError` is called once per answered failure, which is self-limiting. A
+ * rejection is not: while the gateway is unreachable, every polling query across
+ * ~190 call sites rejects on each tick, and left uncapped a few offline seconds
+ * would evict all 20 real reports (`MAX_JOURNAL`) and fill the ring with
+ * identical "Failed to fetch" lines — losing the very context this journal
+ * exists to keep. The cap records the FIRST rejection for a `method + endpoint`,
+ * then suppresses repeats for that key for a cooldown window; a different
+ * endpoint still records on its own first miss, so a true outage leaves one
+ * entry per affected endpoint rather than one surface's retries drowning them.
+ *
+ * The key is `method + endpoint`, not endpoint alone: a `GET /api/x` poll and a
+ * `POST /api/x` the user triggered are different requests, and sharing a bucket
+ * would suppress the POST's report and leave its notice resolving the poll's
+ * method. A suppressed repeat is not simply dropped — the report recorded for
+ * its key is kept in {@link _rejectionReportByKey} and returned, so the
+ * rejection it rode on still gets THIS request's endpoint pinned to it (the
+ * caller attaches it) rather than falling back to a message match.
+ *
+ * A second ceiling bounds the TOTAL distinct keys that may record within one
+ * cooldown window ({@link TRANSPORT_REJECTION_WINDOW_CAP}). The per-key cap
+ * alone does not stop a long outage across many endpoints from flushing the
+ * ring — 20+ distinct polling endpoints each record once and the 20-deep ring
+ * is still emptied of answered failures. Past the window ceiling a new key is
+ * suppressed (its rejection resolves through the one report already kept for a
+ * sibling key), so answered-failure reports from before the outage survive.
+ */
+export const TRANSPORT_REJECTION_COOLDOWN_MS = 10_000
+/**
+ * Most distinct transport-rejection keys that may hold a journal slot at once.
+ * Half the ring, so a wide outage can take at most half the entries and the
+ * answered failures that preceded it keep the rest. Past this, a new key is
+ * suppressed until an existing one's cooldown lapses and frees a slot.
+ */
+export const TRANSPORT_REJECTION_WINDOW_CAP = Math.floor(MAX_JOURNAL / 2)
+const _rejectionSeenAt = new Map<string, number>()
+/**
+ * The report recorded for each key still inside its cooldown, so a suppressed
+ * repeat can hand back the entry its first miss created instead of nothing.
+ * Dropped in lock-step with `_rejectionSeenAt` as cooldowns lapse.
+ */
+const _rejectionReportByKey = new Map<string, ErrorReport>()
+
+/** Forget every key whose cooldown has lapsed, so the ceiling counts only keys
+ *  that currently hold a slot. Keeps the per-key cooldown an INDEPENDENT timer
+ *  (each key expires 10s after its own last miss) while the ceiling bounds how
+ *  many may be live together. */
+function _pruneRejectionKeys(now: number): void {
+  for (const [k, seenAt] of _rejectionSeenAt) {
+    if (now - seenAt >= TRANSPORT_REJECTION_COOLDOWN_MS) {
+      _rejectionSeenAt.delete(k)
+      _rejectionReportByKey.delete(k)
+    }
+  }
+}
+
+/**
+ * Record a transport-layer rejection — a `fetch` that rejected before any HTTP
+ * `Response` existed (a network drop, a `withDeadline` `TimeoutError`). Returns
+ * the stored report — the one its own first miss created, even when the
+ * per-endpoint burst cap suppressed this repeat — or `undefined` only when the
+ * ceiling suppressed a brand-new key that has no report of its own. `status` is
+ * deliberately never set: no response arrived, and a synthetic one would send a
+ * reader to audit a server that never spoke.
+ *
+ * Caller is responsible for excluding deliberate aborts (`AbortError`): an
+ * unmount or a superseded react-query key cancels on purpose and is not a
+ * failure a user can act on.
+ */
+export function recordTransportRejection(input: {
+  message: string
+  endpoint?: string
+  method?: string
+  code?: string
+}): ErrorReport | undefined {
+  // Key the cap on method + endpoint; a rejection with no parseable endpoint
+  // falls back to its own message so unlike failures do not share one bucket
+  // (and no sentinel string is needed, which also keeps this out of the i18n
+  // scan). GET and POST on one path are different requests and get their own
+  // buckets, so a suppressed poll never answers for the write the user made.
+  const target = input.endpoint ?? input.message
+  const key = `${(input.method ?? 'GET').toUpperCase()} ${target}`
+  const now = Date.now()
+  _pruneRejectionKeys(now)
+
+  const last = _rejectionSeenAt.get(key)
+  if (last !== undefined && now - last < TRANSPORT_REJECTION_COOLDOWN_MS) {
+    // Suppressed repeat: hand back the report this key already produced, so the
+    // caller can pin THIS request's endpoint to the rejection instead of letting
+    // a notice fall through to a message match that resolves another endpoint.
+    return _rejectionReportByKey.get(key)
+  }
+  // A brand-new key past the ceiling records nothing: the outage has already
+  // taken its share of the ring, so the rejection resolves through a sibling
+  // key's report rather than evicting an answered failure that is still useful.
+  if (_rejectionSeenAt.size >= TRANSPORT_REJECTION_WINDOW_CAP) return undefined
+
+  _rejectionSeenAt.set(key, now)
+  // The HTTP method travels in its own `method` field (buildErrorPrompt renders
+  // it, and the layer that broke is already named by `code: network|timeout`),
+  // so nothing here needs a free-form `detail` marker — the message, endpoint,
+  // method and code carry the whole report.
+  const report = recordError({
+    source: 'api',
+    message: input.message,
+    endpoint: input.endpoint,
+    method: input.method,
+    code: input.code,
+  })
+  _rejectionReportByKey.set(key, report)
+  return report
+}
+
 /** Newest-first snapshot of the journal. */
 export function recentErrors(): ErrorReport[] {
   return _journal
+}
+
+/**
+ * A transport rejection shares its message with every other network drop — the
+ * browser's one `Failed to fetch` / `Load failed` — so matching it by message
+ * is matching nothing specific. {@link isTransportRejection} marks those entries
+ * so the message-only lookup can refuse them (see {@link findReport}).
+ */
+function isTransportRejection(report: ErrorReport): boolean {
+  return report.code === 'network' || report.code === 'timeout'
 }
 
 /**
@@ -253,12 +409,62 @@ export function recentErrors(): ErrorReport[] {
  * shared banner is handed only the string it always had, and looks the context
  * back up here. Exact match, newest first — an identical message from an older
  * request describes the same failure well enough to prompt with.
+ *
+ * **Transport rejections are deliberately NOT findable this way.** Every network
+ * drop carries the same message (`Failed to fetch` in Chrome, `Load failed` in
+ * Safari), so a message match during an outage returns whichever endpoint
+ * journaled LAST — usually some background poll's, not the request the user
+ * acted on. Naming the wrong endpoint with confidence is worse than the bare
+ * message this journal replaces. Those entries are reachable ONLY through the
+ * report {@link attachReport} pins to the rejection, read by
+ * {@link reportForError}; a bare message resolves to the newest ANSWERED failure
+ * that matches, or to nothing.
  */
 export function findReport(message: string | null | undefined): ErrorReport | undefined {
   if (!message) return undefined
   const needle = redactSecrets(message).trim()
   if (!needle) return undefined
-  return _journal.find(r => r.message.trim() === needle)
+  return _journal.find(r => !isTransportRejection(r) && r.message.trim() === needle)
+}
+
+/** Where {@link attachReport} pins the report on its error. A string key, not a symbol, so the
+ *  entry is visible on the rejection in devtools; defined NON-enumerable so a spread or JSON copy
+ *  of the error's fields does not carry the report's route and detail along with them. */
+const ATTACHED_REPORT = 'errorReport'
+
+/**
+ * Pin a journal entry to the rejection it describes.
+ *
+ * {@link findReport} resolves by EXACT MESSAGE over a newest-first journal, which is the right
+ * precision for the `setError(e.message)` sites it was built for -- but the client's bounded reads
+ * all reject with the same contract message (`deadline exceeded`), so two of them failing in
+ * sequence both resolve to whichever journaled LAST, and one notice hands the agent the other
+ * read's endpoint. The transport holds the report at the moment it rethrows, so it pins it here;
+ * {@link reportForError} reads that first and falls back to the message match only for a
+ * rejection nothing pinned to.
+ */
+export function attachReport<E extends object>(error: E, report: ErrorReport): E {
+  Object.defineProperty(error, ATTACHED_REPORT, { value: report, enumerable: false, configurable: true })
+  return error
+}
+
+/** The report {@link attachReport} pinned to this rejection, if any. Shape-checked rather than
+ *  trusted, because the error is `unknown` and the key is an ordinary property. */
+function attachedReport(error: unknown): ErrorReport | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const pinned = (error as Record<string, unknown>)[ATTACHED_REPORT]
+  if (typeof pinned !== 'object' || pinned === null) return undefined
+  const r = pinned as Partial<ErrorReport>
+  return typeof r.id === 'string' && typeof r.message === 'string' ? (r as ErrorReport) : undefined
+}
+
+/**
+ * The structured report behind a caught error: its own pinned entry when the transport attached
+ * one, else the newest journal entry with the same message. The read every notice that renders a
+ * bounded read's failure should use, for the reason {@link attachReport} gives.
+ */
+export function reportForError(error: unknown): ErrorReport | undefined {
+  return attachedReport(error) ?? findReport(errMessage(error))
 }
 
 /** Subscribe to journal changes. Returns an unsubscribe. */
@@ -272,6 +478,8 @@ export function __resetErrorJournalForTests(): void {
   _journal = []
   _seq = 0
   _listeners.clear()
+  _rejectionSeenAt.clear()
+  _rejectionReportByKey.clear()
 }
 
 // `buildErrorPrompt` deliberately lives in `errorReport.prompt.ts` (the
@@ -280,38 +488,157 @@ export function __resetErrorJournalForTests(): void {
 // close the import graph into a runtime cycle. Import it from
 // `./errorReport.prompt` directly.
 
+type ChatHandoffEntry = { prompt: string; ts: number }
+type ClaimedChatHandoffEntry = { prompt: string }
+
 /**
- * Stage a prompt for the chat composer.
+ * Locally claimed hand-offs awaiting a durable target-slot prefill.
+ *
+ * This is separate from {@link ERROR_HANDOFF_KEY}: subscribers may append and
+ * drain that ingress queue while a session request is pending. Keeping the
+ * claimed FIFO under its own key prevents a later diagnostic from consuming
+ * the active diagnostic's crash-recovery copy.
+ */
+const ERROR_HANDOFF_CLAIMED_KEY = 'kirocrew_error_handoff_claimed'
+
+/** Decode both the original single entry and the queued wire shape. */
+function decodeChatHandoffs(raw: string | null): ChatHandoffEntry[] {
+  if (!raw) return []
+  try {
+    const decoded: unknown = JSON.parse(raw)
+    const entries = Array.isArray(decoded) ? decoded : [decoded]
+    const now = Date.now()
+    return entries.flatMap((entry): ChatHandoffEntry[] => {
+      if (!entry || typeof entry !== 'object') return []
+      const { prompt, ts } = entry as { prompt?: unknown; ts?: unknown }
+      if (typeof prompt !== 'string' || !prompt) return []
+      if (typeof ts !== 'number' || now - ts > HANDOFF_TTL_MS) return []
+      return [{ prompt, ts }]
+    })
+  } catch {
+    return []
+  }
+}
+
+function decodeClaimedChatHandoffs(raw: string | null): ClaimedChatHandoffEntry[] {
+  if (!raw) return []
+  try {
+    const decoded: unknown = JSON.parse(raw)
+    const entries = Array.isArray(decoded) ? decoded : [decoded]
+    return entries.flatMap((entry): ClaimedChatHandoffEntry[] => {
+      if (!entry || typeof entry !== 'object') return []
+      const { prompt } = entry as { prompt?: unknown }
+      return typeof prompt === 'string' && prompt ? [{ prompt }] : []
+    })
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Mirror ChatPage's active + local FIFO while durable ingress storage is empty.
+ * Claimed entries deliberately do not age out: ChatPage may own them while
+ * disconnected for longer than the ingress TTL, and ownership must not turn a
+ * saved diagnostic into an expiring one.
+ */
+export function persistClaimedChatHandoffs(prompts: readonly string[]): boolean {
+  if (!prompts.length) {
+    try {
+      sessionStorage.removeItem(ERROR_HANDOFF_CLAIMED_KEY)
+      return true
+    } catch {
+      return false
+    }
+  }
+  return safeSetSessionItem(
+    ERROR_HANDOFF_CLAIMED_KEY,
+    JSON.stringify(prompts.map(prompt => ({ prompt }))),
+  )
+}
+
+/**
+ * Recover a prior page's claimed FIFO ahead of newer ingress entries.
+ *
+ * This runs once when this module loads. A same-document ChatPage remount does
+ * not replay an active request that the old component instance still owns, but
+ * a reload gets a new module instance and atomically promotes the crash copy
+ * back to the normal ingress queue. Write before delete: a failed promotion
+ * leaves the claimed copy available for the next reload rather than losing it.
+ */
+export function recoverClaimedChatHandoffs(): void {
+  let claimedRaw: string | null
+  try {
+    claimedRaw = sessionStorage.getItem(ERROR_HANDOFF_CLAIMED_KEY)
+  } catch {
+    return
+  }
+  if (claimedRaw === null) return
+
+  const claimed = decodeClaimedChatHandoffs(claimedRaw)
+  if (!claimed.length) {
+    try { sessionStorage.removeItem(ERROR_HANDOFF_CLAIMED_KEY) } catch { /* best effort */ }
+    return
+  }
+
+  let queued: ChatHandoffEntry[] = []
+  try {
+    queued = decodeChatHandoffs(sessionStorage.getItem(ERROR_HANDOFF_KEY))
+  } catch { /* best-effort storage: safeSetSessionItem handles the write */ }
+  const now = Date.now()
+  const recovered = [
+    ...claimed.map(({ prompt }) => ({ prompt, ts: now })),
+    ...queued,
+  ]
+  if (!safeSetSessionItem(ERROR_HANDOFF_KEY, JSON.stringify(recovered))) return
+  try { sessionStorage.removeItem(ERROR_HANDOFF_CLAIMED_KEY) } catch { /* duplicate-safe on retry */ }
+}
+
+/**
+ * Stage a prompt for a fresh chat session.
  *
  * sessionStorage rather than a Redux dispatch because the most valuable caller
  * is the root ErrorBoundary: when the React tree has already thrown, the store
  * and router may be exactly what is broken, so the hand-off has to survive a
  * hard `location.assign`. Same channel serves the healthy in-app path, so there
  * is one code path to reason about instead of two.
+ *
+ * The stored value is a queue. Two error surfaces can hand off before the first
+ * session request settles, and replacing a single entry would silently discard
+ * one diagnostic if both requests later needed to be re-staged.
  */
-export function handoffToChat(prompt: string): void {
-  safeSetSessionItem(ERROR_HANDOFF_KEY, JSON.stringify({ prompt, ts: Date.now() }))
+export function handoffToChat(prompt: string | readonly string[]): boolean {
+  const prompts = typeof prompt === 'string' ? [prompt] : prompt
+  if (!prompts.length) return true
+  let queued: ChatHandoffEntry[] = []
+  try {
+    queued = decodeChatHandoffs(sessionStorage.getItem(ERROR_HANDOFF_KEY))
+  } catch { /* best-effort storage: safeSetSessionItem handles the write */ }
+  const now = Date.now()
+  queued.push(...prompts.map(item => ({ prompt: item, ts: now })))
+  return safeSetSessionItem(ERROR_HANDOFF_KEY, JSON.stringify(queued))
 }
 
-/** Drain the hand-off channel. Returns the prompt, or null when absent/stale. */
+/** Drain one queued hand-off. Returns the oldest prompt, or null when absent/stale. */
 export function consumeChatHandoff(): string | null {
   let raw: string | null = null
   try {
     raw = sessionStorage.getItem(ERROR_HANDOFF_KEY)
+    // Claim the snapshot before decoding it. If rewriting the remainder fails,
+    // a consumed prompt still cannot be delivered twice.
     if (raw !== null) sessionStorage.removeItem(ERROR_HANDOFF_KEY)
   } catch {
     return null
   }
-  if (!raw) return null
-  try {
-    const { prompt, ts } = JSON.parse(raw) as { prompt?: unknown; ts?: unknown }
-    if (typeof prompt !== 'string' || !prompt) return null
-    if (typeof ts !== 'number' || Date.now() - ts > HANDOFF_TTL_MS) return null
-    return prompt
-  } catch {
-    return null
-  }
+  const queued = decodeChatHandoffs(raw)
+  const next = queued.shift()
+  if (!next) return null
+  if (queued.length) safeSetSessionItem(ERROR_HANDOFF_KEY, JSON.stringify(queued))
+  return next.prompt
 }
+
+// Module evaluation is the page-lifetime boundary: it repeats on reload but not
+// on a same-document React remount, which is exactly when claimed work is orphaned.
+recoverClaimedChatHandoffs()
 
 // ── Soft-navigation seam ─────────────────────────────────────────────────────
 //
@@ -325,11 +652,16 @@ export function consumeChatHandoff(): string | null {
 // imperative seam so non-page modules can navigate without importing a page.
 
 let _softNavigate: ((to: string) => void) | null = null
+let _maySoftNavigate: (() => boolean) | null = null
 const _handoffListeners = new Set<() => void>()
 
-/** Install (or clear, with `null`) the in-app navigator. Called by App.tsx. */
-export function installSoftNavigate(fn: ((to: string) => void) | null): void {
+/** Install (or clear, with `null`) the in-app navigator and its leave guard. Called by App.tsx. */
+export function installSoftNavigate(
+  fn: ((to: string) => void) | null,
+  mayNavigate: (() => boolean) | null = null,
+): void {
   _softNavigate = fn
+  _maySoftNavigate = fn ? mayNavigate : null
 }
 
 /**
@@ -345,29 +677,105 @@ export function subscribeChatHandoff(fn: () => void): () => void {
 }
 
 /**
- * Stage the prompt and get the user to the composer.
+ * Stage the prompt and get the user to a fresh chat session.
  *
  * `hard: true` forces a full page load — for the root ErrorBoundary, where a
  * soft navigation would re-render the very tree that just threw.
+ *
+ * **Navigating is conditional on the staging having stuck.** With storage
+ * unavailable or quota-exhausted the prompt never lands, so a navigation would
+ * unmount the surface the user was on and deliver them to an empty chat — it
+ * destroys context and gains nothing. Staying put keeps the error, and whatever
+ * they had typed, on screen. Returns whether the hand-off proceeded.
+ *
+ * `leaveGranted: true` says the caller has ALREADY asked the page's leave
+ * guard through its own gate (`AskAgentButton`'s `gate`, built on
+ * `useGuardedLeave`) and the page agreed. The installed `mayNavigate` is that
+ * same channel, so asking it again here would pose the discard question a
+ * second time — and a page guard that confirms a draft away does not clear the
+ * draft until it unmounts, so the second ask is a live confirm, not a free
+ * `true`. Cancelling it would abort a hand-off the user had just accepted.
+ * Ungated callers keep the ask.
  */
-export function sendErrorToChat(prompt: string, opts: { hard?: boolean } = {}): void {
-  handoffToChat(prompt)
-  if (!opts.hard) {
+export function sendErrorToChat(prompt: string, opts: { hard?: boolean; leaveGranted?: boolean } = {}): boolean {
+  // The app-level leave guard must run before staging: if the page refuses to
+  // leave, a queued prompt would ambush the next chat the user opens even
+  // though this click did not navigate. Hard mode is the root-boundary escape
+  // hatch and deliberately bypasses the live React tree.
+  const softNavigate = !opts.hard ? _softNavigate : null
+  if (softNavigate && !opts.leaveGranted && _maySoftNavigate && !_maySoftNavigate()) return false
+  if (!handoffToChat(prompt)) return false
+  if (softNavigate) {
     // Notify before navigating: an already-mounted ChatPage drains here, and a
     // not-yet-mounted one drains on mount instead.
     for (const fn of _handoffListeners) {
       try { fn() } catch { /* a bad subscriber must not strand the hand-off */ }
     }
-    if (_softNavigate) {
-      _softNavigate('/chat')
-      return
-    }
+    softNavigate('/chat')
+    return true
   }
-  try { window.location.assign('/chat') } catch { /* nothing left to try */ }
+  try { window.location.assign(withBase('/chat')) } catch { /* nothing left to try */ }
+  return true
 }
 
 /** Test seam — the seam is module state. */
 export function __resetNavSeamForTests(): void {
   _softNavigate = null
+  _maySoftNavigate = null
   _handoffListeners.clear()
+}
+
+// ── Gateway-connectivity seam ────────────────────────────────────────────────
+//
+// The hand-off delivers the error to a chat composer, and the composer can only
+// send while the gateway is reachable — while it is down the composer itself is
+// inert ("gateway offline — message will not send"). So an "Ask the agent"
+// affordance shown next to a connectivity failure is a dead end: the click
+// navigates to a chat that cannot run the agent, which is worse than no button.
+//
+// The dashboard's authoritative flag is `dashboardSlice.connected`, but the
+// button must stay mountable OUTSIDE the store `<Provider>` (its callers include
+// ErrorBoundary fallbacks — see AskAgentButton). Same resolution as the
+// soft-navigation seam above: the helpers in `hooks/websocket/gatewayConnectivity`
+// write the flag here, beside the dispatches that set the store's copy, and the
+// button subscribes to this module instead of the store.
+//
+// Defaults to `true` — reachable until the socket layer reports otherwise — so
+// nothing changes for surfaces that never learn about connectivity (popouts
+// mount the socket hook too, but a test render or an embedded frame may not).
+
+let _gatewayConnected = true
+const _gatewayListeners = new Set<() => void>()
+
+/**
+ * Mirror of the dashboard↔gateway connection flag. Written only by the
+ * `markGatewayConnected`/`markGatewayDisconnected` helpers in
+ * `hooks/websocket/gatewayConnectivity.ts`, each of which dispatches the
+ * store's `sseConnected`/`sseDisconnected` and sets this flag in one call.
+ * The store flag has another writer: `sseStatus` sets `connected = true` on
+ * its own, without touching this flag, so the two can differ.
+ */
+export function setGatewayConnected(connected: boolean): void {
+  if (_gatewayConnected === connected) return
+  _gatewayConnected = connected
+  for (const fn of _gatewayListeners) {
+    try { fn() } catch { /* a bad subscriber must not break connectivity tracking */ }
+  }
+}
+
+/** Snapshot for `useSyncExternalStore`. */
+export function isGatewayConnected(): boolean {
+  return _gatewayConnected
+}
+
+/** Subscribe to connectivity changes. Returns an unsubscribe. */
+export function subscribeGatewayConnected(fn: () => void): () => void {
+  _gatewayListeners.add(fn)
+  return () => { _gatewayListeners.delete(fn) }
+}
+
+/** Test seam — the flag is module state. */
+export function __resetGatewayConnectedForTests(): void {
+  _gatewayConnected = true
+  _gatewayListeners.clear()
 }
